@@ -17454,51 +17454,78 @@ ggml_cgraph * llama_model::build_graph(const llm_graph_params & params) const {
 
 void llama_model::duplicate_for_numa() {
 #if defined(__gnu_linux__) && defined(GGML_USE_NUMA)
-    // Check if NUMA duplication is enabled and needed
     if (ggml_numa_get_strategy() != GGML_NUMA_STRATEGY_DUPLICATE || !ggml_is_numa()) {
         return;
     }
-
+    
     int num_nodes = numa_num_configured_nodes();
     if (num_nodes <= 1) {
+        GGML_LOG_INFO("NUMA: Only 1 node detected, skipping model duplication\n");
         return;
     }
+    
+    GGML_LOG_INFO("NUMA: Duplicating model across %d nodes\n", num_nodes);
+    
+    // track total memory allocated and successful duplications
+    size_t total_duplicated_size = 0;
+    int successful_buffers = 0;
+    int total_buffers = 0;
 
-    LLAMA_LOG_INFO("%s: duplicating model weights for NUMA strategy DUPLICATE\n", __func__);
-
-    // Access the implementation's buffers
-    // Note: We need to know the actual structure of pimpl to access bufs
-    // This assumes pimpl->bufs exists as a vector of backend buffers
+    // access the implementation's buffers
     for (auto & buf : pimpl->bufs) {
         void * main_buffer = ggml_backend_buffer_get_base(buf.get());
         size_t buffer_size = ggml_backend_buffer_get_size(buf.get());
         
         if (main_buffer && buffer_size > 0) {
-            // Register the main buffer (node 0)
+            total_buffers++;
+            
+            // register the main buffer (node 0)
             ggml_numa_set_buffer(main_buffer, buffer_size);
             
-            // Duplicate to other NUMA nodes
+            int buffer_duplicates = 0;
+            
+            // duplicate to other nodes
             for (int node = 1; node < num_nodes; node++) {
                 void * node_buffer = numa_alloc_onnode(buffer_size, node);
                 if (node_buffer) {
-                    // Copy the model weights
+                    // copy the buffer contents
                     memcpy(node_buffer, main_buffer, buffer_size);
                     
-                    // Register the node-specific buffer
+                    // register the node-specific buffer
                     ggml_numa_set_buffer_for_node(node_buffer, node);
                     
-                    LLAMA_LOG_INFO("%s: duplicated %zu MB to NUMA node %d\n", 
-                        __func__, buffer_size / (1024*1024), node);
+                    buffer_duplicates++;
+                    total_duplicated_size += buffer_size;
                 } else {
-                    LLAMA_LOG_ERROR("%s: failed to allocate %zu MB on NUMA node %d\n", 
-                        __func__, buffer_size / (1024*1024), node);
+                    GGML_LOG_WARN("NUMA: Failed to allocate %zu bytes on node %d for buffer %d\n", 
+                                  buffer_size, node, total_buffers - 1);
                 }
+            }
+            
+            if (buffer_duplicates == num_nodes - 1) {
+                successful_buffers++;
+            } else if (buffer_duplicates > 0) {
+                GGML_LOG_WARN("NUMA: Buffer %d only duplicated to %d/%d nodes\n", 
+                              total_buffers - 1, buffer_duplicates, num_nodes - 1);
+            } else {
+                GGML_LOG_ERROR("NUMA: Buffer %d failed to duplicate to any nodes\n", 
+                               total_buffers - 1);
             }
         }
     }
+    
+    if (successful_buffers == total_buffers && total_buffers > 0) {
+        GGML_LOG_INFO("NUMA: Successfully duplicated all %d buffers (%.2f GB total) across %d nodes\n", 
+                      total_buffers, total_duplicated_size / (1024.0 * 1024.0 * 1024.0), num_nodes);
+    } else if (successful_buffers > 0) {
+        GGML_LOG_WARN("NUMA: Partially duplicated %d/%d buffers across nodes\n", 
+                      successful_buffers, total_buffers);
+    } else {
+        GGML_LOG_ERROR("NUMA: Failed to duplicate any buffers across nodes\n");
+    }
 #else
     // NUMA not available or not compiled with NUMA support
-    (void)this; // Suppress unused parameter warning
+    (void)this; // suppress unused parameter warning
 #endif
 }
 
