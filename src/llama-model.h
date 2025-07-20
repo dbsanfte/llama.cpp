@@ -456,6 +456,9 @@ struct llama_model {
     // TODO: move this to new llm_arch_model_i interface
     ggml_cgraph * build_graph(const llm_graph_params & params) const;
 
+    // NUMA duplication support
+    void duplicate_for_numa();
+
 private:
     struct impl;
     std::unique_ptr<impl> pimpl;

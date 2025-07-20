@@ -96,6 +96,17 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
         target_link_libraries(${GGML_CPU_NAME} PUBLIC memkind)
     endif()
 
+    # Add NUMA library linking for Linux systems
+    if (CMAKE_SYSTEM_NAME MATCHES "Linux")
+        find_library(NUMA_LIBRARY numa)
+        if (NUMA_LIBRARY)
+            message(STATUS "NUMA library found")
+            target_link_libraries(${GGML_CPU_NAME} PRIVATE ${NUMA_LIBRARY})
+        else()
+            message(WARNING "NUMA library not found. NUMA support will be disabled.")
+        endif()
+    endif()
+
     if (GGML_SYSTEM_ARCH STREQUAL "ARM")
         message(STATUS "ARM detected")
         list(APPEND GGML_CPU_SOURCES

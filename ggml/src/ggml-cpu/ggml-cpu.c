@@ -36,6 +36,8 @@
 #include <signal.h>
 #if defined(__gnu_linux__)
 #include <syscall.h>
+#include <numa.h>
+#include <numaif.h>
 #endif
 
 #ifdef GGML_USE_OPENMP
@@ -503,6 +505,8 @@ struct ggml_numa_nodes {
     uint32_t n_nodes;
     uint32_t total_cpus; // hardware threads on system
     uint32_t current_node; // node on which main process is execting
+    void * buffers[GGML_NUMA_MAX_NODES]; // for DUPLICATE strategy
+    size_t buffer_size;                 // for DUPLICATE strategy
 #if defined(__gnu_linux__)
     cpu_set_t cpuset; // cpuset from numactl
 #else
@@ -598,10 +602,15 @@ void ggml_numa_init(enum ggml_numa_strategy numa_flag) {
 
     GGML_PRINT_DEBUG("numa strategy %u\n",g_state.numa.numa_strategy);
 
+    if (g_state.numa.numa_strategy != GGML_NUMA_STRATEGY_DISABLED && numa_available() < 0) {
+        GGML_LOG_WARN("%s: NUMA support is not available on this system.\n", __func__);
+        g_state.numa.numa_strategy = GGML_NUMA_STRATEGY_DISABLED;
+    }
+
     g_state.numa.cpuset = ggml_get_numa_affinity();
 
     // enumerate nodes
-    while (g_state.numa.n_nodes < GGML_NUMA_MAX_NODES) {
+    while (g_state.numa.numa_strategy != GGML_NUMA_STRATEGY_DISABLED && g_state.numa.numa_strategy != GGML_NUMA_STRATEGY_NUMACTL && g_state.numa.n_nodes < GGML_NUMA_MAX_NODES) {
         rv = snprintf(path, sizeof(path), "/sys/devices/system/node/node%u", g_state.numa.n_nodes);
         GGML_ASSERT(rv > 0 && (unsigned)rv < sizeof(path));
         if (stat(path, &st) != 0) { break; }
@@ -671,6 +680,27 @@ void ggml_numa_init(enum ggml_numa_strategy numa_flag) {
 
 bool ggml_is_numa(void) {
     return g_state.numa.n_nodes > 1;
+}
+
+enum ggml_numa_strategy ggml_numa_get_strategy(void) {
+    return g_state.numa.numa_strategy;
+}
+
+void ggml_numa_set_buffer(void * buffer, size_t size) {
+    if (!ggml_is_numa() || g_state.numa.numa_strategy != GGML_NUMA_STRATEGY_DUPLICATE) {
+        return;
+    }
+    g_state.numa.buffers[0] = buffer;
+    g_state.numa.buffer_size = size;
+}
+
+void ggml_numa_set_buffer_for_node(void * buffer, int node) {
+    if (!ggml_is_numa() || g_state.numa.numa_strategy != GGML_NUMA_STRATEGY_DUPLICATE) {
+        return;
+    }
+    if (node >= 0 && (unsigned)node < g_state.numa.n_nodes) {
+        g_state.numa.buffers[node] = buffer;
+    }
 }
 
 #if defined(__ARM_ARCH)
@@ -1638,7 +1668,7 @@ static void ggml_compute_forward_mul_mat_id(
 
         while (current_chunk < nchunk0 * nchunk1) {
             const int64_t ith0 = current_chunk % nchunk0;
-            const int64_t ith1 = current_chunk / nchunk0;
+                       const int64_t ith1 = current_chunk / nchunk0;
 
             const int64_t ir0_start = dr0 * ith0;
             const int64_t ir0_end = MIN(ir0_start + dr0, nr0);
@@ -1669,6 +1699,57 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
     if (tensor->op == GGML_OP_NONE || ggml_is_empty(tensor)) {
         return;
     }
+
+#if defined(__gnu_linux__)
+    // Local pointers for NUMA redirection
+    void * local_data = tensor->data;
+    void * local_src_data[GGML_MAX_SRC];
+    
+    // Initialize local source pointers
+    for (int i = 0; i < GGML_MAX_SRC; ++i) {
+        local_src_data[i] = tensor->src[i] ? tensor->src[i]->data : NULL;
+    }
+    
+    if (g_state.numa.numa_strategy == GGML_NUMA_STRATEGY_DUPLICATE && g_state.numa.buffer_size > 0) {
+        unsigned int current_node;
+        if (syscall(SYS_getcpu, NULL, &current_node) == 0) {
+            if (current_node < g_state.numa.n_nodes && g_state.numa.buffers[current_node] != NULL) {
+                // Check if tensor data is within the main buffer (node 0)
+                if (tensor->data >= g_state.numa.buffers[0] && (char *)tensor->data < (char *)g_state.numa.buffers[0] + g_state.numa.buffer_size) {
+                    // Redirect to node-local buffer
+                    size_t offset = (char *)tensor->data - (char *)g_state.numa.buffers[0];
+                    local_data = (char *)g_state.numa.buffers[current_node] + offset;
+                }
+                // Same for source tensors
+                for (int i = 0; i < GGML_MAX_SRC; ++i) {
+                    if (tensor->src[i] != NULL) {
+                        if (tensor->src[i]->data >= g_state.numa.buffers[0] && (char *)tensor->src[i]->data < (char *)g_state.numa.buffers[0] + g_state.numa.buffer_size) {
+                            size_t offset = (char *)tensor->src[i]->data - (char *)g_state.numa.buffers[0];
+                            local_src_data[i] = (char *)g_state.numa.buffers[current_node] + offset;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    // Create a temporary tensor structure with redirected pointers
+    struct ggml_tensor temp_tensor = *tensor;
+    temp_tensor.data = local_data;
+    
+    // Create temporary source tensor structures if needed
+    struct ggml_tensor temp_src[GGML_MAX_SRC];
+    for (int i = 0; i < GGML_MAX_SRC; ++i) {
+        if (tensor->src[i] != NULL) {
+            temp_src[i] = *tensor->src[i];
+            temp_src[i].data = local_src_data[i];
+            temp_tensor.src[i] = &temp_src[i];
+        }
+    }
+    
+    // Use the temporary tensor for computation
+    tensor = &temp_tensor;
+#endif
 
     // extra_buffer op?
     if (ggml_cpu_extra_compute_forward(params, tensor)) {
@@ -2064,6 +2145,12 @@ static void set_numa_thread_affinity(int thread_n) {
                 fprintf(stderr, "warning: pthread_setaffinity_np() failed: %s\n",strerror(rv));
             }
             return;
+        case GGML_NUMA_STRATEGY_INTERLEAVE:
+        case GGML_NUMA_STRATEGY_DUPLICATE:
+            // For INTERLEAVE and DUPLICATE strategies, we distribute threads
+            // across nodes to maximize memory bandwidth utilization
+            node_num = thread_n % g_state.numa.n_nodes;
+            break;
         default:
             return;
     }
@@ -2794,7 +2881,7 @@ struct ggml_cplan ggml_graph_plan(
                     } break;
                 case GGML_OP_FLASH_ATTN_BACK:
                     {
-                        const int64_t    D = node->src[0]->ne[0];
+                            const int64_t    D = node->src[0]->ne[0];
                         const int64_t ne11 = ggml_up(node->src[1]->ne[1], GGML_SOFT_MAX_UNROLL);
                         const int64_t mxDn = MAX(D, ne11) * 2; // *2 because of S and SM in ggml_compute_forward_flash_attn_back
                         if (node->src[1]->type == GGML_TYPE_F32) {

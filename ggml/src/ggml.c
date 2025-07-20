@@ -37,6 +37,10 @@
 #include <syscall.h>
 #endif
 
+#if defined(__gnu_linux__) && defined(GGML_USE_NUMA)
+#include <numa.h>
+#endif
+
 #if defined(__APPLE__)
 #include <unistd.h>
 #include <mach/mach.h>
@@ -283,6 +287,10 @@ void ggml_log_callback_default(enum ggml_log_level level, const char * text, voi
 // end of logging block
 //
 
+// Forward declarations for NUMA functions
+extern bool ggml_is_numa(void);
+extern enum ggml_numa_strategy ggml_numa_get_strategy(void);
+
 #ifdef GGML_USE_ACCELERATE
 // uncomment to use vDSP for soft max computation
 // note: not sure if it is actually faster
@@ -291,6 +299,17 @@ void ggml_log_callback_default(enum ggml_log_level level, const char * text, voi
 
 
 void * ggml_aligned_malloc(size_t size) {
+#if defined(__gnu_linux__) && defined(GGML_USE_NUMA)
+    // Check if NUMA is available and INTERLEAVE strategy is active
+    if (ggml_is_numa() && ggml_numa_get_strategy() == GGML_NUMA_STRATEGY_INTERLEAVE) {
+        void * ptr = numa_alloc_interleaved(size);
+        if (ptr != NULL) {
+            return ptr;
+        }
+        // Fall back to regular allocation if NUMA allocation fails
+        GGML_LOG_WARN("NUMA interleaved allocation failed for size %zu, falling back to regular allocation\n", size);
+    }
+#endif
 #if defined(__s390x__)
     const int alignment = 256;
 #else
@@ -347,6 +366,17 @@ void * ggml_aligned_malloc(size_t size) {
 }
 
 void ggml_aligned_free(void * ptr, size_t size) {
+    if (ptr == NULL) {
+        return;
+    }
+
+#if defined(__gnu_linux__) && defined(GGML_USE_NUMA)
+    // Check if this was a NUMA allocation
+    if (ggml_is_numa() && ggml_numa_get_strategy() == GGML_NUMA_STRATEGY_INTERLEAVE) {
+        numa_free(ptr, size);
+        return;
+    }
+#endif
     GGML_UNUSED(size);
 #if defined(_MSC_VER) || defined(__MINGW32__)
     _aligned_free(ptr);
