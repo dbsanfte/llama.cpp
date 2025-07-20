@@ -698,7 +698,7 @@ void ggml_numa_set_buffer_for_node(void * buffer, int node) {
     if (!ggml_is_numa() || g_state.numa.numa_strategy != GGML_NUMA_STRATEGY_DUPLICATE) {
         return;
     }
-    if (node >= 0 && (unsigned)node < g_state.numa.n_nodes) {
+    if (node >= 0 && node < (int)g_state.numa.n_nodes) {
         g_state.numa.buffers[node] = buffer;
     }
 }

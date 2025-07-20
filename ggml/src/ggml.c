@@ -300,13 +300,13 @@ extern enum ggml_numa_strategy ggml_numa_get_strategy(void);
 
 void * ggml_aligned_malloc(size_t size) {
 #if defined(__gnu_linux__) && defined(GGML_USE_NUMA)
-    // Check if NUMA is available and INTERLEAVE strategy is active
+    // check if NUMA is available and INTERLEAVE strategy is active
     if (ggml_is_numa() && ggml_numa_get_strategy() == GGML_NUMA_STRATEGY_INTERLEAVE) {
         void * ptr = numa_alloc_interleaved(size);
         if (ptr != NULL) {
             return ptr;
         }
-        // Fall back to regular allocation if NUMA allocation fails
+        // fall back to regular allocation if NUMA allocation fails
         GGML_LOG_WARN("NUMA interleaved allocation failed for size %zu, falling back to regular allocation\n", size);
     }
 #endif
