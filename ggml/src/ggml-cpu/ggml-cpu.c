@@ -1529,17 +1529,17 @@ static void ggml_compute_forward_mul_mat_id(
         assert(params->wsize >= ne13*nbw3);
         GGML_ASSERT(src1->type == GGML_TYPE_F32);
 
-#if 0
+    #if 0
         for (int64_t i13 = 0; i13 < ne13; ++i13) {
-            for (int64_t i12 = ith; i12 < ne12; i12 += nth) {
-                for (int64_t i11 = 0; i11 < ne11; ++i11) {
+            for (int64_t i12 = 0; i12 < ne12; ++i12) {
+                for (int64_t i11 = ith; i11 < ne11; i11 += nth) {
                     from_float((float *)((char *) src1->data + i13*nb13 + i12*nb12 + i11*nb11),
                                (void *)               (wdata + i13*nbw3 + i12*nbw2 + i11*nbw1),
-                               ne10);
+                                ne10);
                 }
             }
         }
-#else
+    #else
         for (int64_t i13 = 0; i13 < ne13; ++i13) {
             for (int64_t i12 = 0; i12 < ne12; ++i12) {
                 for (int64_t i11 = 0; i11 < ne11; ++i11) {
@@ -1552,22 +1552,36 @@ static void ggml_compute_forward_mul_mat_id(
                 }
             }
         }
-#endif
+    #endif
     }
 
-    if (ith == 0) {
-        // initialize matrix_row_counts
-        memset(matrix_row_counts, 0, n_as*sizeof(int64_t));
+    // parallelize initialization of matrix_row_counts and matrix_rows
+    {
+        const int64_t n_per_thread = (ids->ne[1] + nth - 1) / nth;
+        const int64_t iid1_start = n_per_thread * ith;
+        const int64_t iid1_end   = MIN(iid1_start + n_per_thread, ids->ne[1]);
+
+        // zero the part of matrix_row_counts that this thread will be responsible for.
+        // can't just zero the whole thing in thread 0 as that would defeat the purpose of NUMA-aware initialization.
+        for (int64_t iid1 = iid1_start; iid1 < iid1_end; ++iid1) {
+            for (int id = 0; id < n_ids; ++id) {
+                const int32_t i02 = *(const int32_t *) ((const char *) ids->data + iid1*ids->nb[1] + id*ids->nb[0]);
+                matrix_row_counts[i02] = 0;
+            }
+        }
+
+        ggml_barrier(params->threadpool);
 
         // group rows by src0 matrix
-        for (int64_t iid1 = 0; iid1 < ids->ne[1]; ++iid1) {
+        for (int64_t iid1 = iid1_start; iid1 < iid1_end; ++iid1) {
             for (int id = 0; id < n_ids; ++id) {
                 const int32_t i02 = *(const int32_t *) ((const char *) ids->data + iid1*ids->nb[1] + id*ids->nb[0]);
 
                 assert(i02 >= 0 && i02 < n_as);
 
-                MMID_MATRIX_ROW(i02, matrix_row_counts[i02]) = (struct mmid_row_mapping) {id, iid1};
-                matrix_row_counts[i02] += 1;
+                // atomic increment, since multiple threads can touch the same i02
+                int64_t offset = atomic_fetch_add(&matrix_row_counts[i02], 1);
+                MMID_MATRIX_ROW(i02, offset) = (struct mmid_row_mapping) {id, iid1};
             }
         }
     }
