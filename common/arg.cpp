@@ -2290,8 +2290,9 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         "- numactl: use the CPU map provided by numactl\n"
         "- interleave: use interleaved memory allocation across all nodes\n"
         "- duplicate: use the CPU map provided by numactl, but duplicate the model on all nodes\n"
-        "             NOTE: this is an experimental feature, and may not work on all systems\n"        
-        "if run without this previously, it is recommended to drop the system page cache before using this\n"
+        "             NOTE: this is an experimental feature, and you probably want to set SNC=disable in bios\n"  
+        "\n"      
+        "if run without numa previously, it is recommended to drop the system page cache before using this\n"
         "see https://github.com/ggml-org/llama.cpp/issues/1437",
         [](common_params & params, const std::string & value) {
             /**/ if (value == "distribute" || value == "") { params.numa = GGML_NUMA_STRATEGY_DISTRIBUTE; }
