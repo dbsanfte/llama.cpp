@@ -15,7 +15,7 @@
 
 #include "ggml-cpu.h"  // For NUMA functions
 
-#if defined(__gnu_linux__) && defined(GGML_USE_NUMA)
+#if defined(__gnu_linux__)
 #include <numa.h>
 #include <numaif.h>
 #endif
@@ -17453,7 +17453,7 @@ ggml_cgraph * llama_model::build_graph(const llm_graph_params & params) const {
 //
 
 void llama_model::duplicate_for_numa() {
-#if defined(__gnu_linux__) && defined(GGML_USE_NUMA)
+#if defined(__gnu_linux__)
     if (ggml_numa_get_strategy() != GGML_NUMA_STRATEGY_DUPLICATE || !ggml_is_numa()) {
         return;
     }

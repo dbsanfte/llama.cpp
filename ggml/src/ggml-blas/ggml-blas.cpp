@@ -7,7 +7,7 @@
 #include <vector>
 #include <cstring>
 
-#if defined(__gnu_linux__) && defined(GGML_USE_NUMA)
+#if defined(__gnu_linux__) 
 #include <numa.h>
 #endif
 
@@ -64,7 +64,7 @@ static void ggml_backend_blas_mul_mat(ggml_backend_blas_context * ctx, struct gg
 
     if (ctx->work_size < desired_wsize) {
         if (ggml_is_numa()) {
-#if defined(__gnu_linux__) && defined(GGML_USE_NUMA)
+#if defined(__gnu_linux__)
             if (ggml_numa_get_strategy() == GGML_NUMA_STRATEGY_INTERLEAVE) {
                 void * data = numa_alloc_interleaved(desired_wsize);
                 ctx->work_data.reset((char *)data, [=](char * ptr) { numa_free(ptr, desired_wsize); });

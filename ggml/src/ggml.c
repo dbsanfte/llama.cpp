@@ -37,7 +37,7 @@
 #include <syscall.h>
 #endif
 
-#if defined(__gnu_linux__) && defined(GGML_USE_NUMA)
+#if defined(__gnu_linux__)
 #include <numa.h>
 #endif
 
@@ -299,7 +299,7 @@ extern enum ggml_numa_strategy ggml_numa_get_strategy(void);
 
 
 void * ggml_aligned_malloc(size_t size) {
-#if defined(__gnu_linux__) && defined(GGML_USE_NUMA)
+#if defined(__gnu_linux__) 
     // check if NUMA is available and INTERLEAVE strategy is active
     if (ggml_is_numa() && ggml_numa_get_strategy() == GGML_NUMA_STRATEGY_INTERLEAVE) {
         void * ptr = numa_alloc_interleaved(size);
@@ -370,7 +370,7 @@ void ggml_aligned_free(void * ptr, size_t size) {
         return;
     }
 
-#if defined(__gnu_linux__) && defined(GGML_USE_NUMA)
+#if defined(__gnu_linux__) 
     // Check if this was a NUMA allocation
     if (ggml_is_numa() && ggml_numa_get_strategy() == GGML_NUMA_STRATEGY_INTERLEAVE) {
         numa_free(ptr, size);
