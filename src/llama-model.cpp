@@ -17472,16 +17472,17 @@ ggml_cgraph * llama_model::build_graph(const llm_graph_params & params) const {
 void llama_model::duplicate_for_numa() {
 #if defined(__gnu_linux__)
     if (ggml_numa_get_strategy() != GGML_NUMA_STRATEGY_DUPLICATE || !ggml_is_numa()) {
+        LLAMA_LOG_DEBUG("NUMA: Skipping model duplication because NUMA is not enabled or strategy is not set to duplicate\n");
         return;
     }
     
     int num_nodes = numa_num_configured_nodes();
     if (num_nodes <= 1) {
-        GGML_LOG_INFO("NUMA: Only 1 node detected, skipping model duplication\n");
+        LLAMA_LOG_INFO("NUMA: Only 1 node detected, skipping model duplication\n");
         return;
     }
     
-    GGML_LOG_INFO("NUMA: Duplicating model across %d nodes\n", num_nodes);
+    LLAMA_LOG_INFO("NUMA: Duplicating model across %d nodes\n", num_nodes);
     
     // track total memory allocated and successful duplications
     size_t total_duplicated_size = 0;
@@ -17514,7 +17515,7 @@ void llama_model::duplicate_for_numa() {
                     buffer_duplicates++;
                     total_duplicated_size += buffer_size;
                 } else {
-                    GGML_LOG_WARN("NUMA: Failed to allocate %zu bytes on node %d for buffer %d\n", 
+                    LLAMA_LOG_WARN("NUMA: Failed to allocate %zu bytes on node %d for buffer %d\n", 
                                   buffer_size, node, total_buffers - 1);
                 }
             }
@@ -17522,23 +17523,23 @@ void llama_model::duplicate_for_numa() {
             if (buffer_duplicates == num_nodes - 1) {
                 successful_buffers++;
             } else if (buffer_duplicates > 0) {
-                GGML_LOG_WARN("NUMA: Buffer %d only duplicated to %d/%d nodes\n", 
+                LLAMA_LOG_WARN("NUMA: Buffer %d only duplicated to %d/%d nodes\n", 
                               total_buffers - 1, buffer_duplicates, num_nodes - 1);
             } else {
-                GGML_LOG_ERROR("NUMA: Buffer %d failed to duplicate to any nodes\n", 
+                LLAMA_LOG_ERROR("NUMA: Buffer %d failed to duplicate to any nodes\n", 
                                total_buffers - 1);
             }
         }
     }
     
     if (successful_buffers == total_buffers && total_buffers > 0) {
-        GGML_LOG_INFO("NUMA: Successfully duplicated all %d buffers (%.2f GB total) across %d nodes\n", 
+        LLAMA_LOG_INFO("NUMA: Successfully duplicated all %d buffers (%.2f GB total) across %d nodes\n", 
                       total_buffers, total_duplicated_size / (1024.0 * 1024.0 * 1024.0), num_nodes);
     } else if (successful_buffers > 0) {
-        GGML_LOG_WARN("NUMA: Partially duplicated %d/%d buffers across nodes\n", 
+        LLAMA_LOG_WARN("NUMA: Partially duplicated %d/%d buffers across nodes\n", 
                       successful_buffers, total_buffers);
     } else {
-        GGML_LOG_ERROR("NUMA: Failed to duplicate any buffers across nodes\n");
+        LLAMA_LOG_ERROR("NUMA: Failed to duplicate any buffers across nodes\n");
     }
 #else
     // NUMA not available or not compiled with NUMA support

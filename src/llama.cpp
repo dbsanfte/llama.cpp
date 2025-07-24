@@ -127,11 +127,21 @@ static int llama_model_load(const std::string & fname, std::vector<std::string> 
             return -2;
         }
 
-        // Apply NUMA duplication if needed
-        model.duplicate_for_numa();
+        // NEW: integrated NUMA logic based on strategy
+        if (ggml_numa_get_strategy() == GGML_NUMA_STRATEGY_DUPLICATE) {
+            // the model's data is in the first memory map.
+            // this is cleaner because it uses the low-level ggml function
+            // and directly accesses the mmap'd buffer.
+            if (!model.pimpl->mappings.empty()) {
+                auto & mapping = model.pimpl->mappings.front();
+                if (mapping->addr && mapping->size > 0) {
+                    ggml_numa_duplicate_buffer(mapping->addr, mapping->size);
+                }
+            }
+        }
 
     } catch (const std::exception & err) {
-        LLAMA_LOG_ERROR("%s: error loading model: %s\n", __func__, err.what());
+        LLAMA_LOG_ERROR(NULL, "error loading model: %s", err.what());
         return -1;
     }
 

@@ -206,6 +206,42 @@ void ggml_print_backtrace(void) {
 }
 #endif
 
+// New function to handle NUMA duplication
+void ggml_numa_duplicate_buffer(void * buffer, size_t size) {
+#if defined(__gnu_linux__)
+    if (!ggml_is_numa()) {
+        return;
+    }
+
+    const int n_nodes = numa_num_configured_nodes();
+    if (n_nodes <= 1) {
+        return;
+    }
+
+    GGML_LOG_INFO("%s: duplicating buffer across %d NUMA nodes\n", __func__, n_nodes);
+
+    // Create a thread for each NUMA node to touch the pages
+    // This forces the OS to fault the pages into the local RAM of each node
+    #pragma omp parallel for
+    for (int i = 0; i < n_nodes; ++i) {
+        if (numa_run_on_node(i) == -1) {
+            GGML_LOG_WARN("%s: failed to pin thread to NUMA node %d\n", __func__, i);
+        }
+
+        // Iterate over the buffer with a large step size to touch pages
+        // A simple loop is sufficient to cause the page faults
+        volatile char * p = (volatile char *)buffer;
+        for (size_t j = 0; j < size; j += 4096) { // 4096 is a typical page size
+            p[j];
+        }
+    }
+#else
+    // Suppress unused parameter warnings on non-Linux systems
+    (void)buffer;
+    (void)size;
+#endif
+}
+
 static ggml_abort_callback_t g_abort_callback = NULL;
 
 // Set the abort callback (passing null will restore original abort functionality: printing a message to stdout)
@@ -299,15 +335,12 @@ extern enum ggml_numa_strategy ggml_numa_get_strategy(void);
 
 
 void * ggml_aligned_malloc(size_t size) {
-#if defined(__gnu_linux__) 
+#if defined(__gnu_linux__)
     // check if NUMA is available and DISTRIBUTE strategy is active
     if (ggml_is_numa() && ggml_numa_get_strategy() == GGML_NUMA_STRATEGY_DISTRIBUTE) {
         void * ptr = numa_alloc_interleaved(size);
-        if (ptr != NULL) {
-            return ptr;
-        }
-        // fall back to regular allocation if NUMA allocation fails
-        GGML_LOG_WARN("NUMA interleaved allocation failed for size %zu, falling back to regular allocation\n", size);
+        GGML_ASSERT(ptr != NULL);
+        return ptr;
     }
 #endif
 #if defined(__s390x__)
@@ -370,9 +403,9 @@ void ggml_aligned_free(void * ptr, size_t size) {
         return;
     }
 
-#if defined(__gnu_linux__) 
-    // Check if this was a NUMA allocation
+#if defined(__gnu_linux__)
     if (ggml_is_numa() && ggml_numa_get_strategy() == GGML_NUMA_STRATEGY_DISTRIBUTE) {
+        // this memory was allocated with numa_alloc_interleaved, so it must be freed with numa_free.
         numa_free(ptr, size);
         return;
     }
