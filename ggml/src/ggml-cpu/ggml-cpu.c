@@ -2130,6 +2130,7 @@ static void set_numa_thread_affinity(int thread_n) {
     size_t setsize = CPU_ALLOC_SIZE(g_state.numa.total_cpus);
 
     switch(g_state.numa.numa_strategy) {
+        case GGML_NUMA_STRATEGY_DUPLICATE:
         case GGML_NUMA_STRATEGY_DISTRIBUTE:
             // run thread on node_num thread_n / (threads per node)
             node_num = thread_n % g_state.numa.n_nodes;
@@ -2145,12 +2146,6 @@ static void set_numa_thread_affinity(int thread_n) {
                 fprintf(stderr, "warning: pthread_setaffinity_np() failed: %s\n",strerror(rv));
             }
             return;
-        case GGML_NUMA_STRATEGY_INTERLEAVE:
-        case GGML_NUMA_STRATEGY_DUPLICATE:
-            // For INTERLEAVE and DUPLICATE strategies, we distribute threads
-            // across nodes to maximize memory bandwidth utilization
-            node_num = thread_n % g_state.numa.n_nodes;
-            break;
         default:
             return;
     }

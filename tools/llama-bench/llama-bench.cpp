@@ -632,8 +632,6 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                     params.numa = GGML_NUMA_STRATEGY_ISOLATE;
                 } else if (value == "numactl") {
                     params.numa = GGML_NUMA_STRATEGY_NUMACTL;
-                } else if (value == "interleave") {
-                    params.numa = GGML_NUMA_STRATEGY_INTERLEAVE;
                 } else if (value == "duplicate") {
                     params.numa = GGML_NUMA_STRATEGY_DUPLICATE;
                 } else {

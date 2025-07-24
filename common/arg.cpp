@@ -2285,14 +2285,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     add_opt(common_arg(
         {"--numa"}, "TYPE",
         "attempt optimizations that help on some NUMA systems\n"
-        "- distribute: spread execution evenly over all nodes\n"
+        "- distribute: spread execution evenly over all nodes with interleaved memory allocation\n"
         "- isolate: only spawn threads on CPUs on the node that execution started on\n"
         "- numactl: use the CPU map provided by numactl\n"
-        "- interleave: use interleaved memory allocation across all nodes (better cross-numa perf)\n"
         "- duplicate: use the CPU map provided by numactl, but duplicate the model on all nodes.\n"
-        "             gives better performance than interleave, but you need enough ram to fit the whole model\n"
+        "             gives better performance than distribute, but you need enough ram to fit the whole model\n"
         "             on each individual numa node.\n" 
-        "             NOTE: this is an experimental feature, and you probably want to set SNC=disable in bios (Xeon)\n"  
+        "             NOTE: this is an experimental feature, and you probably want to set SNC=disable in bios for Xeon\n"  
         "\n"      
         "if run without numa previously, it is recommended to drop the system page cache before using this\n"
         "see https://github.com/ggml-org/llama.cpp/issues/1437",
@@ -2300,7 +2299,6 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             /**/ if (value == "distribute" || value == "") { params.numa = GGML_NUMA_STRATEGY_DISTRIBUTE; }
             else if (value == "isolate") { params.numa = GGML_NUMA_STRATEGY_ISOLATE; }
             else if (value == "numactl") { params.numa = GGML_NUMA_STRATEGY_NUMACTL; }
-            else if (value == "interleave") { params.numa = GGML_NUMA_STRATEGY_INTERLEAVE; }
             else if (value == "duplicate") { params.numa = GGML_NUMA_STRATEGY_DUPLICATE; }
             else { throw std::invalid_argument("invalid value"); }
         }

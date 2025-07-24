@@ -300,8 +300,8 @@ extern enum ggml_numa_strategy ggml_numa_get_strategy(void);
 
 void * ggml_aligned_malloc(size_t size) {
 #if defined(__gnu_linux__) 
-    // check if NUMA is available and INTERLEAVE strategy is active
-    if (ggml_is_numa() && ggml_numa_get_strategy() == GGML_NUMA_STRATEGY_INTERLEAVE) {
+    // check if NUMA is available and DISTRIBUTE strategy is active
+    if (ggml_is_numa() && ggml_numa_get_strategy() == GGML_NUMA_STRATEGY_DISTRIBUTE) {
         void * ptr = numa_alloc_interleaved(size);
         if (ptr != NULL) {
             return ptr;
@@ -372,7 +372,7 @@ void ggml_aligned_free(void * ptr, size_t size) {
 
 #if defined(__gnu_linux__) 
     // Check if this was a NUMA allocation
-    if (ggml_is_numa() && ggml_numa_get_strategy() == GGML_NUMA_STRATEGY_INTERLEAVE) {
+    if (ggml_is_numa() && ggml_numa_get_strategy() == GGML_NUMA_STRATEGY_DISTRIBUTE) {
         numa_free(ptr, size);
         return;
     }
