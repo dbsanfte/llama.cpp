@@ -586,9 +586,9 @@ static uint32_t ggml_get_numa_affinity(void) {
 #endif
 
 void ggml_numa_init(enum ggml_numa_strategy numa_flag) {
+    GGML_LOG_DEBUG("%s: strategy %d\n", __func__, numa_flag);
     if (g_state.numa.n_nodes > 0) {
-        fprintf(stderr, "ggml_numa_init: NUMA already initialized\n");
-
+        GGML_LOG_WARN("%s: NUMA already initialized\n", __func__);
         return;
     }
 
@@ -600,7 +600,7 @@ void ggml_numa_init(enum ggml_numa_strategy numa_flag) {
     // set numa scheme
     g_state.numa.numa_strategy = numa_flag;
 
-    GGML_PRINT_DEBUG("numa strategy %u\n",g_state.numa.numa_strategy);
+    GGML_LOG_DEBUG("%s: numa strategy %u\n", __func__, g_state.numa.numa_strategy);
 
     if (g_state.numa.numa_strategy != GGML_NUMA_STRATEGY_DISABLED && numa_available() < 0) {
         GGML_LOG_WARN("%s: NUMA support is not available on this system.\n", __func__);
@@ -625,7 +625,7 @@ void ggml_numa_init(enum ggml_numa_strategy numa_flag) {
         ++g_state.numa.total_cpus;
     }
 
-    GGML_PRINT_DEBUG("found %u numa nodes, %u CPUs\n", g_state.numa.n_nodes, g_state.numa.total_cpus);
+    GGML_LOG_DEBUG("%s: found %u numa nodes, %u CPUs\n", __func__, g_state.numa.n_nodes, g_state.numa.total_cpus);
 
     // figure out which node we're on
     uint current_cpu;
@@ -641,25 +641,26 @@ void ggml_numa_init(enum ggml_numa_strategy numa_flag) {
 #endif
 
     if (g_state.numa.n_nodes < 1 || g_state.numa.total_cpus < 1 || getcpu_ret != 0) {
+        GGML_LOG_DEBUG("%s: NUMA support disabled\n", __func__);
         g_state.numa.n_nodes = 0;
         return;
     }
 
-    GGML_PRINT_DEBUG("found our process on numa node %u, CPU %u\n", g_state.numa.current_node, current_cpu);
+    GGML_LOG_DEBUG("%s: found our process on numa node %u, CPU %u\n", __func__, g_state.numa.current_node, current_cpu);
 
     for (uint32_t n = 0; n < g_state.numa.n_nodes; ++n) {
         struct ggml_numa_node * node = &g_state.numa.nodes[n];
-        GGML_PRINT_DEBUG("CPUs on node %u:", n);
+        GGML_LOG_DEBUG("%s: CPUs on node %u:", __func__, n);
         node->n_cpus = 0;
         for (uint32_t c = 0; c < g_state.numa.total_cpus; ++c) {
             rv = snprintf(path, sizeof(path), "/sys/devices/system/node/node%u/cpu%u", n, c);
             GGML_ASSERT(rv > 0 && (unsigned)rv < sizeof(path));
             if (stat(path, &st) == 0) {
                 node->cpus[node->n_cpus++] = c;
-                GGML_PRINT_DEBUG(" %u", c);
+                GGML_LOG_DEBUG(" %u", c);
             }
         }
-        GGML_PRINT_DEBUG("\n");
+        GGML_LOG_DEBUG("\n");
     }
 
     if (ggml_is_numa()) {
@@ -683,10 +684,12 @@ bool ggml_is_numa(void) {
 }
 
 enum ggml_numa_strategy ggml_numa_get_strategy(void) {
+    GGML_LOG_DEBUG("%s: strategy %d\n", __func__, g_state.numa.numa_strategy);
     return g_state.numa.numa_strategy;
 }
 
 void ggml_numa_set_buffer(void * buffer, size_t size) {
+    GGML_LOG_DEBUG("%s: buffer %p, size %zu\n", __func__, buffer, size);
     if (!ggml_is_numa() || g_state.numa.numa_strategy != GGML_NUMA_STRATEGY_DUPLICATE) {
         return;
     }
@@ -695,6 +698,7 @@ void ggml_numa_set_buffer(void * buffer, size_t size) {
 }
 
 void ggml_numa_set_buffer_for_node(void * buffer, int node) {
+    GGML_LOG_DEBUG("%s: buffer %p, node %d\n", __func__, buffer, node);
     if (!ggml_is_numa() || g_state.numa.numa_strategy != GGML_NUMA_STRATEGY_DUPLICATE) {
         return;
     }
@@ -1719,6 +1723,7 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
                     // Redirect to node-local buffer
                     size_t offset = (char *)tensor->data - (char *)g_state.numa.buffers[0];
                     local_data = (char *)g_state.numa.buffers[current_node] + offset;
+                    GGML_LOG_DEBUG("%s: tensor '%s' data redirected to node %u at offset %zu\n", __func__, tensor->name, current_node, offset);
                 }
                 // Same for source tensors
                 for (int i = 0; i < GGML_MAX_SRC; ++i) {
@@ -1726,6 +1731,7 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
                         if (tensor->src[i]->data >= g_state.numa.buffers[0] && (char *)tensor->src[i]->data < (char *)g_state.numa.buffers[0] + g_state.numa.buffer_size) {
                             size_t offset = (char *)tensor->src[i]->data - (char *)g_state.numa.buffers[0];
                             local_src_data[i] = (char *)g_state.numa.buffers[current_node] + offset;
+                            GGML_LOG_DEBUG("%s: src[%d] tensor '%s' data redirected to node %u at offset %zu\n", __func__, i, tensor->src[i]->name, current_node, offset);
                         }
                     }
                 }
@@ -2125,6 +2131,8 @@ static void set_numa_thread_affinity(int thread_n) {
         return;
     }
 
+    GGML_LOG_DEBUG("%s: setting affinity for thread %d\n", __func__, thread_n);
+
     int node_num;
     int rv;
     size_t setsize = CPU_ALLOC_SIZE(g_state.numa.total_cpus);
@@ -2134,13 +2142,16 @@ static void set_numa_thread_affinity(int thread_n) {
         case GGML_NUMA_STRATEGY_DISTRIBUTE:
             // run thread on node_num thread_n / (threads per node)
             node_num = thread_n % g_state.numa.n_nodes;
+            GGML_LOG_DEBUG("%s: thread %d assigned to node %d\n", __func__, thread_n, node_num);
             break;
         case GGML_NUMA_STRATEGY_ISOLATE:
             // run thread on current_node
             node_num = g_state.numa.current_node;
+            GGML_LOG_DEBUG("%s: thread %d assigned to current node %d\n", __func__, thread_n, node_num);
             break;
         case GGML_NUMA_STRATEGY_NUMACTL:
             // use the cpuset that numactl gave us
+            GGML_LOG_DEBUG("%s: using numactl cpuset for thread %d\n", __func__, thread_n);
             rv = pthread_setaffinity_np(pthread_self(), setsize, &g_state.numa.cpuset);
             if (rv) {
                 fprintf(stderr, "warning: pthread_setaffinity_np() failed: %s\n",strerror(rv));
@@ -2170,6 +2181,8 @@ static void clear_numa_thread_affinity(void) {
     if (!ggml_is_numa()) {
         return;
     }
+
+    GGML_LOG_DEBUG("%s: clearing thread affinity\n", __func__);
 
     size_t setsize = CPU_ALLOC_SIZE(g_state.numa.total_cpus);
 
