@@ -1,15 +1,10 @@
 #include "ggml-impl.h"
 #include "ggml-blas.h"
 #include "ggml-backend-impl.h"
-#include "ggml-cpu.h"
 
 #include <future>
 #include <vector>
 #include <cstring>
-
-#if defined(__gnu_linux__) 
-#include <numa.h>
-#endif
 
 #if defined(GGML_BLAS_USE_ACCELERATE)
 #   include <Accelerate/Accelerate.h>
@@ -25,7 +20,7 @@
 
 struct ggml_backend_blas_context {
     int n_threads = GGML_DEFAULT_N_THREADS;
-    std::unique_ptr<char[], std::function<void(char *)>> work_data;
+    std::unique_ptr<char[]> work_data;
     size_t work_size = 0;
 #ifndef GGML_USE_OPENMP
     std::vector<std::future<void>> tasks;
@@ -63,20 +58,7 @@ static void ggml_backend_blas_mul_mat(ggml_backend_blas_context * ctx, struct gg
     const size_t  desired_wsize = type == GGML_TYPE_F32 ? 0 : ne03*ne02*ne_plane*sizeof(float);
 
     if (ctx->work_size < desired_wsize) {
-        if (ggml_is_numa()) {
-#if defined(__gnu_linux__)
-            if (ggml_numa_get_strategy() == GGML_NUMA_STRATEGY_DISTRIBUTE) {
-                void * data = numa_alloc_interleaved(desired_wsize);
-                ctx->work_data.reset((char *)data, [=](char * ptr) { numa_free(ptr, desired_wsize); });
-            } else
-#endif
-            {
-                // first-touch allocation
-                ctx->work_data.reset(new char[desired_wsize], std::default_delete<char[]>());
-            }
-        } else {
-            ctx->work_data.reset(new char[desired_wsize], std::default_delete<char[]>());
-        }
+        ctx->work_data.reset(new char[desired_wsize]);
         ctx->work_size = desired_wsize;
     }
     void * wdata = ctx->work_data.get();
@@ -145,14 +127,6 @@ static void ggml_backend_blas_mul_mat(ggml_backend_blas_context * ctx, struct gg
     nvpl_blas_set_num_threads(ctx->n_threads);
 #endif
 
-#if defined(OPENBLAS_VERSION) && defined(GGML_USE_OPENMP)
-    // Tell OpenBLAS to use the current threads and not to create its own
-    openblas_set_num_threads(1);
-#endif
-
-#ifdef GGML_USE_OPENMP
-#pragma omp parallel for
-#endif
     for (int64_t i13 = 0; i13 < ne13; i13++) {
         for (int64_t i12 = 0; i12 < ne12; i12++) {
             const int64_t i03 = i13/r3;
@@ -161,13 +135,6 @@ static void ggml_backend_blas_mul_mat(ggml_backend_blas_context * ctx, struct gg
             const float * x = (float *) ((char *) src0->data + i02*nb02 + i03*nb03);
             const float * y = (float *) ((char *) src1->data + i12*nb12 + i13*nb13);
                   float * d = (float *) ((char *)  dst->data + i12*nb2  + i13*nb3);
-
-            if (ggml_is_numa() && ggml_numa_get_strategy() == GGML_NUMA_STRATEGY_DUPLICATE) {
-                const int node_id = ggml_get_numa_node_for_thread(omp_get_thread_num());
-                const size_t node_offset = node_id * ggml_get_tensor_size(src0);
-                x = (const float *) ((const char *) src0->data + node_offset + i02*nb02 + i03*nb03);
-                y = (const float *) ((const char *) src1->data + node_offset + i12*nb12 + i13*nb13);
-            }
 
             if (type != GGML_TYPE_F32) {
                 x = (float *) wdata + i02*ne_plane + i03*ne02*ne_plane;
