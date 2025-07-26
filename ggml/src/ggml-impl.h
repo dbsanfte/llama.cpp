@@ -334,6 +334,10 @@ struct ggml_cgraph ggml_graph_view(struct ggml_cgraph * cgraph, int i0, int i1);
 GGML_API void * ggml_aligned_malloc(size_t size);
 GGML_API void ggml_aligned_free(void * ptr, size_t size);
 
+// numa
+void ggml_numa_duplicate_buffer(void * buffer, size_t size);
+
+
 // FP16 <-> FP32
 // ref: https://github.com/Maratyszcza/FP16
 
