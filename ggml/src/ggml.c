@@ -222,7 +222,9 @@ void ggml_numa_duplicate_buffer(void * buffer, size_t size) {
 
     // Create a thread for each NUMA node to touch the pages
     // This forces the OS to fault the pages into the local RAM of each node
+#ifdef _OPENMP
     #pragma omp parallel for
+#endif
     for (int i = 0; i < n_nodes; ++i) {
         if (numa_run_on_node(i) == -1) {
             GGML_LOG_WARN("%s: failed to pin thread to NUMA node %d\n", __func__, i);
