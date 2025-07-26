@@ -54,6 +54,23 @@ bool llama_supports_rpc(void) {
     return ggml_backend_reg_by_name("RPC") != nullptr;
 }
 
+// forward declaration for ggml internal function
+extern "C" void ggml_numa_duplicate_buffer(void * buffer, size_t size);
+
+void llama_model::duplicate_data() {
+#if defined(__gnu_linux__)
+    // the model's data is in the first memory map.
+    // this is cleaner because it uses the low-level ggml function
+    // and directly accesses the mmap'd buffer.
+    if (!pimpl->mappings.empty()) {
+        auto & mapping = pimpl->mappings.front();
+        if (mapping->addr && mapping->size > 0) {
+            ggml_numa_duplicate_buffer(mapping->addr, mapping->size);
+        }
+    }
+#endif
+}
+
 void llama_backend_init(void) {
     ggml_time_init();
 
@@ -93,34 +110,10 @@ static int llama_model_load(const std::string & fname, std::vector<std::string> 
     model.t_start_us = tm.t_start_us;
 
     try {
-        llama_model_loader ml(fname, splits, params.use_mmap, params.check_tensors, params.kv_overrides, params.tensor_buft_overrides);
+        llama_model_loader ml(fname, splits, *model, params);
 
-        ml.print_info();
-
-        model.hparams.vocab_only = params.vocab_only;
-
-        try {
-            model.load_arch(ml);
-        } catch(const std::exception & e) {
-            throw std::runtime_error("error loading model architecture: " + std::string(e.what()));
-        }
-        try {
-            model.load_hparams(ml);
-        } catch(const std::exception & e) {
-            throw std::runtime_error("error loading model hyperparameters: " + std::string(e.what()));
-        }
-        try {
-            model.load_vocab(ml);
-        } catch(const std::exception & e) {
-            throw std::runtime_error("error loading model vocabulary: " + std::string(e.what()));
-        }
-
-        model.load_stats(ml);
-        model.print_info();
-
-        if (params.vocab_only) {
-            LLAMA_LOG_INFO("%s: vocab only - skipping tensors\n", __func__);
-            return 0;
+        if (!ml.load()) {
+            return -1;
         }
 
         if (!model.load_tensors(ml)) {
@@ -129,19 +122,11 @@ static int llama_model_load(const std::string & fname, std::vector<std::string> 
 
         // NEW: integrated NUMA logic based on strategy
         if (ggml_numa_get_strategy() == GGML_NUMA_STRATEGY_DUPLICATE) {
-            // the model's data is in the first memory map.
-            // this is cleaner because it uses the low-level ggml function
-            // and directly accesses the mmap'd buffer.
-            if (!model.pimpl->mappings.empty()) {
-                auto & mapping = model.pimpl->mappings.front();
-                if (mapping->addr && mapping->size > 0) {
-                    ggml_numa_duplicate_buffer(mapping->addr, mapping->size);
-                }
-            }
+            model.duplicate_data();
         }
 
     } catch (const std::exception & err) {
-        LLAMA_LOG_ERROR(NULL, "error loading model: %s", err.what());
+        LLAMA_LOG_ERROR("error loading model: %s", err.what());
         return -1;
     }
 
