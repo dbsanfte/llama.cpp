@@ -57,20 +57,6 @@ bool llama_supports_rpc(void) {
 // forward declaration for ggml internal function
 extern "C" void ggml_numa_duplicate_buffer(void * buffer, size_t size);
 
-void llama_model::duplicate_data() {
-#if defined(__gnu_linux__)
-    // the model's data is in the first memory map.
-    // this is cleaner because it uses the low-level ggml function
-    // and directly accesses the mmap'd buffer.
-    if (!pimpl->mappings.empty()) {
-        auto & mapping = pimpl->mappings.front();
-        if (mapping->addr && mapping->size > 0) {
-            ggml_numa_duplicate_buffer(mapping->addr, mapping->size);
-        }
-    }
-#endif
-}
-
 void llama_backend_init(void) {
     ggml_time_init();
 
@@ -110,9 +96,9 @@ static int llama_model_load(const std::string & fname, std::vector<std::string> 
     model.t_start_us = tm.t_start_us;
 
     try {
-        llama_model_loader ml(fname, splits, *model, params);
+        llama_model_loader ml(fname, splits, model, params);  // Remove the * dereference
 
-        if (!ml.load()) {
+        if (!ml.init()) {  // Changed from load() to init()
             return -1;
         }
 
@@ -126,7 +112,7 @@ static int llama_model_load(const std::string & fname, std::vector<std::string> 
         }
 
     } catch (const std::exception & err) {
-        LLAMA_LOG_ERROR("error loading model: %s", err.what());
+        LLAMA_LOG_ERROR("error loading model: %s\n", err.what());
         return -1;
     }
 
@@ -340,6 +326,20 @@ const char * llama_print_system_info(void) {
         auto * reg = ggml_backend_reg_get(i);
         auto * get_features_fn = (ggml_backend_get_features_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_get_features");
         if (get_features_fn) {
+            ggml_backend_feature * features = get_features_fn(reg);
+            s += ggml_backend_reg_name(reg);
+            s += " : ";
+            for (; features->name; features++) {
+                s += features->name;
+                s += " = ";
+                s += features->value;
+                s += " | ";
+            }
+        }
+    }
+
+    return s.c_str();
+}
             ggml_backend_feature * features = get_features_fn(reg);
             s += ggml_backend_reg_name(reg);
             s += " : ";

@@ -425,6 +425,26 @@ struct llama_model::impl {
     bool has_tensor_overrides;
 };
 
+// forward declaration for ggml internal function
+extern "C" void ggml_numa_duplicate_buffer(void * buffer, size_t size);
+
+void llama_model::duplicate_data() {
+#if defined(__gnu_linux__)
+    // the model's data is in the first memory map.
+    // this is cleaner because it uses the low-level ggml function
+    // and directly accesses the mmap'd buffer.
+    if (!pimpl->mappings.empty()) {
+        auto & mapping = pimpl->mappings.front();
+        if (mapping->addr && mapping->size > 0) {
+            ggml_numa_duplicate_buffer(mapping->addr, mapping->size);
+        }
+    }
+#else
+    // NUMA not available or not compiled with NUMA support
+    (void)this; // suppress unused parameter warning
+#endif
+}
+
 llama_model::llama_model(const llama_model_params & params) : params(params), pimpl(std::make_unique<impl>()) {
     pimpl->has_tensor_overrides = params.tensor_buft_overrides && params.tensor_buft_overrides[0].pattern;
 }
