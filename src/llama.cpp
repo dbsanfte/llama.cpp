@@ -8,6 +8,7 @@
 #include "llama-model.h"
 
 #include "ggml.h"
+#include "ggml-impl.h"
 #include "ggml-backend.h"
 
 #include <algorithm>
@@ -52,6 +53,20 @@ bool llama_supports_gpu_offload(void) {
 
 bool llama_supports_rpc(void) {
     return ggml_backend_reg_by_name("RPC") != nullptr;
+}
+
+void llama_model::duplicate_data() {
+#if defined(__gnu_linux__)
+    // the model's data is in the first memory map.
+    // this is cleaner because it uses the low-level ggml function
+    // and directly accesses the mmap'd buffer.
+    if (!pimpl->mappings.empty()) {
+        auto & mapping = pimpl->mappings.front();
+        if (mapping->addr && mapping->size > 0) {
+            ggml_numa_duplicate_buffer(mapping->addr, mapping->size);
+        }
+    }
+#endif
 }
 
 void llama_backend_init(void) {
@@ -129,19 +144,11 @@ static int llama_model_load(const std::string & fname, std::vector<std::string> 
 
         // NEW: integrated NUMA logic based on strategy
         if (ggml_numa_get_strategy() == GGML_NUMA_STRATEGY_DUPLICATE) {
-            // the model's data is in the first memory map.
-            // this is cleaner because it uses the low-level ggml function
-            // and directly accesses the mmap'd buffer.
-            if (!model.pimpl->mappings.empty()) {
-                auto & mapping = model.pimpl->mappings.front();
-                if (mapping->addr && mapping->size > 0) {
-                    ggml_numa_duplicate_buffer(mapping->addr, mapping->size);
-                }
-            }
+            model.duplicate_data();
         }
 
     } catch (const std::exception & err) {
-        LLAMA_LOG_ERROR(NULL, "error loading model: %s", err.what());
+        LLAMA_LOG_ERROR("error loading model: %s", err.what());
         return -1;
     }
 

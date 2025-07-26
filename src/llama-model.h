@@ -459,7 +459,14 @@ struct llama_model {
     // NUMA duplication support
     void duplicate_for_numa();
 
+    // for internal use
+    const llama_model_kv_override * get_kv_override(const char * name, enum ggml_type type) const;
+
+    // duplicate the model's data on all numa nodes
+    void duplicate_data();
+
 private:
+    friend struct llama_model_loader;
     struct impl;
     std::unique_ptr<impl> pimpl;
 };
