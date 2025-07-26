@@ -8,7 +8,6 @@
 #include "llama-model.h"
 
 #include "ggml.h"
-#include "ggml-impl.h"
 #include "ggml-backend.h"
 
 #include <algorithm>
@@ -54,6 +53,9 @@ bool llama_supports_gpu_offload(void) {
 bool llama_supports_rpc(void) {
     return ggml_backend_reg_by_name("RPC") != nullptr;
 }
+
+// forward declaration for ggml internal function
+extern "C" void ggml_numa_duplicate_buffer(void * buffer, size_t size);
 
 void llama_model::duplicate_data() {
 #if defined(__gnu_linux__)
@@ -108,34 +110,10 @@ static int llama_model_load(const std::string & fname, std::vector<std::string> 
     model.t_start_us = tm.t_start_us;
 
     try {
-        llama_model_loader ml(fname, splits, params.use_mmap, params.check_tensors, params.kv_overrides, params.tensor_buft_overrides);
+        llama_model_loader ml(fname, splits, *model, params);
 
-        ml.print_info();
-
-        model.hparams.vocab_only = params.vocab_only;
-
-        try {
-            model.load_arch(ml);
-        } catch(const std::exception & e) {
-            throw std::runtime_error("error loading model architecture: " + std::string(e.what()));
-        }
-        try {
-            model.load_hparams(ml);
-        } catch(const std::exception & e) {
-            throw std::runtime_error("error loading model hyperparameters: " + std::string(e.what()));
-        }
-        try {
-            model.load_vocab(ml);
-        } catch(const std::exception & e) {
-            throw std::runtime_error("error loading model vocabulary: " + std::string(e.what()));
-        }
-
-        model.load_stats(ml);
-        model.print_info();
-
-        if (params.vocab_only) {
-            LLAMA_LOG_INFO("%s: vocab only - skipping tensors\n", __func__);
-            return 0;
+        if (!ml.load()) {
+            return -1;
         }
 
         if (!model.load_tensors(ml)) {
