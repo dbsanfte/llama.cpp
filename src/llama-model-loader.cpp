@@ -874,9 +874,9 @@ void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps
             
             // The unified mapping represents all files, so we need to store it
             // for each file index to maintain compatibility with existing code
-            size_t total_size = unified_mapping->size();
             for (size_t i = 0; i < files.size(); ++i) {
-                mmaps_used.emplace_back(total_size, 0);
+                // For mmaps_used, store the individual file size, not the total unified size
+                mmaps_used.emplace_back(files[i]->size(), 0);
                 if (mlock_mmaps && i == 0) { // Only lock once for the unified mapping
                     std::unique_ptr<llama_mlock> mlock_mmap(new llama_mlock());
                     mlock_mmap->init(unified_mapping->addr());
@@ -885,9 +885,13 @@ void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps
                     // Add empty entries for consistency
                     mlock_mmaps->emplace_back(nullptr);
                 }
-                // Store the same unified mapping for each file index
-                mappings.emplace_back(i == 0 ? std::move(unified_mapping) : 
-                    std::unique_ptr<llama_mmap>(nullptr));
+                // Store the unified mapping only in the first slot
+                // Other slots remain nullptr - access code will check for unified mapping
+                if (i == 0) {
+                    mappings.emplace_back(std::move(unified_mapping));
+                } else {
+                    mappings.emplace_back(nullptr);
+                }
             }
         } else {
 #endif
@@ -917,7 +921,7 @@ void llama_model_loader::get_mapping_range(size_t * first, size_t * last, void *
     GGML_ASSERT(!mappings.empty());
     
 #ifdef GGML_NUMA_MIRROR
-    // Check if this is a unified mapping (mapping[0] exists but others are null)  
+    // Check if this is a unified mapping by seeing if mappings[1] is null but mappings[0] exists
     bool is_unified_mapping = mappings.size() > 1 && mappings[0] && !mappings[1];
     
     if (is_unified_mapping) {
@@ -927,7 +931,7 @@ void llama_model_loader::get_mapping_range(size_t * first, size_t * last, void *
         // Calculate the offset for this file within the unified mapping
         size_t file_offset = 0;
         for (int i = 0; i < idx; ++i) {
-            file_offset += files[i]->size;
+            file_offset += files[i]->size();
         }
         
         *first = mapping->size();  // Start with full mapping size
@@ -946,10 +950,10 @@ void llama_model_loader::get_mapping_range(size_t * first, size_t * last, void *
         
         // Adjust first and last to be relative to this file's start
         if (*first != mapping->size()) {
-            *first = std::min(*first, files[idx]->size);
+            *first = std::min(*first, files[idx]->size());
         }
         if (*last != 0) {
-            *last = std::min(*last, files[idx]->size);
+            *last = std::min(*last, files[idx]->size());
         }
     } else {
 #endif
@@ -977,14 +981,23 @@ void llama_model_loader::load_data_for(struct ggml_tensor * cur) const {
 
     if (use_mmap) {
 #ifdef GGML_NUMA_MIRROR
-        // Check if this is a unified mapping (mapping[0] exists but others are null)
-        bool is_unified_mapping = mappings.size() > 1 && mappings[0] && !mappings[1];
+        // Check if this is a unified mapping by comparing if all mappings point to the same object
+        bool is_unified_mapping = mappings.size() > 1;
+        if (is_unified_mapping) {
+            llama_mmap * first_ptr = mappings[0].get();
+            for (size_t i = 1; i < mappings.size(); ++i) {
+                if (mappings[i].get() != first_ptr) {
+                    is_unified_mapping = false;
+                    break;
+                }
+            }
+        }
         
         if (is_unified_mapping) {
             // For unified mapping, calculate offset within the unified mapping
             size_t unified_offset = w.offs;
             for (int i = 0; i < w.idx; ++i) {
-                unified_offset += files[i]->size;
+                unified_offset += files[i]->size();
             }
             
             const auto & mapping = mappings[0];
@@ -1134,12 +1147,34 @@ bool llama_model_loader::load_all_data(
         size_t n_size = ggml_nbytes(cur);
 
         if (use_mmap) {
-            const auto & mapping = mappings.at(weight->idx);
+            // Check if this is a unified mapping and get the appropriate mapping
+            std::unique_ptr<llama_mmap> * mapping_ptr;
+            size_t file_offset = 0;
+            
+#ifdef GGML_NUMA_MIRROR
+            // Check if this is a unified mapping by seeing if mappings[1] is null but mappings[0] exists
+            bool is_unified_mapping = mappings.size() > 1 && mappings[0] && !mappings[1];
+            if (is_unified_mapping) {
+                // For unified mapping, always use mappings[0] and calculate the file offset
+                mapping_ptr = &mappings[0];
+                // Calculate offset for this file within the unified mapping
+                for (int i = 0; i < weight->idx; ++i) {
+                    file_offset += files[i]->size();
+                }
+            } else {
+                // Standard per-file mapping
+                mapping_ptr = &mappings.at(weight->idx);
+            }
+#else
+            mapping_ptr = &mappings.at(weight->idx);
+#endif
+            
+            const auto & mapping = *mapping_ptr;
             ggml_backend_buffer_t buf_mmap = nullptr;
             if (bufs.count(weight->idx)) {
                 buf_mmap = bufs.at(weight->idx);
             }
-            uint8_t * data = (uint8_t *) mapping->addr() + weight->offs;
+            uint8_t * data = (uint8_t *) mapping->addr() + file_offset + weight->offs;
 
             if (check_tensors) {
                 validation_result.emplace_back(std::async(std::launch::async, [cur, data, n_size] {
@@ -1232,17 +1267,19 @@ bool llama_model_loader::load_all_data(
     if (size_done >= size_data) {
         // unmap offloaded tensors and metadata
         if (use_mmap) {
-            for (uint32_t idx = 0; idx < mappings.size(); idx++) {
-                const auto & mmap_used = mmaps_used.at(idx);
-                auto & mapping = mappings.at(idx);
-                
-                // Check if this mapping uses NUMA mirroring
-                // If so, skip the unmap_fragment calls as cleanup is handled in the destructor
-                bool is_numa_mirrored = false;
-#ifdef GGML_NUMA_MIRROR
-                is_numa_mirrored = true;
-#endif
-                if (!is_numa_mirrored) {
+            // Check if this is a unified mapping by seeing if mappings[1] is null but mappings[0] exists
+            bool is_unified_mapping = mappings.size() > 1 && mappings[0] && !mappings[1];
+            
+            if (is_unified_mapping) {
+                // For unified mappings, skip unmap_fragment calls entirely
+                // Cleanup will be handled by the unified mapping destructor
+                LLAMA_LOG_DEBUG("Skipping unmap_fragment calls for unified mapping\n");
+            } else {
+                // Original per-file mapping cleanup
+                for (uint32_t idx = 0; idx < mappings.size(); idx++) {
+                    const auto & mmap_used = mmaps_used.at(idx);
+                    auto & mapping = mappings.at(idx);
+                    
                     mapping->unmap_fragment(0, mmap_used.first);
                     if (mmap_used.second != 0) {
                         mapping->unmap_fragment(mmap_used.second, mapping->size());
