@@ -156,7 +156,7 @@ static inline __m256i _mm512_extracti256_epi32_emu(__m512i a, int imm8) {
 
 // Helper functions for quants.c AVX-512 code
 
-static inline __m512i bytes_from_nibbles_64(const uint8_t * rsi) {
+__m512i bytes_from_nibbles_64(const uint8_t * rsi) {
     // Load 32 bytes containing packed 4-bit values
     const __m256i tmp = _mm256_loadu_si256((const __m256i *)rsi);
     const __m256i lowMask = _mm256_set1_epi8(0xF);
@@ -183,7 +183,7 @@ static inline __m512i bytes_from_bits_32(const uint8_t * x) {
     return _mm512_cmpeq_epi8(bytes, bit_mask);
 }
 
-static inline __m512i bytes_from_bits_64(const uint8_t * x) {
+__m512i bytes_from_bits_64(const uint8_t * x) {
     // Use the 32-byte version but load 64 bits
     uint64_t x64;
     memcpy(&x64, x, sizeof(uint64_t));
@@ -212,7 +212,7 @@ static inline __m512i bytes_from_bits_64(const uint8_t * x) {
     return _mm512_mask_blend_epi32(0xFF00, result_lo, result_hi);
 }
 
-static inline __m512 mul_sum_i8_pairs_float_avx512(const __m512i x, const __m512i y) {
+__m512 mul_sum_i8_pairs_float_avx512(const __m512i x, const __m512i y) {
 #if defined(__AVX512VNNI__)
     const __m512i zero = _mm512_setzero_si512();
     const __m512i summed_pairs = _mm512_dpbssd_epi32(zero, x, y);
@@ -227,7 +227,7 @@ static inline __m512 mul_sum_i8_pairs_float_avx512(const __m512i x, const __m512
 #endif
 }
 
-static inline float hsum_float_16(const __m512 x) {
+float hsum_float_16(const __m512 x) {
     return _mm512_reduce_add_ps(x);
 }
 
