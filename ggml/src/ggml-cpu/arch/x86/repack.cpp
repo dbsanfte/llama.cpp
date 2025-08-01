@@ -105,6 +105,138 @@ static inline __m256 __avx_rearranged_f32cx8_load(ggml_fp16_t *x, __m128i arrang
 #endif
 #endif
 
+#if defined(__AVX512F__)
+
+// Helper functions for quants.c AVX-512 code
+
+static inline __m512i bytes_from_nibbles_64(const uint8_t * rsi) {
+    // Load 32 bytes containing packed 4-bit values
+    const __m256i tmp = _mm256_loadu_si256((const __m256i *)rsi);
+    const __m256i lowMask = _mm256_set1_epi8(0xF);
+    
+    // Extract low and high nibbles
+    const __m256i q4l = _mm256_and_si256(tmp, lowMask);
+    const __m256i q4h = _mm256_and_si256(_mm256_srli_epi16(tmp, 4), lowMask);
+    
+    // Combine into a 512-bit register
+    return _mm512_inserti32x8(_mm512_castsi256_si512(q4l), q4h, 1);
+}
+
+static inline __m512i bytes_from_bits_32(const uint8_t * x) {
+    uint32_t x32;
+    memcpy(&x32, x, sizeof(uint32_t));
+    __m512i bytes = _mm512_set1_epi32(x32);
+    const __m512i bit_mask = _mm512_set_epi32(
+        0x01010101, 0x02020202, 0x04040404, 0x08080808,
+        0x10101010, 0x20202020, 0x40404040, 0x80808080,
+        0x01010101, 0x02020202, 0x04040404, 0x08080808,
+        0x10101010, 0x20202020, 0x40404040, 0x80808080
+    );
+    bytes = _mm512_and_si512(bytes, bit_mask);
+    return _mm512_cmpeq_epi8(bytes, bit_mask);
+}
+
+static inline __m512i bytes_from_bits_64(const uint8_t * x) {
+    // Use the 32-byte version but load 64 bits
+    uint64_t x64;
+    memcpy(&x64, x, sizeof(uint64_t));
+    
+    // Split into two 32-bit values
+    uint32_t x32_lo = (uint32_t)(x64 & 0xFFFFFFFF);
+    uint32_t x32_hi = (uint32_t)(x64 >> 32);
+    
+    __m512i bytes_lo = _mm512_set1_epi32(x32_lo);
+    __m512i bytes_hi = _mm512_set1_epi32(x32_hi);
+    
+    const __m512i bit_mask = _mm512_set_epi32(
+        0x01010101, 0x02020202, 0x04040404, 0x08080808,
+        0x10101010, 0x20202020, 0x40404404, 0x80808080,
+        0x01010101, 0x02020202, 0x04040404, 0x08080808,
+        0x10101010, 0x20202020, 0x40404404, 0x80808080
+    );
+    
+    bytes_lo = _mm512_and_si512(bytes_lo, bit_mask);
+    bytes_hi = _mm512_and_si512(bytes_hi, bit_mask);
+    
+    __m512i result_lo = _mm512_cmpeq_epi8(bytes_lo, bit_mask);
+    __m512i result_hi = _mm512_cmpeq_epi8(bytes_hi, bit_mask);
+    
+    // Combine low and high results
+    return _mm512_mask_blend_epi32(0xFF00, result_lo, result_hi);
+}
+
+static inline __m512 mul_sum_i8_pairs_float_avx512(const __m512i x, const __m512i y) {
+#if defined(__AVX512VNNI__)
+    const __m512i zero = _mm512_setzero_si512();
+    const __m512i summed_pairs = _mm512_dpbssd_epi32(zero, x, y);
+    return _mm512_cvtepi32_ps(summed_pairs);
+#else
+    // Fallback: use AVX512F instructions for multiply and accumulate
+    // Convert to 16-bit, multiply, and add pairs
+    const __m512i ones = _mm512_set1_epi16(1);
+    const __m512i dot = _mm512_maddubs_epi16(x, y);
+    const __m512i summed_pairs = _mm512_madd_epi16(ones, dot);
+    return _mm512_cvtepi32_ps(summed_pairs);
+#endif
+}
+
+static inline float hsum_float_16(const __m512 x) {
+    return _mm512_reduce_add_ps(x);
+}
+
+// Emulate missing AVX-512 intrinsics with available ones
+static inline __m512i _mm512_sign_epi8_emu(__m512i a, __m512i b) {
+    const __m512i zero = _mm512_setzero_si512();
+    __mmask64 neg_mask = _mm512_movepi8_mask(b);
+    return _mm512_mask_sub_epi8(a, neg_mask, zero, a);
+}
+
+static inline __m512i _mm512_dpbssd_epi32_emu(__m512i acc, __m512i a, __m512i b) {
+#if defined(__AVX512VNNI__)
+    return _mm512_dpbssd_epi32(acc, a, b);
+#else
+    // Fallback implementation
+    const __m512i zero = _mm512_setzero_si512();
+    const __m512i ax = _mm512_abs_epi8(a);
+    __mmask64 blt0 = _mm512_movepi8_mask(a);
+    const __m512i sy = _mm512_mask_sub_epi8(b, blt0, zero, b);
+    const __m512i dot = _mm512_maddubs_epi16(ax, sy);
+    const __m512i ones = _mm512_set1_epi16(1);
+    const __m512i summed_pairs = _mm512_madd_epi16(ones, dot);
+    return _mm512_add_epi32(acc, summed_pairs);
+#endif
+}
+
+static inline __m512i _mm512_inserti256_emu(__m512i a, __m256i b, int imm8) {
+    if (imm8 == 0) {
+        return _mm512_inserti32x8(a, b, 0);
+    } else {
+        return _mm512_inserti32x8(a, b, 1);
+    }
+}
+
+static inline __m512i _mm512_cmpeq_epi8_emu(__m512i a, __m512i b) {
+    __mmask64 mask = _mm512_cmpeq_epi8_mask(a, b);
+    return _mm512_movm_epi8(mask);
+}
+
+static inline __m256i _mm512_extracti256_epi32_emu(__m512i a, int imm8) {
+    if (imm8 == 0) {
+        return _mm512_extracti32x8_epi32(a, 0);
+    } else {
+        return _mm512_extracti32x8_epi32(a, 1);
+    }
+}
+
+// Define macros to use the emulated functions
+#define _mm512_sign_epi8(a, b) _mm512_sign_epi8_emu(a, b)
+#define _mm512_dpbssd_epi32(acc, a, b) _mm512_dpbssd_epi32_emu(acc, a, b)
+#define _mm512_inserti256(a, b, imm8) _mm512_inserti256_emu(a, b, imm8)
+#define _mm512_cmpeq_epi8(a, b) _mm512_cmpeq_epi8_emu(a, b)
+#define _mm512_extracti256_epi32(a, imm8) _mm512_extracti256_epi32_emu(a, imm8)
+
+#endif // __AVX512F__
+
 static inline int nearest_int(float fval) {
     assert(fabsf(fval) <= 4194303.f);
     float val = fval + 12582912.f;
