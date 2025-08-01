@@ -36,16 +36,6 @@ cmake --build build --parallel $(nproc)
 ctest --list --output-on-failure
 ```
 
-### Available VS Code Tasks
-
-- **Ctrl+Shift+P** → "Tasks: Run Task":
-  - `cmake-configure` - Configure CMake
-  - `cmake-build` - Build project (default)
-  - `cmake-release` - Release build
-  - `cmake-clean` - Clean build directory
-  - `test-cpu-topology` - Test CPU topology detection
-  - `check-numa` - Display NUMA hardware info
-
 ## 🧠 Key Areas of Focus
 
 ### 1. NUMA Memory Management
@@ -112,6 +102,14 @@ done
 
 # NUMA binding test
 numactl --cpunodebind=0 --membind=0 ./build/bin/llama-server --model model.gguf
+```
+
+# Test binaries for testing quantisation functionality and performance
+```bash
+# After the project is built:
+./build/bin/test-quantize-fns
+./build/bin/test-quantize-perfs
+./build/bin/test-quantize-stats
 ```
 
 ### 3. Memory Access Monitoring
