@@ -107,6 +107,57 @@ static inline __m256 __avx_rearranged_f32cx8_load(ggml_fp16_t *x, __m128i arrang
 
 #if defined(__AVX512F__)
 
+// Emulate missing AVX-512 intrinsics with available ones - MUST BE DEFINED FIRST
+static inline __m512i _mm512_sign_epi8_emu(__m512i a, __m512i b) {
+    const __m512i zero = _mm512_setzero_si512();
+    __mmask64 neg_mask = _mm512_movepi8_mask(b);
+    return _mm512_mask_sub_epi8(a, neg_mask, zero, a);
+}
+
+static inline __m512i _mm512_dpbssd_epi32_emu(__m512i acc, __m512i a, __m512i b) {
+#if defined(__AVX512VNNI__)
+    return _mm512_dpbssd_epi32(acc, a, b);
+#else
+    // Fallback implementation
+    const __m512i zero = _mm512_setzero_si512();
+    const __m512i ax = _mm512_abs_epi8(a);
+    __mmask64 blt0 = _mm512_movepi8_mask(a);
+    const __m512i sy = _mm512_mask_sub_epi8(b, blt0, zero, b);
+    const __m512i dot = _mm512_maddubs_epi16(ax, sy);
+    const __m512i ones = _mm512_set1_epi16(1);
+    const __m512i summed_pairs = _mm512_madd_epi16(ones, dot);
+    return _mm512_add_epi32(acc, summed_pairs);
+#endif
+}
+
+static inline __m512i _mm512_inserti256_emu(__m512i a, __m256i b, int imm8) {
+    if (imm8 == 0) {
+        return _mm512_inserti32x8(a, b, 0);
+    } else {
+        return _mm512_inserti32x8(a, b, 1);
+    }
+}
+
+static inline __m512i _mm512_cmpeq_epi8_emu(__m512i a, __m512i b) {
+    __mmask64 mask = _mm512_cmpeq_epi8_mask(a, b);
+    return _mm512_movm_epi8(mask);
+}
+
+static inline __m256i _mm512_extracti256_epi32_emu(__m512i a, int imm8) {
+    if (imm8 == 0) {
+        return _mm512_extracti32x8_epi32(a, 0);
+    } else {
+        return _mm512_extracti32x8_epi32(a, 1);
+    }
+}
+
+// Define macros to use the emulated functions
+#define _mm512_sign_epi8(a, b) _mm512_sign_epi8_emu(a, b)
+#define _mm512_dpbssd_epi32(acc, a, b) _mm512_dpbssd_epi32_emu(acc, a, b)
+#define _mm512_inserti256(a, b, imm8) _mm512_inserti256_emu(a, b, imm8)
+#define _mm512_cmpeq_epi8(a, b) _mm512_cmpeq_epi8_emu(a, b)
+#define _mm512_extracti256_epi32(a, imm8) _mm512_extracti256_epi32_emu(a, imm8)
+
 // Helper functions for quants.c AVX-512 code
 
 static inline __m512i bytes_from_nibbles_64(const uint8_t * rsi) {
@@ -183,57 +234,6 @@ static inline __m512 mul_sum_i8_pairs_float_avx512(const __m512i x, const __m512
 static inline float hsum_float_16(const __m512 x) {
     return _mm512_reduce_add_ps(x);
 }
-
-// Emulate missing AVX-512 intrinsics with available ones
-static inline __m512i _mm512_sign_epi8_emu(__m512i a, __m512i b) {
-    const __m512i zero = _mm512_setzero_si512();
-    __mmask64 neg_mask = _mm512_movepi8_mask(b);
-    return _mm512_mask_sub_epi8(a, neg_mask, zero, a);
-}
-
-static inline __m512i _mm512_dpbssd_epi32_emu(__m512i acc, __m512i a, __m512i b) {
-#if defined(__AVX512VNNI__)
-    return _mm512_dpbssd_epi32(acc, a, b);
-#else
-    // Fallback implementation
-    const __m512i zero = _mm512_setzero_si512();
-    const __m512i ax = _mm512_abs_epi8(a);
-    __mmask64 blt0 = _mm512_movepi8_mask(a);
-    const __m512i sy = _mm512_mask_sub_epi8(b, blt0, zero, b);
-    const __m512i dot = _mm512_maddubs_epi16(ax, sy);
-    const __m512i ones = _mm512_set1_epi16(1);
-    const __m512i summed_pairs = _mm512_madd_epi16(ones, dot);
-    return _mm512_add_epi32(acc, summed_pairs);
-#endif
-}
-
-static inline __m512i _mm512_inserti256_emu(__m512i a, __m256i b, int imm8) {
-    if (imm8 == 0) {
-        return _mm512_inserti32x8(a, b, 0);
-    } else {
-        return _mm512_inserti32x8(a, b, 1);
-    }
-}
-
-static inline __m512i _mm512_cmpeq_epi8_emu(__m512i a, __m512i b) {
-    __mmask64 mask = _mm512_cmpeq_epi8_mask(a, b);
-    return _mm512_movm_epi8(mask);
-}
-
-static inline __m256i _mm512_extracti256_epi32_emu(__m512i a, int imm8) {
-    if (imm8 == 0) {
-        return _mm512_extracti32x8_epi32(a, 0);
-    } else {
-        return _mm512_extracti32x8_epi32(a, 1);
-    }
-}
-
-// Define macros to use the emulated functions
-#define _mm512_sign_epi8(a, b) _mm512_sign_epi8_emu(a, b)
-#define _mm512_dpbssd_epi32(acc, a, b) _mm512_dpbssd_epi32_emu(acc, a, b)
-#define _mm512_inserti256(a, b, imm8) _mm512_inserti256_emu(a, b, imm8)
-#define _mm512_cmpeq_epi8(a, b) _mm512_cmpeq_epi8_emu(a, b)
-#define _mm512_extracti256_epi32(a, imm8) _mm512_extracti256_epi32_emu(a, imm8)
 
 #endif // __AVX512F__
 
