@@ -7,6 +7,7 @@
 
 #include "../../quants.h"
 #include "../../ggml-cpu-impl.h"
+#include "../../repack.h"
 
 #include <math.h>
 #include <string.h>
