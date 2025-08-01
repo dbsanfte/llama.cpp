@@ -115,10 +115,7 @@ static inline __m512i _mm512_sign_epi8_emu(__m512i a, __m512i b) {
 }
 
 static inline __m512i _mm512_dpbssd_epi32_emu(__m512i acc, __m512i a, __m512i b) {
-#if defined(__AVX512VNNI__)
-    return _mm512_dpbssd_epi32(acc, a, b);
-#else
-    // Fallback implementation
+    // Fallback implementation - always use this since _mm512_dpbssd_epi32 may not be available
     const __m512i zero = _mm512_setzero_si512();
     const __m512i ax = _mm512_abs_epi8(a);
     __mmask64 blt0 = _mm512_movepi8_mask(a);
@@ -127,7 +124,6 @@ static inline __m512i _mm512_dpbssd_epi32_emu(__m512i acc, __m512i a, __m512i b)
     const __m512i ones = _mm512_set1_epi16(1);
     const __m512i summed_pairs = _mm512_madd_epi16(ones, dot);
     return _mm512_add_epi32(acc, summed_pairs);
-#endif
 }
 
 static inline __m512i _mm512_inserti256_emu(__m512i a, __m256i b, int imm8) {
