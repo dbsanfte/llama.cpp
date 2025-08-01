@@ -204,6 +204,8 @@ if (NOT GGML_BACKEND_DL)
     llama_build_and_test(test-barrier.cpp)
     llama_build_and_test(test-quantize-fns.cpp)
     llama_build_and_test(test-quantize-perf.cpp)
+    llama_build_and_test(test-quantize-avx512.cpp)
+    llama_build(test-quantize-avx512-perf.cpp)  # Performance test - no auto test
     llama_build_and_test(test-rope.cpp)
 endif()
 

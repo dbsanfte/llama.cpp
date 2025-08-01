@@ -512,6 +512,14 @@ void ggml_barrier(struct ggml_threadpool * tp);
 void ggml_threadpool_chunk_set(struct ggml_threadpool * tp, int value);
 int  ggml_threadpool_chunk_add(struct ggml_threadpool * tp, int value);
 
+// AVX-512 helper functions for quantization
+#if defined(__AVX512F__)
+__m512i bytes_from_nibbles_64(const uint8_t * rsi);
+__m512i bytes_from_bits_64(const uint8_t * x);
+__m512 mul_sum_i8_pairs_float_avx512(const __m512i x, const __m512i y);
+float hsum_float_16(const __m512 x);
+#endif
+
 #ifdef __cplusplus
 }
 #endif
