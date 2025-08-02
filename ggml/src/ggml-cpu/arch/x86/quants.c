@@ -4917,9 +4917,13 @@ void ggml_vec_dot_iq4_xs_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const v
             __m512i q4_combined = _mm512_inserti64x4(_mm512_castsi256_si512(q4b_1), q4b_2, 1);
             __m512i q8_combined = _mm512_inserti64x4(_mm512_castsi256_si512(q8b_1), q8b_2, 1);
             
-            // Use AVX512-VNNI for unsigned×signed dot product (like mul_add_epi8)
+            // Apply the same sign manipulation as mul_add_epi8
+            const __m512i ax = _mm512_sign_epi8(q4_combined, q4_combined);  // get absolute values of q4
+            const __m512i sy = _mm512_sign_epi8(q8_combined, q4_combined);  // apply q4's signs to q8
+            
+            // Use AVX512-VNNI for unsigned×signed dot product (matching mul_add_epi8 behavior)
             const __m512i zero = _mm512_setzero_si512();
-            const __m512i dot_result = _mm512_dpbusd_epi32(zero, q4_combined, q8_combined);
+            const __m512i dot_result = _mm512_dpbusd_epi32(zero, ax, sy);
             
             // Apply scales
             const __m512i scales_i32 = _mm512_set_epi32(ls2, ls2, ls2, ls2, ls2, ls2, ls2, ls2,
