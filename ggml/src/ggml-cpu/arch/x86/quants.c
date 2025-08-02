@@ -579,59 +579,24 @@ void ggml_vec_dot_q4_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const voi
     float sumf = 0;
 
 #if defined(__AVX512VNNI__) && defined(__AVX512VL__)
-    // Initialize accumulator with zeros
-    __m512 acc = _mm512_setzero_ps();
+    // Simple single-block processing using existing optimized helpers
+    __m256 acc = _mm256_setzero_ps();
 
-    // Process two blocks at once with 512-bit vectors
-    for (; ib + 1 < nb; ib += 2) {
-        // Load scales
-        const float scale0 = GGML_CPU_FP16_TO_FP32(x[ib].d) * GGML_CPU_FP16_TO_FP32(y[ib].d);
-        const float scale1 = GGML_CPU_FP16_TO_FP32(x[ib + 1].d) * GGML_CPU_FP16_TO_FP32(y[ib + 1].d);
-        
-        // Unpack nibbles from both blocks to bytes
-        __m256i qx0 = bytes_from_nibbles_32(x[ib].qs);
-        __m256i qx1 = bytes_from_nibbles_32(x[ib + 1].qs);
-        
-        // Keep as unsigned [0,15] - q4_0 format uses unsigned 4-bit × signed 8-bit
-        __m512i qx_combined = _mm512_inserti64x4(_mm512_castsi256_si512(qx0), qx1, 1);
-        
-        // Load signed 8-bit values and combine
-        __m256i qy0 = _mm256_loadu_si256((const __m256i *)y[ib].qs);
-        __m256i qy1 = _mm256_loadu_si256((const __m256i *)y[ib + 1].qs);
-        __m512i qy_combined = _mm512_inserti64x4(_mm512_castsi256_si512(qy0), qy1, 1);
-        
-        // Use AVX512 VNNI for unsigned×signed dot product (correct for q4_0)
-        __m512i zero = _mm512_setzero_si512();
-        __m512i dot_result = _mm512_dpbusd_epi32(zero, qx_combined, qy_combined);
-        
-        // Convert to float and apply scales
-        __m512 dot_float = _mm512_cvtepi32_ps(dot_result);
-        __m512 scales = _mm512_set_ps(scale1, scale1, scale1, scale1, scale1, scale1, scale1, scale1,
-                                      scale0, scale0, scale0, scale0, scale0, scale0, scale0, scale0);
-        
-        // Multiply by scales and accumulate
-        acc = _mm512_fmadd_ps(scales, dot_float, acc);
+    // Main loop - process single blocks efficiently
+    for (; ib < nb; ++ib) {
+        /* Compute combined scale for the block */
+        const __m256 d = _mm256_set1_ps( GGML_CPU_FP16_TO_FP32(x[ib].d) * GGML_CPU_FP16_TO_FP32(y[ib].d) );
+
+        __m256i bx = bytes_from_nibbles_32(x[ib].qs);
+        const __m256i by = _mm256_loadu_si256( (const __m256i *)y[ib].qs );
+
+        const __m256 q = mul_sum_us8_pairs_float(bx, by);
+
+        /* Multiply q with scale and accumulate */
+        acc = _mm256_fmadd_ps( d, q, acc );
     }
 
-    // Handle remaining single block using 256-bit processing
-    if (ib < nb) {
-        const float scale = GGML_CPU_FP16_TO_FP32(x[ib].d) * GGML_CPU_FP16_TO_FP32(y[ib].d);
-        
-        // Unpack nibbles - keep as unsigned [0,15] for q4_0
-        __m256i qx = bytes_from_nibbles_32(x[ib].qs);
-        __m256i qy = _mm256_loadu_si256((const __m256i *)y[ib].qs);
-        
-        // Use unsigned×signed VNNI for the remainder
-        const __m256 q = mul_sum_us8_pairs_float(qx, qy);
-        const __m256 d = _mm256_set1_ps(scale);
-        const __m256 scaled_result = _mm256_mul_ps(d, q);
-        acc = _mm512_add_ps(acc, _mm512_castps256_ps512(scaled_result));
-        
-        ib++;
-    }
-
-    // Horizontal sum of 512-bit vector
-    sumf = hsum_float_16(acc);
+    sumf = hsum_float_8(acc);
 
 #elif defined(__AVX2__)
     // Initialize accumulator with zeros
