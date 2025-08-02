@@ -798,7 +798,68 @@ void ggml_vec_dot_q4_1_q8_1(int n, float * GGML_RESTRICT s, size_t bs, const voi
     int ib = 0;
     float sumf = 0;
 
-#if defined(__AVX2__) || defined(__AVX__)
+#if defined(__AVX512VNNI__) && defined(__AVX512VL__)
+    // AVX512 VNNI optimization for q4_1_q8_1
+    __m512 acc = _mm512_setzero_ps();
+    float summs = 0;
+
+    // Process two blocks at a time with AVX512
+    for (; ib + 1 < nb; ib += 2) {
+        const float d0_0 = GGML_CPU_FP16_TO_FP32(x[ib].d);
+        const float d1_0 = GGML_CPU_FP16_TO_FP32(y[ib].d);
+        const float d0_1 = GGML_CPU_FP16_TO_FP32(x[ib+1].d);
+        const float d1_1 = GGML_CPU_FP16_TO_FP32(y[ib+1].d);
+
+        summs += GGML_CPU_FP16_TO_FP32(x[ib].m) * GGML_CPU_FP16_TO_FP32(y[ib].s);
+        summs += GGML_CPU_FP16_TO_FP32(x[ib+1].m) * GGML_CPU_FP16_TO_FP32(y[ib+1].s);
+
+        // Load and unpack 4-bit values for both blocks
+        const __m256i qx_0 = bytes_from_nibbles_32(x[ib].qs);
+        const __m256i qx_1 = bytes_from_nibbles_32(x[ib+1].qs);
+        const __m256i qy_0 = _mm256_loadu_si256((const __m256i *)y[ib].qs);
+        const __m256i qy_1 = _mm256_loadu_si256((const __m256i *)y[ib+1].qs);
+
+        // Combine into 512-bit vectors
+        const __m512i qx_combined = _mm512_inserti64x4(_mm512_castsi256_si512(qx_0), qx_1, 1);
+        const __m512i qy_combined = _mm512_inserti64x4(_mm512_castsi256_si512(qy_0), qy_1, 1);
+
+        // Use AVX512 VNNI for unsigned×signed dot product
+        const __m512i zero = _mm512_setzero_si512();
+        const __m512i dot_result = _mm512_dpbusd_epi32(zero, qx_combined, qy_combined);
+
+        // Convert to float and apply scales
+        const __m512 scales = _mm512_set_ps(d0_1*d1_1, d0_1*d1_1, d0_1*d1_1, d0_1*d1_1, 
+                                            d0_1*d1_1, d0_1*d1_1, d0_1*d1_1, d0_1*d1_1,
+                                            d0_0*d1_0, d0_0*d1_0, d0_0*d1_0, d0_0*d1_0,
+                                            d0_0*d1_0, d0_0*d1_0, d0_0*d1_0, d0_0*d1_0);
+        acc = _mm512_fmadd_ps(scales, _mm512_cvtepi32_ps(dot_result), acc);
+    }
+
+    // Handle remaining single block with AVX2
+    for (; ib < nb; ++ib) {
+        const float d0 = GGML_CPU_FP16_TO_FP32(x[ib].d);
+        const float d1 = GGML_CPU_FP16_TO_FP32(y[ib].d);
+
+        summs += GGML_CPU_FP16_TO_FP32(x[ib].m) * GGML_CPU_FP16_TO_FP32(y[ib].s);
+
+        const __m256 d0v = _mm256_set1_ps( d0 );
+        const __m256 d1v = _mm256_set1_ps( d1 );
+
+        // Compute combined scales
+        const __m256 d0d1 = _mm256_mul_ps( d0v, d1v );
+
+        // Load 16 bytes, and unpack 4 bit fields into bytes, making 32 bytes
+        const __m256i qx = bytes_from_nibbles_32(x[ib].qs);
+        const __m256i qy = _mm256_loadu_si256( (const __m256i *)y[ib].qs );
+
+        const __m256 xy = mul_sum_us8_pairs_float(qx, qy);
+
+        // Accumulate d0*d1*x*y
+        acc = _mm512_add_ps(acc, _mm512_castps256_ps512(_mm256_mul_ps( d0d1, xy )));
+    }
+
+    sumf = hsum_float_16(acc) + summs;
+#elif defined(__AVX2__) || defined(__AVX__)
     // Initialize accumulator with zeros
     __m256 acc = _mm256_setzero_ps();
 
