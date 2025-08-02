@@ -1075,55 +1075,19 @@ void ggml_vec_dot_q8_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const voi
     float sumf = 0;
 
 #if defined(__AVX512VNNI__) && defined(__AVX512VL__)
-    // Initialize accumulator with zeros
-    __m512 acc = _mm512_setzero_ps();
+    // Use the same approach as AVX2, just with better processing
+    __m256 acc = _mm256_setzero_ps();
 
-    // Process two blocks at once with 512-bit vectors
-    for (; ib + 1 < nb; ib += 2) {
-        // Load scales and broadcast
-        const float scale0 = GGML_CPU_FP16_TO_FP32(x[ib].d) * GGML_CPU_FP16_TO_FP32(y[ib].d);
-        const float scale1 = GGML_CPU_FP16_TO_FP32(x[ib + 1].d) * GGML_CPU_FP16_TO_FP32(y[ib + 1].d);
-        
-        // Load quantized data from both blocks
-        __m256i qx0 = _mm256_loadu_si256((const __m256i *)x[ib].qs);
-        __m256i qy0 = _mm256_loadu_si256((const __m256i *)y[ib].qs);
-        __m256i qx1 = _mm256_loadu_si256((const __m256i *)x[ib + 1].qs);  
-        __m256i qy1 = _mm256_loadu_si256((const __m256i *)y[ib + 1].qs);
-        
-        // Combine into 512-bit vectors
-        __m512i qx_combined = _mm512_inserti64x4(_mm512_castsi256_si512(qx0), qx1, 1);
-        __m512i qy_combined = _mm512_inserti64x4(_mm512_castsi256_si512(qy0), qy1, 1);
-        
-        // Use AVX512 VNNI for signed 8-bit dot product
-        __m512i zero = _mm512_setzero_si512();
-        __m512i dot_result = _mm512_dpwssd_epi32(zero, qx_combined, qy_combined);
-        
-        // Convert to float and apply scales
-        __m512 dot_float = _mm512_cvtepi32_ps(dot_result);
-        __m512 scales = _mm512_set_ps(scale1, scale1, scale1, scale1, scale1, scale1, scale1, scale1,
-                                      scale0, scale0, scale0, scale0, scale0, scale0, scale0, scale0);
-        
-        // Multiply by scales and accumulate
-        acc = _mm512_fmadd_ps(scales, dot_float, acc);
-    }
-
-    // Handle remaining single block using 256-bit processing
-    if (ib < nb) {
+    for (; ib < nb; ++ib) {
         const float scale = GGML_CPU_FP16_TO_FP32(x[ib].d) * GGML_CPU_FP16_TO_FP32(y[ib].d);
         __m256i qx = _mm256_loadu_si256((const __m256i *)x[ib].qs);
         __m256i qy = _mm256_loadu_si256((const __m256i *)y[ib].qs);
-        
-        // Use 256-bit VNNI for the remainder
+
         const __m256 q = mul_sum_i8_pairs_float(qx, qy);
-        const __m256 d = _mm256_set1_ps(scale);
-        const __m256 scaled_result = _mm256_mul_ps(d, q);
-        acc = _mm512_add_ps(acc, _mm512_castps256_ps512(scaled_result));
-        
-        ib++;
+        acc = _mm256_fmadd_ps(_mm256_set1_ps(scale), q, acc);
     }
 
-    // Horizontal sum of 512-bit vector
-    sumf = hsum_float_16(acc);
+    sumf = hsum_float_8(acc);
     
 #elif defined(__AVX2__)
     // Initialize accumulator with zeros
@@ -1999,71 +1963,7 @@ void ggml_vec_dot_q4_K_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const voi
 
     uint32_t utmp[4];
 
-#if defined(__AVX512VNNI__) && defined(__AVX512VL__)
-
-    const __m256i m4 = _mm256_set1_epi8(0xF);
-    __m256 acc = _mm256_setzero_ps();
-    __m128 acc_m = _mm_setzero_ps();
-
-    for (int i = 0; i < nb; ++i) {
-
-        const float d = y[i].d * GGML_CPU_FP16_TO_FP32(x[i].d);
-        const float dmin = -y[i].d * GGML_CPU_FP16_TO_FP32(x[i].dmin);
-
-        memcpy(utmp, x[i].scales, 12);
-        utmp[3] = ((utmp[2] >> 4) & kmask2) | (((utmp[1] >> 6) & kmask3) << 4);
-        const uint32_t uaux = utmp[1] & kmask1;
-        utmp[1] = (utmp[2] & kmask2) | (((utmp[0] >> 6) & kmask3) << 4);
-        utmp[2] = uaux;
-        utmp[0] &= kmask1;
-
-        const uint8_t * GGML_RESTRICT q4 = x[i].qs;
-        const int8_t  * GGML_RESTRICT q8 = y[i].qs;
-
-        const __m256i mins_and_scales = _mm256_cvtepu8_epi16(_mm_set_epi32(utmp[3], utmp[2], utmp[1], utmp[0]));
-
-        const __m256i q8sums = _mm256_loadu_si256((const __m256i*)y[i].bsums);
-        const __m128i q8s = _mm_hadd_epi16(_mm256_extracti128_si256(q8sums, 0), _mm256_extracti128_si256(q8sums, 1));
-        const __m128i prod = _mm_madd_epi16(_mm256_extracti128_si256(mins_and_scales, 1), q8s);
-        acc_m = _mm_fmadd_ps(_mm_set1_ps(dmin), _mm_cvtepi32_ps(prod), acc_m);
-
-        const __m128i sc128  = _mm256_extracti128_si256(mins_and_scales, 0);
-        const __m256i scales = MM256_SET_M128I(sc128, sc128);
-
-        __m256i sumi = _mm256_setzero_si256();
-
-        for (int j = 0; j < QK_K/64; ++j) {
-
-            const __m256i scale_l = _mm256_shuffle_epi8(scales, get_scale_shuffle_k4(2*j+0));
-            const __m256i scale_h = _mm256_shuffle_epi8(scales, get_scale_shuffle_k4(2*j+1));
-
-            const __m256i q4bits = _mm256_loadu_si256((const __m256i*)q4); q4 += 32;
-            const __m256i q4l = _mm256_and_si256(q4bits, m4);
-            const __m256i q4h = _mm256_and_si256(_mm256_srli_epi16(q4bits, 4), m4);
-
-            const __m256i q8l = _mm256_loadu_si256((const __m256i*)q8); q8 += 32;
-            // Use AVX512 VNNI for unsigned 4-bit × signed 8-bit dot products
-            __m256i p16l = _mm256_dpbusd_epi32(_mm256_setzero_si256(), q4l, q8l);
-            p16l = _mm256_mullo_epi32(p16l, _mm256_cvtepi16_epi32(_mm256_extracti128_si256(scale_l, 0)));
-
-            const __m256i q8h = _mm256_loadu_si256((const __m256i*)q8); q8 += 32;
-            __m256i p16h = _mm256_dpbusd_epi32(_mm256_setzero_si256(), q4h, q8h);
-            p16h = _mm256_mullo_epi32(p16h, _mm256_cvtepi16_epi32(_mm256_extracti128_si256(scale_h, 0)));
-            
-            const __m256i sumj = _mm256_add_epi32(p16l, p16h);
-            sumi = _mm256_add_epi32(sumi, sumj);
-        }
-
-        __m256 vd = _mm256_set1_ps(d);
-        acc = _mm256_fmadd_ps(vd, _mm256_cvtepi32_ps(sumi), acc);
-    }
-
-    acc_m = _mm_add_ps(acc_m, _mm_movehl_ps(acc_m, acc_m));
-    acc_m = _mm_add_ss(acc_m, _mm_movehdup_ps(acc_m));
-
-    *s = hsum_float_8(acc) + _mm_cvtss_f32(acc_m);
-
-#elif defined __AVX2__
+#if defined __AVX2__
 
     const __m256i m4 = _mm256_set1_epi8(0xF);
 
@@ -4941,64 +4841,6 @@ void ggml_vec_dot_iq4_nl_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const v
     const __m128i values128 = _mm_loadu_si128((const __m128i*)kvalues_iq4nl);
     const __m128i m4b  = _mm_set1_epi8(0x0f);
 
-    __m512 accum = _mm512_setzero_ps();
-    
-    // Process 4 blocks at once using AVX512
-    for (; ib + 3 < nb; ib += 4) {
-        const __m128i q4bits_0 = _mm_loadu_si128((const __m128i*)x[ib + 0].qs);
-        const __m128i q4bits_1 = _mm_loadu_si128((const __m128i*)x[ib + 1].qs);
-        const __m128i q4bits_2 = _mm_loadu_si128((const __m128i*)x[ib + 2].qs);
-        const __m128i q4bits_3 = _mm_loadu_si128((const __m128i*)x[ib + 3].qs);
-        
-        // Load q8 values and combine into 512-bit vectors
-        const __m256i q8b_0 = _mm256_loadu_si256((const __m256i *)y[ib + 0].qs);
-        const __m256i q8b_1 = _mm256_loadu_si256((const __m256i *)y[ib + 1].qs);
-        const __m256i q8b_2 = _mm256_loadu_si256((const __m256i *)y[ib + 2].qs);
-        const __m256i q8b_3 = _mm256_loadu_si256((const __m256i *)y[ib + 3].qs);
-        
-        __m512i q8_combined_01 = _mm512_inserti64x4(_mm512_castsi256_si512(q8b_0), q8b_1, 1);
-        __m512i q8_combined_23 = _mm512_inserti64x4(_mm512_castsi256_si512(q8b_2), q8b_3, 1);
-        
-        // Dequantize q4nl values using lookup table
-        const __m256i q4b_0 = MM256_SET_M128I(_mm_shuffle_epi8(values128, _mm_and_si128(_mm_srli_epi16(q4bits_0, 4), m4b)),
-                                              _mm_shuffle_epi8(values128, _mm_and_si128(q4bits_0, m4b)));
-        const __m256i q4b_1 = MM256_SET_M128I(_mm_shuffle_epi8(values128, _mm_and_si128(_mm_srli_epi16(q4bits_1, 4), m4b)),
-                                              _mm_shuffle_epi8(values128, _mm_and_si128(q4bits_1, m4b)));
-        const __m256i q4b_2 = MM256_SET_M128I(_mm_shuffle_epi8(values128, _mm_and_si128(_mm_srli_epi16(q4bits_2, 4), m4b)),
-                                              _mm_shuffle_epi8(values128, _mm_and_si128(q4bits_2, m4b)));
-        const __m256i q4b_3 = MM256_SET_M128I(_mm_shuffle_epi8(values128, _mm_and_si128(_mm_srli_epi16(q4bits_3, 4), m4b)),
-                                              _mm_shuffle_epi8(values128, _mm_and_si128(q4bits_3, m4b)));
-        
-        __m512i q4_combined_01 = _mm512_inserti64x4(_mm512_castsi256_si512(q4b_0), q4b_1, 1);
-        __m512i q4_combined_23 = _mm512_inserti64x4(_mm512_castsi256_si512(q4b_2), q4b_3, 1);
-        
-        // Use AVX512-VNNI for signed 8-bit × signed 8-bit dot product
-        const __m512i zero = _mm512_setzero_si512();
-        const __m512i dot_01 = _mm512_dpwssd_epi32(zero, q4_combined_01, q8_combined_01);
-        const __m512i dot_23 = _mm512_dpwssd_epi32(zero, q4_combined_23, q8_combined_23);
-        
-        // Apply scales
-        const __m512 scales = _mm512_set_ps(GGML_CPU_FP16_TO_FP32(y[ib + 3].d)*GGML_CPU_FP16_TO_FP32(x[ib + 3].d),
-                                            GGML_CPU_FP16_TO_FP32(y[ib + 3].d)*GGML_CPU_FP16_TO_FP32(x[ib + 3].d),
-                                            GGML_CPU_FP16_TO_FP32(y[ib + 3].d)*GGML_CPU_FP16_TO_FP32(x[ib + 3].d),
-                                            GGML_CPU_FP16_TO_FP32(y[ib + 3].d)*GGML_CPU_FP16_TO_FP32(x[ib + 3].d),
-                                            GGML_CPU_FP16_TO_FP32(y[ib + 2].d)*GGML_CPU_FP16_TO_FP32(x[ib + 2].d),
-                                            GGML_CPU_FP16_TO_FP32(y[ib + 2].d)*GGML_CPU_FP16_TO_FP32(x[ib + 2].d),
-                                            GGML_CPU_FP16_TO_FP32(y[ib + 2].d)*GGML_CPU_FP16_TO_FP32(x[ib + 2].d),
-                                            GGML_CPU_FP16_TO_FP32(y[ib + 2].d)*GGML_CPU_FP16_TO_FP32(x[ib + 2].d),
-                                            GGML_CPU_FP16_TO_FP32(y[ib + 1].d)*GGML_CPU_FP16_TO_FP32(x[ib + 1].d),
-                                            GGML_CPU_FP16_TO_FP32(y[ib + 1].d)*GGML_CPU_FP16_TO_FP32(x[ib + 1].d),
-                                            GGML_CPU_FP16_TO_FP32(y[ib + 1].d)*GGML_CPU_FP16_TO_FP32(x[ib + 1].d),
-                                            GGML_CPU_FP16_TO_FP32(y[ib + 1].d)*GGML_CPU_FP16_TO_FP32(x[ib + 1].d),
-                                            GGML_CPU_FP16_TO_FP32(y[ib + 0].d)*GGML_CPU_FP16_TO_FP32(x[ib + 0].d),
-                                            GGML_CPU_FP16_TO_FP32(y[ib + 0].d)*GGML_CPU_FP16_TO_FP32(x[ib + 0].d),
-                                            GGML_CPU_FP16_TO_FP32(y[ib + 0].d)*GGML_CPU_FP16_TO_FP32(x[ib + 0].d),
-                                            GGML_CPU_FP16_TO_FP32(y[ib + 0].d)*GGML_CPU_FP16_TO_FP32(x[ib + 0].d));
-        
-        accum = _mm512_fmadd_ps(scales, _mm512_cvtepi32_ps(_mm512_add_epi32(dot_01, dot_23)), accum);
-    }
-    
-    // Process remaining blocks with AVX2
     __m256 accum1 = _mm256_setzero_ps();
     __m256 accum2 = _mm256_setzero_ps();
     const __m256i mone = _mm256_set1_epi16(1);
@@ -5021,23 +4863,8 @@ void ggml_vec_dot_iq4_nl_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const v
         accum2 = _mm256_fmadd_ps(_mm256_set1_ps(GGML_CPU_FP16_TO_FP32(y[ib + 1].d)*GGML_CPU_FP16_TO_FP32(x[ib + 1].d)),
                 _mm256_cvtepi32_ps(p_2), accum2);
     }
-    
-    // Add AVX2 results to AVX512 accumulator
-    accum = _mm512_add_ps(accum, _mm512_castps256_ps512(_mm256_add_ps(accum1, accum2)));
 
-    // Handle remaining single block
-    if (ib < nb) {
-        const __m128i q4bits = _mm_loadu_si128((const __m128i*)x[ib].qs);
-        const __m256i q8b = _mm256_loadu_si256((const __m256i *)y[ib].qs);
-        const __m256i q4b = MM256_SET_M128I(_mm_shuffle_epi8(values128, _mm_and_si128(_mm_srli_epi16(q4bits, 4), m4b)),
-                                            _mm_shuffle_epi8(values128, _mm_and_si128(q4bits, m4b)));
-        const __m256i p16 = mul_add_epi8(q4b, q8b);
-        const __m256i p = _mm256_madd_epi16(p16, mone);
-        accum = _mm512_add_ps(accum, _mm512_castps256_ps512(_mm256_mul_ps(_mm256_set1_ps(GGML_CPU_FP16_TO_FP32(y[ib].d)*GGML_CPU_FP16_TO_FP32(x[ib].d)),
-                                                                          _mm256_cvtepi32_ps(p))));
-    }
-
-    sumf = hsum_float_16(accum);
+    sumf = hsum_float_8(_mm256_add_ps(accum1, accum2));
 
 #elif defined __AVX2__
 
