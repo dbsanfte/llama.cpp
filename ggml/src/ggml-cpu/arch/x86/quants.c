@@ -2884,9 +2884,11 @@ void ggml_vec_dot_iq2_xxs_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const 
             __m512i s2_combined_1 = _mm512_inserti64x4(_mm512_castsi256_si512(s2_0_1), s2_1_1, 1);
             __m512i s2_combined_2 = _mm512_inserti64x4(_mm512_castsi256_si512(s2_0_2), s2_1_2, 1);
             
-            // Apply signs
-            const __m512i q8s_1 = _mm512_sign_epi8(q8_combined_1, s2_combined_1);
-            const __m512i q8s_2 = _mm512_sign_epi8(q8_combined_2, s2_combined_2);
+            // Apply signs using conditional negation (AVX512 doesn't have _mm512_sign_epi8)
+            const __mmask64 sign_mask_1 = _mm512_cmplt_epi8_mask(s2_combined_1, _mm512_setzero_si512());
+            const __mmask64 sign_mask_2 = _mm512_cmplt_epi8_mask(s2_combined_2, _mm512_setzero_si512());
+            const __m512i q8s_1 = _mm512_mask_sub_epi8(q8_combined_1, sign_mask_1, _mm512_setzero_si512(), q8_combined_1);
+            const __m512i q8s_2 = _mm512_mask_sub_epi8(q8_combined_2, sign_mask_2, _mm512_setzero_si512(), q8_combined_2);
             
             // Compute unsigned * signed products and convert to 32-bit with scaling
             const __m512i dot1 = _mm512_maddubs_epi16(q2_combined_1, q8s_1);
@@ -2894,8 +2896,12 @@ void ggml_vec_dot_iq2_xxs_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const 
             
             // Apply local scales and accumulate
             const __m512i scales_1 = _mm512_set_epi16(2*ls1_1+1, 2*ls1_1+1, 2*ls1_1+1, 2*ls1_1+1, 2*ls1_1+1, 2*ls1_1+1, 2*ls1_1+1, 2*ls1_1+1,
+                                                      2*ls0_1+1, 2*ls0_1+1, 2*ls0_1+1, 2*ls0_1+1, 2*ls0_1+1, 2*ls0_1+1, 2*ls0_1+1, 2*ls0_1+1,
+                                                      2*ls1_1+1, 2*ls1_1+1, 2*ls1_1+1, 2*ls1_1+1, 2*ls1_1+1, 2*ls1_1+1, 2*ls1_1+1, 2*ls1_1+1,
                                                       2*ls0_1+1, 2*ls0_1+1, 2*ls0_1+1, 2*ls0_1+1, 2*ls0_1+1, 2*ls0_1+1, 2*ls0_1+1, 2*ls0_1+1);
             const __m512i scales_2 = _mm512_set_epi16(2*ls1_2+1, 2*ls1_2+1, 2*ls1_2+1, 2*ls1_2+1, 2*ls1_2+1, 2*ls1_2+1, 2*ls1_2+1, 2*ls1_2+1,
+                                                      2*ls0_2+1, 2*ls0_2+1, 2*ls0_2+1, 2*ls0_2+1, 2*ls0_2+1, 2*ls0_2+1, 2*ls0_2+1, 2*ls0_2+1,
+                                                      2*ls1_2+1, 2*ls1_2+1, 2*ls1_2+1, 2*ls1_2+1, 2*ls1_2+1, 2*ls1_2+1, 2*ls1_2+1, 2*ls1_2+1,
                                                       2*ls0_2+1, 2*ls0_2+1, 2*ls0_2+1, 2*ls0_2+1, 2*ls0_2+1, 2*ls0_2+1, 2*ls0_2+1, 2*ls0_2+1);
             
             const __m512i p1 = _mm512_madd_epi16(dot1, scales_1);
@@ -3085,7 +3091,6 @@ void ggml_vec_dot_iq2_xs_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const v
 
 #if defined(__AVX512VNNI__) && defined(__AVX512VL__)
 
-    const __m512i mone = _mm512_set1_epi8(1);
     static const char block_sign_shuffle_mask_1[32] = {
         0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02,
         0x04, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06,
@@ -3094,23 +3099,9 @@ void ggml_vec_dot_iq2_xs_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const v
         0x08, 0x08, 0x08, 0x08, 0x08, 0x08, 0x08, 0x08, 0x0a, 0x0a, 0x0a, 0x0a, 0x0a, 0x0a, 0x0a, 0x0a,
         0x0c, 0x0c, 0x0c, 0x0c, 0x0c, 0x0c, 0x0c, 0x0c, 0x0e, 0x0e, 0x0e, 0x0e, 0x0e, 0x0e, 0x0e, 0x0e,
     };
-    static const uint8_t bit_selector_mask_bytes[32] = {
-        0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80, 0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80,
-        0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80, 0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80,
-    };
 
-    const __m256i bit_selector_mask = _mm256_loadu_si256((const __m256i*)bit_selector_mask_bytes);
     const __m256i block_sign_shuffle_1 = _mm256_loadu_si256((const __m256i*)block_sign_shuffle_mask_1);
     const __m256i block_sign_shuffle_2 = _mm256_loadu_si256((const __m256i*)block_sign_shuffle_mask_2);
-
-    static const uint8_t k_bit_helper[32] = {
-        0x00, 0x80, 0x80, 0x00, 0x80, 0x00, 0x00, 0x80, 0x80, 0x00, 0x00, 0x80, 0x00, 0x80, 0x80, 0x00,
-        0x00, 0x80, 0x80, 0x00, 0x80, 0x00, 0x00, 0x80, 0x80, 0x00, 0x00, 0x80, 0x00, 0x80, 0x80, 0x00,
-    };
-    const __m256i bit_helper = _mm256_loadu_si256((const __m256i*)k_bit_helper);
-    const __m256i m511 = _mm256_set1_epi16(511);
-    const __m128i m4 = _mm_set1_epi8(0xf);
-    const __m128i m1 = _mm_set1_epi8(1);
 
     uint64_t aux64;
     __m256i aux_gindex;
@@ -3589,14 +3580,14 @@ void ggml_vec_dot_iq2_s_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const vo
             const __m256i q8_1_2 = _mm256_loadu_si256((const __m256i *)q8_1); q8_1 += 32;
             
             // Process quantized values and signs for block 0
-            const __m256i q2_0_1 = iq2s_grid_256[qs_0[2*ib32+0] | (((qh_0[ib32+0] << 8) | (qh_0[ib32+0] << 4)) & 0x300)];
-            const __m256i q2_0_2 = iq2s_grid_256[qs_0[2*ib32+1] | (((qh_0[ib32+0] << 6) | (qh_0[ib32+0] << 2)) & 0x300)];
+            const __m256i q2_0_1 = _mm256_loadu_si256(&iq2s_grid[qs_0[2*ib32+0] | (((qh_0[ib32+0] << 8) | (qh_0[ib32+0] << 4)) & 0x300)]);
+            const __m256i q2_0_2 = _mm256_loadu_si256(&iq2s_grid[qs_0[2*ib32+1] | (((qh_0[ib32+0] << 6) | (qh_0[ib32+0] << 2)) & 0x300)]);
             const __m256i signs_bits_0_1 = _mm256_shuffle_epi8(_mm256_set1_epi16(signs_0[ib32+0]), mask1);
             const __m256i signs_bits_0_2 = _mm256_shuffle_epi8(_mm256_set1_epi16(signs_0[ib32+0] >> 8), mask1);
             
             // Process quantized values and signs for block 1  
-            const __m256i q2_1_1 = iq2s_grid_256[qs_1[2*ib32+0] | (((qh_1[ib32+0] << 8) | (qh_1[ib32+0] << 4)) & 0x300)];
-            const __m256i q2_1_2 = iq2s_grid_256[qs_1[2*ib32+1] | (((qh_1[ib32+0] << 6) | (qh_1[ib32+0] << 2)) & 0x300)];
+            const __m256i q2_1_1 = _mm256_loadu_si256(&iq2s_grid[qs_1[2*ib32+0] | (((qh_1[ib32+0] << 8) | (qh_1[ib32+0] << 4)) & 0x300)]);
+            const __m256i q2_1_2 = _mm256_loadu_si256(&iq2s_grid[qs_1[2*ib32+1] | (((qh_1[ib32+0] << 6) | (qh_1[ib32+0] << 2)) & 0x300)]);
             const __m256i signs_bits_1_1 = _mm256_shuffle_epi8(_mm256_set1_epi16(signs_1[ib32+0]), mask1);
             const __m256i signs_bits_1_2 = _mm256_shuffle_epi8(_mm256_set1_epi16(signs_1[ib32+0] >> 8), mask1);
             
@@ -3623,8 +3614,9 @@ void ggml_vec_dot_iq2_s_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const vo
             const __m512i scales_2 = _mm512_inserti64x4(_mm512_castsi256_si512(_mm256_shuffle_epi32(scales16_0, _MM_SHUFFLE(1, 1, 1, 1))),
                                                         _mm256_shuffle_epi32(scales16_1, _MM_SHUFFLE(1, 1, 1, 1)), 1);
             
-            const __m512i scaled_dot1 = _mm512_madd_epi16(_mm512_cvtepi32_epi16(dot1), _mm512_cvtepi32_epi16(scales_1));
-            const __m512i scaled_dot2 = _mm512_madd_epi16(_mm512_cvtepi32_epi16(dot2), _mm512_cvtepi32_epi16(scales_2));
+            // Apply scales directly to the 32-bit dot products
+            const __m512i scaled_dot1 = _mm512_mullo_epi32(dot1, scales_1);
+            const __m512i scaled_dot2 = _mm512_mullo_epi32(dot2, scales_2);
             sumi_pair = _mm512_add_epi32(sumi_pair, _mm512_add_epi32(scaled_dot1, scaled_dot2));
         }
         
