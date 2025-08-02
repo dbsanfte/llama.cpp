@@ -130,11 +130,6 @@ static inline __m256 mul_sum_i8_pairs_float(const __m256i x, const __m256i y) {
 static inline __m128i packNibbles( __m256i bytes )
 {
     // Move bits within 16-bit lanes from 0000_abcd_0000_efgh into 0000_0000_abcd_efgh
-#if __AVX512F__
-    const __m256i bytes_srli_4 = _mm256_srli_epi16(bytes, 4);   // 0000_0000_abcd_0000
-    bytes = _mm256_or_si256(bytes, bytes_srli_4);               // 0000_abcd_abcd_efgh
-    return _mm256_cvtepi16_epi8(bytes);                         // abcd_efgh
-#else
     const __m256i lowByte = _mm256_set1_epi16( 0xFF );
     __m256i high = _mm256_andnot_si256( lowByte, bytes );
     __m256i low = _mm256_and_si256( lowByte, bytes );
@@ -145,7 +140,6 @@ static inline __m128i packNibbles( __m256i bytes )
     __m128i r0 = _mm256_castsi256_si128( bytes );
     __m128i r1 = _mm256_extracti128_si256( bytes, 1 );
     return _mm_packus_epi16( r0, r1 );
-#endif
 }
 #elif defined(__AVX__)
 static inline __m128i packNibbles( __m128i bytes1, __m128i bytes2 )
@@ -3336,21 +3330,12 @@ void ggml_vec_dot_iq3_xxs_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const 
                                                    signs64[(aux32[1] >>  7) & 127], signs64[(aux32[1] >>  0) & 127]);
             const __m256i q8s_1 = _mm256_sign_epi8(q8_1, s2_1);
             const __m256i q8s_2 = _mm256_sign_epi8(q8_2, s2_2);
-            const uint16_t ls1 = aux32[0] >> 28;
-            const uint16_t ls2 = aux32[1] >> 28;
-#if defined(__AVX512VNNI__) && defined(__AVX512VL__)
-            // Use AVX512-VNNI for optimized dot product computation
-            // dpbusd expects unsigned bytes in first arg, signed bytes in second arg
-            const __m256i dot1 = _mm256_dpbusd_epi32(_mm256_setzero_si256(), q2_1, q8s_1);
-            const __m256i dot2 = _mm256_dpbusd_epi32(_mm256_setzero_si256(), q2_2, q8s_2);
-            const __m256i p1 = _mm256_mullo_epi32(dot1, _mm256_set1_epi32(2*ls1+1));
-            const __m256i p2 = _mm256_mullo_epi32(dot2, _mm256_set1_epi32(2*ls2+1));
-#else
             const __m256i dot1  = _mm256_maddubs_epi16(q2_1, q8s_1);
             const __m256i dot2  = _mm256_maddubs_epi16(q2_2, q8s_2);
+            const uint16_t ls1 = aux32[0] >> 28;
+            const uint16_t ls2 = aux32[1] >> 28;
             const __m256i p1 = _mm256_madd_epi16(dot1, _mm256_set1_epi16(2*ls1+1));
             const __m256i p2 = _mm256_madd_epi16(dot2, _mm256_set1_epi16(2*ls2+1));
-#endif
             sumi1 = _mm256_add_epi32(sumi1, p1);
             sumi2 = _mm256_add_epi32(sumi2, p2);
         }
