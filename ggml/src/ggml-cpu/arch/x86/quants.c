@@ -596,9 +596,7 @@ void ggml_vec_dot_q4_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const voi
         __m256i qx0 = bytes_from_nibbles_32(x[ib].qs);
         __m256i qx1 = bytes_from_nibbles_32(x[ib + 1].qs);
         
-        // Offset from [0,15] to [-8,7] range and combine to 512-bit
-        qx0 = _mm256_sub_epi8(qx0, _mm256_set1_epi8(8));
-        qx1 = _mm256_sub_epi8(qx1, _mm256_set1_epi8(8));
+        // Keep as unsigned [0,15] - q4_0 format uses unsigned 4-bit × signed 8-bit
         __m512i qx_combined = _mm512_inserti64x4(_mm512_castsi256_si512(qx0), qx1, 1);
         
         // Load signed 8-bit values and combine
@@ -606,9 +604,9 @@ void ggml_vec_dot_q4_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const voi
         __m256i qy1 = _mm256_loadu_si256((const __m256i *)y[ib + 1].qs);
         __m512i qy_combined = _mm512_inserti64x4(_mm512_castsi256_si512(qy0), qy1, 1);
         
-        // Use AVX512 VNNI for signed 8-bit dot product (treating adjusted q4 as signed) 
+        // Use AVX512 VNNI for unsigned×signed dot product (correct for q4_0)
         __m512i zero = _mm512_setzero_si512();
-        __m512i dot_result = _mm512_dpwssd_epi32(zero, qx_combined, qy_combined);
+        __m512i dot_result = _mm512_dpbusd_epi32(zero, qx_combined, qy_combined);
         
         // Convert to float and apply scales
         __m512 dot_float = _mm512_cvtepi32_ps(dot_result);
@@ -623,13 +621,12 @@ void ggml_vec_dot_q4_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const voi
     if (ib < nb) {
         const float scale = GGML_CPU_FP16_TO_FP32(x[ib].d) * GGML_CPU_FP16_TO_FP32(y[ib].d);
         
-        // Unpack nibbles and offset
+        // Unpack nibbles - keep as unsigned [0,15] for q4_0
         __m256i qx = bytes_from_nibbles_32(x[ib].qs);
-        qx = _mm256_sub_epi8(qx, _mm256_set1_epi8(8));
         __m256i qy = _mm256_loadu_si256((const __m256i *)y[ib].qs);
         
-        // Use 256-bit VNNI for the remainder
-        const __m256 q = mul_sum_i8_pairs_float(qx, qy);
+        // Use unsigned×signed VNNI for the remainder
+        const __m256 q = mul_sum_us8_pairs_float(qx, qy);
         const __m256 d = _mm256_set1_ps(scale);
         const __m256 scaled_result = _mm256_mul_ps(d, q);
         acc = _mm512_add_ps(acc, _mm512_castps256_ps512(scaled_result));
