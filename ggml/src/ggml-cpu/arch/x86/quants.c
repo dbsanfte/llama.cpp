@@ -587,10 +587,10 @@ void ggml_vec_dot_q4_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const voi
         /* Compute combined scale for the block */
         const __m256 d = _mm256_set1_ps( GGML_CPU_FP16_TO_FP32(x[ib].d) * GGML_CPU_FP16_TO_FP32(y[ib].d) );
 
-        __m256i bx = bytes_from_nibbles_32(x[ib].qs);
-        const __m256i by = _mm256_loadu_si256( (const __m256i *)y[ib].qs );
+        __m256i qx = bytes_from_nibbles_32(x[ib].qs);
+        const __m256i qy = _mm256_loadu_si256( (const __m256i *)y[ib].qs );
 
-        const __m256 q = mul_sum_us8_pairs_float(bx, by);
+        const __m256 q = mul_sum_us8_pairs_float(qx, qy);
 
         /* Multiply q with scale and accumulate */
         acc = _mm256_fmadd_ps( d, q, acc );
