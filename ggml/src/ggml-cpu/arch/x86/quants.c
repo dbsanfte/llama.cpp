@@ -4917,12 +4917,18 @@ void ggml_vec_dot_iq4_xs_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const v
             __m512i q4_combined = _mm512_inserti64x4(_mm512_castsi256_si512(q4b_1), q4b_2, 1);
             __m512i q8_combined = _mm512_inserti64x4(_mm512_castsi256_si512(q8b_1), q8b_2, 1);
             
-            // Apply the same sign manipulation as mul_add_epi8
-            const __m512i ax = _mm512_sign_epi8(q4_combined, q4_combined);  // get absolute values of q4
-            const __m512i sy = _mm512_sign_epi8(q8_combined, q4_combined);  // apply q4's signs to q8
+            // Implement _mm512_sign_epi8 equivalent for ax = _mm256_sign_epi8(q4, q4) - get absolute values
+            const __m512i zero = _mm512_setzero_si512();
+            __mmask64 q4_blt0 = _mm512_movepi8_mask(q4_combined);
+            __mmask64 q4_ble0 = _mm512_cmple_epi8_mask(q4_combined, zero);
+            __m512i q4_blt0_vals = _mm512_mask_mov_epi8(zero, q4_blt0, q4_combined);
+            const __m512i ax = _mm512_mask_sub_epi8(q4_combined, q4_ble0, zero, q4_blt0_vals);
+            
+            // Implement _mm512_sign_epi8 equivalent for sy = _mm256_sign_epi8(q8, q4) - apply q4's signs to q8
+            __m512i q8_blt0_vals = _mm512_mask_mov_epi8(zero, q4_blt0, q8_combined);
+            const __m512i sy = _mm512_mask_sub_epi8(q8_combined, q4_ble0, zero, q8_blt0_vals);
             
             // Use AVX512-VNNI for unsigned×signed dot product (matching mul_add_epi8 behavior)
-            const __m512i zero = _mm512_setzero_si512();
             const __m512i dot_result = _mm512_dpbusd_epi32(zero, ax, sy);
             
             // Apply scales
