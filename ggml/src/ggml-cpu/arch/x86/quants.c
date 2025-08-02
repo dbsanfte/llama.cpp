@@ -578,27 +578,7 @@ void ggml_vec_dot_q4_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const voi
     int ib = 0;
     float sumf = 0;
 
-#if defined(__AVX512VNNI__) && defined(__AVX512VL__)
-    // Simple single-block processing using existing optimized helpers
-    __m256 acc = _mm256_setzero_ps();
-
-    // Main loop - process single blocks efficiently
-    for (; ib < nb; ++ib) {
-        /* Compute combined scale for the block */
-        const __m256 d = _mm256_set1_ps( GGML_CPU_FP16_TO_FP32(x[ib].d) * GGML_CPU_FP16_TO_FP32(y[ib].d) );
-
-        __m256i qx = bytes_from_nibbles_32(x[ib].qs);
-        const __m256i qy = _mm256_loadu_si256( (const __m256i *)y[ib].qs );
-
-        const __m256 q = mul_sum_us8_pairs_float(qx, qy);
-
-        /* Multiply q with scale and accumulate */
-        acc = _mm256_fmadd_ps( d, q, acc );
-    }
-
-    sumf = hsum_float_8(acc);
-
-#elif defined(__AVX2__)
+#if defined(__AVX2__)
     // Initialize accumulator with zeros
     __m256 acc = _mm256_setzero_ps();
 
