@@ -3580,14 +3580,14 @@ void ggml_vec_dot_iq2_s_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const vo
             const __m256i q8_1_2 = _mm256_loadu_si256((const __m256i *)q8_1); q8_1 += 32;
             
             // Process quantized values and signs for block 0
-            const __m256i q2_0_1 = _mm256_loadu_si256(&iq2s_grid[qs_0[2*ib32+0] | (((qh_0[ib32+0] << 8) | (qh_0[ib32+0] << 4)) & 0x300)]);
-            const __m256i q2_0_2 = _mm256_loadu_si256(&iq2s_grid[qs_0[2*ib32+1] | (((qh_0[ib32+0] << 6) | (qh_0[ib32+0] << 2)) & 0x300)]);
+            const __m256i q2_0_1 = _mm256_loadu_si256((const __m256i*)&iq2s_grid[qs_0[2*ib32+0] | (((qh_0[ib32+0] << 8) | (qh_0[ib32+0] << 4)) & 0x300)]);
+            const __m256i q2_0_2 = _mm256_loadu_si256((const __m256i*)&iq2s_grid[qs_0[2*ib32+1] | (((qh_0[ib32+0] << 6) | (qh_0[ib32+0] << 2)) & 0x300)]);
             const __m256i signs_bits_0_1 = _mm256_shuffle_epi8(_mm256_set1_epi16(signs_0[ib32+0]), mask1);
             const __m256i signs_bits_0_2 = _mm256_shuffle_epi8(_mm256_set1_epi16(signs_0[ib32+0] >> 8), mask1);
             
             // Process quantized values and signs for block 1  
-            const __m256i q2_1_1 = _mm256_loadu_si256(&iq2s_grid[qs_1[2*ib32+0] | (((qh_1[ib32+0] << 8) | (qh_1[ib32+0] << 4)) & 0x300)]);
-            const __m256i q2_1_2 = _mm256_loadu_si256(&iq2s_grid[qs_1[2*ib32+1] | (((qh_1[ib32+0] << 6) | (qh_1[ib32+0] << 2)) & 0x300)]);
+            const __m256i q2_1_1 = _mm256_loadu_si256((const __m256i*)&iq2s_grid[qs_1[2*ib32+0] | (((qh_1[ib32+0] << 8) | (qh_1[ib32+0] << 4)) & 0x300)]);
+            const __m256i q2_1_2 = _mm256_loadu_si256((const __m256i*)&iq2s_grid[qs_1[2*ib32+1] | (((qh_1[ib32+0] << 6) | (qh_1[ib32+0] << 2)) & 0x300)]);
             const __m256i signs_bits_1_1 = _mm256_shuffle_epi8(_mm256_set1_epi16(signs_1[ib32+0]), mask1);
             const __m256i signs_bits_1_2 = _mm256_shuffle_epi8(_mm256_set1_epi16(signs_1[ib32+0] >> 8), mask1);
             
@@ -3642,8 +3642,8 @@ void ggml_vec_dot_iq2_s_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const vo
         for (int ib32 = 0; ib32 < QK_K/32; ib32 += 2) {
             const __m256i q8_1 = _mm256_loadu_si256((const __m256i *)q8); q8 += 32;
             const __m256i q8_2 = _mm256_loadu_si256((const __m256i *)q8); q8 += 32;
-            const __m256i q2_1 = iq2s_grid_256[qs[2*ib32+0] | (((qh[ib32+0] << 8) | (qh[ib32+0] << 4)) & 0x300)];
-            const __m256i q2_2 = iq2s_grid_256[qs[2*ib32+1] | (((qh[ib32+0] << 6) | (qh[ib32+0] << 2)) & 0x300)];
+            const __m256i q2_1 = _mm256_loadu_si256((const __m256i*)&iq2s_grid[qs[2*ib32+0] | (((qh[ib32+0] << 8) | (qh[ib32+0] << 4)) & 0x300)]);
+            const __m256i q2_2 = _mm256_loadu_si256((const __m256i*)&iq2s_grid[qs[2*ib32+1] | (((qh[ib32+0] << 6) | (qh[ib32+0] << 2)) & 0x300)]);
             const __m256i signs_bits_1 = _mm256_shuffle_epi8(_mm256_set1_epi16(signs[ib32+0]), mask1);
             const __m256i signs_bits_2 = _mm256_shuffle_epi8(_mm256_set1_epi16(signs[ib32+0] >> 8), mask1);
             const __m256i q8s_1 = _mm256_sign_epi8(q8_1, _mm256_cmpeq_epi8(_mm256_and_si256(signs_bits_1, mask2), mask2));
