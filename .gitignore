@@ -32,8 +32,6 @@
 .swiftpm
 .vs/
 .vscode/
-.devcontainer/
-.github/copilot-instructions.md
 nppBackup
 
 
