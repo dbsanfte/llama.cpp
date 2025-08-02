@@ -798,33 +798,7 @@ void ggml_vec_dot_q4_1_q8_1(int n, float * GGML_RESTRICT s, size_t bs, const voi
     int ib = 0;
     float sumf = 0;
 
-#if defined(__AVX512VNNI__) && defined(__AVX512VL__)
-    // AVX512 optimization: use 512-bit accumulator but keep efficient single-block processing
-    __m512 acc = _mm512_setzero_ps();
-    float summs = 0;
-
-    // Main loop - process single blocks efficiently
-    for (; ib < nb; ++ib) {
-        const float d0 = GGML_CPU_FP16_TO_FP32(x[ib].d);
-        const float d1 = GGML_CPU_FP16_TO_FP32(y[ib].d);
-
-        summs += GGML_CPU_FP16_TO_FP32(x[ib].m) * GGML_CPU_FP16_TO_FP32(y[ib].s);
-
-        // Load and unpack 4-bit values to 8-bit
-        const __m256i qx = bytes_from_nibbles_32(x[ib].qs);
-        const __m256i qy = _mm256_loadu_si256((const __m256i *)y[ib].qs);
-
-        // Use the optimized mul_sum_us8_pairs_float which already has AVX512 VNNI
-        const __m256 xy = mul_sum_us8_pairs_float(qx, qy);
-        
-        // Scale and accumulate into 512-bit register
-        const __m256 scaled = _mm256_mul_ps(_mm256_set1_ps(d0 * d1), xy);
-        acc = _mm512_add_ps(acc, _mm512_castps256_ps512(scaled));
-    }
-
-    sumf = hsum_float_16(acc) + summs;
-
-#elif defined(__AVX2__) || defined(__AVX__)
+#if defined(__AVX2__) || defined(__AVX__)
     // Initialize accumulator with zeros
     __m256 acc = _mm256_setzero_ps();
 
