@@ -4917,16 +4917,16 @@ void ggml_vec_dot_iq4_xs_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const v
             __m512i q4_combined = _mm512_inserti64x4(_mm512_castsi256_si512(q4b_1), q4b_2, 1);
             __m512i q8_combined = _mm512_inserti64x4(_mm512_castsi256_si512(q8b_1), q8b_2, 1);
             
-            // Implement _mm512_sign_epi8 equivalent for ax = _mm256_sign_epi8(q4, q4) - get absolute values
+            // Implement optimized _mm512_sign_epi8 equivalent for ax = _mm256_sign_epi8(q4, q4) - get absolute values
             const __m512i zero = _mm512_setzero_si512();
-            __mmask64 q4_blt0 = _mm512_movepi8_mask(q4_combined);
-            __mmask64 q4_ble0 = _mm512_cmple_epi8_mask(q4_combined, zero);
-            __m512i q4_blt0_vals = _mm512_mask_mov_epi8(zero, q4_blt0, q4_combined);
-            const __m512i ax = _mm512_mask_sub_epi8(q4_combined, q4_ble0, zero, q4_blt0_vals);
+            __mmask64 q4_nonzero = _mm512_test_epi8_mask(q4_combined, q4_combined);
+            __mmask64 q4_neg = _mm512_movepi8_mask(q4_combined);  // extract sign bits: q4 < 0
+            __m512i q4_zeroed = _mm512_maskz_mov_epi8(q4_nonzero, q4_combined);  // (q4!=0) ? q4 : 0
+            const __m512i ax = _mm512_mask_sub_epi8(q4_zeroed, q4_neg, zero, q4_zeroed);  // q4_neg ? 0-q4_zeroed : q4_zeroed
             
-            // Implement _mm512_sign_epi8 equivalent for sy = _mm256_sign_epi8(q8, q4) - apply q4's signs to q8
-            __m512i q8_blt0_vals = _mm512_mask_mov_epi8(zero, q4_blt0, q8_combined);
-            const __m512i sy = _mm512_mask_sub_epi8(q8_combined, q4_ble0, zero, q8_blt0_vals);
+            // Implement optimized _mm512_sign_epi8 equivalent for sy = _mm256_sign_epi8(q8, q4) - apply q4's signs to q8
+            __m512i q8_zeroed = _mm512_maskz_mov_epi8(q4_nonzero, q8_combined);  // (q4!=0) ? q8 : 0
+            const __m512i sy = _mm512_mask_sub_epi8(q8_zeroed, q4_neg, zero, q8_zeroed);  // q4_neg ? 0-q8_zeroed : q8_zeroed
             
             // Use AVX512-VNNI for unsigned×signed dot product (matching mul_add_epi8 behavior)
             const __m512i dot_result = _mm512_dpbusd_epi32(zero, ax, sy);
