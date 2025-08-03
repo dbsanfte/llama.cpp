@@ -3,6 +3,8 @@
 #include "llama-impl.h"
 
 #include "ggml.h"
+#include "ggml-backend.h"
+#include "ggml-cpu.h"
 
 #include <cstring>
 #include <climits>
@@ -293,6 +295,38 @@ struct llama_mmap::impl {
 
     impl(struct llama_file * file, size_t prefetch, bool numa) {
 #ifdef GGML_NUMA_MIRROR
+        // Check if we're in isolate mode - if so, don't mirror data across NUMA nodes
+        bool should_mirror = numa;
+        if (numa && ggml_get_numa_strategy() == GGML_NUMA_STRATEGY_ISOLATE) {
+            should_mirror = false;
+            LLAMA_LOG_INFO("NUMA isolate mode detected - allocating memory only on target node, no mirroring\n");
+        }
+        
+        if (!should_mirror) {
+            // Use regular mmap for isolate mode
+            GGML_UNUSED(prefetch);
+            size = file->size();
+            int fd = file->file_id();
+            addr = mmap(nullptr, file->size(), PROT_READ, MAP_PRIVATE, fd, 0);
+            if (addr == MAP_FAILED) {
+                throw std::runtime_error(format("mmap failed: %s", strerror(errno)));
+            }
+            
+            if (prefetch > 0) {
+                if (posix_madvise(addr, std::min(file->size(), prefetch), POSIX_MADV_WILLNEED)) {
+                    LLAMA_LOG_WARN("warning: posix_madvise(.., POSIX_MADV_WILLNEED) failed: %s\n",
+                            strerror(errno));
+                }
+            }
+            if (numa) {
+                if (posix_madvise(addr, file->size(), POSIX_MADV_RANDOM)) {
+                    LLAMA_LOG_WARN("warning: posix_madvise(.., POSIX_MADV_RANDOM) failed: %s\n",
+                            strerror(errno));
+                }
+            }
+            return;
+        }
+        
         GGML_UNUSED(prefetch);
         GGML_UNUSED(numa);
 #endif        
@@ -473,12 +507,49 @@ struct llama_mmap::impl {
     // Constructor for unified multi-part file mapping (NUMA-aware)
     impl(const std::vector<struct llama_file *> & files, size_t prefetch, bool numa) {
 #ifdef GGML_NUMA_MIRROR
-        GGML_UNUSED(prefetch);
-        GGML_UNUSED(numa);
-        
         if (files.empty()) {
             throw std::runtime_error("Cannot create unified mapping with empty file list");
         }
+        
+        // Check if we're in isolate mode - if so, don't mirror data across NUMA nodes  
+        bool should_mirror = numa;
+        if (numa && ggml_get_numa_strategy() == GGML_NUMA_STRATEGY_ISOLATE) {
+            should_mirror = false;
+            LLAMA_LOG_INFO("NUMA isolate mode detected for multi-file mapping - allocating memory only on target node, no mirroring\n");
+        }
+        
+        if (!should_mirror) {
+            // Use regular mapping for isolate mode - just map each file separately and concatenate
+            GGML_UNUSED(prefetch);
+            size_t total_size = 0;
+            for (const auto * file : files) {
+                total_size += file->size();
+            }
+            size = total_size;
+            
+            // For simplicity in isolate mode, use a single large mapping
+            // Map the first file to get a base address, then remap the entire range
+            addr = mmap(nullptr, total_size, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+            if (addr == MAP_FAILED) {
+                throw std::runtime_error(format("mmap failed for isolate mode: %s", strerror(errno)));
+            }
+            
+            // Map each file at the appropriate offset
+            size_t offset = 0;
+            for (const auto * file : files) {
+                void * file_addr = mmap((char*)addr + offset, file->size(), PROT_READ, 
+                                      MAP_PRIVATE | MAP_FIXED, file->file_id(), 0);
+                if (file_addr == MAP_FAILED) {
+                    munmap(addr, total_size);
+                    throw std::runtime_error(format("mmap failed for file in isolate mode: %s", strerror(errno)));
+                }
+                offset += file->size();
+            }
+            return;
+        }
+        
+        GGML_UNUSED(prefetch);
+        GGML_UNUSED(numa);
         
         // Calculate total size across all files
         size_t total_size = 0;

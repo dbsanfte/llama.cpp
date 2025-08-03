@@ -123,7 +123,15 @@ int main(int argc, char ** argv) {
     LOG_INF("%s: llama backend init\n", __func__);
 
     llama_backend_init();
-    llama_numa_init(params.numa);
+    
+    // Print comprehensive topology if NUMA is enabled (before NUMA allocation begins)
+    common_numa_print_topology_if_enabled(params);
+    
+    if (params.numa == GGML_NUMA_STRATEGY_ISOLATE && params.numa_isolate_node >= 0) {
+        llama_numa_init_with_node(params.numa, params.numa_isolate_node);
+    } else {
+        llama_numa_init(params.numa);
+    }
 
     llama_model * model = nullptr;
     llama_context * ctx = nullptr;

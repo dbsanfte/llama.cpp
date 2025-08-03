@@ -3,6 +3,15 @@
 #include "ggml.h"
 #include "ggml-backend.h"
 
+// NUMA flag compatibility layer - make GGML_NUMA and GGML_NUMA_MIRROR synonyms
+#if defined(GGML_NUMA) && !defined(GGML_NUMA_MIRROR)
+#define GGML_NUMA_MIRROR
+#endif
+
+#if defined(GGML_NUMA_MIRROR) && !defined(GGML_NUMA)
+#define GGML_NUMA
+#endif
+
 #ifdef  __cplusplus
 extern "C" {
 #endif
@@ -32,7 +41,9 @@ extern "C" {
     };
 
     GGML_BACKEND_API void    ggml_numa_init(enum ggml_numa_strategy numa); // call once for better performance on NUMA systems
+    GGML_BACKEND_API void    ggml_numa_init_with_node(enum ggml_numa_strategy numa, int isolate_node); // call once for better performance on NUMA systems with specific isolate node
     GGML_BACKEND_API bool    ggml_is_numa(void); // true if init detected that system has >1 NUMA node
+    GGML_BACKEND_API enum ggml_numa_strategy ggml_get_numa_strategy(void); // get current NUMA strategy
 
     GGML_BACKEND_API struct ggml_tensor * ggml_new_i32(struct ggml_context * ctx, int32_t value);
     GGML_BACKEND_API struct ggml_tensor * ggml_new_f32(struct ggml_context * ctx, float value);

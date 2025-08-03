@@ -3677,11 +3677,29 @@ int main(int argc, char ** argv) {
 
     common_init();
 
+    // Print CPU topology if requested
+    if (params.print_cpu_topology) {
+        // Ensure CPU params are processed first
+        postprocess_cpu_params(params.cpuparams, nullptr);
+        
+        printf("\n=== CPU/GPU/NUMA TOPOLOGY AT STARTUP ===\n");
+        cpu_print_comprehensive_topology_with_gpu(params.cpuparams, params);
+        printf("==========================================\n\n");
+    }
+
     // struct that contains llama context and inference
     server_context ctx_server;
 
     llama_backend_init();
-    llama_numa_init(params.numa);
+    
+    // Print comprehensive topology if NUMA is enabled (before NUMA allocation begins)
+    common_numa_print_topology_if_enabled(params);
+    
+    if (params.numa == GGML_NUMA_STRATEGY_ISOLATE && params.numa_isolate_node >= 0) {
+        llama_numa_init_with_node(params.numa, params.numa_isolate_node);
+    } else {
+        llama_numa_init(params.numa);
+    }
 
     LOG_INF("system info: n_threads = %d, n_threads_batch = %d, total_threads = %d\n", params.cpuparams.n_threads, params.cpuparams_batch.n_threads, std::thread::hardware_concurrency());
     LOG_INF("\n");

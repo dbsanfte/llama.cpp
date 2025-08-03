@@ -314,7 +314,9 @@ static void print_usage(int /* argc */, char ** argv) {
     printf("\n");
     printf("options:\n");
     printf("  -h, --help\n");
+#ifdef GGML_NUMA_MIRROR
     printf("  --numa <distribute|isolate|numactl>       numa mode (default: disabled)\n");
+#endif // GGML_NUMA_MIRROR
     printf("  -r, --repetitions <n>                     number of times to repeat each test (default: %d)\n",
            cmd_params_defaults.reps);
     printf("  --prio <-1|0|1|2|3>                          process/thread priority (default: %d)\n",
@@ -620,6 +622,7 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                 }
                 auto p = string_split<bool>(argv[i], split_delim);
                 params.no_kv_offload.insert(params.no_kv_offload.end(), p.begin(), p.end());
+#ifdef GGML_NUMA_MIRROR
             } else if (arg == "--numa") {
                 if (++i >= argc) {
                     invalid_param = true;
@@ -636,6 +639,7 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                     invalid_param = true;
                     break;
                 }
+#endif // GGML_NUMA_MIRROR
             } else if (arg == "-fa" || arg == "--flash-attn") {
                 if (++i >= argc) {
                     invalid_param = true;

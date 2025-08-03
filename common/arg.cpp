@@ -1402,10 +1402,22 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ));
     add_opt(common_arg(
         {"--cpu-topology"},
-        "print detailed CPU topology information and exit",
-        [](common_params & /*params*/) {
-            cpu_print_topology_info();
+        "print CPU/GPU/NUMA topology and threading plan, then exit",
+        [](common_params & params) {
+            // Ensure CPU params are processed first
+            postprocess_cpu_params(params.cpuparams, nullptr);
+            
+            // Print comprehensive topology (without debug output)
+            cpu_print_comprehensive_topology_with_gpu(params.cpuparams, params);
+            
             exit(0);
+        }
+    ));
+    add_opt(common_arg(
+        {"--print-cpu-topology"},
+        "print CPU/GPU/NUMA topology at startup",
+        [](common_params & params) {
+            params.print_cpu_topology = true;
         }
     ));
     add_opt(common_arg(
@@ -2304,21 +2316,41 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.use_mmap = false;
         }
     ).set_env("LLAMA_ARG_NO_MMAP"));
+#ifdef GGML_NUMA_MIRROR
     add_opt(common_arg(
         {"--numa"}, "TYPE",
         "attempt optimizations that help on some NUMA systems\n"
         "- distribute: spread execution evenly over all nodes\n"
         "- isolate: only spawn threads on CPUs on the node that execution started on\n"
+        "- isolate N: only spawn threads on CPUs on NUMA node N (if valid)\n"
         "- numactl: use the CPU map provided by numactl\n"
         "if run without this previously, it is recommended to drop the system page cache before using this\n"
         "see https://github.com/ggml-org/llama.cpp/issues/1437",
         [](common_params & params, const std::string & value) {
-            /**/ if (value == "distribute" || value == "") { params.numa = GGML_NUMA_STRATEGY_DISTRIBUTE; }
-            else if (value == "isolate") { params.numa = GGML_NUMA_STRATEGY_ISOLATE; }
+            /**/ if (value == "distribute" || value == "") { 
+                params.numa = GGML_NUMA_STRATEGY_DISTRIBUTE; 
+            }
+            else if (value == "isolate") { 
+                params.numa = GGML_NUMA_STRATEGY_ISOLATE; 
+                params.numa_isolate_node = -1; // Use current node
+            }
+            else if (value.substr(0, 8) == "isolate ") {
+                params.numa = GGML_NUMA_STRATEGY_ISOLATE;
+                try {
+                    int node = std::stoi(value.substr(8));
+                    if (node < 0) {
+                        throw std::invalid_argument("NUMA node number must be non-negative");
+                    }
+                    params.numa_isolate_node = node;
+                } catch (const std::exception & e) {
+                    throw std::invalid_argument("invalid NUMA node number: " + std::string(e.what()));
+                }
+            }
             else if (value == "numactl") { params.numa = GGML_NUMA_STRATEGY_NUMACTL; }
             else { throw std::invalid_argument("invalid value"); }
         }
     ).set_env("LLAMA_ARG_NUMA"));
+#endif // GGML_NUMA_MIRROR
     add_opt(common_arg(
         {"-dev", "--device"}, "<dev1,dev2,..>",
         "comma-separated list of devices to use for offloading (none = don't offload)\n"

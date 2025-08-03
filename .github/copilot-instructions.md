@@ -24,12 +24,14 @@ This is a fork of llama.cpp with **NUMA-aware improvements** for better CPU thre
 ### Quick Build Commands
 
 ```bash
-# Manual build steps
+# Manual build steps (NUMA-enabled)
 cmake -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_EXPORT_COMPILE_COMMANDS=ON -DGGML_NUMA_MIRROR=ON
+# Or equivalently: -DGGML_NUMA=ON (both flags are synonyms)
 cmake --build build --parallel $(nproc)
 
 # Debug build
 cmake -B build -DCMAKE_BUILD_TYPE=Debug -DCMAKE_EXPORT_COMPILE_COMMANDS=ON -DGGML_NUMA_MIRROR=ON
+# Or equivalently: -DGGML_NUMA=ON (both flags are synonyms)
 cmake --build build --parallel $(nproc)
 
 # Run tests

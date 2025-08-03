@@ -210,6 +210,7 @@ set   (GGML_OPENCL_TARGET_VERSION "300" CACHE STRING
                                             "gmml: OpenCL API version to target")
                                             
 option(GGML_NUMA_MIRROR "ggml: support numa aware tensor data" OFF)
+option(GGML_NUMA        "ggml: support numa aware tensor data (synonym for GGML_NUMA_MIRROR)" OFF)
 
 # toolchain for vulkan-shaders-gen
 set   (GGML_VULKAN_SHADERS_GEN_TOOLCHAIN "" CACHE FILEPATH "ggml: toolchain file for vulkan-shaders-gen")
@@ -330,6 +331,14 @@ set(variable_set_statements
 
 set(GGML_SHARED_LIB ${BUILD_SHARED_LIBS})
 
+# Make GGML_NUMA and GGML_NUMA_MIRROR synonyms
+if (GGML_NUMA AND NOT GGML_NUMA_MIRROR)
+    set(GGML_NUMA_MIRROR ON)
+endif()
+if (GGML_NUMA_MIRROR AND NOT GGML_NUMA)
+    set(GGML_NUMA ON)
+endif()
+
 if (GGML_NUMA_MIRROR)
     find_library(NUMA_LIBRARY NAMES numa)
     if (!NUMA_LIBRARY)
@@ -349,7 +358,7 @@ if (GGML_NUMA_MIRROR)
 
     message(STATUS
             "-----------------\n"
-            "Enabling GGML_NUMA_MIRROR\n"
+            "Enabling GGML_NUMA_MIRROR (GGML_NUMA compatibility enabled)\n"
             "Hugepages must be reserved properly,\n"
             "and your program should have write access to /dev/hugepages\n"
             "GGML_MMAP_VIRTUAL_MEMORY_BASE_OFFSET    = ${GGML_MMAP_VIRTUAL_MEMORY_BASE_OFFSET}\n"
@@ -360,6 +369,7 @@ if (GGML_NUMA_MIRROR)
 
     foreach(lib "ggml" "ggml-base")
         target_compile_definitions(${lib} PUBLIC GGML_NUMA_MIRROR)
+        target_compile_definitions(${lib} PUBLIC GGML_NUMA)
         target_compile_definitions(${lib} PUBLIC GGML_MMAP_VIRTUAL_MEMORY_BASE_OFFSET=${GGML_MMAP_VIRTUAL_MEMORY_BASE_OFFSET})
         target_compile_definitions(${lib} PUBLIC GGML_MMAP_VIRTUAL_MEMORY_NUMA_INCREMENT=${GGML_MMAP_VIRTUAL_MEMORY_NUMA_INCREMENT})
         target_compile_definitions(${lib} PUBLIC GGML_MMAP_HUGEPAGESZ=${GGML_MMAP_HUGEPAGESZ})

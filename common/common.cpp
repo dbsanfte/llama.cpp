@@ -123,6 +123,10 @@ int32_t cpu_get_num_physical_cores() {
 #include <pthread.h>
 #include <map>
 #include <set>
+#ifdef GGML_NUMA_MIRROR
+#include <numa.h>
+#include <numaif.h>
+#endif
 
 static void cpuid(unsigned leaf, unsigned subleaf,
                   unsigned *eax, unsigned *ebx, unsigned *ecx, unsigned *edx) {
@@ -307,14 +311,14 @@ int32_t cpu_get_num_math_from_params(const cpu_params & params) {
         return cpu_get_num_physical_cores();
     }
     
-    if (is_hybrid_cpu()) {
-        cpu_set_t affinity;
-        if (!pthread_getaffinity_np(pthread_self(), sizeof(affinity), &affinity)) {
-            int result = cpu_count_math_cpus(n_cpu, params.use_hyperthreading, params.use_efficiency_cores);
-            pthread_setaffinity_np(pthread_self(), sizeof(affinity), &affinity);
-            if (result > 0) {
-                return result;
-            }
+    // Always use the advanced CPU detection on Linux x86_64, not just for hybrid CPUs
+    // This ensures hyperthreading settings are respected for all CPU types
+    cpu_set_t affinity;
+    if (!pthread_getaffinity_np(pthread_self(), sizeof(affinity), &affinity)) {
+        int result = cpu_count_math_cpus(n_cpu, params.use_hyperthreading, params.use_efficiency_cores);
+        pthread_setaffinity_np(pthread_self(), sizeof(affinity), &affinity);
+        if (result > 0) {
+            return result;
         }
     }
 #endif
@@ -546,6 +550,30 @@ void common_init() {
 #endif
 
     LOG_INF("build: %d (%s) with %s for %s%s\n", LLAMA_BUILD_NUMBER, LLAMA_COMMIT, LLAMA_COMPILER, LLAMA_BUILD_TARGET, build_type);
+}
+
+void common_numa_print_topology_if_enabled(const common_params & params) {
+    // Always print comprehensive topology when NUMA is enabled (before NUMA allocation begins)
+    if (params.numa != GGML_NUMA_STRATEGY_DISABLED) {
+        // Need to create a mutable copy to pass to postprocess_cpu_params
+        cpu_params cpu_params_copy = params.cpuparams;
+        postprocess_cpu_params(cpu_params_copy, nullptr);
+        
+        printf("\n");
+        printf("╔══════════════════════════════════════════════════════════════════════════════════╗\n");
+        printf("║                    NUMA ENABLED - SYSTEM TOPOLOGY ANALYSIS                       ║\n");
+        printf("╚══════════════════════════════════════════════════════════════════════════════════╝\n");
+        fflush(stdout);  // Force immediate output
+        
+        cpu_print_comprehensive_topology_with_gpu(cpu_params_copy, params);
+        
+        printf("\n");
+        printf("╔══════════════════════════════════════════════════════════════════════════════════╗\n");
+        printf("║                         BEGINNING NUMA INITIALIZATION                            ║\n");
+        printf("╚══════════════════════════════════════════════════════════════════════════════════╝\n");
+        printf("\n");
+        fflush(stdout);  // Force immediate output
+    }
 }
 
 std::string common_params_get_system_info(const common_params & params) {
@@ -1748,4 +1776,904 @@ ggml_opt_dataset_t common_opt_dataset_init(struct llama_context * ctx, const std
     }
 
     return result;
+}
+
+/**
+ * Detect GPU-NUMA affinity by reading PCIe topology and backend information
+ */
+std::vector<gpu_numa_info> detect_gpu_numa_affinity() {
+    std::vector<gpu_numa_info> gpu_infos;
+    
+    // First, get all available backend devices
+    std::map<std::string, ggml_backend_dev_t> backend_devices;
+    size_t dev_count = ggml_backend_dev_count();
+    
+    for (size_t i = 0; i < dev_count; i++) {
+        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+        if (dev && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+            const char* dev_name = ggml_backend_dev_name(dev);
+            if (dev_name) {
+                backend_devices[std::string(dev_name)] = dev;
+            }
+        }
+    }
+    
+#if defined(__x86_64__) && defined(__linux__) && !defined(__ANDROID__)
+    // Check for GPUs via sysfs and correlate with backends
+    const std::string gpu_base_path = "/sys/class/drm";
+    
+    try {
+        for (const auto& entry : std::filesystem::directory_iterator(gpu_base_path)) {
+            std::string device_name = entry.path().filename();
+            
+            // Look for card devices (skip render nodes)
+            if (device_name.find("card") == 0 && device_name.find("-") == std::string::npos) {
+                gpu_numa_info info;
+                info.gpu_id = -1;
+                info.numa_node = -1;
+                info.device_name = device_name;
+                info.pci_bus_id = "";
+                info.affinity_detected = false;
+                info.backend_name = "";
+                info.backend_device_name = "";
+                info.backend_device_desc = "";
+                info.total_memory = 0;
+                info.free_memory = 0;
+                info.backend_available = false;
+                
+                // Initialize CPU-GPU NUMA affinity tracking
+                info.is_virtual_gpu = false;
+                info.cpu_affinity_verified = false;
+                info.memory_locality_verified = false;
+                
+                // Extract GPU ID from card name (card0 -> 0)
+                std::string id_str = device_name.substr(4);
+                if (!id_str.empty() && std::all_of(id_str.begin(), id_str.end(), ::isdigit)) {
+                    info.gpu_id = std::stoi(id_str);
+                }
+                
+                // Try to find PCI bus ID and NUMA node
+                std::string device_path = entry.path().string() + "/device";
+                std::string uevent_path = device_path + "/uevent";
+                std::string subsystem_path = device_path + "/subsystem";
+                
+                // Check if this is a virtual/platform device
+                bool is_virtual_gpu = false;
+                std::ifstream uevent_file(uevent_path);
+                if (uevent_file.is_open()) {
+                    std::string line;
+                    while (std::getline(uevent_file, line)) {
+                        if (line.find("PCI_SLOT_NAME=") == 0) {
+                            info.pci_bus_id = line.substr(14);
+                        } else if (line.find("MODALIAS=platform:") == 0) {
+                            is_virtual_gpu = true;
+                            std::string platform_name = line.substr(18);
+                            info.pci_bus_id = "virtual:" + platform_name;
+                        }
+                    }
+                }
+                
+                // For virtual GPUs, NUMA affinity doesn't apply
+                if (is_virtual_gpu) {
+                    info.is_virtual_gpu = true;
+                    info.numa_node = 0; // Default to node 0 for virtual devices
+                    info.affinity_detected = true; // Mark as "detected" but virtual
+                } else {
+                    info.is_virtual_gpu = false;
+                    // Try to find NUMA node from PCI device (real hardware only)
+                    std::string numa_node_path = device_path + "/numa_node";
+                    std::ifstream numa_file(numa_node_path);
+                    if (numa_file.is_open()) {
+                        std::string numa_str;
+                        if (std::getline(numa_file, numa_str) && !numa_str.empty() && numa_str != "-1") {
+                            info.numa_node = std::stoi(numa_str);
+                            info.affinity_detected = true;
+                        }
+                    }
+                    
+                    // If NUMA node not found, try alternative method via CPU affinity
+                    if (!info.affinity_detected && !info.pci_bus_id.empty()) {
+                        std::string local_cpus_path = device_path + "/local_cpus";
+                        std::ifstream cpus_file(local_cpus_path);
+                        if (cpus_file.is_open()) {
+                            std::string cpu_mask;
+                            if (std::getline(cpus_file, cpu_mask) && !cpu_mask.empty()) {
+                                // Find first set bit to get a representative CPU
+                                for (size_t i = 0; i < cpu_mask.length(); ++i) {
+                                    char c = cpu_mask[cpu_mask.length() - 1 - i];
+                                    if (c != '0' && c != ',') {
+                                        int cpu_id = i * 4; // rough approximation
+                                        // Try to find NUMA node for this CPU
+#ifdef GGML_NUMA_MIRROR
+                                        int node = numa_node_of_cpu(cpu_id);
+                                        if (node >= 0) {
+                                            info.numa_node = node;
+                                            info.affinity_detected = true;
+                                            break;
+                                        }
+#endif
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                
+                // Populate local CPU cores for the detected NUMA node (for real GPUs only)
+                if (!info.is_virtual_gpu && info.affinity_detected && info.numa_node >= 0) {
+#ifdef GGML_NUMA_MIRROR
+                    // Get all CPUs on this NUMA node
+                    struct bitmask* node_cpus = numa_allocate_cpumask();
+                    if (node_cpus) {
+                        int result = numa_node_to_cpus(info.numa_node, node_cpus);
+                        if (result == 0) {
+                            for (int cpu = 0; cpu < numa_num_possible_cpus(); cpu++) {
+                                if (numa_bitmask_isbitset(node_cpus, cpu)) {
+                                    info.local_cpu_cores.push_back(cpu);
+                                }
+                            }
+                        }
+                        numa_free_cpumask(node_cpus);
+                    }
+#endif
+                }
+                
+                // Try to match with backend devices
+                // Look for backend devices that might correspond to this DRM device
+                for (const auto& [backend_name, backend_dev] : backend_devices) {
+                    // Try different matching strategies
+                    std::string lower_backend_name = backend_name;
+                    std::transform(lower_backend_name.begin(), lower_backend_name.end(), 
+                                 lower_backend_name.begin(), ::tolower);
+                    
+                    // Check if backend device ID matches our GPU ID
+                    if ((lower_backend_name.find("cuda") != std::string::npos && info.gpu_id >= 0) ||
+                        (lower_backend_name.find("vulkan") != std::string::npos && info.gpu_id >= 0) ||
+                        (lower_backend_name.find("rocm") != std::string::npos && info.gpu_id >= 0) ||
+                        (lower_backend_name.find("hip") != std::string::npos && info.gpu_id >= 0)) {
+                        
+                        // Extract device number from backend name if possible
+                        size_t last_digit_pos = backend_name.find_last_of("0123456789");
+                        if (last_digit_pos != std::string::npos) {
+                            int backend_id = std::stoi(backend_name.substr(last_digit_pos));
+                            if (backend_id == info.gpu_id) {
+                                info.backend_available = true;
+                                info.backend_name = backend_name;
+                                info.backend_device_name = ggml_backend_dev_name(backend_dev);
+                                
+                                const char* desc = ggml_backend_dev_description(backend_dev);
+                                if (desc) {
+                                    info.backend_device_desc = desc;
+                                }
+                                
+                                // Get memory information
+                                ggml_backend_dev_memory(backend_dev, &info.free_memory, &info.total_memory);
+                                break;
+                            }
+                        } else if (info.gpu_id == 0) {
+                            // If no device ID in backend name, assume it's device 0
+                            info.backend_available = true;
+                            info.backend_name = backend_name;
+                            info.backend_device_name = ggml_backend_dev_name(backend_dev);
+                            
+                            const char* desc = ggml_backend_dev_description(backend_dev);
+                            if (desc) {
+                                info.backend_device_desc = desc;
+                            }
+                            
+                            ggml_backend_dev_memory(backend_dev, &info.free_memory, &info.total_memory);
+                            break;
+                        }
+                    }
+                }
+                
+                gpu_infos.push_back(info);
+            }
+        }
+    } catch (const std::exception& e) {
+        // Silently continue if we can't read GPU topology
+    }
+#endif
+    
+    // Add any backend devices that weren't matched with DRM devices
+    for (const auto& [backend_name, backend_dev] : backend_devices) {
+        bool found = false;
+        for (const auto& gpu_info : gpu_infos) {
+            if (gpu_info.backend_name == backend_name) {
+                found = true;
+                break;
+            }
+        }
+        
+        if (!found) {
+            gpu_numa_info info;
+            info.gpu_id = -1;
+            info.numa_node = -1;
+            info.device_name = "backend-only";
+            info.pci_bus_id = "";
+            info.affinity_detected = false;
+            info.backend_available = true;
+            info.backend_name = backend_name;
+            info.backend_device_name = ggml_backend_dev_name(backend_dev);
+            
+            // Initialize CPU-GPU NUMA affinity tracking (assume virtual for backend-only)
+            info.is_virtual_gpu = true;
+            info.cpu_affinity_verified = false;
+            info.memory_locality_verified = false;
+            
+            const char* desc = ggml_backend_dev_description(backend_dev);
+            if (desc) {
+                info.backend_device_desc = desc;
+            }
+            
+            ggml_backend_dev_memory(backend_dev, &info.free_memory, &info.total_memory);
+            info.total_memory = 0;
+            info.free_memory = 0;
+            
+            gpu_infos.push_back(info);
+        }
+    }
+    
+    return gpu_infos;
+}
+
+// Forward declaration for GPU layer distribution calculation
+std::vector<std::pair<int, int>> calculate_gpu_layer_distribution(const common_params & params, size_t num_gpus);
+
+/**
+ * Print GPU-NUMA topology and threading recommendations
+ */
+void print_gpu_numa_topology(const std::vector<gpu_numa_info> & gpu_info, const common_params & params) {
+    if (gpu_info.empty() && params.n_gpu_layers <= 0) {
+        return; // No GPU usage, skip this section
+    }
+    
+    printf("\n[^] GPU/NUMA TOPOLOGY & OFFLOADING PLAN:\n");
+    
+    if (gpu_info.empty()) {
+        printf("   - GPU detection: No GPUs detected via sysfs\n");
+        if (params.n_gpu_layers > 0) {
+            printf("   [!] GPU layers requested (-ngl %d) but no GPUs detected\n", params.n_gpu_layers);
+        }
+        return;
+    }
+    
+    printf("   - Detected GPUs: %zu\n", gpu_info.size());
+    
+    for (const auto& gpu : gpu_info) {
+        printf("   - GPU %d: %s", gpu.gpu_id, gpu.device_name.c_str());
+        if (!gpu.pci_bus_id.empty()) {
+            printf(" [%s]", gpu.pci_bus_id.c_str());
+        }
+        
+        if (gpu.pci_bus_id.find("virtual:") == 0) {
+            printf(" -> Virtual GPU (no NUMA affinity)");
+        } else if (gpu.affinity_detected) {
+            printf(" -> NUMA node %d", gpu.numa_node);
+            
+            // Show CPU affinity details for real GPUs
+            if (!gpu.local_cpu_cores.empty()) {
+                printf(" (%zu local CPU cores)", gpu.local_cpu_cores.size());
+            }
+        } else {
+            printf(" -> NUMA affinity unknown");
+        }
+        
+        // Show backend information
+        if (gpu.backend_available) {
+            printf("\n     Backend: %s", gpu.backend_name.c_str());
+            if (!gpu.backend_device_desc.empty()) {
+                printf(" (%s)", gpu.backend_device_desc.c_str());
+            }
+            if (gpu.total_memory > 0) {
+                printf("\n     Memory: %.1f GB total, %.1f GB free", 
+                       gpu.total_memory / (1024.0 * 1024.0 * 1024.0),
+                       gpu.free_memory / (1024.0 * 1024.0 * 1024.0));
+            }
+        } else {
+            printf("\n     Backend: Not available");
+        }
+        
+        // Show CPU-GPU NUMA locality status
+        if (!gpu.is_virtual_gpu && gpu.affinity_detected) {
+            printf("\n     CPU-GPU Locality: ");
+            if (!gpu.local_cpu_cores.empty()) {
+                printf("CPU cores [");
+                for (size_t i = 0; i < gpu.local_cpu_cores.size() && i < 8; i++) {
+                    if (i > 0) printf(",");
+                    printf("%d", gpu.local_cpu_cores[i]);
+                }
+                if (gpu.local_cpu_cores.size() > 8) {
+                    printf(",...+%zu more", gpu.local_cpu_cores.size() - 8);
+                }
+                printf("] on NUMA %d", gpu.numa_node);
+            } else {
+                printf("No local CPU cores detected");
+            }
+        }
+        
+        printf("\n");
+    }
+    
+    // GPU offloading configuration
+    if (params.n_gpu_layers > 0) {
+        printf("\n   GPU Offloading Configuration:\n");
+        printf("   - Layers to offload: %d (-ngl)\n", params.n_gpu_layers);
+        printf("   - Main GPU: %d (-mg)\n", params.main_gpu);
+        printf("   - Split mode: %s\n", 
+               params.split_mode == LLAMA_SPLIT_MODE_LAYER ? "layer" :
+               params.split_mode == LLAMA_SPLIT_MODE_ROW ? "row" : "none");
+        
+        // Calculate and display layer distribution
+        auto layer_distribution = calculate_gpu_layer_distribution(params, gpu_info.size());
+        printf("\n   Layer Distribution Plan:\n");
+        bool any_layers = false;
+        for (const auto& [gpu_id, num_layers] : layer_distribution) {
+            if (num_layers > 0) {
+                any_layers = true;
+                printf("   - GPU %d: %d layers", gpu_id, num_layers);
+                if (gpu_id < (int)gpu_info.size()) {
+                    const auto& gpu = gpu_info[gpu_id];
+                    if (gpu.backend_available) {
+                        printf(" [%s]", gpu.backend_name.c_str());
+                    }
+                }
+                printf("\n");
+            }
+        }
+        if (!any_layers) {
+            printf("   - No layers assigned to GPUs (CPU-only)\n");
+        }
+        
+        // Show tensor split ratios if configured
+        bool has_tensor_split = false;
+        for (int i = 0; i < (int)llama_max_devices(); i++) {
+            if (params.tensor_split[i] != 0.0f) {
+                has_tensor_split = true;
+                break;
+            }
+        }
+        if (has_tensor_split) {
+            printf("\n   Tensor Split Ratios:\n");
+            for (int i = 0; i < (int)llama_max_devices() && i < (int)gpu_info.size(); i++) {
+                if (params.tensor_split[i] != 0.0f) {
+                    printf("   - GPU %d: %.3f", i, params.tensor_split[i]);
+                    if (i < (int)gpu_info.size() && gpu_info[i].backend_available) {
+                        printf(" [%s]", gpu_info[i].backend_name.c_str());
+                    }
+                    printf("\n");
+                }
+            }
+        }
+        
+        // Check if main GPU has known NUMA affinity
+        if (params.main_gpu < (int)gpu_info.size()) {
+            const auto& main_gpu = gpu_info[params.main_gpu];
+            
+            if (main_gpu.pci_bus_id.find("virtual:") == 0) {
+                printf("   - Main GPU: Virtual GPU (no NUMA considerations)\n");
+                printf("\n   [INFO] Virtual GPU detected - NUMA locality not applicable\n");
+                printf("   [NOTE] This appears to be a development/container environment\n");
+                printf("   [TIP] On real hardware with PCIe GPUs, NUMA locality becomes important\n");
+            } else if (main_gpu.affinity_detected) {
+                printf("   - Main GPU NUMA node: %d\n", main_gpu.numa_node);
+                
+                // Threading recommendations for GPU-NUMA locality
+                printf("\n   [!] CPU-GPU NUMA Locality Enforcement:\n");
+                printf("   [CRITICAL] Ensure CPU threads handling GPU work are bound to GPU's NUMA node\n");
+                printf("   [ACTION] Use bind_thread_to_gpu_numa_node() before GPU operations\n");
+                
+                if (!main_gpu.local_cpu_cores.empty()) {
+                    printf("   [INFO] GPU %d has %zu local CPU cores: ", params.main_gpu, main_gpu.local_cpu_cores.size());
+                    for (size_t i = 0; i < std::min((size_t)4, main_gpu.local_cpu_cores.size()); i++) {
+                        if (i > 0) printf(",");
+                        printf("%d", main_gpu.local_cpu_cores[i]);
+                    }
+                    if (main_gpu.local_cpu_cores.size() > 4) {
+                        printf(",...+%zu more", main_gpu.local_cpu_cores.size() - 4);
+                    }
+                    printf("\n");
+                    
+                    printf("   [VERIFY] Call monitor_cross_socket_gpu_traffic() to detect violations\n");
+                } else {
+                    printf("   [WARNING] No local CPU cores detected for GPU %d\n", params.main_gpu);
+                }
+                
+                printf("   [MEMORY] Use allocate_gpu_numa_local_memory() for GPU-CPU transfers\n");
+                printf("   [COMMAND] Manual override: numactl --cpunodebind=%d --membind=%d\n", 
+                       main_gpu.numa_node, main_gpu.numa_node);
+                
+                // Check if current thread configuration conflicts
+#ifdef GGML_NUMA_MIRROR
+                int numa_nodes = numa_num_configured_nodes();
+                if (numa_nodes > 1) {
+                    printf("   [URGENT] Multi-NUMA system (%d nodes) - GPU-CPU locality is CRITICAL\n", numa_nodes);
+                    printf("   [WARNING] Cross-socket GPU traffic can reduce performance by 50%% or more\n");
+                    
+                    // Check current thread's NUMA binding
+                    cpu_set_t current_affinity;
+                    CPU_ZERO(&current_affinity);
+                    if (pthread_getaffinity_np(pthread_self(), sizeof(cpu_set_t), &current_affinity) == 0) {
+                        bool bound_to_gpu_node = false;
+                        for (int cpu_core : main_gpu.local_cpu_cores) {
+                            if (CPU_ISSET(cpu_core, &current_affinity)) {
+                                bound_to_gpu_node = true;
+                                break;
+                            }
+                        }
+                        
+                        if (bound_to_gpu_node) {
+                            printf("   [GOOD] Current thread appears bound to GPU %d's NUMA node\n", params.main_gpu);
+                        } else {
+                            printf("   [DANGER] Current thread NOT bound to GPU %d's NUMA node!\n", params.main_gpu);
+                            printf("   [FIX] Call bind_thread_to_gpu_numa_node(%d) immediately\n", params.main_gpu);
+                        }
+                    }
+                }
+#endif
+            } else {
+                printf("   [!] Cannot determine NUMA affinity for main GPU %d\n", params.main_gpu);
+                printf("   [TIP] Monitor cross-socket traffic if performance is suboptimal\n");
+            }
+        }
+        
+        // Batch size considerations
+        printf("\n   Batch Size & GPU Offloading:\n");
+        printf("   - Logical batch size: %d (-b)\n", params.n_batch);
+        printf("   - Physical batch size: %d (-ub)\n", params.n_ubatch);
+        
+        if (params.n_batch > 512) {
+            printf("   [TIP] Large batch sizes increase GPU memory pressure\n");
+            printf("         and may benefit from NUMA-local CPU processing\n");
+        }
+        
+        if (params.n_ubatch > 0 && params.n_ubatch < params.n_batch) {
+            printf("   [INFO] Logical > Physical batch enables pipeline parallelism\n");
+            printf("          Useful for multi-GPU setups with pipeline processing\n");
+        }
+        
+    } else {
+        printf("\n   - GPU offloading: Disabled (CPU-only inference)\n");
+        if (!gpu_info.empty()) {
+            printf("   [TIP] Consider using -ngl <layers> to offload to GPU\n");
+        }
+    }
+    
+    // Show practical implementation guidance
+    if (params.n_gpu_layers > 0 && !gpu_info.empty()) {
+        printf("\n   [IMPLEMENTATION] CPU-GPU NUMA Enforcement Code Example:\n");
+        printf("   ```cpp\n");
+        printf("   // 1. Detect GPU-NUMA topology\n");
+        printf("   std::vector<gpu_numa_info> gpu_infos = detect_gpu_numa_affinity();\n");
+        printf("   \n");
+        printf("   // 2. Bind main thread to GPU's NUMA node\n");
+        printf("   bind_thread_to_gpu_numa_node(%d, gpu_infos);\n", params.main_gpu);
+        printf("   \n");
+        printf("   // 3. Allocate GPU-CPU transfer buffers with NUMA locality\n");
+        printf("   void* buffer = allocate_gpu_numa_local_memory(size, gpu_infos[%d].numa_node);\n", params.main_gpu);
+        printf("   \n");
+        printf("   // 4. Monitor for cross-socket violations\n");
+        printf("   bool locality_ok = monitor_cross_socket_gpu_traffic(gpu_infos);\n");
+        printf("   ```\n");
+    }
+}
+
+/**
+ * Print comprehensive CPU/GPU/NUMA topology and threading plan
+ */
+void cpu_print_comprehensive_topology(const cpu_params & params) {
+    printf("\n");
+    printf("╔══════════════════════════════════════════════════════════════════════════════════╗\n");
+    printf("║                    CPU/GPU/NUMA TOPOLOGY & THREADING PLAN                        ║\n");
+    printf("╚══════════════════════════════════════════════════════════════════════════════════╝\n");
+    
+#if defined(__x86_64__) && defined(__linux__) && !defined(__ANDROID__)
+    // Basic system info
+    int total_logical = std::thread::hardware_concurrency();
+    int total_physical = cpu_get_num_physical_cores();
+    
+    printf("\n[*] SYSTEM OVERVIEW:\n");
+    printf("   - Total logical CPUs: %d\n", total_logical);
+    printf("   - Total physical cores: %d\n", total_physical);
+    printf("   - Hyperthreading: %s\n", (total_logical > total_physical) ? "Available" : "Not available");
+    
+    // NUMA information
+    bool numa_available = false;
+    int numa_nodes = 0;
+#ifdef GGML_NUMA_MIRROR
+    numa_nodes = numa_num_configured_nodes();
+    numa_available = numa_nodes > 1;
+    
+    printf("   - NUMA nodes: %d %s\n", numa_nodes, numa_available ? "(multi-node system)" : "(single-node system)");
+    
+    if (numa_available) {
+        printf("\n[+] NUMA NODE DETAILS:\n");
+        for (int node = 0; node < numa_nodes; node++) {
+            struct bitmask* node_cpus = numa_allocate_cpumask();
+            if (numa_node_to_cpus(node, node_cpus) == 0) {
+                printf("   Node %d CPUs: ", node);
+                bool first = true;
+                for (int cpu = 0; cpu < total_logical; cpu++) {
+                    if (numa_bitmask_isbitset(node_cpus, cpu)) {
+                        if (!first) printf(", ");
+                        printf("%d", cpu);
+                        first = false;
+                    }
+                }
+                
+                // Show memory info if available
+                long long memory = numa_node_size64(node, NULL);
+                if (memory > 0) {
+                    printf(" (%.1f GB memory)", memory / (1024.0 * 1024.0 * 1024.0));
+                }
+                printf("\n");
+            }
+            numa_free_cpumask(node_cpus);
+        }
+    }
+#else
+    printf("   - NUMA: Not compiled with NUMA support\n");
+#endif
+    
+    // GPU-NUMA topology detection and display
+    std::vector<gpu_numa_info> gpu_info = detect_gpu_numa_affinity();
+    
+    // User's threading configuration
+    printf("\n[=] THREADING CONFIGURATION:\n");
+    printf("   - Requested threads: %d %s\n", 
+           params.n_threads, 
+           (params.n_threads <= 0) ? "(auto-detect)" : "");
+    printf("   - Use hyperthreading: %s\n", params.use_hyperthreading ? "Yes" : "No");
+    printf("   - Use efficiency cores: %s\n", params.use_efficiency_cores ? "Yes" : "No");
+    
+    // Calculate actual thread count
+    int actual_threads = params.n_threads;
+    if (actual_threads <= 0) {
+        actual_threads = cpu_get_num_math_from_params(params);
+    }
+    
+    printf("   - Computed thread count: %d\n", actual_threads);
+    
+    // Thread distribution plan
+    printf("\n[>] THREAD DISTRIBUTION PLAN:\n");
+    if (numa_available) {
+        int threads_per_node = (actual_threads + numa_nodes - 1) / numa_nodes;
+        int remaining_threads = actual_threads;
+        
+        printf("   - Distribution strategy: Round-robin across NUMA nodes\n");
+        for (int node = 0; node < numa_nodes && remaining_threads > 0; node++) {
+            int node_threads = std::min(threads_per_node, remaining_threads);
+            printf("   - NUMA node %d: %d threads\n", node, node_threads);
+            remaining_threads -= node_threads;
+        }
+    } else {
+        printf("   - Distribution strategy: Single NUMA node\n");
+        printf("   - Node 0: %d threads\n", actual_threads);
+    }
+    
+    // Performance recommendations
+    printf("\n[!] PERFORMANCE RECOMMENDATIONS:\n");
+    if (is_hybrid_cpu()) {
+        cpu_topology_info topo = detect_cpu_topology();
+        int recommended_threads = cpu_count_math_cpus(total_logical, true, false);
+        if (actual_threads != recommended_threads) {
+            printf("   [!] Consider using %d threads for optimal performance (P-cores + HT)\n", recommended_threads);
+        } else {
+            printf("   [OK] Thread count looks optimal for this hybrid CPU\n");
+        }
+        
+        if (!params.use_hyperthreading && total_logical > total_physical) {
+            printf("   [TIP] Hyperthreading is disabled but available - may improve performance\n");
+        }
+        
+        if (params.use_efficiency_cores) {
+            printf("   [TIP] E-cores enabled - may help with high thread counts but check performance\n");
+        }
+    } else {
+        if (actual_threads > total_physical && !params.use_hyperthreading) {
+            printf("   [!] More threads than physical cores without hyperthreading\n");
+        } else if (actual_threads == total_physical) {
+            printf("   [OK] Using all physical cores\n");
+        } else if (actual_threads == total_logical) {
+            printf("   [OK] Using all logical CPUs (with hyperthreading)\n");
+        }
+    }
+    
+#else
+    // Non-Linux platforms
+    printf("\n[*] SYSTEM OVERVIEW:\n");
+    printf("   - Platform: %s\n", 
+#if defined(_WIN32)
+           "Windows"
+#elif defined(__APPLE__)
+           "macOS"  
+#else
+           "Non-Linux Unix"
+#endif
+    );
+    printf("   - Total logical CPUs: %d\n", (int)std::thread::hardware_concurrency());
+    printf("   - Detailed topology: Not available on this platform\n");
+    printf("\n[=] THREADING CONFIGURATION:\n");
+    printf("   - Requested threads: %d\n", params.n_threads);
+    printf("   - Note: Advanced CPU topology features require Linux x86_64\n");
+    
+    // Still try to detect GPU info on other platforms
+    std::vector<gpu_numa_info> gpu_info = detect_gpu_numa_affinity();
+#endif
+    
+    printf("\n");
+    printf("═══════════════════════════════════════════════════════════════════════════════════\n");
+    printf("\n");
+}
+
+/**
+ * Enhanced comprehensive topology that includes GPU-NUMA considerations
+ */
+void cpu_print_comprehensive_topology_with_gpu(const cpu_params & params, const common_params & full_params) {
+    // Print CPU topology first
+    cpu_print_comprehensive_topology(params);
+    
+    // Then print GPU-NUMA topology
+    std::vector<gpu_numa_info> gpu_info = detect_gpu_numa_affinity();
+    print_gpu_numa_topology(gpu_info, full_params);
+}
+
+/**
+ * Calculate layer distribution across GPUs based on offloading parameters
+ */
+std::vector<std::pair<int, int>> calculate_gpu_layer_distribution(const common_params & params, size_t num_gpus) {
+    std::vector<std::pair<int, int>> distribution; // pairs of (gpu_id, num_layers)
+    
+    if (params.n_gpu_layers <= 0 || num_gpus == 0) {
+        return distribution; // No GPU offloading
+    }
+    
+    // Initialize distribution
+    for (size_t i = 0; i < num_gpus; i++) {
+        distribution.push_back({(int)i, 0});
+    }
+    
+    if (params.split_mode == LLAMA_SPLIT_MODE_LAYER) {
+        // Layer-wise split: distribute layers round-robin or based on tensor_split
+        bool has_tensor_split = false;
+        for (int i = 0; i < (int)llama_max_devices(); i++) {
+            if (params.tensor_split[i] != 0.0f) {
+                has_tensor_split = true;
+                break;
+            }
+        }
+        
+        if (has_tensor_split) {
+            // Use tensor_split ratios to distribute layers
+            float total_split = 0.0f;
+            for (size_t i = 0; i < num_gpus && i < llama_max_devices(); i++) {
+                total_split += params.tensor_split[i];
+            }
+            
+            int remaining_layers = params.n_gpu_layers;
+            for (size_t i = 0; i < num_gpus && i < llama_max_devices() && remaining_layers > 0; i++) {
+                if (total_split > 0.0f) {
+                    int layers_for_gpu = (int)((params.tensor_split[i] / total_split) * params.n_gpu_layers);
+                    layers_for_gpu = std::min(layers_for_gpu, remaining_layers);
+                    distribution[i].second = layers_for_gpu;
+                    remaining_layers -= layers_for_gpu;
+                } else {
+                    break;
+                }
+            }
+            
+            // Distribute any remaining layers to main GPU
+            if (remaining_layers > 0 && params.main_gpu < (int)num_gpus) {
+                distribution[params.main_gpu].second += remaining_layers;
+            }
+        } else {
+            // Simple round-robin distribution, but main GPU gets priority
+            if (params.main_gpu < (int)num_gpus) {
+                distribution[params.main_gpu].second = params.n_gpu_layers;
+            } else if (num_gpus > 0) {
+                distribution[0].second = params.n_gpu_layers; // Fallback to GPU 0
+            }
+        }
+    } else if (params.split_mode == LLAMA_SPLIT_MODE_ROW) {
+        // Row-wise split: all layers go to main GPU, but with row-wise tensor splitting
+        if (params.main_gpu < (int)num_gpus) {
+            distribution[params.main_gpu].second = params.n_gpu_layers;
+        } else if (num_gpus > 0) {
+            distribution[0].second = params.n_gpu_layers;
+        }
+    } else {
+        // No split mode: all layers go to main GPU
+        if (params.main_gpu < (int)num_gpus) {
+            distribution[params.main_gpu].second = params.n_gpu_layers;
+        } else if (num_gpus > 0) {
+            distribution[0].second = params.n_gpu_layers;
+        }
+    }
+    
+    return distribution;
+}
+
+//
+// CPU-GPU NUMA Affinity Enforcement Functions
+//
+
+/**
+ * Enforce CPU thread affinity to match GPU's NUMA node
+ * Returns true if affinity was successfully set, false otherwise
+ */
+bool enforce_gpu_cpu_numa_affinity(int gpu_id, const gpu_numa_info & gpu_info) {
+    if (gpu_info.is_virtual_gpu) {
+        // Virtual GPUs don't need NUMA affinity
+        return true;
+    }
+    
+    if (!gpu_info.affinity_detected || gpu_info.numa_node < 0) {
+        printf("[WARNING] Cannot enforce NUMA affinity for GPU %d - NUMA node unknown\n", gpu_id);
+        return false;
+    }
+    
+    if (gpu_info.local_cpu_cores.empty()) {
+        printf("[WARNING] No local CPU cores found for GPU %d on NUMA node %d\n", gpu_id, gpu_info.numa_node);
+        return false;
+    }
+    
+#ifdef __linux__
+    // Set CPU affinity to GPUs local NUMA node cores
+    cpu_set_t cpuset;
+    CPU_ZERO(&cpuset);
+    
+    for (int cpu_core : gpu_info.local_cpu_cores) {
+        CPU_SET(cpu_core, &cpuset);
+    }
+    
+    int result = pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset);
+    if (result != 0) {
+        printf("[ERROR] Failed to set CPU affinity for GPU %d: %s\n", gpu_id, strerror(result));
+        return false;
+    }
+    
+    printf("[INFO] Thread bound to %zu CPU cores on NUMA node %d for GPU %d\n", 
+           gpu_info.local_cpu_cores.size(), gpu_info.numa_node, gpu_id);
+    return true;
+#else
+    printf("[WARNING] CPU-GPU NUMA affinity not supported on this platform\n");
+    return false;
+#endif
+}
+
+/**
+ * Verify GPU memory locality by checking NUMA node preferences
+ */
+bool verify_gpu_numa_memory_locality(int gpu_id, const gpu_numa_info & gpu_info) {
+    if (gpu_info.is_virtual_gpu) {
+        return true; // Virtual GPUs don't have NUMA concerns
+    }
+    
+    if (!gpu_info.affinity_detected) {
+        printf("[WARNING] Cannot verify memory locality for GPU %d - NUMA info unavailable\n", gpu_id);
+        return false;
+    }
+    
+#ifdef GGML_NUMA_MIRROR
+    // Check current thread's memory policy
+    int current_node = numa_preferred();
+    if (current_node == gpu_info.numa_node) {
+        printf("[INFO] Memory policy correctly set to NUMA node %d for GPU %d\n", gpu_info.numa_node, gpu_id);
+        return true;
+    } else {
+        printf("[WARNING] Memory policy mismatch - current: %d, GPU %d needs: %d\n", 
+               current_node, gpu_id, gpu_info.numa_node);
+        
+        // Try to set correct memory policy
+        struct bitmask* nodemask = numa_allocate_nodemask();
+        if (nodemask) {
+            numa_bitmask_setbit(nodemask, gpu_info.numa_node);
+            numa_set_membind(nodemask);
+            numa_free_nodemask(nodemask);
+            
+            printf("[INFO] Set memory binding to NUMA node %d for GPU %d\n", gpu_info.numa_node, gpu_id);
+            return true;
+        }
+    }
+#endif
+    return false;
+}
+
+/**
+ * Bind current thread to GPU's NUMA node
+ */
+void bind_thread_to_gpu_numa_node(int gpu_id, const std::vector<gpu_numa_info> & gpu_infos) {
+    if (gpu_id < 0 || gpu_id >= (int)gpu_infos.size()) {
+        printf("[ERROR] Invalid GPU ID %d for thread binding\n", gpu_id);
+        return;
+    }
+    
+    const auto & gpu_info = gpu_infos[gpu_id];
+    
+    // Enforce CPU affinity
+    bool cpu_affinity_ok = enforce_gpu_cpu_numa_affinity(gpu_id, gpu_info);
+    
+    // Verify/set memory locality
+    bool memory_locality_ok = verify_gpu_numa_memory_locality(gpu_id, gpu_info);
+    
+    if (cpu_affinity_ok && memory_locality_ok) {
+        printf("[SUCCESS] Thread fully bound to NUMA locality for GPU %d\n", gpu_id);
+    } else {
+        printf("[WARNING] Incomplete NUMA binding for GPU %d (CPU: %s, Memory: %s)\n", 
+               gpu_id, cpu_affinity_ok ? "OK" : "FAILED", memory_locality_ok ? "OK" : "FAILED"); 
+    }
+}
+
+/**
+ * Allocate memory that's local to a specific NUMA node
+ */
+void* allocate_gpu_numa_local_memory(size_t size, int numa_node) {
+    if (numa_node < 0) {
+        return malloc(size); // Fall back to regular allocation
+    }
+    
+#ifdef GGML_NUMA_MIRROR
+    // Try NUMA-local allocation
+    void* ptr = numa_alloc_onnode(size, numa_node);
+    if (ptr) {
+        printf("[INFO] Allocated %zu bytes on NUMA node %d\n", size, numa_node);
+        return ptr;
+    } else {
+        printf("[WARNING] NUMA allocation failed on node %d, using regular malloc\n", numa_node);
+    }
+#endif
+    
+    return malloc(size);
+}
+
+/**
+ * Free memory allocated with allocate_gpu_numa_local_memory
+ */
+void free_gpu_numa_local_memory(void* ptr, size_t size) {
+    if (!ptr) return;
+    
+#ifdef GGML_NUMA_MIRROR
+    numa_free(ptr, size);
+#else
+    free(ptr);
+#endif
+}
+
+/**
+ * Monitor cross-socket GPU traffic and warn about performance issues
+ */
+bool monitor_cross_socket_gpu_traffic(const std::vector<gpu_numa_info> & gpu_infos) {
+    bool potential_cross_socket_traffic = false;
+    
+#ifdef __linux__
+    // Get current thread's CPU affinity
+    cpu_set_t current_affinity;
+    CPU_ZERO(&current_affinity);
+    
+    if (pthread_getaffinity_np(pthread_self(), sizeof(cpu_set_t), &current_affinity) == 0) {
+        for (const auto & gpu_info : gpu_infos) {
+            if (gpu_info.is_virtual_gpu || !gpu_info.affinity_detected) {
+                continue; // Skip virtual or unknown GPUs
+            }
+            
+            // Check if current thread affinity overlaps with GPU's local cores
+            bool has_local_cpu_affinity = false;
+            for (int cpu_core : gpu_info.local_cpu_cores) {
+                if (CPU_ISSET(cpu_core, &current_affinity)) {
+                    has_local_cpu_affinity = true;
+                    break;
+                }
+            }
+            
+            if (!has_local_cpu_affinity) {
+                printf("[WARNING] Thread accessing GPU %d (NUMA %d) is not bound to local CPUs!\n", 
+                       gpu_info.gpu_id, gpu_info.numa_node);
+                printf("          This may cause cross-socket traffic and performance degradation.\n");
+                potential_cross_socket_traffic = true;
+            }
+        }
+    }
+#endif
+    
+    return !potential_cross_socket_traffic;
 }

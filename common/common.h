@@ -59,10 +59,48 @@ struct cpu_params {
     bool     use_efficiency_cores        = true;    // Use efficiency cores (E-cores) for math operations (enabled by default)
 };
 
+struct gpu_numa_info {
+    int gpu_id;
+    int numa_node;
+    std::string device_name;
+    std::string pci_bus_id;
+    bool affinity_detected;
+    
+    // Backend information
+    std::string backend_name;        // e.g., "CUDA", "Vulkan", "ROCm", "Metal"
+    std::string backend_device_name; // Full device name from backend
+    std::string backend_device_desc; // Device description
+    size_t total_memory;            // Total GPU memory in bytes
+    size_t free_memory;             // Free GPU memory in bytes
+    bool backend_available;         // Whether backend detected this GPU
+    
+    // CPU-GPU NUMA affinity tracking
+    std::vector<int> local_cpu_cores; // CPU cores on same NUMA node as GPU
+    bool is_virtual_gpu;             // True for virtual/emulated GPUs
+    bool cpu_affinity_verified;      // True if CPU thread affinity is enforced
+    bool memory_locality_verified;   // True if memory allocations are NUMA-local
+};
+
+// Forward declaration
+struct common_params;
+
 int32_t cpu_get_num_physical_cores();
 int32_t cpu_get_num_math();
 int32_t cpu_get_num_math_from_params(const cpu_params & params);
 void cpu_print_topology_info();
+void cpu_print_comprehensive_topology(const cpu_params & params);
+void cpu_print_comprehensive_topology_with_gpu(const cpu_params & params, const common_params & full_params);
+std::vector<gpu_numa_info> detect_gpu_numa_affinity();
+void print_gpu_numa_topology(const std::vector<gpu_numa_info> & gpu_info, const common_params & params);
+std::vector<std::pair<int, int>> calculate_gpu_layer_distribution(const common_params & params, size_t num_gpus);
+
+// CPU-GPU NUMA affinity enforcement functions
+bool enforce_gpu_cpu_numa_affinity(int gpu_id, const gpu_numa_info & gpu_info);
+bool verify_gpu_numa_memory_locality(int gpu_id, const gpu_numa_info & gpu_info);
+void bind_thread_to_gpu_numa_node(int gpu_id, const std::vector<gpu_numa_info> & gpu_infos);
+void* allocate_gpu_numa_local_memory(size_t size, int numa_node);
+void free_gpu_numa_local_memory(void* ptr, size_t size);
+bool monitor_cross_socket_gpu_traffic(const std::vector<gpu_numa_info> & gpu_infos);
 
 //
 // Common params
@@ -274,6 +312,7 @@ struct common_params {
     void * cb_eval_user_data                 = nullptr;
 
     ggml_numa_strategy numa = GGML_NUMA_STRATEGY_DISABLED;
+    int                numa_isolate_node = -1; // -1 = use current node, >= 0 = use specified node
 
     enum llama_rope_scaling_type rope_scaling_type = LLAMA_ROPE_SCALING_TYPE_UNSPECIFIED;
     enum llama_pooling_type      pooling_type      = LLAMA_POOLING_TYPE_UNSPECIFIED; // pooling type for embeddings
@@ -332,6 +371,7 @@ struct common_params {
     bool completion        = false; // print source-able completion script
     bool use_color         = false; // use color to distinguish generations and inputs
     bool special           = false; // enable special token output
+    bool print_cpu_topology= false; // print comprehensive CPU/NUMA topology at startup
     bool interactive       = false; // interactive mode
     bool interactive_first = false; // wait for user input immediately
     bool prompt_cache_all  = false; // save user input and generations to prompt cache
@@ -465,6 +505,9 @@ struct common_params {
 // call once at the start of a program if it uses libcommon
 // initializes the logging system and prints info about the build
 void common_init();
+
+// Print comprehensive CPU/GPU/NUMA topology if NUMA is enabled (call before llama_numa_init)
+void common_numa_print_topology_if_enabled(const common_params & params);
 
 std::string common_params_get_system_info(const common_params & params);
 
