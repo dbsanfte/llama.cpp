@@ -2158,10 +2158,8 @@ void print_gpu_numa_topology(const std::vector<gpu_numa_info> & gpu_info, const 
             } else if (main_gpu.affinity_detected) {
                 printf("   - Main GPU NUMA node: %d\n", main_gpu.numa_node);
                 
-                // Threading recommendations for GPU-NUMA locality
-                printf("\n   [!] CPU-GPU NUMA Locality Enforcement:\n");
-                printf("   [CRITICAL] Ensure CPU threads handling GPU work are bound to GPU's NUMA node\n");
-                printf("   [ACTION] Use bind_thread_to_gpu_numa_node() before GPU operations\n");
+                // Checks for GPU-NUMA locality
+                printf("\n   [!] CPU-GPU NUMA Locality Checks:\n");
                 
                 if (!main_gpu.local_cpu_cores.empty()) {
                     printf("   [INFO] GPU %d has %zu local CPU cores: ", params.main_gpu, main_gpu.local_cpu_cores.size());
@@ -2173,22 +2171,15 @@ void print_gpu_numa_topology(const std::vector<gpu_numa_info> & gpu_info, const 
                         printf(",...+%zu more", main_gpu.local_cpu_cores.size() - 4);
                     }
                     printf("\n");
-                    
-                    printf("   [VERIFY] Call monitor_cross_socket_gpu_traffic() to detect violations\n");
                 } else {
                     printf("   [WARNING] No local CPU cores detected for GPU %d\n", params.main_gpu);
                 }
-                
-                printf("   [MEMORY] Use allocate_gpu_numa_local_memory() for GPU-CPU transfers\n");
-                printf("   [COMMAND] Manual override: numactl --cpunodebind=%d --membind=%d\n", 
-                       main_gpu.numa_node, main_gpu.numa_node);
                 
                 // Check if current thread configuration conflicts
 #ifdef GGML_NUMA_MIRROR
                 int numa_nodes = numa_num_configured_nodes();
                 if (numa_nodes > 1) {
-                    printf("   [URGENT] Multi-NUMA system (%d nodes) - GPU-CPU locality is CRITICAL\n", numa_nodes);
-                    printf("   [WARNING] Cross-socket GPU traffic can reduce performance by 50%% or more\n");
+                    printf("   [INFO] Multi-NUMA system (%d nodes) - GPU-CPU locality is critical\n", numa_nodes);
                     
                     // Check current thread's NUMA binding
                     cpu_set_t current_affinity;
@@ -2203,10 +2194,9 @@ void print_gpu_numa_topology(const std::vector<gpu_numa_info> & gpu_info, const 
                         }
                         
                         if (bound_to_gpu_node) {
-                            printf("   [GOOD] Current thread appears bound to GPU %d's NUMA node\n", params.main_gpu);
+                            printf("   [INFO] Current thread appears bound to GPU %d's NUMA node\n", params.main_gpu);
                         } else {
-                            printf("   [DANGER] Current thread NOT bound to GPU %d's NUMA node!\n", params.main_gpu);
-                            printf("   [FIX] Call bind_thread_to_gpu_numa_node(%d) immediately\n", params.main_gpu);
+                            printf("   [WARNING] Current thread NOT bound to GPU %d's NUMA node!\n", params.main_gpu);
                         }
                     }
                 }
@@ -2224,7 +2214,6 @@ void print_gpu_numa_topology(const std::vector<gpu_numa_info> & gpu_info, const 
         
         if (params.n_batch > 512) {
             printf("   [TIP] Large batch sizes increase GPU memory pressure\n");
-            printf("         and may benefit from NUMA-local CPU processing\n");
         }
         
         if (params.n_ubatch > 0 && params.n_ubatch < params.n_batch) {
@@ -2237,24 +2226,6 @@ void print_gpu_numa_topology(const std::vector<gpu_numa_info> & gpu_info, const 
         if (!gpu_info.empty()) {
             printf("   [TIP] Consider using -ngl <layers> to offload to GPU\n");
         }
-    }
-    
-    // Show practical implementation guidance
-    if (params.n_gpu_layers > 0 && !gpu_info.empty()) {
-        printf("\n   [IMPLEMENTATION] CPU-GPU NUMA Enforcement Code Example:\n");
-        printf("   ```cpp\n");
-        printf("   // 1. Detect GPU-NUMA topology\n");
-        printf("   std::vector<gpu_numa_info> gpu_infos = detect_gpu_numa_affinity();\n");
-        printf("   \n");
-        printf("   // 2. Bind main thread to GPU's NUMA node\n");
-        printf("   bind_thread_to_gpu_numa_node(%d, gpu_infos);\n", params.main_gpu);
-        printf("   \n");
-        printf("   // 3. Allocate GPU-CPU transfer buffers with NUMA locality\n");
-        printf("   void* buffer = allocate_gpu_numa_local_memory(size, gpu_infos[%d].numa_node);\n", params.main_gpu);
-        printf("   \n");
-        printf("   // 4. Monitor for cross-socket violations\n");
-        printf("   bool locality_ok = monitor_cross_socket_gpu_traffic(gpu_infos);\n");
-        printf("   ```\n");
     }
 }
 
