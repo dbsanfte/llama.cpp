@@ -666,7 +666,8 @@ void ggml_numa_init(enum ggml_numa_strategy numa_flag) {
         if (fptr != NULL) {
             char buf[42];
             if (fgets(buf, sizeof(buf), fptr) && strncmp(buf, "0\n", sizeof(buf)) != 0) {
-                GGML_LOG_WARN("/proc/sys/kernel/numa_balancing is enabled, this has been observed to impair performance\n");
+                GGML_LOG_WARN("kernel NUMA balancing is enabled, this can interfere with llama.cpp's NUMA optimizations\n");
+                GGML_LOG_WARN("consider disabling it for better performance: echo 0 | sudo tee /proc/sys/kernel/numa_balancing\n");
             }
             fclose(fptr);
         }
@@ -762,7 +763,8 @@ void ggml_numa_init_with_node(enum ggml_numa_strategy numa_flag, int isolate_nod
         if (fptr != NULL) {
             char buf[42];
             if (fgets(buf, sizeof(buf), fptr) && strncmp(buf, "0\n", sizeof(buf)) != 0) {
-                GGML_LOG_WARN("/proc/sys/kernel/numa_balancing is enabled, this has been observed to impair performance\n");
+                GGML_LOG_WARN("kernel NUMA balancing is enabled, this can interfere with llama.cpp's NUMA optimizations\n");
+                GGML_LOG_WARN("consider disabling it for better performance: echo 0 | sudo tee /proc/sys/kernel/numa_balancing\n");
             }
             fclose(fptr);
         }

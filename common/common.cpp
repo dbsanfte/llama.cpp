@@ -19,6 +19,7 @@
 #include <ctime>
 #include <filesystem>
 #include <fstream>
+#include <iomanip>
 #include <iostream>
 #include <iterator>
 #include <regex>
@@ -148,6 +149,22 @@ static bool is_hybrid_cpu(void) {
     unsigned eax, ebx, ecx, edx;
     cpuid(7, 0, &eax, &ebx, &ecx, &edx);
     return !!(edx & (1u << 15));
+}
+
+static bool is_numa_balancing_enabled(void) {
+#if defined(__x86_64__) && defined(__linux__) && !defined(__ANDROID__)
+    FILE *fptr = fopen("/proc/sys/kernel/numa_balancing", "r");
+    if (fptr != NULL) {
+        char buf[42];
+        bool enabled = false;
+        if (fgets(buf, sizeof(buf), fptr) && strncmp(buf, "0\n", sizeof(buf)) != 0) {
+            enabled = true;
+        }
+        fclose(fptr);
+        return enabled;
+    }
+#endif
+    return false; // Not available or disabled
 }
 
 static bool is_running_on_efficiency_core(void) {
@@ -333,51 +350,55 @@ void cpu_print_topology_info() {
     if (is_hybrid_cpu()) {
         cpu_topology_info topo = detect_cpu_topology();
         
-        printf("CPU Topology Information:\n");
-        printf("  Total logical CPUs: %d\n", topo.total_logical_cpus);
-        printf("  Total physical cores: %d\n", topo.total_physical_cores);
-        printf("  Performance cores: %d\n", topo.performance_cores);
-        printf("  Efficiency cores: %d\n", topo.efficiency_cores);
+        LOG_INF("CPU Topology Information:\n");
+        LOG_INF("  Total logical CPUs: %d\n", topo.total_logical_cpus);
+        LOG_INF("  Total physical cores: %d\n", topo.total_physical_cores);
+        LOG_INF("  Performance cores: %d\n", topo.performance_cores);
+        LOG_INF("  Efficiency cores: %d\n", topo.efficiency_cores);
         
-        printf("  Performance CPU IDs: ");
+        // Build performance CPU IDs string
+        std::ostringstream perf_cpus;
+        perf_cpus << "  Performance CPU IDs: ";
         for (size_t i = 0; i < topo.performance_cpus.size(); ++i) {
-            if (i > 0) printf(", ");
-            printf("%d", topo.performance_cpus[i]);
+            if (i > 0) perf_cpus << ", ";
+            perf_cpus << topo.performance_cpus[i];
         }
-        printf("\n");
+        LOG_INF("%s\n", perf_cpus.str().c_str());
         
         if (!topo.efficiency_cpus.empty()) {
-            printf("  Efficiency CPU IDs: ");
+            std::ostringstream eff_cpus;
+            eff_cpus << "  Efficiency CPU IDs: ";
             for (size_t i = 0; i < topo.efficiency_cpus.size(); ++i) {
-                if (i > 0) printf(", ");
-                printf("%d", topo.efficiency_cpus[i]);
+                if (i > 0) eff_cpus << ", ";
+                eff_cpus << topo.efficiency_cpus[i];
             }
-            printf("\n");
+            LOG_INF("%s\n", eff_cpus.str().c_str());
         }
         
-        printf("  Core sibling groups (hyperthreading):\n");
+        LOG_INF("  Core sibling groups (hyperthreading):\n");
         for (size_t i = 0; i < topo.core_siblings.size(); ++i) {
-            printf("    Core %zu: ", i);
+            std::ostringstream core_siblings;
+            core_siblings << "    Core " << i << ": ";
             for (size_t j = 0; j < topo.core_siblings[i].size(); ++j) {
-                if (j > 0) printf(", ");
-                printf("%d", topo.core_siblings[i][j]);
+                if (j > 0) core_siblings << ", ";
+                core_siblings << topo.core_siblings[i][j];
             }
-            printf("\n");
+            LOG_INF("%s\n", core_siblings.str().c_str());
         }
         
         // Show what would be selected with different options
-        printf("\n  Thread count recommendations:\n");
-        printf("    Default (P-cores + hyperthreading): %d\n", cpu_count_math_cpus(topo.total_logical_cpus, true, false));
-        printf("    Without hyperthreading: %d\n", cpu_count_math_cpus(topo.total_logical_cpus, false, false));
-        printf("    With E-cores (+ HT): %d\n", cpu_count_math_cpus(topo.total_logical_cpus, true, true));
-        printf("    With E-cores (no HT): %d\n", cpu_count_math_cpus(topo.total_logical_cpus, false, true));
+        LOG_INF("\n  Thread count recommendations:\n");
+        LOG_INF("    Default (P-cores + hyperthreading): %d\n", cpu_count_math_cpus(topo.total_logical_cpus, true, false));
+        LOG_INF("    Without hyperthreading: %d\n", cpu_count_math_cpus(topo.total_logical_cpus, false, false));
+        LOG_INF("    With E-cores (+ HT): %d\n", cpu_count_math_cpus(topo.total_logical_cpus, true, true));
+        LOG_INF("    With E-cores (no HT): %d\n", cpu_count_math_cpus(topo.total_logical_cpus, false, true));
     } else {
-        printf("CPU Topology: Non-hybrid CPU detected\n");
-        printf("  Physical cores: %d\n", cpu_get_num_physical_cores());
-        printf("  Logical CPUs: %d\n", (int)std::thread::hardware_concurrency());
+        LOG_INF("CPU Topology: Non-hybrid CPU detected\n");
+        LOG_INF("  Physical cores: %d\n", cpu_get_num_physical_cores());
+        LOG_INF("  Logical CPUs: %d\n", (int)std::thread::hardware_concurrency());
     }
 #else
-    printf("CPU topology detection not available on this platform\n");
+    LOG_INF("CPU topology detection not available on this platform\n");
 #endif
 }
 
@@ -559,20 +580,18 @@ void common_numa_print_topology_if_enabled(const common_params & params) {
         cpu_params cpu_params_copy = params.cpuparams;
         postprocess_cpu_params(cpu_params_copy, nullptr);
         
-        printf("\n");
-        printf("╔══════════════════════════════════════════════════════════════════════════════════╗\n");
-        printf("║                    NUMA ENABLED - SYSTEM TOPOLOGY ANALYSIS                       ║\n");
-        printf("╚══════════════════════════════════════════════════════════════════════════════════╝\n");
-        fflush(stdout);  // Force immediate output
+        LOG_INF("\n");
+        LOG_INF("╔══════════════════════════════════════════════════════════════════════════════════╗\n");
+        LOG_INF("║                    NUMA ENABLED - SYSTEM TOPOLOGY ANALYSIS                       ║\n");
+        LOG_INF("╚══════════════════════════════════════════════════════════════════════════════════╝\n");
         
         cpu_print_comprehensive_topology_with_gpu(cpu_params_copy, params);
         
-        printf("\n");
-        printf("╔══════════════════════════════════════════════════════════════════════════════════╗\n");
-        printf("║                         BEGINNING NUMA INITIALIZATION                            ║\n");
-        printf("╚══════════════════════════════════════════════════════════════════════════════════╝\n");
-        printf("\n");
-        fflush(stdout);  // Force immediate output
+        LOG_INF("\n");
+        LOG_INF("╔══════════════════════════════════════════════════════════════════════════════════╗\n");
+        LOG_INF("║                         BEGINNING NUMA INITIALIZATION                            ║\n");
+        LOG_INF("╚══════════════════════════════════════════════════════════════════════════════════╝\n");
+        LOG_INF("\n");
     }
 }
 
@@ -2033,79 +2052,86 @@ void print_gpu_numa_topology(const std::vector<gpu_numa_info> & gpu_info, const 
         return; // No GPU usage, skip this section
     }
     
-    printf("\n[^] GPU/NUMA TOPOLOGY & OFFLOADING PLAN:\n");
+    LOG_INF("\n[^] GPU/NUMA TOPOLOGY & OFFLOADING PLAN:\n");
     
     if (gpu_info.empty()) {
-        printf("   - GPU detection: No GPUs detected via sysfs\n");
+        LOG_INF("   - GPU detection: No GPUs detected via sysfs\n");
         if (params.n_gpu_layers > 0) {
-            printf("   [!] GPU layers requested (-ngl %d) but no GPUs detected\n", params.n_gpu_layers);
+            LOG_WRN("   [!] GPU layers requested (-ngl %d) but no GPUs detected\n", params.n_gpu_layers);
         }
         return;
     }
     
-    printf("   - Detected GPUs: %zu\n", gpu_info.size());
+    LOG_INF("   - Detected GPUs: %zu\n", gpu_info.size());
     
     for (const auto& gpu : gpu_info) {
-        printf("   - GPU %d: %s", gpu.gpu_id, gpu.device_name.c_str());
+        std::ostringstream gpu_line;
+        gpu_line << "   - GPU " << gpu.gpu_id << ": " << gpu.device_name;
         if (!gpu.pci_bus_id.empty()) {
-            printf(" [%s]", gpu.pci_bus_id.c_str());
+            gpu_line << " [" << gpu.pci_bus_id << "]";
         }
         
         if (gpu.pci_bus_id.find("virtual:") == 0) {
-            printf(" -> Virtual GPU (no NUMA affinity)");
+            gpu_line << " -> Virtual GPU (no NUMA affinity)";
         } else if (gpu.affinity_detected) {
-            printf(" -> NUMA node %d", gpu.numa_node);
+            gpu_line << " -> NUMA node " << gpu.numa_node;
             
             // Show CPU affinity details for real GPUs
             if (!gpu.local_cpu_cores.empty()) {
-                printf(" (%zu local CPU cores)", gpu.local_cpu_cores.size());
+                gpu_line << " (" << gpu.local_cpu_cores.size() << " local CPU cores)";
             }
         } else {
-            printf(" -> NUMA affinity unknown");
+            gpu_line << " -> NUMA affinity unknown";
         }
+        LOG_INF("%s\n", gpu_line.str().c_str());
         
         // Show backend information
         if (gpu.backend_available) {
-            printf("\n     Backend: %s", gpu.backend_name.c_str());
+            std::ostringstream backend_line;
+            backend_line << "     Backend: " << gpu.backend_name;
             if (!gpu.backend_device_desc.empty()) {
-                printf(" (%s)", gpu.backend_device_desc.c_str());
+                backend_line << " (" << gpu.backend_device_desc << ")";
             }
+            LOG_INF("%s\n", backend_line.str().c_str());
+            
             if (gpu.total_memory > 0) {
-                printf("\n     Memory: %.1f GB total, %.1f GB free", 
+                LOG_INF("     Memory: %.1f GB total, %.1f GB free\n", 
                        gpu.total_memory / (1024.0 * 1024.0 * 1024.0),
                        gpu.free_memory / (1024.0 * 1024.0 * 1024.0));
             }
         } else {
-            printf("\n     Backend: Not available");
+            LOG_INF("     Backend: Not available\n");
         }
         
         // Show CPU-GPU NUMA locality status
         if (!gpu.is_virtual_gpu && gpu.affinity_detected) {
-            printf("\n     CPU-GPU Locality: ");
+            std::ostringstream locality;
+            locality << "     CPU-GPU Locality: ";
             if (!gpu.local_cpu_cores.empty()) {
-                printf("CPU cores [");
+                locality << "CPU cores [";
                 for (size_t i = 0; i < gpu.local_cpu_cores.size() && i < 8; i++) {
-                    if (i > 0) printf(",");
-                    printf("%d", gpu.local_cpu_cores[i]);
+                    if (i > 0) locality << ",";
+                    locality << gpu.local_cpu_cores[i];
                 }
                 if (gpu.local_cpu_cores.size() > 8) {
-                    printf(",...+%zu more", gpu.local_cpu_cores.size() - 8);
+                    locality << ",...+" << (gpu.local_cpu_cores.size() - 8) << " more";
                 }
-                printf("] on NUMA %d", gpu.numa_node);
+                locality << "] on NUMA " << gpu.numa_node;
             } else {
-                printf("No local CPU cores detected");
+                locality << "No local CPU cores detected";
             }
+            LOG_INF("%s\n", locality.str().c_str());
         }
         
-        printf("\n");
+        LOG_INF("\n");
     }
     
     // GPU offloading configuration
     if (params.n_gpu_layers > 0) {
-        printf("\n   GPU Offloading Configuration:\n");
-        printf("   - Layers to offload: %d (-ngl)\n", params.n_gpu_layers);
-        printf("   - Main GPU: %d (-mg)\n", params.main_gpu);
-        printf("   - Split mode: %s\n", 
+        LOG_INF("\n   GPU Offloading Configuration:\n");
+        LOG_INF("   - Layers to offload: %d (-ngl)\n", params.n_gpu_layers);
+        LOG_INF("   - Main GPU: %d (-mg)\n", params.main_gpu);
+        LOG_INF("   - Split mode: %s\n", 
                params.split_mode == LLAMA_SPLIT_MODE_LAYER ? "layer" :
                params.split_mode == LLAMA_SPLIT_MODE_ROW ? "row" : "none");
         
@@ -2118,42 +2144,71 @@ void print_gpu_numa_topology(const std::vector<gpu_numa_info> & gpu_info, const 
             }
         }
         
+        // Try to get actual model layer count from model file (do this first, regardless of GPU status)
+        int model_n_layer = -1;
+        if (!params.model.path.empty()) {
+            // Silent log callback to suppress model loading output during topology detection
+            auto silent_log_callback = [](enum ggml_log_level level, const char * text, void * user_data) {
+                // Do nothing - silence all log output
+                (void)level; (void)text; (void)user_data;
+            };
+
+            // Temporarily silence logging for model layer detection
+            llama_log_set(silent_log_callback, nullptr);
+            
+            int detected_layers = get_model_layer_count(params.model.path);
+            
+            // Restore default logging
+            llama_log_set(nullptr, nullptr);
+            
+            if (detected_layers >= 0) {
+                model_n_layer = detected_layers;
+                if (detected_layers > 0) {
+                    LOG_INF("   [INFO] Model has %d layers (detected from %s)\n", 
+                           model_n_layer, params.model.path.c_str());
+                } else {
+                    LOG_INF("   [INFO] Model has 0 layers (vocab-only model detected from %s)\n", 
+                           params.model.path.c_str());
+                }
+            } else {
+                LOG_WRN("   [WARN] Can't estimate layers (model file not accessible or layer detection failed)\n");
+            }
+        } else {
+            LOG_WRN("   [WARN] Can't estimate layers (no model file specified)\n");
+        }
+
         // Calculate and display REALISTIC layer distribution
-        printf("\n   Layer Distribution Plan:\n");
+        LOG_INF("\n   Layer Distribution Plan:\n");
         
         if (!any_gpu_backend_available) {
             // No working GPU backends - everything goes to CPU
-            printf("   [WARNING] No usable GPU backends available!\n");
-            printf("   [INFO] All layers will remain on CPU despite -ngl %d request\n", params.n_gpu_layers);
-            printf("   - CPU: all layers (forced by lack of GPU support) [Host memory]\n");
+            LOG_WRN("   [WARNING] No usable GPU backends available!\n");
+            LOG_INF("   [INFO] All layers will remain on CPU despite -ngl %d request\n", params.n_gpu_layers);
+            if (model_n_layer > 0) {
+                LOG_INF("   - CPU: all %d layers (forced by lack of GPU support) [Host memory]\n", model_n_layer);
+            } else if (model_n_layer == 0) {
+                LOG_INF("   - CPU: vocab-only model (0 layers, forced by lack of GPU support) [Host memory]\n");
+            } else {
+                LOG_INF("   - CPU: all layers (forced by lack of GPU support) [Host memory]\n");
+            }
             
         } else {
             // We have working GPU backends - show actual distribution
             auto layer_distribution = calculate_gpu_layer_distribution(params, gpu_info);
             bool any_layers = false;
             
-            // Try to get actual model layer count from model file
-            int model_n_layer = 40; // Default assumption
-            if (!params.model.path.empty()) {
-                int detected_layers = get_model_layer_count(params.model.path);
-                if (detected_layers > 0) {
-                    model_n_layer = detected_layers;
-                    printf("   [INFO] Model has %d layers (detected from %s)\n", 
-                           model_n_layer, params.model.path.c_str());
-                } else {
-                    printf("   [INFO] Using estimated %d layers (model file not accessible)\n", model_n_layer);
-                }
-            } else {
-                printf("   [INFO] Using estimated %d layers (no model file specified)\n", model_n_layer);
-            }
-            
             // Calculate actual layer assignments (matching load_tensors logic)
-            int i_gpu_start = std::max(model_n_layer - params.n_gpu_layers, 0);
+            int i_gpu_start = model_n_layer > 0 ? std::max(model_n_layer - params.n_gpu_layers, 0) : 0;
             
-            // Show CPU layers first
-            if (i_gpu_start > 0) {
-                printf("   - CPU: layers 0-%d (%d layers) [Host memory]\n", 
-                       i_gpu_start - 1, i_gpu_start);
+            // Handle special case of 0-layer models
+            if (model_n_layer == 0) {
+                LOG_INF("   - CPU: vocab-only model (0 layers) [Host memory]\n");
+            } else {
+                // Show CPU layers first
+                if (i_gpu_start > 0) {
+                    LOG_INF("   - CPU: layers 0-%d (%d layers) [Host memory]\n", 
+                           i_gpu_start - 1, i_gpu_start);
+                }
             }
             
             // Show GPU layer assignments
@@ -2176,40 +2231,48 @@ void print_gpu_numa_topology(const std::vector<gpu_numa_info> & gpu_info, const 
                         gpu_end_layer = gpu_start_layer + num_layers - 1;
                     }
                     
-                    printf("   - GPU %d: layers %d-%d (%d layers)", 
+                    LOG_INF("   - GPU %d: layers %d-%d (%d layers)", 
                            gpu_id, gpu_start_layer, gpu_end_layer, num_layers);
                     
                     if (gpu_id < (int)gpu_info.size()) {
                         const auto& gpu = gpu_info[gpu_id];
                         if (gpu.backend_available) {
-                            printf(" [%s]", gpu.backend_name.c_str());
+                            LOG_INF(" [%s]", gpu.backend_name.c_str());
                         }
                     }
-                    printf("\n");
+                    LOG_INF("\n");
                 }
             }
             
             // Show output layer assignment
             if (params.n_gpu_layers > model_n_layer) {
-                printf("   - GPU %d: output layer [%s]\n", 
+                LOG_INF("   - GPU %d: output layer [%s]\n", 
                        params.main_gpu, 
                        params.main_gpu < (int)gpu_info.size() && gpu_info[params.main_gpu].backend_available ? 
                        gpu_info[params.main_gpu].backend_name.c_str() : "Unknown");
             } else {
-                printf("   - CPU: output layer [Host memory]\n");
+                LOG_INF("   - CPU: output layer [Host memory]\n");
             }
             
             if (!any_layers && params.n_gpu_layers > 0) {
-                printf("   [WARNING] No layers assigned to GPUs despite request!\n");
+                if (model_n_layer == 0) {
+                    LOG_INF("   [INFO] No layers to assign (vocab-only model)\n");
+                } else {
+                    LOG_WRN("   [WARNING] No layers assigned to GPUs despite request!\n");
+                }
             }
             
             // Add notes about layer assignment logic
-            printf("\n   [INFO] Layer assignment follows last-to-first strategy:\n");
-            printf("   [INFO] - GPU layers are assigned from the end of the model backwards\n");  
-            printf("   [INFO] - Earlier layers (closer to input) remain on CPU for efficiency\n");
-            if (params.n_gpu_layers > 0) {
-                printf("   [INFO] - With %d GPU layers requested, layers %d-%d will use GPU\n", 
-                       params.n_gpu_layers, i_gpu_start, std::min(i_gpu_start + params.n_gpu_layers - 1, model_n_layer - 1));
+            if (model_n_layer > 0) {
+                LOG_INF("\n   [INFO] Layer assignment follows last-to-first strategy:\n");
+                LOG_INF("   [INFO] - GPU layers are assigned from the end of the model backwards\n");  
+                LOG_INF("   [INFO] - Earlier layers (closer to input) remain on CPU for efficiency\n");
+                if (params.n_gpu_layers > 0) {
+                    LOG_INF("   [INFO] - With %d GPU layers requested, layers %d-%d will use GPU\n", 
+                           params.n_gpu_layers, i_gpu_start, std::min(i_gpu_start + params.n_gpu_layers - 1, model_n_layer - 1));
+                }
+            } else if (model_n_layer == 0) {
+                LOG_INF("\n   [INFO] Vocab-only model has no transformer layers to distribute\n");
             }
         }
         
@@ -2222,7 +2285,7 @@ void print_gpu_numa_topology(const std::vector<gpu_numa_info> & gpu_info, const 
             }
         }
         if (has_tensor_split) {
-            printf("\n   Tensor Split Configuration:\n");
+            LOG_INF("\n   Tensor Split Configuration:\n");
             float total_split = 0.0f;
             for (int i = 0; i < (int)llama_max_devices() && i < (int)gpu_info.size(); i++) {
                 total_split += params.tensor_split[i];
@@ -2231,18 +2294,20 @@ void print_gpu_numa_topology(const std::vector<gpu_numa_info> & gpu_info, const 
             for (int i = 0; i < (int)llama_max_devices() && i < (int)gpu_info.size(); i++) {
                 if (params.tensor_split[i] != 0.0f) {
                     float percentage = total_split > 0.0f ? (params.tensor_split[i] / total_split) * 100.0f : 0.0f;
-                    printf("   - GPU %d: ratio %.3f (%.1f%%)", i, params.tensor_split[i], percentage);
+                    std::ostringstream split_line;
+                    split_line << "   - GPU " << i << ": ratio " << std::fixed << std::setprecision(3) << params.tensor_split[i] 
+                              << " (" << std::fixed << std::setprecision(1) << percentage << "%%)";
                     if (i < (int)gpu_info.size() && gpu_info[i].backend_available) {
-                        printf(" [%s]", gpu_info[i].backend_name.c_str());
+                        split_line << " [" << gpu_info[i].backend_name << "]";
                     }
-                    printf("\n");
+                    LOG_INF("%s\n", split_line.str().c_str());
                 }
             }
             
             if (params.split_mode == LLAMA_SPLIT_MODE_LAYER) {
-                printf("   [INFO] Layer split mode: ratios determine layer count per GPU\n");
+                LOG_INF("   [INFO] Layer split mode: ratios determine layer count per GPU\n");
             } else if (params.split_mode == LLAMA_SPLIT_MODE_ROW) {
-                printf("   [INFO] Row split mode: ratios determine tensor memory per GPU\n");
+                LOG_INF("   [INFO] Row split mode: ratios determine tensor memory per GPU\n");
             }
         }
         
@@ -2251,34 +2316,35 @@ void print_gpu_numa_topology(const std::vector<gpu_numa_info> & gpu_info, const 
             const auto& main_gpu = gpu_info[params.main_gpu];
             
             if (main_gpu.pci_bus_id.find("virtual:") == 0) {
-                printf("   - Main GPU: Virtual GPU (no NUMA considerations)\n");
-                printf("\n   [INFO] Virtual GPU detected - NUMA locality not applicable\n");
-                printf("   [NOTE] This appears to be a development/container environment\n");
+                LOG_INF("   - Main GPU: Virtual GPU (no NUMA considerations)\n");
+                LOG_INF("\n   [INFO] Virtual GPU detected - NUMA locality not applicable\n");
+                LOG_INF("   [NOTE] This appears to be a development/container environment\n");
             } else if (main_gpu.affinity_detected) {
-                printf("   - Main GPU NUMA node: %d\n", main_gpu.numa_node);
+                LOG_INF("   - Main GPU NUMA node: %d\n", main_gpu.numa_node);
                 
                 // Checks for GPU-NUMA locality
-                printf("\n   [!] CPU-GPU NUMA Locality Checks:\n");
+                LOG_INF("\n   [!] CPU-GPU NUMA Locality Checks:\n");
                 
                 if (!main_gpu.local_cpu_cores.empty()) {
-                    printf("   [INFO] GPU %d has %zu local CPU cores: ", params.main_gpu, main_gpu.local_cpu_cores.size());
+                    std::ostringstream cpu_cores;
+                    cpu_cores << "   [INFO] GPU " << params.main_gpu << " has " << main_gpu.local_cpu_cores.size() << " local CPU cores: ";
                     for (size_t i = 0; i < std::min((size_t)4, main_gpu.local_cpu_cores.size()); i++) {
-                        if (i > 0) printf(",");
-                        printf("%d", main_gpu.local_cpu_cores[i]);
+                        if (i > 0) cpu_cores << ",";
+                        cpu_cores << main_gpu.local_cpu_cores[i];
                     }
                     if (main_gpu.local_cpu_cores.size() > 4) {
-                        printf(",...+%zu more", main_gpu.local_cpu_cores.size() - 4);
+                        cpu_cores << ",...+" << (main_gpu.local_cpu_cores.size() - 4) << " more";
                     }
-                    printf("\n");
+                    LOG_INF("%s\n", cpu_cores.str().c_str());
                 } else {
-                    printf("   [WARNING] No local CPU cores detected for GPU %d\n", params.main_gpu);
+                    LOG_WRN("   [WARNING] No local CPU cores detected for GPU %d\n", params.main_gpu);
                 }
                 
                 // Check if current thread configuration conflicts
 #ifdef GGML_NUMA_MIRROR
                 int numa_nodes = numa_num_configured_nodes();
                 if (numa_nodes > 1) {
-                    printf("   [INFO] Multi-NUMA system (%d nodes) - GPU-CPU locality is critical\n", numa_nodes);
+                    LOG_INF("   [INFO] Multi-NUMA system (%d nodes) - GPU-CPU locality is critical\n", numa_nodes);
                     
                     // Check current thread's NUMA binding
                     cpu_set_t current_affinity;
@@ -2293,26 +2359,26 @@ void print_gpu_numa_topology(const std::vector<gpu_numa_info> & gpu_info, const 
                         }
                         
                         if (bound_to_gpu_node) {
-                            printf("   [INFO] Current thread appears bound to GPU %d's NUMA node\n", params.main_gpu);
+                            LOG_INF("   [INFO] Current thread appears bound to GPU %d's NUMA node\n", params.main_gpu);
                         } else {
-                            printf("   [WARNING] Current thread NOT bound to GPU %d's NUMA node!\n", params.main_gpu);
+                            LOG_WRN("   [WARNING] Current thread NOT bound to GPU %d's NUMA node!\n", params.main_gpu);
                         }
                     }
                 }
 #endif
             } else {
-                printf("   [!] Cannot determine NUMA affinity for main GPU %d\n", params.main_gpu);
-                printf("   [!] Monitor cross-socket traffic if performance is suboptimal\n");
+                LOG_WRN("   [!] Cannot determine NUMA affinity for main GPU %d\n", params.main_gpu);
+                LOG_WRN("   [!] Monitor cross-socket traffic if performance is suboptimal\n");
             }
         }
         
         // Batch size considerations
-        printf("\n   Batch Size & GPU Offloading:\n");
-        printf("   - Logical batch size: %d (-b)\n", params.n_batch);
-        printf("   - Physical batch size: %d (-ub)\n", params.n_ubatch);
+        LOG_INF("\n   Batch Size & GPU Offloading:\n");
+        LOG_INF("   - Logical batch size: %d (-b)\n", params.n_batch);
+        LOG_INF("   - Physical batch size: %d (-ub)\n", params.n_ubatch);
         
     } else {
-        printf("\n   - GPU offloading: Disabled (CPU-only inference)\n");
+        LOG_INF("\n   - GPU offloading: Disabled (CPU-only inference)\n");
     }
 }
 
@@ -2320,20 +2386,20 @@ void print_gpu_numa_topology(const std::vector<gpu_numa_info> & gpu_info, const 
  * Print comprehensive CPU/GPU/NUMA topology and threading plan
  */
 void cpu_print_comprehensive_topology(const cpu_params & params) {
-    printf("\n");
-    printf("╔══════════════════════════════════════════════════════════════════════════════════╗\n");
-    printf("║                    CPU/GPU/NUMA TOPOLOGY & THREADING PLAN                        ║\n");
-    printf("╚══════════════════════════════════════════════════════════════════════════════════╝\n");
+    LOG_INF("\n");
+    LOG_INF("╔══════════════════════════════════════════════════════════════════════════════════╗\n");
+    LOG_INF("║                    CPU/GPU/NUMA TOPOLOGY & THREADING PLAN                        ║\n");
+    LOG_INF("╚══════════════════════════════════════════════════════════════════════════════════╝\n");
     
 #if defined(__x86_64__) && defined(__linux__) && !defined(__ANDROID__)
     // Basic system info
     int total_logical = std::thread::hardware_concurrency();
     int total_physical = cpu_get_num_physical_cores();
     
-    printf("\n[*] SYSTEM OVERVIEW:\n");
-    printf("   - Total logical CPUs: %d\n", total_logical);
-    printf("   - Total physical cores: %d\n", total_physical);
-    printf("   - Hyperthreading: %s\n", (total_logical > total_physical) ? "Available" : "Not available");
+    LOG_INF("\n[*] SYSTEM OVERVIEW:\n");
+    LOG_INF("   - Total logical CPUs: %d\n", total_logical);
+    LOG_INF("   - Total physical cores: %d\n", total_physical);
+    LOG_INF("   - Hyperthreading: %s\n", (total_logical > total_physical) ? "Available" : "Not available");
     
     // NUMA information
     bool numa_available = false;
@@ -2342,19 +2408,20 @@ void cpu_print_comprehensive_topology(const cpu_params & params) {
     numa_nodes = numa_num_configured_nodes();
     numa_available = numa_nodes > 1;
     
-    printf("   - NUMA nodes: %d %s\n", numa_nodes, numa_available ? "(multi-node system)" : "(single-node system)");
+    LOG_INF("   - NUMA nodes: %d %s\n", numa_nodes, numa_available ? "(multi-node system)" : "(single-node system)");
     
     if (numa_available) {
-        printf("\n[+] NUMA NODE DETAILS:\n");
+        LOG_INF("\n[+] NUMA NODE DETAILS:\n");
         for (int node = 0; node < numa_nodes; node++) {
             struct bitmask* node_cpus = numa_allocate_cpumask();
             if (numa_node_to_cpus(node, node_cpus) == 0) {
-                printf("   Node %d CPUs: ", node);
+                std::ostringstream cpu_list;
+                cpu_list << "   Node " << node << " CPUs: ";
                 bool first = true;
                 for (int cpu = 0; cpu < total_logical; cpu++) {
                     if (numa_bitmask_isbitset(node_cpus, cpu)) {
-                        if (!first) printf(", ");
-                        printf("%d", cpu);
+                        if (!first) cpu_list << ", ";
+                        cpu_list << cpu;
                         first = false;
                     }
                 }
@@ -2362,27 +2429,27 @@ void cpu_print_comprehensive_topology(const cpu_params & params) {
                 // Show memory info if available
                 long long memory = numa_node_size64(node, NULL);
                 if (memory > 0) {
-                    printf(" (%.1f GB memory)", memory / (1024.0 * 1024.0 * 1024.0));
+                    cpu_list << " (" << std::fixed << std::setprecision(1) << (memory / (1024.0 * 1024.0 * 1024.0)) << " GB memory)";
                 }
-                printf("\n");
+                LOG_INF("%s\n", cpu_list.str().c_str());
             }
             numa_free_cpumask(node_cpus);
         }
     }
 #else
-    printf("   - NUMA: Not compiled with NUMA support\n");
+    LOG_INF("   - NUMA: Not compiled with NUMA support\n");
 #endif
     
     // GPU-NUMA topology detection and display
     std::vector<gpu_numa_info> gpu_info = detect_gpu_numa_affinity();
     
     // User's threading configuration
-    printf("\n[=] THREADING CONFIGURATION:\n");
-    printf("   - Requested threads: %d %s\n", 
+    LOG_INF("\n[=] THREADING CONFIGURATION:\n");
+    LOG_INF("   - Requested threads: %d %s\n", 
            params.n_threads, 
            (params.n_threads <= 0) ? "(auto-detect)" : "");
-    printf("   - Use hyperthreading: %s\n", params.use_hyperthreading ? "Yes" : "No");
-    printf("   - Use efficiency cores: %s\n", params.use_efficiency_cores ? "Yes" : "No");
+    LOG_INF("   - Use hyperthreading: %s\n", params.use_hyperthreading ? "Yes" : "No");
+    LOG_INF("   - Use efficiency cores: %s\n", params.use_efficiency_cores ? "Yes" : "No");
     
     // Calculate actual thread count
     int actual_threads = params.n_threads;
@@ -2390,57 +2457,63 @@ void cpu_print_comprehensive_topology(const cpu_params & params) {
         actual_threads = cpu_get_num_math_from_params(params);
     }
     
-    printf("   - Computed thread count: %d\n", actual_threads);
+    LOG_INF("   - Computed thread count: %d\n", actual_threads);
     
     // Thread distribution plan
-    printf("\n[>] THREAD DISTRIBUTION PLAN:\n");
+    LOG_INF("\n[>] THREAD DISTRIBUTION PLAN:\n");
     if (numa_available) {
         int threads_per_node = (actual_threads + numa_nodes - 1) / numa_nodes;
         int remaining_threads = actual_threads;
         
-        printf("   - Distribution strategy: Round-robin across NUMA nodes\n");
+        LOG_INF("   - Distribution strategy: Round-robin across NUMA nodes\n");
         for (int node = 0; node < numa_nodes && remaining_threads > 0; node++) {
             int node_threads = std::min(threads_per_node, remaining_threads);
-            printf("   - NUMA node %d: %d threads\n", node, node_threads);
+            LOG_INF("   - NUMA node %d: %d threads\n", node, node_threads);
             remaining_threads -= node_threads;
         }
     } else {
-        printf("   - Distribution strategy: Single NUMA node\n");
-        printf("   - Node 0: %d threads\n", actual_threads);
+        LOG_INF("   - Distribution strategy: Single NUMA node\n");
+        LOG_INF("   - Node 0: %d threads\n", actual_threads);
     }
     
     // Performance recommendations
-    printf("\n[!] PERFORMANCE RECOMMENDATIONS:\n");
+    LOG_INF("\n[!] PERFORMANCE RECOMMENDATIONS:\n");
     if (is_hybrid_cpu()) {
         cpu_topology_info topo = detect_cpu_topology();
         int recommended_threads = cpu_count_math_cpus(total_logical, true, false);
         if (actual_threads != recommended_threads) {
-            printf("   [!] Consider using %d threads for optimal performance (P-cores + HT)\n", recommended_threads);
+            LOG_WRN("   [!] Consider using %d threads for optimal performance (P-cores + HT)\n", recommended_threads);
         } else {
-            printf("   [OK] Thread count looks optimal for this hybrid CPU\n");
+            LOG_INF("   [OK] Thread count looks optimal for this hybrid CPU\n");
         }
         
         if (!params.use_hyperthreading && total_logical > total_physical) {
-            printf("   [TIP] Hyperthreading is disabled but available - may improve performance\n");
+            LOG_INF("   [TIP] Hyperthreading is disabled but available - may improve performance\n");
         }
         
         if (params.use_efficiency_cores) {
-            printf("   [TIP] E-cores enabled - may help with high thread counts but check performance\n");
+            LOG_INF("   [TIP] E-cores enabled - may help with high thread counts but check performance\n");
         }
     } else {
         if (actual_threads > total_physical && !params.use_hyperthreading) {
-            printf("   [!] More threads than physical cores without hyperthreading\n");
+            LOG_WRN("   [!] More threads than physical cores without hyperthreading\n");
         } else if (actual_threads == total_physical) {
-            printf("   [OK] Using all physical cores\n");
+            LOG_INF("   [OK] Using all physical cores\n");
         } else if (actual_threads == total_logical) {
-            printf("   [OK] Using all logical CPUs (with hyperthreading)\n");
+            LOG_INF("   [OK] Using all logical CPUs (with hyperthreading)\n");
         }
+    }
+    
+    // Check for kernel NUMA balancing interference
+    if (numa_available && is_numa_balancing_enabled()) {
+        LOG_WRN("   [!] Kernel NUMA balancing is enabled - may interfere with NUMA optimizations\n");
+        LOG_INF("   [TIP] Consider disabling: echo 0 | sudo tee /proc/sys/kernel/numa_balancing\n");
     }
     
 #else
     // Non-Linux platforms
-    printf("\n[*] SYSTEM OVERVIEW:\n");
-    printf("   - Platform: %s\n", 
+    LOG_INF("\n[*] SYSTEM OVERVIEW:\n");
+    LOG_INF("   - Platform: %s\n", 
 #if defined(_WIN32)
            "Windows"
 #elif defined(__APPLE__)
@@ -2449,19 +2522,19 @@ void cpu_print_comprehensive_topology(const cpu_params & params) {
            "Non-Linux Unix"
 #endif
     );
-    printf("   - Total logical CPUs: %d\n", (int)std::thread::hardware_concurrency());
-    printf("   - Detailed topology: Not available on this platform\n");
-    printf("\n[=] THREADING CONFIGURATION:\n");
-    printf("   - Requested threads: %d\n", params.n_threads);
-    printf("   - Note: Advanced CPU topology features require Linux x86_64\n");
+    LOG_INF("   - Total logical CPUs: %d\n", (int)std::thread::hardware_concurrency());
+    LOG_INF("   - Detailed topology: Not available on this platform\n");
+    LOG_INF("\n[=] THREADING CONFIGURATION:\n");
+    LOG_INF("   - Requested threads: %d\n", params.n_threads);
+    LOG_INF("   - Note: Advanced CPU topology features require Linux x86_64\n");
     
     // Still try to detect GPU info on other platforms
     std::vector<gpu_numa_info> gpu_info = detect_gpu_numa_affinity();
 #endif
     
-    printf("\n");
-    printf("═══════════════════════════════════════════════════════════════════════════════════\n");
-    printf("\n");
+    LOG_INF("\n");
+    LOG_INF("═══════════════════════════════════════════════════════════════════════════════════\n");
+    LOG_INF("\n");
 }
 
 /**
@@ -2592,47 +2665,39 @@ std::vector<std::pair<int, int>> calculate_gpu_layer_distribution(const common_p
 }
 
 /**
- * Get the number of layers in a model by reading the GGUF file
+ * Get the number of layers in a model by loading it with vocab_only mode
  * Returns -1 if the model file cannot be read or layer count cannot be determined
  */
 int get_model_layer_count(const std::string & model_path) {
     if (model_path.empty()) {
         return -1;
     }
-    
+
+    int result = -1;
     try {
-        // Try to read GGUF metadata to get layer count
-        struct gguf_init_params params = {
-            /*.no_alloc = */ true,
-            /*.ctx      = */ nullptr,
-        };
-        
-        struct gguf_context * ctx = gguf_init_from_file(model_path.c_str(), params);
-        if (!ctx) {
-            return -1;
+        // Use vocab_only mode to load just metadata without heavy tensor data
+        auto mparams = llama_model_default_params();
+        mparams.vocab_only = true;
+        mparams.use_mmap = false;     // Don't need mmap for metadata only
+        mparams.check_tensors = false; // Skip tensor validation for speed
+
+        // Load model with minimal resource usage
+        auto model = llama_model_load_from_file(model_path.c_str(), mparams);
+        if (model) {
+            // Get layer count using the proper API
+            const int n_layer = llama_model_n_layer(model);
+            
+            // Clean up the model
+            llama_model_free(model);
+            
+            // Use whatever the API gives us (could be 0 for vocab-only models)
+            result = (n_layer >= 0) ? n_layer : -1;
         }
-        
-        // Look for the block count key (n_layer)
-        const int key_idx = gguf_find_key(ctx, "llama.block_count");
-        if (key_idx >= 0) {
-            const uint32_t n_layer = gguf_get_val_u32(ctx, key_idx);
-            gguf_free(ctx);
-            return (int)n_layer;
-        }
-        
-        // Fallback: try older key names
-        const int key_idx_old = gguf_find_key(ctx, "llama.n_layer");
-        if (key_idx_old >= 0) {
-            const uint32_t n_layer = gguf_get_val_u32(ctx, key_idx_old);
-            gguf_free(ctx);
-            return (int)n_layer;
-        }
-        
-        gguf_free(ctx);
-        return -1;
     } catch (...) {
-        return -1;
+        result = -1;
     }
+
+    return result;
 }
 
 //
@@ -2650,12 +2715,12 @@ bool enforce_gpu_cpu_numa_affinity(int gpu_id, const gpu_numa_info & gpu_info) {
     }
     
     if (!gpu_info.affinity_detected || gpu_info.numa_node < 0) {
-        printf("[WARNING] Cannot enforce NUMA affinity for GPU %d - NUMA node unknown\n", gpu_id);
+        LOG_WRN("[WARNING] Cannot enforce NUMA affinity for GPU %d - NUMA node unknown\n", gpu_id);
         return false;
     }
     
     if (gpu_info.local_cpu_cores.empty()) {
-        printf("[WARNING] No local CPU cores found for GPU %d on NUMA node %d\n", gpu_id, gpu_info.numa_node);
+        LOG_WRN("[WARNING] No local CPU cores found for GPU %d on NUMA node %d\n", gpu_id, gpu_info.numa_node);
         return false;
     }
     
@@ -2670,15 +2735,15 @@ bool enforce_gpu_cpu_numa_affinity(int gpu_id, const gpu_numa_info & gpu_info) {
     
     int result = pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset);
     if (result != 0) {
-        printf("[ERROR] Failed to set CPU affinity for GPU %d: %s\n", gpu_id, strerror(result));
+        LOG_ERR("[ERROR] Failed to set CPU affinity for GPU %d: %s\n", gpu_id, strerror(result));
         return false;
     }
     
-    printf("[INFO] Thread bound to %zu CPU cores on NUMA node %d for GPU %d\n", 
+    LOG_INF("[INFO] Thread bound to %zu CPU cores on NUMA node %d for GPU %d\n", 
            gpu_info.local_cpu_cores.size(), gpu_info.numa_node, gpu_id);
     return true;
 #else
-    printf("[WARNING] CPU-GPU NUMA affinity not supported on this platform\n");
+    LOG_WRN("[WARNING] CPU-GPU NUMA affinity not supported on this platform\n");
     return false;
 #endif
 }
@@ -2692,7 +2757,7 @@ bool verify_gpu_numa_memory_locality(int gpu_id, const gpu_numa_info & gpu_info)
     }
     
     if (!gpu_info.affinity_detected) {
-        printf("[WARNING] Cannot verify memory locality for GPU %d - NUMA info unavailable\n", gpu_id);
+        LOG_WRN("[WARNING] Cannot verify memory locality for GPU %d - NUMA info unavailable\n", gpu_id);
         return false;
     }
     
@@ -2700,10 +2765,10 @@ bool verify_gpu_numa_memory_locality(int gpu_id, const gpu_numa_info & gpu_info)
     // Check current thread's memory policy
     int current_node = numa_preferred();
     if (current_node == gpu_info.numa_node) {
-        printf("[INFO] Memory policy correctly set to NUMA node %d for GPU %d\n", gpu_info.numa_node, gpu_id);
+        LOG_INF("[INFO] Memory policy correctly set to NUMA node %d for GPU %d\n", gpu_info.numa_node, gpu_id);
         return true;
     } else {
-        printf("[WARNING] Memory policy mismatch - current: %d, GPU %d needs: %d\n", 
+        LOG_WRN("[WARNING] Memory policy mismatch - current: %d, GPU %d needs: %d\n", 
                current_node, gpu_id, gpu_info.numa_node);
         
         // Try to set correct memory policy
@@ -2713,7 +2778,7 @@ bool verify_gpu_numa_memory_locality(int gpu_id, const gpu_numa_info & gpu_info)
             numa_set_membind(nodemask);
             numa_free_nodemask(nodemask);
             
-            printf("[INFO] Set memory binding to NUMA node %d for GPU %d\n", gpu_info.numa_node, gpu_id);
+            LOG_INF("[INFO] Set memory binding to NUMA node %d for GPU %d\n", gpu_info.numa_node, gpu_id);
             return true;
         }
     }
@@ -2726,7 +2791,7 @@ bool verify_gpu_numa_memory_locality(int gpu_id, const gpu_numa_info & gpu_info)
  */
 void bind_thread_to_gpu_numa_node(int gpu_id, const std::vector<gpu_numa_info> & gpu_infos) {
     if (gpu_id < 0 || gpu_id >= (int)gpu_infos.size()) {
-        printf("[ERROR] Invalid GPU ID %d for thread binding\n", gpu_id);
+        LOG_ERR("[ERROR] Invalid GPU ID %d for thread binding\n", gpu_id);
         return;
     }
     
@@ -2739,9 +2804,9 @@ void bind_thread_to_gpu_numa_node(int gpu_id, const std::vector<gpu_numa_info> &
     bool memory_locality_ok = verify_gpu_numa_memory_locality(gpu_id, gpu_info);
     
     if (cpu_affinity_ok && memory_locality_ok) {
-        printf("[SUCCESS] Thread fully bound to NUMA locality for GPU %d\n", gpu_id);
+        LOG_INF("[SUCCESS] Thread fully bound to NUMA locality for GPU %d\n", gpu_id);
     } else {
-        printf("[WARNING] Incomplete NUMA binding for GPU %d (CPU: %s, Memory: %s)\n", 
+        LOG_WRN("[WARNING] Incomplete NUMA binding for GPU %d (CPU: %s, Memory: %s)\n", 
                gpu_id, cpu_affinity_ok ? "OK" : "FAILED", memory_locality_ok ? "OK" : "FAILED"); 
     }
 }
@@ -2758,10 +2823,10 @@ void* allocate_gpu_numa_local_memory(size_t size, int numa_node) {
     // Try NUMA-local allocation
     void* ptr = numa_alloc_onnode(size, numa_node);
     if (ptr) {
-        printf("[INFO] Allocated %zu bytes on NUMA node %d\n", size, numa_node);
+        LOG_INF("Allocated %zu bytes on NUMA node %d\n", size, numa_node);
         return ptr;
     } else {
-        printf("[WARNING] NUMA allocation failed on node %d, using regular malloc\n", numa_node);
+        LOG_WRN("NUMA allocation failed on node %d, using regular malloc\n", numa_node);
     }
 #endif
     
@@ -2808,9 +2873,9 @@ bool monitor_cross_socket_gpu_traffic(const std::vector<gpu_numa_info> & gpu_inf
             }
             
             if (!has_local_cpu_affinity) {
-                printf("[WARNING] Thread accessing GPU %d (NUMA %d) is not bound to local CPUs!\n", 
+                LOG_WRN("Thread accessing GPU %d (NUMA %d) is not bound to local CPUs!\n", 
                        gpu_info.gpu_id, gpu_info.numa_node);
-                printf("          This may cause cross-socket traffic and performance degradation.\n");
+                LOG_WRN("          This may cause cross-socket traffic and performance degradation.\n");
                 potential_cross_socket_traffic = true;
             }
         }
