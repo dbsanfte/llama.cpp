@@ -97,8 +97,6 @@ void cpu_print_comprehensive_topology(const cpu_params & params);
 void cpu_print_comprehensive_topology_with_gpu(const cpu_params & params, const common_params & full_params);
 std::vector<gpu_numa_info> detect_gpu_numa_affinity();
 void print_gpu_numa_topology(const std::vector<gpu_numa_info> & gpu_info, const common_params & params);
-std::vector<std::pair<int, int>> calculate_gpu_layer_distribution(const common_params & params, const std::vector<gpu_numa_info> & gpu_info);
-int get_model_layer_count(const std::string & model_path);
 bool enforce_gpu_cpu_numa_affinity(int gpu_id, const gpu_numa_info & gpu_info);
 
 // CPU-GPU NUMA affinity enforcement functions
