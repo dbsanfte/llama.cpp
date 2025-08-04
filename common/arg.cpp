@@ -1401,6 +1401,30 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ));
     add_opt(common_arg(
+        {"--numa-no-aware"},
+        "disable NUMA-aware CPU assignment (use simple round-robin)",
+        [](common_params & params) {
+            params.cpuparams.numa_aware = false;
+            params.cpuparams_batch.numa_aware = false;
+        }
+    ));
+    add_opt(common_arg(
+        {"--numa-respect-strict"},
+        "never override user --cpu-strict setting for NUMA locality",
+        [](common_params & params) {
+            params.cpuparams.allow_numa_override = false;
+            params.cpuparams_batch.allow_numa_override = false;
+        }
+    ));
+    add_opt(common_arg(
+        {"--numa-no-warn"},
+        "disable warnings when NUMA overrides user CPU settings",
+        [](common_params & params) {
+            params.cpuparams.warn_on_numa_override = false;
+            params.cpuparams_batch.warn_on_numa_override = false;
+        }
+    ));
+    add_opt(common_arg(
         {"--cpu-topology"},
         "print CPU/GPU/NUMA topology and threading plan, then exit",
         [](common_params & params) {
@@ -1411,13 +1435,6 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             cpu_print_comprehensive_topology_with_gpu(params.cpuparams, params);
             
             exit(0);
-        }
-    ));
-    add_opt(common_arg(
-        {"--print-cpu-topology"},
-        "print CPU/GPU/NUMA topology at startup",
-        [](common_params & params) {
-            params.print_cpu_topology = true;
         }
     ));
     add_opt(common_arg(

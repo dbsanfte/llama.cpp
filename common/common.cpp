@@ -1402,9 +1402,14 @@ struct ggml_threadpool_params ggml_threadpool_params_from_cpu_params(const cpu_p
         std::memcpy(&tpp.cpumask, &params.cpumask, GGML_MAX_N_THREADS);
     }
 
-    tpp.prio       = params.priority;
-    tpp.poll       = params.poll;
-    tpp.strict_cpu = params.strict_cpu;
+    tpp.prio                  = params.priority;
+    tpp.poll                  = params.poll;
+    tpp.strict_cpu            = params.strict_cpu;
+    
+    // Unified CPU assignment parameters
+    tpp.numa_aware            = params.numa_aware;
+    tpp.allow_numa_override   = params.allow_numa_override;
+    tpp.warn_on_numa_override = params.warn_on_numa_override;
 
     return tpp;
 }
@@ -2104,25 +2109,108 @@ void print_gpu_numa_topology(const std::vector<gpu_numa_info> & gpu_info, const 
                params.split_mode == LLAMA_SPLIT_MODE_LAYER ? "layer" :
                params.split_mode == LLAMA_SPLIT_MODE_ROW ? "row" : "none");
         
-        // Calculate and display layer distribution
-        auto layer_distribution = calculate_gpu_layer_distribution(params, gpu_info.size());
-        printf("\n   Layer Distribution Plan:\n");
-        bool any_layers = false;
-        for (const auto& [gpu_id, num_layers] : layer_distribution) {
-            if (num_layers > 0) {
-                any_layers = true;
-                printf("   - GPU %d: %d layers", gpu_id, num_layers);
-                if (gpu_id < (int)gpu_info.size()) {
-                    const auto& gpu = gpu_info[gpu_id];
-                    if (gpu.backend_available) {
-                        printf(" [%s]", gpu.backend_name.c_str());
-                    }
-                }
-                printf("\n");
+        // Check if any GPUs actually have working backends
+        bool any_gpu_backend_available = false;
+        for (const auto& gpu : gpu_info) {
+            if (gpu.backend_available) {
+                any_gpu_backend_available = true;
+                break;
             }
         }
-        if (!any_layers) {
-            printf("   - No layers assigned to GPUs (CPU-only)\n");
+        
+        // Calculate and display REALISTIC layer distribution
+        printf("\n   Layer Distribution Plan:\n");
+        
+        if (!any_gpu_backend_available) {
+            // No working GPU backends - everything goes to CPU
+            printf("   [WARNING] No usable GPU backends available!\n");
+            printf("   [INFO] All layers will remain on CPU despite -ngl %d request\n", params.n_gpu_layers);
+            printf("   - CPU: all layers (forced by lack of GPU support) [Host memory]\n");
+            
+        } else {
+            // We have working GPU backends - show actual distribution
+            auto layer_distribution = calculate_gpu_layer_distribution(params, gpu_info);
+            bool any_layers = false;
+            
+            // Try to get actual model layer count from model file
+            int model_n_layer = 40; // Default assumption
+            if (!params.model.path.empty()) {
+                int detected_layers = get_model_layer_count(params.model.path);
+                if (detected_layers > 0) {
+                    model_n_layer = detected_layers;
+                    printf("   [INFO] Model has %d layers (detected from %s)\n", 
+                           model_n_layer, params.model.path.c_str());
+                } else {
+                    printf("   [INFO] Using estimated %d layers (model file not accessible)\n", model_n_layer);
+                }
+            } else {
+                printf("   [INFO] Using estimated %d layers (no model file specified)\n", model_n_layer);
+            }
+            
+            // Calculate actual layer assignments (matching load_tensors logic)
+            int i_gpu_start = std::max(model_n_layer - params.n_gpu_layers, 0);
+            
+            // Show CPU layers first
+            if (i_gpu_start > 0) {
+                printf("   - CPU: layers 0-%d (%d layers) [Host memory]\n", 
+                       i_gpu_start - 1, i_gpu_start);
+            }
+            
+            // Show GPU layer assignments
+            for (const auto& [gpu_id, num_layers] : layer_distribution) {
+                if (num_layers > 0) {
+                    any_layers = true;
+                    
+                    // Calculate actual layer range for this GPU
+                    int gpu_start_layer = i_gpu_start;
+                    int gpu_end_layer = std::min(i_gpu_start + num_layers - 1, model_n_layer - 1);
+                    
+                    if (params.split_mode == LLAMA_SPLIT_MODE_LAYER && layer_distribution.size() > 1) {
+                        // For multi-GPU layer split, calculate proportional ranges
+                        int layers_before = 0;
+                        for (const auto& [id, count] : layer_distribution) {
+                            if (id < gpu_id) layers_before += count;
+                        }
+                        
+                        gpu_start_layer = i_gpu_start + layers_before;
+                        gpu_end_layer = gpu_start_layer + num_layers - 1;
+                    }
+                    
+                    printf("   - GPU %d: layers %d-%d (%d layers)", 
+                           gpu_id, gpu_start_layer, gpu_end_layer, num_layers);
+                    
+                    if (gpu_id < (int)gpu_info.size()) {
+                        const auto& gpu = gpu_info[gpu_id];
+                        if (gpu.backend_available) {
+                            printf(" [%s]", gpu.backend_name.c_str());
+                        }
+                    }
+                    printf("\n");
+                }
+            }
+            
+            // Show output layer assignment
+            if (params.n_gpu_layers > model_n_layer) {
+                printf("   - GPU %d: output layer [%s]\n", 
+                       params.main_gpu, 
+                       params.main_gpu < (int)gpu_info.size() && gpu_info[params.main_gpu].backend_available ? 
+                       gpu_info[params.main_gpu].backend_name.c_str() : "Unknown");
+            } else {
+                printf("   - CPU: output layer [Host memory]\n");
+            }
+            
+            if (!any_layers && params.n_gpu_layers > 0) {
+                printf("   [WARNING] No layers assigned to GPUs despite request!\n");
+            }
+            
+            // Add notes about layer assignment logic
+            printf("\n   [INFO] Layer assignment follows last-to-first strategy:\n");
+            printf("   [INFO] - GPU layers are assigned from the end of the model backwards\n");  
+            printf("   [INFO] - Earlier layers (closer to input) remain on CPU for efficiency\n");
+            if (params.n_gpu_layers > 0) {
+                printf("   [INFO] - With %d GPU layers requested, layers %d-%d will use GPU\n", 
+                       params.n_gpu_layers, i_gpu_start, std::min(i_gpu_start + params.n_gpu_layers - 1, model_n_layer - 1));
+            }
         }
         
         // Show tensor split ratios if configured
@@ -2134,15 +2222,27 @@ void print_gpu_numa_topology(const std::vector<gpu_numa_info> & gpu_info, const 
             }
         }
         if (has_tensor_split) {
-            printf("\n   Tensor Split Ratios:\n");
+            printf("\n   Tensor Split Configuration:\n");
+            float total_split = 0.0f;
+            for (int i = 0; i < (int)llama_max_devices() && i < (int)gpu_info.size(); i++) {
+                total_split += params.tensor_split[i];
+            }
+            
             for (int i = 0; i < (int)llama_max_devices() && i < (int)gpu_info.size(); i++) {
                 if (params.tensor_split[i] != 0.0f) {
-                    printf("   - GPU %d: %.3f", i, params.tensor_split[i]);
+                    float percentage = total_split > 0.0f ? (params.tensor_split[i] / total_split) * 100.0f : 0.0f;
+                    printf("   - GPU %d: ratio %.3f (%.1f%%)", i, params.tensor_split[i], percentage);
                     if (i < (int)gpu_info.size() && gpu_info[i].backend_available) {
                         printf(" [%s]", gpu_info[i].backend_name.c_str());
                     }
                     printf("\n");
                 }
+            }
+            
+            if (params.split_mode == LLAMA_SPLIT_MODE_LAYER) {
+                printf("   [INFO] Layer split mode: ratios determine layer count per GPU\n");
+            } else if (params.split_mode == LLAMA_SPLIT_MODE_ROW) {
+                printf("   [INFO] Row split mode: ratios determine tensor memory per GPU\n");
             }
         }
         
@@ -2154,7 +2254,6 @@ void print_gpu_numa_topology(const std::vector<gpu_numa_info> & gpu_info, const 
                 printf("   - Main GPU: Virtual GPU (no NUMA considerations)\n");
                 printf("\n   [INFO] Virtual GPU detected - NUMA locality not applicable\n");
                 printf("   [NOTE] This appears to be a development/container environment\n");
-                printf("   [TIP] On real hardware with PCIe GPUs, NUMA locality becomes important\n");
             } else if (main_gpu.affinity_detected) {
                 printf("   - Main GPU NUMA node: %d\n", main_gpu.numa_node);
                 
@@ -2203,7 +2302,7 @@ void print_gpu_numa_topology(const std::vector<gpu_numa_info> & gpu_info, const 
 #endif
             } else {
                 printf("   [!] Cannot determine NUMA affinity for main GPU %d\n", params.main_gpu);
-                printf("   [TIP] Monitor cross-socket traffic if performance is suboptimal\n");
+                printf("   [!] Monitor cross-socket traffic if performance is suboptimal\n");
             }
         }
         
@@ -2212,20 +2311,8 @@ void print_gpu_numa_topology(const std::vector<gpu_numa_info> & gpu_info, const 
         printf("   - Logical batch size: %d (-b)\n", params.n_batch);
         printf("   - Physical batch size: %d (-ub)\n", params.n_ubatch);
         
-        if (params.n_batch > 512) {
-            printf("   [TIP] Large batch sizes increase GPU memory pressure\n");
-        }
-        
-        if (params.n_ubatch > 0 && params.n_ubatch < params.n_batch) {
-            printf("   [INFO] Logical > Physical batch enables pipeline parallelism\n");
-            printf("          Useful for multi-GPU setups with pipeline processing\n");
-        }
-        
     } else {
         printf("\n   - GPU offloading: Disabled (CPU-only inference)\n");
-        if (!gpu_info.empty()) {
-            printf("   [TIP] Consider using -ngl <layers> to offload to GPU\n");
-        }
     }
 }
 
@@ -2391,16 +2478,29 @@ void cpu_print_comprehensive_topology_with_gpu(const cpu_params & params, const 
 
 /**
  * Calculate layer distribution across GPUs based on offloading parameters
+ * Takes into account GPU backend availability
  */
-std::vector<std::pair<int, int>> calculate_gpu_layer_distribution(const common_params & params, size_t num_gpus) {
+std::vector<std::pair<int, int>> calculate_gpu_layer_distribution(const common_params & params, const std::vector<gpu_numa_info> & gpu_info) {
     std::vector<std::pair<int, int>> distribution; // pairs of (gpu_id, num_layers)
     
-    if (params.n_gpu_layers <= 0 || num_gpus == 0) {
+    if (params.n_gpu_layers <= 0 || gpu_info.empty()) {
         return distribution; // No GPU offloading
     }
     
-    // Initialize distribution
-    for (size_t i = 0; i < num_gpus; i++) {
+    // Count GPUs with working backends
+    size_t usable_gpus = 0;
+    for (const auto& gpu : gpu_info) {
+        if (gpu.backend_available) {
+            usable_gpus++;
+        }
+    }
+    
+    if (usable_gpus == 0) {
+        return distribution; // No usable GPUs
+    }
+    
+    // Initialize distribution for all GPUs (including non-usable ones)
+    for (size_t i = 0; i < gpu_info.size(); i++) {
         distribution.push_back({(int)i, 0});
     }
     
@@ -2415,53 +2515,124 @@ std::vector<std::pair<int, int>> calculate_gpu_layer_distribution(const common_p
         }
         
         if (has_tensor_split) {
-            // Use tensor_split ratios to distribute layers
+            // Use tensor_split ratios to distribute layers (only to usable GPUs)
             float total_split = 0.0f;
-            for (size_t i = 0; i < num_gpus && i < llama_max_devices(); i++) {
-                total_split += params.tensor_split[i];
+            for (size_t i = 0; i < gpu_info.size() && i < llama_max_devices(); i++) {
+                if (gpu_info[i].backend_available) {
+                    total_split += params.tensor_split[i];
+                }
             }
             
             int remaining_layers = params.n_gpu_layers;
-            for (size_t i = 0; i < num_gpus && i < llama_max_devices() && remaining_layers > 0; i++) {
-                if (total_split > 0.0f) {
+            for (size_t i = 0; i < gpu_info.size() && i < llama_max_devices() && remaining_layers > 0; i++) {
+                if (gpu_info[i].backend_available && total_split > 0.0f) {
                     int layers_for_gpu = (int)((params.tensor_split[i] / total_split) * params.n_gpu_layers);
                     layers_for_gpu = std::min(layers_for_gpu, remaining_layers);
                     distribution[i].second = layers_for_gpu;
                     remaining_layers -= layers_for_gpu;
-                } else {
-                    break;
                 }
             }
             
-            // Distribute any remaining layers to main GPU
-            if (remaining_layers > 0 && params.main_gpu < (int)num_gpus) {
+            // Distribute any remaining layers to main GPU (if it has working backend)
+            if (remaining_layers > 0 && params.main_gpu < (int)gpu_info.size() && 
+                gpu_info[params.main_gpu].backend_available) {
                 distribution[params.main_gpu].second += remaining_layers;
+            } else if (remaining_layers > 0) {
+                // Fallback: find first GPU with working backend
+                for (size_t i = 0; i < gpu_info.size(); i++) {
+                    if (gpu_info[i].backend_available) {
+                        distribution[i].second += remaining_layers;
+                        break;
+                    }
+                }
             }
         } else {
-            // Simple round-robin distribution, but main GPU gets priority
-            if (params.main_gpu < (int)num_gpus) {
+            // Simple assignment to main GPU if it has working backend
+            if (params.main_gpu < (int)gpu_info.size() && gpu_info[params.main_gpu].backend_available) {
                 distribution[params.main_gpu].second = params.n_gpu_layers;
-            } else if (num_gpus > 0) {
-                distribution[0].second = params.n_gpu_layers; // Fallback to GPU 0
+            } else {
+                // Fallback: assign to first GPU with working backend
+                for (size_t i = 0; i < gpu_info.size(); i++) {
+                    if (gpu_info[i].backend_available) {
+                        distribution[i].second = params.n_gpu_layers;
+                        break;
+                    }
+                }
             }
         }
     } else if (params.split_mode == LLAMA_SPLIT_MODE_ROW) {
         // Row-wise split: all layers go to main GPU, but with row-wise tensor splitting
-        if (params.main_gpu < (int)num_gpus) {
+        if (params.main_gpu < (int)gpu_info.size() && gpu_info[params.main_gpu].backend_available) {
             distribution[params.main_gpu].second = params.n_gpu_layers;
-        } else if (num_gpus > 0) {
-            distribution[0].second = params.n_gpu_layers;
+        } else {
+            // Fallback: assign to first GPU with working backend
+            for (size_t i = 0; i < gpu_info.size(); i++) {
+                if (gpu_info[i].backend_available) {
+                    distribution[i].second = params.n_gpu_layers;
+                    break;
+                }
+            }
         }
     } else {
         // No split mode: all layers go to main GPU
-        if (params.main_gpu < (int)num_gpus) {
+        if (params.main_gpu < (int)gpu_info.size() && gpu_info[params.main_gpu].backend_available) {
             distribution[params.main_gpu].second = params.n_gpu_layers;
-        } else if (num_gpus > 0) {
-            distribution[0].second = params.n_gpu_layers;
+        } else {
+            // Fallback: assign to first GPU with working backend
+            for (size_t i = 0; i < gpu_info.size(); i++) {
+                if (gpu_info[i].backend_available) {
+                    distribution[i].second = params.n_gpu_layers;
+                    break;
+                }
+            }
         }
     }
     
     return distribution;
+}
+
+/**
+ * Get the number of layers in a model by reading the GGUF file
+ * Returns -1 if the model file cannot be read or layer count cannot be determined
+ */
+int get_model_layer_count(const std::string & model_path) {
+    if (model_path.empty()) {
+        return -1;
+    }
+    
+    try {
+        // Try to read GGUF metadata to get layer count
+        struct gguf_init_params params = {
+            /*.no_alloc = */ true,
+            /*.ctx      = */ nullptr,
+        };
+        
+        struct gguf_context * ctx = gguf_init_from_file(model_path.c_str(), params);
+        if (!ctx) {
+            return -1;
+        }
+        
+        // Look for the block count key (n_layer)
+        const int key_idx = gguf_find_key(ctx, "llama.block_count");
+        if (key_idx >= 0) {
+            const uint32_t n_layer = gguf_get_val_u32(ctx, key_idx);
+            gguf_free(ctx);
+            return (int)n_layer;
+        }
+        
+        // Fallback: try older key names
+        const int key_idx_old = gguf_find_key(ctx, "llama.n_layer");
+        if (key_idx_old >= 0) {
+            const uint32_t n_layer = gguf_get_val_u32(ctx, key_idx_old);
+            gguf_free(ctx);
+            return (int)n_layer;
+        }
+        
+        gguf_free(ctx);
+        return -1;
+    } catch (...) {
+        return -1;
+    }
 }
 
 //

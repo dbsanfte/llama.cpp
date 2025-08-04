@@ -6938,6 +6938,12 @@ void ggml_threadpool_params_init(struct ggml_threadpool_params * p, int n_thread
     p->poll       = 50;    // hybrid-polling enabled
     p->strict_cpu = false; // no strict placement (all threads share same cpumask)
     p->paused     = false; // threads are ready to go
+    
+    // Unified CPU assignment defaults
+    p->numa_aware           = true;  // Enable NUMA-aware assignment by default
+    p->allow_numa_override  = true;  // Allow NUMA to override strict_cpu for locality
+    p->warn_on_numa_override = true; // Warn users when we override their settings
+    
     memset(p->cpumask, 0, GGML_MAX_N_THREADS); // all-zero means use the default affinity (usually inherited)
 }
 
@@ -6948,9 +6954,12 @@ struct ggml_threadpool_params ggml_threadpool_params_default(int n_threads) {
 }
 
 bool ggml_threadpool_params_match(const struct ggml_threadpool_params * p0, const struct ggml_threadpool_params * p1) {
-    if (p0->n_threads      != p1->n_threads  )    return false;
-    if (p0->prio           != p1->prio       )    return false;
-    if (p0->poll           != p1->poll       )    return false;
-    if (p0->strict_cpu     != p1->strict_cpu )    return false;
+    if (p0->n_threads             != p1->n_threads            ) return false;
+    if (p0->prio                  != p1->prio                 ) return false;
+    if (p0->poll                  != p1->poll                 ) return false;
+    if (p0->strict_cpu            != p1->strict_cpu           ) return false;
+    if (p0->numa_aware            != p1->numa_aware           ) return false;
+    if (p0->allow_numa_override   != p1->allow_numa_override  ) return false;
+    if (p0->warn_on_numa_override != p1->warn_on_numa_override) return false;
     return memcmp(p0->cpumask, p1->cpumask, GGML_MAX_N_THREADS) == 0;
 }

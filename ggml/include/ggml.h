@@ -2446,6 +2446,11 @@ extern "C" {
         uint32_t            poll;                        // polling level (0 - no polling, 100 - aggressive polling)
         bool                strict_cpu;                  // strict cpu placement
         bool                paused;                      // start in paused state
+        
+        // Unified CPU assignment control (addresses dual assignment problem)
+        bool                numa_aware;                  // enable NUMA-aware CPU assignment
+        bool                allow_numa_override;         // allow NUMA to override strict_cpu setting
+        bool                warn_on_numa_override;       // warn when NUMA overrides user settings
     };
 
     struct ggml_threadpool;     // forward declaration, see ggml.c

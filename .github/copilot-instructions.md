@@ -94,16 +94,16 @@ numactl --hardware
 
 ```bash
 # Compare hyperthreading on/off
-./build/bin/llama-bench -m model.gguf
-./build/bin/llama-bench -m model.gguf --cpu-no-hyperthreading
+./build/bin/llama-bench -m models/model.gguf
+./build/bin/llama-bench -m models/model.gguf --cpu-no-hyperthreading
 
 # Test different thread counts
 for threads in 4 8 16; do
-    ./build/bin/llama-bench -m model.gguf --threads $threads
+    ./build/bin/llama-bench -m models/model.gguf --threads $threads
 done
 
 # NUMA binding test
-numactl --cpunodebind=0 --membind=0 ./build/bin/llama-server --model model.gguf
+numactl --cpunodebind=0 --membind=0 ./build/bin/llama-server --model models/model.gguf
 ```
 
 ### 3. Memory Access Monitoring
@@ -123,7 +123,7 @@ numastat -p $(pgrep llama-server)
 
 1. **Identify the area**: NUMA allocation, CPU detection, CLI args, etc.
 2. **Use dev container**: Ensure consistent environment
-3. **Build incrementally**: Use `cmake --build build` for faster iteration
+3. **Build incrementally**: Use `cmake --build build --parallel` for faster iteration
 4. **Test immediately**: Run `./build/bin/llama-server --cpu-topology` after changes
 5. **Check compilation**: Use `get_errors` tool to validate syntax
 
@@ -232,3 +232,7 @@ cmake --build build --verbose
 7. **Validate with real workloads** - not just compilation success
 
 Remember: NUMA and CPU topology changes can have subtle effects. Always validate performance and correctness thoroughly before considering changes complete.
+
+## Changelog
+
+After each task is complete, document what you did in a new markdown file in `.devcontainer/changelog`. You can also search through markdown files in this folder for records of other similar past changes if you want to check past actions for more context on a task.

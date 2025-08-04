@@ -3677,16 +3677,6 @@ int main(int argc, char ** argv) {
 
     common_init();
 
-    // Print CPU topology if requested
-    if (params.print_cpu_topology) {
-        // Ensure CPU params are processed first
-        postprocess_cpu_params(params.cpuparams, nullptr);
-        
-        printf("\n=== CPU/GPU/NUMA TOPOLOGY AT STARTUP ===\n");
-        cpu_print_comprehensive_topology_with_gpu(params.cpuparams, params);
-        printf("==========================================\n\n");
-    }
-
     // struct that contains llama context and inference
     server_context ctx_server;
 

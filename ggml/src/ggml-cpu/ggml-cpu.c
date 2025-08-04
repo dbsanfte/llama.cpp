@@ -461,6 +461,9 @@ struct ggml_threadpool {
 
     int32_t      prio;        // Scheduling priority
     uint32_t     poll;        // Polling level (0 - no polling)
+    
+    // Store threadpool parameters for unified CPU assignment
+    struct ggml_threadpool_params params;
 
     enum ggml_status ec;
 };
@@ -2645,6 +2648,95 @@ static bool ggml_thread_cpumask_is_valid(const bool * mask) {
     return false;
 }
 
+// Unified CPU assignment function - resolves dual assignment problem
+static void ggml_thread_cpumask_unified(
+    const bool * global_mask,     // Available CPU mask from threadpool
+    bool * local_mask,            // Output: mask for this specific thread
+    int thread_id,                // Thread index
+    int total_threads,            // Total number of threads
+    bool user_strict,             // User's strict placement preference
+    bool numa_aware,              // Enable NUMA-aware assignment
+    bool allow_numa_override,     // Can NUMA override user strict setting?
+    bool warn_on_override,        // Should we warn about overrides?
+    int32_t* iter                 // Iterator for round-robin assignment
+) {
+    UNUSED(total_threads);  // Not currently used in implementation
+    memset(local_mask, 0, GGML_MAX_N_THREADS);
+    
+    bool effective_strict = user_strict;
+    bool override_occurred = false;
+    
+#ifdef GGML_NUMA_MIRROR
+    // Check if NUMA awareness should influence CPU assignment
+    if (numa_aware && numa_num_configured_nodes() > 1) {
+        int target_numa_node = thread_id % numa_num_configured_nodes();
+        
+        // Try NUMA-aware assignment
+        struct bitmask* node_cpus = numa_allocate_cpumask();
+        if (numa_node_to_cpus(target_numa_node, node_cpus) == 0) {
+            int assigned_cpu = -1;
+            
+            // Find available CPU on target NUMA node
+            for (int i = 0; i < GGML_MAX_N_THREADS; ++i) {
+                if (global_mask[i] && numa_bitmask_isbitset(node_cpus, i)) {
+                    if (!user_strict || !allow_numa_override) {
+                        // Non-strict or user doesn't allow override: add all CPUs on this node
+                        local_mask[i] = true;
+                    } else {
+                        // Strict placement: just take the first available CPU
+                        if (assigned_cpu == -1) {
+                            assigned_cpu = i;
+                        }
+                    }
+                }
+            }
+            
+            // If we found NUMA-local CPUs
+            if (assigned_cpu != -1 || !user_strict) {
+                numa_free_cpumask(node_cpus);
+                
+                if (user_strict && assigned_cpu != -1) {
+                    local_mask[assigned_cpu] = true;
+                }
+                
+                // Check if we overrode user preference
+                if (!user_strict && allow_numa_override) {
+                    effective_strict = true;  // We're effectively doing strict assignment
+                    override_occurred = true;
+                }
+                
+                if (override_occurred && warn_on_override) {
+                    GGML_LOG_WARN("NUMA: Overriding user --cpu-strict setting for NUMA locality (thread %d -> NUMA node %d)\n", 
+                                  thread_id, target_numa_node);
+                }
+                return;
+            }
+        }
+        numa_free_cpumask(node_cpus);
+    }
+#endif
+    
+    // Fallback to standard assignment (no NUMA or NUMA assignment failed)
+    if (effective_strict) {
+        // Strict assignment: each thread gets one CPU via round-robin
+        int32_t base_idx = *iter;
+        for (int32_t i = 0; i < GGML_MAX_N_THREADS; i++) {
+            int32_t idx = base_idx + i;
+            if (idx >= GGML_MAX_N_THREADS) {
+                idx -= GGML_MAX_N_THREADS;  // Cheaper than modulo
+            }
+            if (global_mask[idx]) {
+                local_mask[idx] = true;
+                *iter = idx + 1;
+                return;
+            }
+        }
+    } else {
+        // Non-strict assignment: all threads share the same CPU mask
+        memcpy(local_mask, global_mask, GGML_MAX_N_THREADS);
+    }
+}
+
 static void ggml_thread_cpumask_next(const bool * global_mask, bool * local_mask, bool strict, int32_t* iter) {
     if (!strict) {
         memcpy(local_mask, global_mask, GGML_MAX_N_THREADS);
@@ -2941,7 +3033,13 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
     const struct ggml_cgraph * cgraph = tp->cgraph;
     const struct ggml_cplan  * cplan  = tp->cplan;
 
-    set_numa_thread_affinity(state->ith);
+    // Only use traditional NUMA affinity if unified assignment allows it
+    if (atomic_load_explicit(&tp->pause, memory_order_relaxed) || tp->params.allow_numa_override) {
+        set_numa_thread_affinity(state->ith);
+    } else if (tp->params.warn_on_numa_override) {
+        // Threadpool assignment takes precedence over NUMA affinity
+        GGML_LOG_WARN("NUMA affinity override blocked by user preference for thread %d\n", state->ith);
+    }
 
     struct ggml_compute_params params = {
         /*.ith       =*/ state->ith,
@@ -2955,59 +3053,71 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
     if (GGML_UNLIKELY(ggml_current_numa_node == -1)) {
         int thread_id = state->ith;
         int n_threads = atomic_load_explicit(&tp->n_threads_cur, memory_order_relaxed);
-
-        // Distribute threads evenly across NUMA nodes first, then assign CPUs within each node
-        int num_numa_nodes = numa_num_configured_nodes();
-        if (num_numa_nodes <= 0) num_numa_nodes = 1;
-        
-        // Calculate which NUMA node this thread should use
-        int target_numa_node = thread_id % num_numa_nodes;
-        
-        bool cpumask[GGML_MAX_N_THREADS];
-        memset(cpumask, 0, sizeof(bool) * GGML_MAX_N_THREADS);
-        for (int i = 0; i < GGML_MAX_N_THREADS; ++i) {
-            if (CPU_ISSET(i, &g_cpuset)) {
-                cpumask[i] = true;
-            }
-        }
-
         int cpuid = -1;
-        
-        // Try to find a CPU on the target NUMA node
-        struct bitmask* node_cpus = numa_allocate_cpumask();
-        if (numa_node_to_cpus(target_numa_node, node_cpus) == 0) {
-            // Find the first available CPU on the target NUMA node that's also in our allowed set
-            for (int i = 0; i < GGML_MAX_N_THREADS; ++i) {
-                if (cpumask[i] && numa_bitmask_isbitset(node_cpus, i)) {
-                    cpuid = i;
-                    break;
-                }
-            }
-        }
-        numa_free_cpumask(node_cpus);
-        
-        // Fallback: if we couldn't find a CPU on the target node, use the original algorithm
-        if (cpuid == -1) {
-            bool local_mask[GGML_MAX_N_THREADS];
-            int iter = 0;
-            for (int j = 0; j < thread_id; ++j) {
-                ggml_thread_cpumask_next(cpumask, local_mask, true, &iter);
-            }
-            memset(local_mask, 0, sizeof(bool) * GGML_MAX_N_THREADS);
-            ggml_thread_cpumask_next(cpumask, local_mask, true, &iter);
-            for (int i = 0; i < GGML_MAX_N_THREADS; ++i) {
-                if (local_mask[i]) {
-                    cpuid = i;
-                    break;
-                }
-            }
-        }
 
-        if (cpuid != -1) {
-            cpu_set_t cpuset;
-            CPU_ZERO(&cpuset);
-            CPU_SET(cpuid, &cpuset);
-            sched_setaffinity(gettid(), sizeof(cpuset), &cpuset);
+        // Check if NUMA override is allowed by threadpool parameters
+        bool allow_numa_override = atomic_load_explicit(&tp->pause, memory_order_relaxed) || tp->params.allow_numa_override;
+        
+        if (allow_numa_override) {
+            // Use NUMA-aware assignment
+            int num_numa_nodes = numa_num_configured_nodes();
+            if (num_numa_nodes <= 0) num_numa_nodes = 1;
+            
+            // Calculate which NUMA node this thread should use
+            int target_numa_node = thread_id % num_numa_nodes;
+            
+            bool cpumask[GGML_MAX_N_THREADS];
+            memset(cpumask, 0, sizeof(bool) * GGML_MAX_N_THREADS);
+            for (int i = 0; i < GGML_MAX_N_THREADS; ++i) {
+                if (CPU_ISSET(i, &g_cpuset)) {
+                    cpumask[i] = true;
+                }
+            }
+
+            // Try to find a CPU on the target NUMA node
+            struct bitmask* node_cpus = numa_allocate_cpumask();
+            if (numa_node_to_cpus(target_numa_node, node_cpus) == 0) {
+                // Find the first available CPU on the target NUMA node that's also in our allowed set
+                for (int i = 0; i < GGML_MAX_N_THREADS; ++i) {
+                    if (cpumask[i] && numa_bitmask_isbitset(node_cpus, i)) {
+                        cpuid = i;
+                        break;
+                    }
+                }
+            }
+            numa_free_cpumask(node_cpus);
+            
+            // Fallback: if we couldn't find a CPU on the target node, use the original algorithm
+            if (cpuid == -1) {
+                bool local_mask[GGML_MAX_N_THREADS];
+                int iter = 0;
+                for (int j = 0; j < thread_id; ++j) {
+                    ggml_thread_cpumask_next(cpumask, local_mask, true, &iter);
+                }
+                memset(local_mask, 0, sizeof(bool) * GGML_MAX_N_THREADS);
+                ggml_thread_cpumask_next(cpumask, local_mask, true, &iter);
+                for (int i = 0; i < GGML_MAX_N_THREADS; ++i) {
+                    if (local_mask[i]) {
+                        cpuid = i;
+                        break;
+                    }
+                }
+            }
+
+            if (cpuid != -1) {
+                cpu_set_t cpuset;
+                CPU_ZERO(&cpuset);
+                CPU_SET(cpuid, &cpuset);
+                sched_setaffinity(gettid(), sizeof(cpuset), &cpuset);
+            }
+
+            GGML_LOG_INFO("NUMA override: thread_id = %02d, target_node = %d, cpuid = %02d, n_threads = %d\n", 
+                         thread_id, target_numa_node, cpuid, n_threads);
+        } else {
+            // Respect threadpool's CPU assignment - no override
+            if (tp->params.warn_on_numa_override) {
+                GGML_LOG_WARN("NUMA override blocked by user preference for thread %d\n", thread_id);
+            }
         }
 
         unsigned int numa_node = 0;
@@ -3018,9 +3128,6 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
         numa_bitmask_setbit(mask, ggml_current_numa_node);
         numa_set_membind(mask);
         numa_bitmask_free(mask);
-
-        GGML_LOG_INFO("thread_id = %02d, target_node = %d, actual_node = %d, cpuid = %02d, n_threads = %d\n", 
-                     thread_id, target_numa_node, ggml_current_numa_node, cpuid, n_threads);
     }
 #endif // GGML_NUMA_MIRROR
 
@@ -3214,6 +3321,7 @@ static struct ggml_threadpool * ggml_threadpool_new_impl(
         threadpool->n_threads_cur    = tpp->n_threads;
         threadpool->poll             = tpp->poll;
         threadpool->prio             = tpp->prio;
+        threadpool->params           = *tpp;  // Store parameters for unified CPU assignment
         threadpool->ec               = GGML_STATUS_SUCCESS;
     }
 
@@ -3234,18 +3342,39 @@ static struct ggml_threadpool * ggml_threadpool_new_impl(
     ggml_cond_init(&threadpool->cond);
 
     // Spin the threads for all workers, and update CPU placements.
-    // Place the main thread last (towards the higher numbered CPU cores).
-
+    // Use unified CPU assignment to avoid dual assignment problem
+    
     int32_t cpumask_iter = 0;
 
     for (int j = 1; j < tpp->n_threads; j++) {
-        ggml_thread_cpumask_next(tpp->cpumask, workers[j].cpumask, tpp->strict_cpu, &cpumask_iter);
+        ggml_thread_cpumask_unified(
+            tpp->cpumask,                 // Available CPU mask
+            workers[j].cpumask,           // Output mask for this thread
+            j,                            // Thread index
+            tpp->n_threads,               // Total threads
+            tpp->strict_cpu,              // User's strict preference
+            tpp->numa_aware,              // NUMA awareness enabled
+            tpp->allow_numa_override,     // Allow NUMA to override strict
+            tpp->warn_on_numa_override,   // Warn on override
+            &cpumask_iter                 // Round-robin iterator
+        );
 
         int32_t rc = ggml_thread_create(&workers[j].thrd, NULL, ggml_graph_compute_secondary_thread, &workers[j]);
         GGML_ASSERT(rc == 0);
     }
 
-    ggml_thread_cpumask_next(tpp->cpumask, workers[0].cpumask, tpp->strict_cpu, &cpumask_iter);
+    // Assign CPU mask for main thread (thread 0)
+    ggml_thread_cpumask_unified(
+        tpp->cpumask,                 // Available CPU mask
+        workers[0].cpumask,           // Output mask for main thread
+        0,                            // Thread index (main thread)
+        tpp->n_threads,               // Total threads
+        tpp->strict_cpu,              // User's strict preference
+        tpp->numa_aware,              // NUMA awareness enabled
+        tpp->allow_numa_override,     // Allow NUMA to override strict
+        tpp->warn_on_numa_override,   // Warn on override
+        &cpumask_iter                 // Round-robin iterator
+    );
 
     if (!threadpool->pause) {
         // Update main thread prio and affinity at the start, otherwise we'll do it in resume
