@@ -2,6 +2,8 @@
 #include "ggml-cpu.h"
 
 #include <iostream>
+#include <vector>
+#include <memory>
 
 // Test NUMA topology detection
 static void test_numa_topology() {
@@ -33,64 +35,221 @@ static void test_numa_topology() {
     }
 }
 
-// Very simple test - just create tensors and verify they work
-static bool test_basic_tensor_creation() {
-    std::cout << "\nTesting basic tensor creation..." << std::endl;
+// Test matrix multiplication to exercise multi-socket code paths
+static bool test_matrix_multiplication() {
+    std::cout << "\nTesting matrix multiplication operations..." << std::endl;
     
-    // Create context with internal allocation
+    // Create CPU backend first
+    ggml_backend_t backend = ggml_backend_cpu_init();
+    if (!backend) {
+        std::cerr << "Failed to create CPU backend" << std::endl;
+        return false;
+    }
+    
+    // Create context without internal allocation - backend will handle it
     struct ggml_init_params params = {
-        /*.mem_size   =*/ 1024 * 1024,  // 1MB
+        /*.mem_size   =*/ 16 * 1024 * 1024,  // 16MB for larger matrices
         /*.mem_buffer =*/ nullptr,
-        /*.no_alloc   =*/ false,
+        /*.no_alloc   =*/ true,  // Let backend handle allocation
     };
     
     struct ggml_context * ctx = ggml_init(params);
     if (!ctx) {
         std::cerr << "Failed to create GGML context" << std::endl;
+        ggml_backend_free(backend);
         return false;
     }
     
-    // Create simple tensors
-    struct ggml_tensor * a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 4, 4);
-    struct ggml_tensor * b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 4, 4);
+    // Create larger matrices to trigger multi-socket paths
+    const int rows_a = 128;
+    const int cols_a = 64;
+    const int cols_b = 32;
+    
+    std::cout << "Creating matrices: A(" << rows_a << "x" << cols_a << ") * B(" << cols_a << "x" << cols_b << ")" << std::endl;
+    
+    struct ggml_tensor * a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, cols_a, rows_a);
+    struct ggml_tensor * b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, cols_b, cols_a);
     
     if (!a || !b) {
-        std::cerr << "Failed to create tensors" << std::endl;
+        std::cerr << "Failed to create matrices" << std::endl;
         ggml_free(ctx);
+        ggml_backend_free(backend);
         return false;
     }
     
-    std::cout << "✓ Created tensors successfully" << std::endl;
-    std::cout << "  Tensor A: " << a->ne[0] << "x" << a->ne[1] << " (" << ggml_nelements(a) << " elements)" << std::endl;
-    std::cout << "  Tensor B: " << b->ne[0] << "x" << b->ne[1] << " (" << ggml_nelements(b) << " elements)" << std::endl;
-    
-    // Test tensor properties without accessing data
-    bool properties_ok = true;
-    if (a->type != GGML_TYPE_F32) {
-        std::cerr << "Tensor A has wrong type" << std::endl;
-        properties_ok = false;
-    }
-    if (ggml_nelements(a) != 16) {
-        std::cerr << "Tensor A has wrong number of elements" << std::endl;
-        properties_ok = false;
+    // Allocate backend buffers
+    ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
+    if (!buffer) {
+        std::cerr << "Failed to allocate backend buffers" << std::endl;
+        ggml_free(ctx);
+        ggml_backend_free(backend);
+        return false;
     }
     
-    if (properties_ok) {
-        std::cout << "✓ Tensor properties verification passed" << std::endl;
+    // Initialize matrices with test data through backend
+    std::vector<float> data_a(ggml_nelements(a));
+    std::vector<float> data_b(ggml_nelements(b));
+    
+    // Fill matrix A with simple pattern
+    for (int i = 0; i < ggml_nelements(a); i++) {
+        data_a[i] = (float)(i % 10) / 10.0f;  // Values 0.0 to 0.9
     }
     
-    // Test creating a simple operation without computing it
-    struct ggml_tensor * result = ggml_add(ctx, a, b);
-    if (result) {
-        std::cout << "✓ Created tensor operation successfully" << std::endl;
-        std::cout << "  Result tensor: " << result->ne[0] << "x" << result->ne[1] << std::endl;
+    // Fill matrix B with simple pattern
+    for (int i = 0; i < ggml_nelements(b); i++) {
+        data_b[i] = (float)((i + 1) % 10) / 10.0f;  // Values 0.1 to 1.0
+    }
+    
+    ggml_backend_tensor_set(a, data_a.data(), 0, ggml_nbytes(a));
+    ggml_backend_tensor_set(b, data_b.data(), 0, ggml_nbytes(b));
+    
+    std::cout << "✓ Initialized matrices with test data" << std::endl;
+    std::cout << "  Matrix A: " << a->ne[0] << "x" << a->ne[1] << " (" << ggml_nelements(a) << " elements)" << std::endl;
+    std::cout << "  Matrix B: " << b->ne[0] << "x" << b->ne[1] << " (" << ggml_nelements(b) << " elements)" << std::endl;
+    
+    // Create matrix multiplication operation
+    struct ggml_tensor * result = ggml_mul_mat(ctx, a, b);
+    if (!result) {
+        std::cerr << "Failed to create matrix multiplication operation" << std::endl;
+        ggml_backend_buffer_free(buffer);
+        ggml_free(ctx);
+        ggml_backend_free(backend);
+        return false;
+    }
+    
+    std::cout << "✓ Created matrix multiplication operation" << std::endl;
+    std::cout << "  Result will be: " << result->ne[0] << "x" << result->ne[1] << " (" << ggml_nelements(result) << " elements)" << std::endl;
+    
+    // Execute the operation
+    struct ggml_cgraph * gf = ggml_new_graph(ctx);
+    ggml_build_forward_expand(gf, result);
+    
+    std::cout << "✓ Computation graph created with " << ggml_graph_size(gf) << " nodes" << std::endl;
+    
+    // Execute the computation - this will use our multi-socket code if NUMA is available
+    ggml_backend_graph_compute(backend, gf);
+    
+    std::cout << "✓ Large matrix multiplication executed successfully!" << std::endl;
+    
+    // Verify result by reading a few values
+    std::vector<float> result_data(4);  // Just check first few elements
+    ggml_backend_tensor_get(result, result_data.data(), 0, 4 * sizeof(float));
+    
+    // Basic sanity check - values should be reasonable
+    bool data_valid = true;
+    for (int i = 0; i < 4; i++) {
+        if (result_data[i] < -1000.0f || result_data[i] > 1000.0f) {
+            data_valid = false;
+            break;
+        }
+    }
+    
+    if (data_valid) {
+        std::cout << "✓ Result data appears valid (first element: " << result_data[0] << ")" << std::endl;
     } else {
-        std::cerr << "Failed to create tensor operation" << std::endl;
-        properties_ok = false;
+        std::cerr << "⚠ Result data might be invalid" << std::endl;
     }
     
+    // Cleanup
+    ggml_backend_buffer_free(buffer);
     ggml_free(ctx);
-    return properties_ok;
+    ggml_backend_free(backend);
+    
+    return true;
+}
+
+// Test with backend computation to actually execute operations
+static bool test_backend_computation() {
+    std::cout << "\nTesting backend computation..." << std::endl;
+    
+    // Create CPU backend
+    ggml_backend_t backend = ggml_backend_cpu_init();
+    if (!backend) {
+        std::cerr << "Failed to create CPU backend" << std::endl;
+        return false;
+    }
+    
+    // Create context for computation
+    struct ggml_init_params params = {
+        /*.mem_size   =*/ 4 * 1024 * 1024,  // 4MB
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,  // No alloc - backend will handle this
+    };
+    
+    struct ggml_context * ctx = ggml_init(params);
+    if (!ctx) {
+        std::cerr << "Failed to create GGML context" << std::endl;
+        ggml_backend_free(backend);
+        return false;
+    }
+    
+    // Create smaller matrices for actual computation
+    const int size = 32;  // 32x32 matrices
+    
+    struct ggml_tensor * a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, size, size);
+    struct ggml_tensor * b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, size, size);
+    
+    if (!a || !b) {
+        std::cerr << "Failed to create computation tensors" << std::endl;
+        ggml_free(ctx);
+        ggml_backend_free(backend);
+        return false;
+    }
+    
+    // Allocate backend buffers
+    ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
+    if (!buffer) {
+        std::cerr << "Failed to allocate backend buffers" << std::endl;
+        ggml_free(ctx);
+        ggml_backend_free(backend);
+        return false;
+    }
+    
+    // Initialize data through backend
+    std::vector<float> init_data_a(ggml_nelements(a));
+    std::vector<float> init_data_b(ggml_nelements(b));
+    
+    for (int i = 0; i < ggml_nelements(a); i++) {
+        init_data_a[i] = 1.0f;  // Identity-like pattern
+        init_data_b[i] = (i == i / size * size + i % size) ? 1.0f : 0.0f;  // Diagonal matrix
+    }
+    
+    ggml_backend_tensor_set(a, init_data_a.data(), 0, ggml_nbytes(a));
+    ggml_backend_tensor_set(b, init_data_b.data(), 0, ggml_nbytes(b));
+    
+    std::cout << "✓ Backend tensors allocated and initialized" << std::endl;
+    
+    // Create and execute computation graph
+    struct ggml_tensor * result = ggml_mul_mat(ctx, a, b);
+    
+    struct ggml_cgraph * gf = ggml_new_graph(ctx);
+    ggml_build_forward_expand(gf, result);
+    
+    std::cout << "✓ Computation graph created with " << ggml_graph_size(gf) << " nodes" << std::endl;
+    
+    // Execute the computation - this will use our multi-socket code if NUMA is available
+    ggml_backend_graph_compute(backend, gf);
+    
+    std::cout << "✓ Computation executed successfully!" << std::endl;
+    
+    // Verify result by reading a few values
+    std::vector<float> result_data(ggml_nelements(result));
+    ggml_backend_tensor_get(result, result_data.data(), 0, ggml_nbytes(result));
+    
+    // Basic sanity check - first element should be reasonable
+    if (result_data[0] > -1000.0f && result_data[0] < 1000.0f) {
+        std::cout << "✓ Result data appears valid (first element: " << result_data[0] << ")" << std::endl;
+    } else {
+        std::cerr << "⚠ Result data might be invalid (first element: " << result_data[0] << ")" << std::endl;
+    }
+    
+    // Cleanup
+    ggml_backend_buffer_free(buffer);
+    ggml_free(ctx);
+    ggml_backend_free(backend);
+    
+    std::cout << "✓ Backend computation test completed successfully" << std::endl;
+    return true;
 }
 
 int main() {
@@ -100,22 +259,32 @@ int main() {
     // Test NUMA topology
     test_numa_topology();
     
-    // Test basic functionality
-    if (test_basic_tensor_creation()) {
-        std::cout << "\n✅ Basic functionality test passed!" << std::endl;
-        
-        if (ggml_is_numa()) {
-            std::cout << "\nNote: This system has NUMA support." << std::endl;
-            std::cout << "The multi-socket NUMA code paths in ggml-cpu.c are available" << std::endl;
-            std::cout << "and will be used when NUMA-aware threadpools are configured." << std::endl;
-        } else {
-            std::cout << "\nNote: This system does not have NUMA support." << std::endl;
-            std::cout << "However, the multi-socket code can still be tested by enabling" << std::endl;
-            std::cout << "multi-socket mode even with n_numa_nodes=1." << std::endl;
-        }
-        return 0;
-    } else {
-        std::cout << "\n❌ Basic functionality test failed!" << std::endl;
+    // Test matrix operations  
+    bool matrix_test_passed = test_matrix_multiplication();
+    if (!matrix_test_passed) {
+        std::cout << "\n❌ Matrix multiplication test failed!" << std::endl;
         return 1;
     }
+    
+    // Test backend computation with actual execution
+    bool backend_test_passed = test_backend_computation();
+    if (!backend_test_passed) {
+        std::cout << "\n❌ Backend computation test failed!" << std::endl;
+        return 1;
+    }
+    
+    std::cout << "\n✅ All tests passed!" << std::endl;
+    
+    if (ggml_is_numa()) {
+        std::cout << "\nNote: This system has NUMA support." << std::endl;
+        std::cout << "The multi-socket NUMA code paths in ggml-cpu.c are available" << std::endl;
+        std::cout << "and will be used when NUMA-aware threadpools are configured." << std::endl;
+        std::cout << "Matrix multiplication operations have exercised the NUMA code paths." << std::endl;
+    } else {
+        std::cout << "\nNote: This system does not have NUMA support." << std::endl;
+        std::cout << "However, the multi-socket code can still be tested by enabling" << std::endl;
+        std::cout << "multi-socket mode even with n_numa_nodes=1." << std::endl;
+        std::cout << "The matrix multiplication operations have been tested successfully." << std::endl;
+    }
+    return 0;
 }

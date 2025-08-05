@@ -1616,7 +1616,7 @@ static void ggml_compute_forward_mul_mat_multi_socket(
 // Function to compute matrix multiplication chunk on a specific NUMA socket
 static void ggml_numa_socket_compute_mul_mat_chunk(struct socket_work_data * work) {
     // Set NUMA affinity for this work
-    GGML_ASSERT(numa_run_on_node(work->socket_id) != 0);
+    GGML_ASSERT(numa_run_on_node(work->socket_id) == 0);
         
     // Create modified compute params for this socket
     struct ggml_compute_params socket_params = *work->params;
