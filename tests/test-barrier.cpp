@@ -25,9 +25,11 @@ int main(int argc, char *argv[]) {
         n_rounds  = std::atoi(argv[2]);
     }
 
-    // Initialize NUMA before any tensor operations (like production code)
+    // Initialize before any tensor operations (like production code)
     llama_backend_init();
+#ifdef GGML_NUMA_MIRROR
     llama_numa_init(GGML_NUMA_STRATEGY_DISABLED);
+#endif
 
     struct ggml_init_params params = {
         /* .mem_size   = */ 1024*1024*1024,

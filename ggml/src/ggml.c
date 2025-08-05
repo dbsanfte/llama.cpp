@@ -1688,6 +1688,22 @@ static struct ggml_tensor * ggml_new_tensor_impl(
         result->nb[i] = result->nb[i - 1]*result->ne[i - 1];
     }
 
+    // Set up data pointers for context-allocated tensors
+    if (view_src == NULL && !ctx->no_alloc && obj_alloc_size > 0) {
+        // Data is allocated right after the tensor struct
+        void * tensor_data_ptr = (char *)result + GGML_TENSOR_SIZE;
+        // Use tensor_set_data to properly handle NUMA mirroring
+        tensor_set_data(result, tensor_data_ptr);
+    } else if (view_src != NULL) {
+        // For view tensors, copy data pointers from source
+#ifdef GGML_NUMA_MIRROR
+        result->__data[0] = data;
+        result->__data[1] = data; // Same data for views
+#else
+        result->data = data;
+#endif
+    }
+
     ctx->n_objects++;
 
     return result;

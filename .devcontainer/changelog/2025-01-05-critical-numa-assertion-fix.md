@@ -1,6 +1,6 @@
 # Critical NUMA Assertion Bug Fix
 
-**Date**: January 5, 2025  
+**Date**: August 5, 2025  
 **Issue**: Segmentation fault in multi-socket NUMA code on real NUMA systems  
 **Severity**: Critical - caused crashes on NUMA systems with RocM/HIP backends  
 
