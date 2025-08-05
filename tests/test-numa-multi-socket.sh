@@ -7,7 +7,7 @@ echo "NUMA Multi-Socket Functionality Test"
 echo "===================================="
 
 # Check if the test executable exists
-if [ ! -f "./build/bin/test-numa-multi-socket" ]; then
+if [ ! -f "../build/bin/test-numa-multi-socket" ]; then
     echo "❌ Test executable not found. Build it first with:"
     echo "   cmake --build build --target test-numa-multi-socket"
     exit 1
@@ -27,7 +27,7 @@ echo "Testing with different environment configurations..."
 # Test with different thread counts
 for threads in 1 2 4 8; do
     echo "Testing with OMP_NUM_THREADS=$threads..."
-    if OMP_NUM_THREADS=$threads ./build/bin/test-numa-multi-socket >/dev/null 2>&1; then
+    if OMP_NUM_THREADS=$threads ../build/bin/test-numa-multi-socket >/dev/null 2>&1; then
         echo "✅ Thread count $threads: OK"
     else
         echo "❌ Thread count $threads: FAILED"
@@ -49,4 +49,3 @@ echo "  1. NUMA threadpools are created with numa_aware=true"
 echo "  2. Multi-socket mode is enabled (enable_multi_socket=true)"
 echo "  3. Matrix multiplication operations are performed"
 echo ""
-echo "✅ Multi-socket NUMA implementation is ready for testing!"
