@@ -192,6 +192,11 @@ if (NOT WIN32)
     llama_build_and_test(test-arg-parser.cpp)
 endif()
 
+# NUMA multi-socket testing
+if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
+    llama_build_and_test(test-numa-multi-socket.cpp LABEL "numa")
+endif()
+
 # llama_build_and_test(test-opt.cpp) # SLOW
 llama_build_and_test(test-gguf.cpp)
 llama_build_and_test(test-backend-ops.cpp)

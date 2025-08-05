@@ -1520,19 +1520,37 @@ UseGgmlGemm2:;
 }
 
 //
-// Multi-socket matrix multiplication
+// Multi-socket matrix multiplication structures
 //
+
+struct socket_work_data {
+    const struct ggml_compute_params * params;
+    struct ggml_tensor * dst;
+    const struct ggml_tensor * src0;
+    const struct ggml_tensor * src1;
+    int64_t row_start;
+    int64_t row_end;
+    struct ggml_numa_threadpool_manager * numa_mgr;
+    int socket_id;
+};
+
+// Forward declarations
+static void ggml_numa_socket_compute_mul_mat_chunk(struct socket_work_data * work);
+static int ggml_numa_socket_get_thread_count(int socket_id, struct ggml_numa_threadpool_manager * numa_mgr);
 
 static void ggml_compute_forward_mul_mat_multi_socket(
         const struct ggml_compute_params * params,
               struct ggml_tensor * dst,
               struct ggml_numa_threadpool_manager * numa_mgr) {
 
-    if (!numa_mgr || !numa_mgr->enable_multi_socket || numa_mgr->n_numa_nodes <= 1) {
+    if (!numa_mgr || !numa_mgr->enable_multi_socket) {
         // Fall back to regular single-threaded approach
         ggml_compute_forward_mul_mat(params, dst);
         return;
     }
+    
+    // Note: We allow multi-socket mode even with n_numa_nodes == 1 for testing purposes
+    // This enables testing the multi-socket code path independently of actual NUMA topology
 
     const struct ggml_tensor * src0 = dst->src[0];
     const struct ggml_tensor * src1 = dst->src[1];
@@ -1552,52 +1570,109 @@ static void ggml_compute_forward_mul_mat_multi_socket(
     GGML_LOG_INFO("Using multi-socket matrix multiplication: %ld x %ld matrix, %d sockets\n", 
                  nr0, nr1, numa_mgr->n_numa_nodes);
 
-    // Split work by rows across sockets
-    int64_t rows_per_socket = nr0 / numa_mgr->n_numa_nodes;
-    int64_t remaining_rows = nr0 % numa_mgr->n_numa_nodes;
-
+    // Split work by rows across sockets, similar to how GGML splits across threads
+    const int64_t dr0 = (nr0 + numa_mgr->n_numa_nodes - 1) / numa_mgr->n_numa_nodes;
+    
     // Reset coordination state
     atomic_store(&numa_mgr->sockets_completed, 0);
 
-    // Instead of creating views, we'll modify the matrix multiplication function
-    // to work on specific row ranges for each socket
-    
-    // Launch work on each socket using a simpler approach
-    for (int socket = 0; socket < numa_mgr->n_numa_nodes; socket++) {
-        int64_t socket_row_start = socket * rows_per_socket;
-        int64_t socket_row_end = socket_row_start + rows_per_socket;
-        
-        // Give remaining rows to the last socket
-        if (socket == numa_mgr->n_numa_nodes - 1) {
-            socket_row_end += remaining_rows;
-        }
+    // Work data for each socket
+    struct socket_work_data work_data[GGML_NUMA_MAX_NODES];
 
-        if (socket_row_start >= socket_row_end) {
+    // Create work packages for each socket using the same chunking logic as GGML
+    for (int socket = 0; socket < numa_mgr->n_numa_nodes; socket++) {
+        const int64_t ir0_start = dr0 * socket;
+        const int64_t ir0_end = MIN(ir0_start + dr0, nr0);
+        
+        if (ir0_start >= ir0_end) {
             continue; // No work for this socket
         }
 
-        // For now, just call the regular function and rely on NUMA affinity
-        // A more sophisticated implementation would split the actual work
-        // but this gives us the foundation for multi-socket coordination
-        
-        struct ggml_compute_params socket_params = *params;
-        socket_params.threadpool = numa_mgr->socket_pools[socket];
-        
-        // Here we would ideally split the work, but for this initial implementation
-        // we'll just ensure each socket threadpool is properly set up with NUMA affinity
-        ggml_compute_forward_mul_mat(&socket_params, dst);
-        
-        // Signal this socket completed
-        atomic_fetch_add(&numa_mgr->sockets_completed, 1);
-        break; // For now, just use one socket to avoid race conditions
+        work_data[socket].params = params;
+        work_data[socket].dst = dst;
+        work_data[socket].src0 = src0;
+        work_data[socket].src1 = src1;
+        work_data[socket].row_start = ir0_start;
+        work_data[socket].row_end = ir0_end;
+        work_data[socket].numa_mgr = numa_mgr;
+        work_data[socket].socket_id = socket;
+
+        // Launch work on this socket's threadpool
+        ggml_numa_socket_compute_mul_mat_chunk(&work_data[socket]);
     }
 
-    // Wait for all sockets to complete (simplified for now)
-    while (atomic_load(&numa_mgr->sockets_completed) < 1) {
-        ggml_thread_cpu_relax();
+    // Wait for all sockets to complete using proper synchronization
+    int completed_sockets = 0;
+    while (completed_sockets < numa_mgr->n_numa_nodes) {
+        completed_sockets = atomic_load(&numa_mgr->sockets_completed);
+        if (completed_sockets < numa_mgr->n_numa_nodes) {
+            ggml_thread_cpu_relax();
+        }
     }
 
     GGML_LOG_INFO("Multi-socket matrix multiplication completed\n");
+}
+
+// Function to compute matrix multiplication chunk on a specific NUMA socket
+static void ggml_numa_socket_compute_mul_mat_chunk(struct socket_work_data * work) {
+    // Set NUMA affinity for this work
+    GGML_ASSERT(numa_run_on_node(work->socket_id) != 0);
+        
+    // Create modified compute params for this socket
+    struct ggml_compute_params socket_params = *work->params;
+    socket_params.ith = 0;  // Main thread for this socket
+    socket_params.nth = ggml_numa_socket_get_thread_count(work->socket_id, work->numa_mgr);
+    socket_params.threadpool = work->numa_mgr->socket_pools[work->socket_id];
+    
+    // Get tensor information
+    const struct ggml_tensor * src0 = work->src0;
+    const struct ggml_tensor * src1 = work->src1;
+    struct ggml_tensor * dst = work->dst;
+    
+    GGML_TENSOR_BINARY_OP_LOCALS
+    
+    const int64_t nr1 = ne1 * ne2 * ne3;  // total columns
+    
+    // Use GGML's existing chunking logic but for our row range
+    const int64_t ir0_start = work->row_start;
+    const int64_t ir0_end = work->row_end;
+    const int64_t ir1_start = 0;      // We process all columns
+    const int64_t ir1_end = nr1;      // We process all columns
+    
+    // Determine vector dot configuration using GGML's type system
+    enum ggml_type           const vec_dot_type         = type_traits_cpu[src0->type].vec_dot_type;
+    int64_t                  const vec_dot_num_rows     = type_traits_cpu[src0->type].nrows;
+    
+    // Use single row processing for simplicity in multi-socket mode
+    int64_t num_rows_per_vec_dot = 1;
+    
+    // For complex cases, use the full row count as GGML does
+    if (vec_dot_num_rows > 1) {
+        num_rows_per_vec_dot = vec_dot_num_rows;
+    }
+    
+    // Call the existing GGML matrix multiplication chunk function
+    // This is the core GGML function that does the actual computation
+    ggml_compute_forward_mul_mat_one_chunk(&socket_params, dst, vec_dot_type, 
+                                          num_rows_per_vec_dot, ir0_start, ir0_end, 
+                                          ir1_start, ir1_end);
+    
+    // Signal completion for this socket
+    atomic_fetch_add(&work->numa_mgr->sockets_completed, 1);
+}
+
+// Helper function to get thread count for a specific socket
+static int ggml_numa_socket_get_thread_count(int socket_id, struct ggml_numa_threadpool_manager * numa_mgr) {
+    // Validate inputs - these are programming errors that should abort
+    GGML_ASSERT(numa_mgr != NULL);
+    GGML_ASSERT(socket_id >= 0 && socket_id < numa_mgr->n_numa_nodes);
+    
+    // Get the socket-specific threadpool
+    struct ggml_threadpool * socket_pool = numa_mgr->socket_pools[socket_id];
+    GGML_ASSERT(socket_pool != NULL);
+    
+    // Return the actual thread count for this socket's threadpool
+    return socket_pool->n_threads_max;
 }
 
 // ggml_compute_forward_mul_mat_id

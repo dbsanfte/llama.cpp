@@ -24,19 +24,16 @@ This is a fork of llama.cpp with **NUMA-aware improvements** for better CPU thre
 ### Quick Build Commands
 
 ```bash
-# Manual build steps (NUMA-enabled)
-cmake -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_EXPORT_COMPILE_COMMANDS=ON -DGGML_NUMA_MIRROR=ON
-# Or equivalently: -DGGML_NUMA=ON (both flags are synonyms)
-cmake --build build --parallel $(nproc)
-
 # Debug build
-cmake -B build -DCMAKE_BUILD_TYPE=Debug -DCMAKE_EXPORT_COMPILE_COMMANDS=ON -DGGML_NUMA_MIRROR=ON
+cmake -B build -DCMAKE_BUILD_TYPE=Debug -DCMAKE_EXPORT_COMPILE_COMMANDS=ON -DGGML_NUMA_MIRROR=ON -DGGML_OPENMP=ON
 # Or equivalently: -DGGML_NUMA=ON (both flags are synonyms)
-cmake --build build --parallel $(nproc)
+cmake --build build --parallel
 
 # Run tests
 ctest --list --output-on-failure
 ```
+
+Note: Never limit the threads count of `--parallel`, just let cmake autodetect the number of cores and choose the max threadcount itself.
 
 ## 🧠 Key Areas of Focus
 
@@ -64,58 +61,7 @@ cpu_print_topology_info()     // Debug information display
 ### 3. Command-Line Interface
 **Files**: `common/arg.cpp`
 
-New arguments added:
-- `--cpu-no-hyperthreading` - Disable hyperthreading (default: enabled)
-- `--cpu-no-efficiency-cores` - Disable E-cores in thread pool (default: enabled)
-- `--cpu-topology` - Display CPU topology and exit
-
-### 4. Environment Variables
-```bash
-LLAMA_CPU_NO_HYPERTHREADING=1     # Disable hyperthreading
-LLAMA_CPU_NO_EFFICIENCY_CORES=1   # Disable efficiency cores
-```
-
-## 🧪 Testing Strategy
-
-### 1. Basic Functionality Tests
-
-```bash
-# Test CPU topology detection
-./build/bin/llama-server --cpu-topology
-
-# Test help output includes new flags
-./build/bin/llama-server --help | grep -E "(hyperthreading|efficiency|topology)"
-
-# Test NUMA hardware detection
-numactl --hardware
-```
-
-### 2. Performance Validation
-
-```bash
-# Compare hyperthreading on/off
-./build/bin/llama-bench -m models/model.gguf
-./build/bin/llama-bench -m models/model.gguf --cpu-no-hyperthreading
-
-# Test different thread counts
-for threads in 4 8 16; do
-    ./build/bin/llama-bench -m models/model.gguf --threads $threads
-done
-
-# NUMA binding test
-numactl --cpunodebind=0 --membind=0 ./build/bin/llama-server --model models/model.gguf
-```
-
-### 3. Memory Access Monitoring
-
-```bash
-# Monitor NUMA memory access
-perf stat -e node-loads,node-stores,node-load-misses,node-store-misses \
-    ./build/bin/llama-bench -m model.gguf
-
-# Check memory allocation patterns
-numastat -p $(pgrep llama-server)
-```
+New command-line arguments for `llama-server` should be added to the file above.
 
 ## 🔧 Development Workflow
 
@@ -156,7 +102,7 @@ cmake --build build
 # Set breakpoints in VS Code, use "Debug llama-server" launch config
 
 # Monitor system calls
-strace -e sched_setaffinity,numa_alloc_onnode ./build/bin/llama-server --cpu-topology
+strace -e sched_setaffinity,numa_alloc_onnode ./build/bin/llama-server 
 
 # Check CPU affinity assignment
 taskset -cp $(pgrep llama-server)
@@ -166,18 +112,12 @@ taskset -cp $(pgrep llama-server)
 
 ### Error Handling
 - Always check return values for system calls
-- Use `LOG_WRN()` for warnings, `LOG_ERR()` for errors
-- Graceful fallbacks when NUMA/topology detection fails
+- Use `LOG_WRN()` for warnings, `LOG_ERR()` for errors, `GGML_ASSERT()` for assertions.
 
 ### Platform Compatibility
 - NUMA features are Linux-specific (`#if defined(__x86_64__) && defined(__linux__)`)
 - Provide fallbacks for other platforms
 - Test Windows compatibility doesn't break
-
-### Performance Considerations
-- Cache topology detection results
-- Minimize system calls in hot paths
-- Use `pin_cpu()` carefully - restore original affinity
 
 ### Testing Guidelines
 1. Unit tests live in the `tests/` folder
@@ -204,7 +144,7 @@ apt list --installed | grep -E "(numa|hwloc|cmake)"
 rm -rf build && cmake -B build
 
 # Verbose build output
-cmake --build build --verbose
+cmake --build build --parallel --verbose
 ```
 
 ## 📚 Key Documentation Files
