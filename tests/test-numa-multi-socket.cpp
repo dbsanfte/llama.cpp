@@ -7,11 +7,18 @@
 static void test_numa_topology() {
     std::cout << "\n=== NUMA Topology Information ===" << std::endl;
     
+    // Initialize NUMA first to detect topology
+    std::cout << "Initializing NUMA detection..." << std::endl;
+    ggml_numa_init(GGML_NUMA_STRATEGY_DISTRIBUTE);
+    
     bool numa_available = ggml_is_numa();
     std::cout << "NUMA available: " << (numa_available ? "Yes" : "No") << std::endl;
     
+    enum ggml_numa_strategy strategy = ggml_get_numa_strategy();
+    std::cout << "NUMA strategy: " << strategy << std::endl;
+    
     if (numa_available) {
-        std::cout << "NUMA functionality is available" << std::endl;
+        std::cout << "NUMA functionality is available - multi-socket code paths will be used" << std::endl;
     } else {
         std::cout << "NUMA not available - testing basic functionality" << std::endl;
     }
