@@ -3339,7 +3339,7 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
     };
 
 #ifdef GGML_NUMA_MIRROR
-    if (GGML_UNLIKELY(ggml_current_numa_node == -1)) {
+    if (ggml_is_numa() && ggml_current_numa_node == -1) {
         int thread_id = state->ith;
         int n_threads = atomic_load_explicit(&tp->n_threads_cur, memory_order_relaxed);
         int cpuid = -1;

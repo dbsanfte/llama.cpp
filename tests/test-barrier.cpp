@@ -1,6 +1,7 @@
 #include "ggml.h"
 #include "ggml-cpu.h"
 #include "ggml-backend.h"
+#include "llama.h"
 
 #include <chrono>
 #include <iostream>
@@ -23,6 +24,10 @@ int main(int argc, char *argv[]) {
     if (argc > 2) {
         n_rounds  = std::atoi(argv[2]);
     }
+
+    // Initialize NUMA before any tensor operations (like production code)
+    llama_backend_init();
+    llama_numa_init(GGML_NUMA_STRATEGY_DISABLED);
 
     struct ggml_init_params params = {
         /* .mem_size   = */ 1024*1024*1024,

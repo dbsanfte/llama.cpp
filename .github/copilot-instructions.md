@@ -31,6 +31,9 @@ cmake --build build --parallel
 
 # Run tests
 ctest --list --output-on-failure
+
+# Troubleshoot a segfault
+gdb --batch --ex run --ex bt --ex quit --args ./build/bin/${testFileName}
 ```
 
 Note: Never limit the threads count of `--parallel`, just let cmake autodetect the number of cores and choose the max threadcount itself.
@@ -70,7 +73,7 @@ New command-line arguments for `llama-server` should be added to the file above.
 1. **Identify the area**: NUMA allocation, CPU detection, CLI args, etc.
 2. **Use dev container**: Ensure consistent environment
 3. **Build incrementally**: Use `cmake --build build --parallel` for faster iteration
-4. **Test immediately**: Run `./build/bin/llama-server --cpu-topology` after changes
+4. **Test immediately**: Run relevant tests in `tests/` which are built as CMake tests and output in `./build/bin`
 5. **Check compilation**: Use `get_errors` tool to validate syntax
 
 ### Common Edit Patterns
@@ -120,18 +123,24 @@ taskset -cp $(pgrep llama-server)
 - Test Windows compatibility doesn't break
 
 ### Testing Guidelines
-1. Unit tests live in the `tests/` folder
-2. Write tests with the Arrange, Act, Assert pattern
-2. Ensure 90%+ coverage for new features
-3. Run tests like this:
-    ```bash
-      set -e
-      rm -rf build-ci-debug && mkdir build-ci-debug && cd build-ci-debug
-      CMAKE_EXTRA="-DLLAMA_FATAL_WARNINGS=ON -DLLAMA_CURL=ON"
-      time cmake -DCMAKE_BUILD_TYPE=Debug ${CMAKE_EXTRA} ..  2>&1 
-      time make -j$(nproc) 2>&1 
-      time ctest --list --output-on-failure 2>&1
+CMake tests live in the `tests/` folder and are built into `build/bin/`
+
+1. Write tests for your new features and add the `test-feature-name.cpp` to `tests/`
+2. Add the test to the end of `/tests/CMakeLists.txt`:
+    ```c
+    # test-my-feature
+    set(LLAMA_TEST_NAME test-my-feature)
+    llama_build_and_test(test-my-feature.cpp)
+    target_link_libraries(${LLAMA_TEST_NAME} PRIVATE ggml ggml-cpu common) # includes may differ
     ```
+3. Configure CMake again so it picks up your test:
+   `cmake -B build -DCMAKE_BUILD_TYPE=Debug -DCMAKE_EXPORT_COMPILE_COMMANDS=ON -DGGML_NUMA_MIRROR=ON -DGGML_OPENMP=ON`
+4. Build with CMake:
+   `cmake --build build --target test-my-feature`
+5. Run the test:
+   `./build/bin/test-my-feature`
+
+A feature isn't done until it has comprehensive, working tests!
 
 ## 🐛 Common Issues and Solutions
 
@@ -151,15 +160,15 @@ cmake --build build --parallel --verbose
 
 - `NUMA_IMPROVEMENTS.md` - Comprehensive technical documentation
 - `.devcontainer/README.md` - Dev container usage guide
+- `.devcontainer/changelog/` - Change log folder for development tasks
 - `docs/build.md` - Official build instructions
-- `build-numa.sh` - Automated build and test script
 
 ## 🎯 Success Criteria for Changes
 
 1. **Builds successfully** in dev container
 2. **No compilation errors** across all modified files
-3. **Unit test coverage** for new features
-3. **No failing unit tests** after changes
+3. **Test coverage** for new features
+4. **No failing tests** in `tests/` after changes
 
 ## 💡 Tips for AI Agents
 
@@ -167,9 +176,8 @@ cmake --build build --parallel --verbose
 2. **Test incrementally** - build and test after each significant change
 3. **Check multiple scenarios** - different thread counts, NUMA configurations
 4. **Read existing code carefully** - NUMA and threading logic is subtle
-5. **Use the build script** - `./build-numa.sh` provides comprehensive testing
-6. **Check for platform-specific code** - many features are Linux-only
-7. **Validate with real workloads** - not just compilation success
+5. **Check for platform-specific code** - many features are Linux-only
+6. **Validate with real tests** - not just compilation success
 
 Remember: NUMA and CPU topology changes can have subtle effects. Always validate performance and correctness thoroughly before considering changes complete.
 

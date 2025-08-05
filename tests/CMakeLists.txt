@@ -221,3 +221,8 @@ target_link_libraries(${LLAMA_TEST_NAME} PRIVATE mtmd)
 get_filename_component(TEST_TARGET test-c.c NAME_WE)
 add_executable(${TEST_TARGET} test-c.c)
 target_link_libraries(${TEST_TARGET} PRIVATE llama)
+
+# tensor-alloc test
+set(LLAMA_TEST_NAME test-simple-tensor-alloc)
+llama_build_and_test(test-simple-tensor-alloc.cpp)
+target_link_libraries(${LLAMA_TEST_NAME} PRIVATE ggml ggml-cpu common)
