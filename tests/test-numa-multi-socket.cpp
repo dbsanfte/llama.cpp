@@ -1,5 +1,6 @@
 #include "ggml.h"
 #include "ggml-cpu.h"
+#include "llama.h"
 
 #include <iostream>
 #include <vector>
@@ -10,11 +11,15 @@ static void test_numa_topology() {
     std::cout << "\n=== NUMA Topology Information ===" << std::endl;
     
     // Initialize NUMA first to detect topology
-    std::cout << "Initializing NUMA detection..." << std::endl;
-    ggml_numa_init(GGML_NUMA_STRATEGY_DISTRIBUTE);
+    std::cout << "Initializing backend and NUMA detection..." << std::endl;
+    llama_backend_init();
+    // Use DISABLED instead of DISTRIBUTE to avoid virtual memory issues
+    ggml_numa_init(GGML_NUMA_STRATEGY_DISABLED);
     
     bool numa_available = ggml_is_numa();
+    int numa_node_count = ggml_numa_node_count();
     std::cout << "NUMA available: " << (numa_available ? "Yes" : "No") << std::endl;
+    std::cout << "NUMA node count: " << numa_node_count << std::endl;
     
     enum ggml_numa_strategy strategy = ggml_get_numa_strategy();
     std::cout << "NUMA strategy: " << strategy << std::endl;
@@ -67,8 +72,10 @@ static bool test_matrix_multiplication() {
     
     std::cout << "Creating matrices: A(" << rows_a << "x" << cols_a << ") * B(" << cols_a << "x" << cols_b << ")" << std::endl;
     
+    // For GGML multiplication, we need ne[0] of both tensors to match
+    // A has shape (cols_a, rows_a) and B has shape (cols_a, cols_b)
     struct ggml_tensor * a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, cols_a, rows_a);
-    struct ggml_tensor * b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, cols_b, cols_a);
+    struct ggml_tensor * b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, cols_a, cols_b);
     
     if (!a || !b) {
         std::cerr << "Failed to create matrices" << std::endl;
@@ -86,7 +93,7 @@ static bool test_matrix_multiplication() {
         return false;
     }
     
-    // Initialize matrices with test data through backend
+    // Initialize data through backend
     std::vector<float> data_a(ggml_nelements(a));
     std::vector<float> data_b(ggml_nelements(b));
     
@@ -99,6 +106,18 @@ static bool test_matrix_multiplication() {
     for (int i = 0; i < ggml_nelements(b); i++) {
         data_b[i] = (float)((i + 1) % 10) / 10.0f;  // Values 0.1 to 1.0
     }
+    
+    // Debug: Check tensor data pointers before setting
+    std::cout << "Debug: tensor a->__data[0] = " << a->__data[0] << std::endl;
+    std::cout << "Debug: tensor a->__data[1] = " << a->__data[1] << std::endl;
+    std::cout << "Debug: tensor b->__data[0] = " << b->__data[0] << std::endl;
+    std::cout << "Debug: tensor b->__data[1] = " << b->__data[1] << std::endl;
+    
+#ifdef GGML_NUMA_MIRROR
+    extern __thread int ggml_current_numa_node;
+    std::cout << "Debug: ggml_current_numa_node = " << ggml_current_numa_node << std::endl;
+    std::cout << "Debug: tensor_data(a) would return: " << tensor_data(a) << std::endl;
+#endif
     
     ggml_backend_tensor_set(a, data_a.data(), 0, ggml_nbytes(a));
     ggml_backend_tensor_set(b, data_b.data(), 0, ggml_nbytes(b));
@@ -120,11 +139,26 @@ static bool test_matrix_multiplication() {
     std::cout << "✓ Created matrix multiplication operation" << std::endl;
     std::cout << "  Result will be: " << result->ne[0] << "x" << result->ne[1] << " (" << ggml_nelements(result) << " elements)" << std::endl;
     
-    // Execute the operation
+    // Debug: Check if result tensor has data allocated
+    std::cout << "Debug: result->__data[0] = " << result->__data[0] << std::endl;
+    std::cout << "Debug: result->__data[1] = " << result->__data[1] << std::endl;
+    
+    // Build graph to include all tensors
     struct ggml_cgraph * gf = ggml_new_graph(ctx);
     ggml_build_forward_expand(gf, result);
     
     std::cout << "✓ Computation graph created with " << ggml_graph_size(gf) << " nodes" << std::endl;
+    
+    // Try to allocate the result tensor after building the graph
+    ggml_backend_buffer_t additional_buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
+    if (additional_buffer) {
+        std::cout << "✓ Additional tensors allocated" << std::endl;
+        std::cout << "Debug: After additional allocation, result->__data[0] = " << result->__data[0] << std::endl;
+    } else {
+        std::cout << "Note: No additional tensors to allocate" << std::endl;
+    }
+    
+    // Execute the operation
     
     // Execute the computation - this will use our multi-socket code if NUMA is available
     ggml_backend_graph_compute(backend, gf);
@@ -151,6 +185,9 @@ static bool test_matrix_multiplication() {
     }
     
     // Cleanup
+    if (additional_buffer) {
+        ggml_backend_buffer_free(additional_buffer);
+    }
     ggml_backend_buffer_free(buffer);
     ggml_free(ctx);
     ggml_backend_free(backend);
@@ -227,6 +264,12 @@ static bool test_backend_computation() {
     
     std::cout << "✓ Computation graph created with " << ggml_graph_size(gf) << " nodes" << std::endl;
     
+    // Allocate result tensor (same fix as the first test)
+    ggml_backend_buffer_t additional_buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
+    if (additional_buffer) {
+        std::cout << "✓ Additional tensors allocated for computation" << std::endl;
+    }
+    
     // Execute the computation - this will use our multi-socket code if NUMA is available
     ggml_backend_graph_compute(backend, gf);
     
@@ -244,6 +287,9 @@ static bool test_backend_computation() {
     }
     
     // Cleanup
+    if (additional_buffer) {
+        ggml_backend_buffer_free(additional_buffer);
+    }
     ggml_backend_buffer_free(buffer);
     ggml_free(ctx);
     ggml_backend_free(backend);

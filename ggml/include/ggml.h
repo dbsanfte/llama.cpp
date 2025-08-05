@@ -220,6 +220,7 @@
 #define GGML_MAX_SRC            10
 #define GGML_MAX_N_THREADS      512
 #define GGML_MAX_OP_PARAMS      64
+#define GGML_MAX_NUMA_NODES     8
 
 #ifndef GGML_MAX_NAME
 #   define GGML_MAX_NAME        64
@@ -627,7 +628,7 @@ extern "C" {
         #ifdef __NVCC__
             void * data;
         #endif
-            void * __data[2];
+            void * __data[GGML_MAX_NUMA_NODES];
         };
 #else
         void * data;
@@ -650,9 +651,18 @@ extern "C" {
 
     static inline void * tensor_data(const struct ggml_tensor * tensor) {
 #ifdef GGML_NUMA_MIRROR
+        // For non-NUMA systems, always use the first data element
+        extern bool ggml_is_numa(void);
+        if (!ggml_is_numa()) {
+            return tensor->__data[0];
+        }
+        
+        // For NUMA systems, use current NUMA node with bounds checking
+        extern int ggml_numa_node_count(void);
         int n = ggml_current_numa_node;
-        if (n == -1)
+        if (n == -1 || n >= ggml_numa_node_count()) {
             n = 0;
+        }
         return tensor->__data[n];
 #else
         return tensor->data;
@@ -661,23 +671,40 @@ extern "C" {
 
     static inline void tensor_set_data(struct ggml_tensor * tensor, void * data) {
 #ifdef GGML_NUMA_MIRROR
-        if ((uint64_t)data >= \
-                GGML_MMAP_VIRTUAL_MEMORY_BASE_OFFSET + \
-                GGML_MMAP_VIRTUAL_MEMORY_NUMA_INCREMENT && \
-            (uint64_t)data < GGML_MMAP_VIRTUAL_MEMORY_BASE_OFFSET + \
-                2 * GGML_MMAP_VIRTUAL_MEMORY_NUMA_INCREMENT) {
-            data = (void*) ((uint64_t)data - GGML_MMAP_VIRTUAL_MEMORY_NUMA_INCREMENT);
+        // For non-NUMA systems, set all pointers to the same data (no mirroring)
+        extern bool ggml_is_numa(void);
+        extern int ggml_numa_node_count(void);
+        
+        if (!ggml_is_numa()) {
+            for (int i = 0; i < GGML_MAX_NUMA_NODES; i++) {
+                tensor->__data[i] = data;
+            }
+            return;
         }
-        tensor->__data[0] = data;
-        if ((uint64_t)data >= \
-                GGML_MMAP_VIRTUAL_MEMORY_BASE_OFFSET && \
-            (uint64_t)data < \
-                GGML_MMAP_VIRTUAL_MEMORY_BASE_OFFSET + \
-                GGML_MMAP_VIRTUAL_MEMORY_NUMA_INCREMENT) {
-            tensor->__data[1] = (void*) ((uint64_t)data + \
-                    GGML_MMAP_VIRTUAL_MEMORY_NUMA_INCREMENT);
-        } else {
-            tensor->__data[1] = data;
+        
+        // For NUMA systems, handle virtual memory mirroring
+        uint64_t base_addr = (uint64_t)data;
+        int numa_nodes = ggml_numa_node_count();
+        
+        // Check if this is a virtual memory address that needs node adjustment
+        if (base_addr >= GGML_MMAP_VIRTUAL_MEMORY_BASE_OFFSET + GGML_MMAP_VIRTUAL_MEMORY_NUMA_INCREMENT &&
+            base_addr < GGML_MMAP_VIRTUAL_MEMORY_BASE_OFFSET + numa_nodes * GGML_MMAP_VIRTUAL_MEMORY_NUMA_INCREMENT) {
+            // This address is for node 1+, adjust back to node 0
+            int node = (base_addr - GGML_MMAP_VIRTUAL_MEMORY_BASE_OFFSET) / GGML_MMAP_VIRTUAL_MEMORY_NUMA_INCREMENT;
+            base_addr = base_addr - node * GGML_MMAP_VIRTUAL_MEMORY_NUMA_INCREMENT;
+        }
+        
+        // Set up addresses for all NUMA nodes
+        for (int i = 0; i < GGML_MAX_NUMA_NODES; i++) {
+            if (i < numa_nodes && 
+                base_addr >= GGML_MMAP_VIRTUAL_MEMORY_BASE_OFFSET && 
+                base_addr < GGML_MMAP_VIRTUAL_MEMORY_BASE_OFFSET + GGML_MMAP_VIRTUAL_MEMORY_NUMA_INCREMENT) {
+                // This is a virtual memory address - create mirrored address for this node
+                tensor->__data[i] = (void*)(base_addr + i * GGML_MMAP_VIRTUAL_MEMORY_NUMA_INCREMENT);
+            } else {
+                // Not virtual memory or beyond available nodes - use same address
+                tensor->__data[i] = (void*)base_addr;
+            }
         }
 #else
         tensor->data = data;
@@ -795,6 +822,9 @@ extern "C" {
     GGML_API void *  ggml_get_mem_buffer     (const struct ggml_context * ctx);
     GGML_API size_t  ggml_get_mem_size       (const struct ggml_context * ctx);
     GGML_API size_t  ggml_get_max_tensor_size(const struct ggml_context * ctx);
+
+    // NUMA support functions
+    GGML_API int     ggml_numa_node_count(void);
 
     GGML_API struct ggml_tensor * ggml_new_tensor(
             struct ggml_context * ctx,

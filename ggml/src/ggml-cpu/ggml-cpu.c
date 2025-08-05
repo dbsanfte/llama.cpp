@@ -801,6 +801,10 @@ bool ggml_is_numa(void) {
     return g_state.numa.n_nodes > 1;
 }
 
+int ggml_numa_node_count(void) {
+    return (int)g_state.numa.n_nodes;
+}
+
 enum ggml_numa_strategy ggml_get_numa_strategy(void) {
     return g_state.numa.numa_strategy;
 }
