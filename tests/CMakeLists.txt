@@ -231,3 +231,12 @@ target_link_libraries(${LLAMA_TEST_NAME} PRIVATE ggml ggml-cpu common)
 set(LLAMA_TEST_NAME test-numa-debug)
 llama_build_and_test(test-numa-debug.cpp)
 target_link_libraries(${LLAMA_TEST_NAME} PRIVATE ggml ggml-cpu common llama)
+
+# 3-tier coordinator tests
+set(LLAMA_TEST_NAME test-coordinator-simple)
+llama_build_and_test(test-coordinator-simple.cpp)
+target_link_libraries(${LLAMA_TEST_NAME} PRIVATE ggml ggml-cpu common)
+
+set(LLAMA_TEST_NAME test-3tier-coordinator)
+llama_build_and_test(test-3tier-coordinator.cpp)
+target_link_libraries(${LLAMA_TEST_NAME} PRIVATE ggml ggml-cpu common)
