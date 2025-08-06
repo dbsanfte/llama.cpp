@@ -244,11 +244,10 @@ static bool test_forced_multi_socket_coordination() {
     tpp.numa_aware = true;
     tpp.allow_numa_override = true;
     tpp.warn_on_numa_override = false;
-    // tpp.force_multi_socket = true;  // This is the key - force multi-socket mode - REMOVED
-    tpp.numa_aware = true;  // Use NUMA awareness instead
+    tpp.force_multi_socket = true;  // This is the key - force multi-socket mode
     
     std::cout << "Creating forced multi-socket threadpool..." << std::endl;
-    std::cout << "  numa_aware = true (enables NUMA coordination)" << std::endl;
+    std::cout << "  force_multi_socket = true (overrides NUMA detection)" << std::endl;
     std::cout << "  n_threads = " << tpp.n_threads << std::endl;
     
     ggml_threadpool_t forced_threadpool = ggml_threadpool_new(&tpp);
@@ -384,8 +383,7 @@ static bool test_forced_multi_socket_coordination() {
     struct ggml_threadpool_params standard_tpp;
     ggml_threadpool_params_init(&standard_tpp, 8); // Same thread count
     standard_tpp.numa_aware = true;
-    // standard_tpp.force_multi_socket = false;  // Standard mode - REMOVED
-    standard_tpp.numa_aware = false;  // Use standard mode instead
+    standard_tpp.force_multi_socket = false;  // Standard mode
     
     ggml_threadpool_t standard_threadpool = ggml_threadpool_new(&standard_tpp);
     if (!standard_threadpool) {
@@ -545,15 +543,15 @@ static bool test_threadpool_manager_behavior() {
     struct TestConfig {
         int n_threads;
         bool numa_aware;
-        bool enable_coordinator;  // Changed from force_multi_socket
+        bool force_multi_socket;
         const char* description;
     };
     
     std::vector<TestConfig> test_configs = {
         {4, true, false, "Standard NUMA-aware threadpool"},
-        {8, true, true, "NUMA coordination with 8 threads"},
-        {12, true, true, "NUMA coordination with 12 threads"},
-        {2, false, false, "Simple threadpool, no NUMA"},
+        {8, true, true, "Forced multi-socket with 8 threads"},
+        {12, true, true, "Forced multi-socket with 12 threads"},
+        {2, false, true, "Forced multi-socket, NUMA-unaware"},
     };
     
     std::vector<ggml_threadpool_t> test_threadpools;
@@ -564,22 +562,20 @@ static bool test_threadpool_manager_behavior() {
         struct ggml_threadpool_params tpp;
         ggml_threadpool_params_init(&tpp, config.n_threads);
         tpp.numa_aware = config.numa_aware;
-        // tpp.force_multi_socket = config.force_multi_socket; - REMOVED
-        tpp.numa_aware = config.numa_aware;  // Use numa_aware instead
-        // Note: enable_coordinator is handled by the coordinator manager separately
+        tpp.force_multi_socket = config.force_multi_socket;
         tpp.warn_on_numa_override = false;
         
         std::cout << "  Configuration:" << std::endl;
         std::cout << "    n_threads = " << config.n_threads << std::endl;
         std::cout << "    numa_aware = " << (config.numa_aware ? "true" : "false") << std::endl;
-        std::cout << "    enable_coordinator = " << (config.enable_coordinator ? "true" : "false") << std::endl;
+        std::cout << "    force_multi_socket = " << (config.force_multi_socket ? "true" : "false") << std::endl;
         
         ggml_threadpool_t tp = ggml_threadpool_new(&tpp);
         if (tp) {
             test_threadpools.push_back(tp);
             std::cout << "  ✓ Threadpool created successfully" << std::endl;
             
-            if (config.enable_coordinator) {
+            if (config.force_multi_socket) {
                 std::cout << "    Expected: Multi-socket manager should be active" << std::endl;
                 std::cout << "    Expected: Socket threadpools should be created and coordinated" << std::endl;
             } else {
