@@ -192,36 +192,6 @@ if (NOT WIN32)
     llama_build_and_test(test-arg-parser.cpp)
 endif()
 
-# NUMA multi-socket testing
-if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
-    llama_build_and_test(test-numa-multi-socket.cpp LABEL "numa")
-
-# test-deep-trace
-set(LLAMA_TEST_NAME test-deep-trace)
-llama_build_and_test(test-deep-trace.cpp)
-
-    # test-numa-data-arrays  
-set(LLAMA_TEST_NAME test-numa-data-arrays)
-llama_build_and_test(test-numa-data-arrays.cpp)
-target_link_libraries(${LLAMA_TEST_NAME} PRIVATE ggml-cpu ggml common)
-
-    # test-tensor-allocation-only
-set(LLAMA_TEST_NAME test-tensor-allocation-only)
-llama_build_and_test(test-tensor-allocation-only.cpp)
-target_link_libraries(${LLAMA_TEST_NAME} PRIVATE ggml ggml-cpu common)
-
-# test-coordinator-e2e
-set(LLAMA_TEST_NAME test-coordinator-e2e)
-llama_build_and_test(test-coordinator-e2e.cpp LABEL "numa")
-target_link_libraries(${LLAMA_TEST_NAME} PRIVATE ggml ggml-cpu common)
-
-# test-tensor-debug
-set(LLAMA_TEST_NAME test-tensor-debug)
-llama_build_and_test(test-tensor-debug.cpp)
-target_link_libraries(${LLAMA_TEST_NAME} PRIVATE ggml ggml-cpu common)
-    llama_build_and_test(test-coordinator-single.cpp LABEL "numa")
-endif()
-
 # llama_build_and_test(test-opt.cpp) # SLOW
 llama_build_and_test(test-gguf.cpp)
 llama_build_and_test(test-backend-ops.cpp)
@@ -247,21 +217,37 @@ get_filename_component(TEST_TARGET test-c.c NAME_WE)
 add_executable(${TEST_TARGET} test-c.c)
 target_link_libraries(${TEST_TARGET} PRIVATE llama)
 
-# tensor-alloc test
-set(LLAMA_TEST_NAME test-simple-tensor-alloc)
-llama_build_and_test(test-simple-tensor-alloc.cpp)
-target_link_libraries(${LLAMA_TEST_NAME} PRIVATE ggml ggml-cpu common)
-
-# numa debug test
-set(LLAMA_TEST_NAME test-numa-debug)
-llama_build_and_test(test-numa-debug.cpp)
-target_link_libraries(${LLAMA_TEST_NAME} PRIVATE ggml ggml-cpu common llama)
-
 # 3-tier coordinator tests
-set(LLAMA_TEST_NAME test-coordinator-simple)
-llama_build_and_test(test-coordinator-simple.cpp)
-target_link_libraries(${LLAMA_TEST_NAME} PRIVATE ggml ggml-cpu common)
-
 set(LLAMA_TEST_NAME test-3tier-coordinator)
 llama_build_and_test(test-3tier-coordinator.cpp)
 target_link_libraries(${LLAMA_TEST_NAME} PRIVATE ggml ggml-cpu common)
+
+set(LLAMA_TEST_NAME test-coordinator-e2e)
+llama_build_and_test(test-coordinator-e2e.cpp LABEL "numa")
+target_link_libraries(${LLAMA_TEST_NAME} PRIVATE ggml ggml-cpu common)
+
+# Simple NUMA performance test
+set(LLAMA_TEST_NAME test-numa-performance-simple)
+llama_build_and_test(test-numa-performance-simple.cpp)
+target_link_libraries(${LLAMA_TEST_NAME} PRIVATE ggml ggml-cpu common)
+
+# Extreme NUMA stress test
+set(LLAMA_TEST_NAME test-numa-extreme-stress)
+llama_build_and_test(test-numa-extreme-stress.cpp)
+target_link_libraries(${LLAMA_TEST_NAME} PRIVATE ggml ggml-cpu common)
+
+# NUMA coordinator validation test
+set(LLAMA_TEST_NAME test-numa-coordinator-validation)
+llama_build_and_test(test-numa-coordinator-validation.cpp)
+target_link_libraries(${LLAMA_TEST_NAME} PRIVATE ggml ggml-cpu common)
+
+# Progress callback test
+set(LLAMA_TEST_NAME test-progress-callback)
+llama_build_and_test(test-progress-callback.cpp)
+target_link_libraries(${LLAMA_TEST_NAME} PRIVATE ggml ggml-cpu common)
+
+# NUMA data parallelism test
+set(LLAMA_TEST_NAME test-numa-data-parallelism)
+llama_build_and_test(test-numa-data-parallelism.cpp)
+target_link_libraries(${LLAMA_TEST_NAME} PRIVATE ggml ggml-cpu common)
+target_include_directories(${LLAMA_TEST_NAME} PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src)

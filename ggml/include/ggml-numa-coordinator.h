@@ -94,6 +94,28 @@ int ggml_numa_coordinator_manager_compute_graph(struct ggml_numa_coordinator_man
 int ggml_numa_coordinator_manager_wait_for_completion(struct ggml_numa_coordinator_manager * mgr);
 
 /**
+ * Progress callback function type
+ * 
+ * @param work_id ID of completed work item
+ * @param numa_node NUMA node that processed the work
+ * @param tensor Tensor that was processed
+ * @param user_data User-provided data pointer
+ */
+typedef void (*ggml_numa_progress_callback_t)(int work_id, int numa_node, struct ggml_tensor * tensor, void * user_data);
+
+/**
+ * Set progress callback for work completion notifications
+ * 
+ * @param mgr Manager instance
+ * @param callback Callback function (NULL to disable)
+ * @param user_data User data pointer passed to callback
+ * @return 0 on success, -1 on failure
+ */
+int ggml_numa_coordinator_manager_set_progress_callback(struct ggml_numa_coordinator_manager * mgr,
+                                                        ggml_numa_progress_callback_t callback,
+                                                        void * user_data);
+
+/**
  * Get performance statistics
  * 
  * @param mgr Manager instance
