@@ -5,10 +5,9 @@
  * 
  * Design Principles:
  * 1. Main thread creates coordinator threads (one per NUMA node)
- * 2. Each coordinator thread manages one NUMA node with its own threadpool/cgraph copy
+ * 2. Each coordinator thread manages one NUMA node with its own threadpool
  * 3. Work flows: main → global queue → coordinator → NUMA pool → coordinator → main
  * 4. Cleanup flows: main → coordinator → NUMA pool (hierarchical)
- * 5. No shared cgraph references - each NUMA node owns its copy
  */
 
 #include "ggml-numa-coordinator.h"

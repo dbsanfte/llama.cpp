@@ -4,9 +4,9 @@
  * This demonstrates the flow you described:
  * 1) Main thread spins up the ggml-cpu backend to start work
  * 2) Main thread serves as the coordinator. It creates a threadpool of coordinator "workers"  
- *    with `n` threads where `n == numa_nodes` on the system, and creates a shared compute graph for them.
+ *    with `n` threads where `n == numa_nodes` on the system
  * 3) Each of those threads creates a threadpool for its assigned numa node with the threads 
- *    pinned to the assigned cpus, with a full fledged copy of the compute graph, since it's a light struct
+ *    pinned to the assigned cpus
  * 4) Main thread apportions work to the child threads in the coordinator, which apportions them to the numa_node pools
  * 5) Numa node pools compute the work items and signal completion of the chunks
  * 6) That numa's coordinator worker picks up the computation result and deposits it in in memory for the main thread
@@ -14,7 +14,7 @@
  *    and when completed, combines them and returns them from the backend.
  * 8) This continues as work items arrive until the program exits.
  * 9) On program exit, the main thread signals cleanup to the coordinator workers, which signal cleanup to their numa_node threadpools
- * 10) numa_node threadpools cleanup and free their copies of the compute graph
+ * 10) numa_node threadpools cleanup 
  * 11) coordinator workers cleanup their numa's threadpool and signal completion
  * 12) main thread cleans up the coordinator threadpool and frees any remaining objects, and exits
  */
