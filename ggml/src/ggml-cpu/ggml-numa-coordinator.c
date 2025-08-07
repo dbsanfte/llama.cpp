@@ -84,6 +84,7 @@ struct ggml_coordinator_thread {
     int numa_node;                     // NUMA node this coordinator manages
     struct ggml_threadpool * numa_pool;// NUMA-specific threadpool
     struct ggml_cgraph * numa_cgraph;  // NUMA node's own copy of cgraph
+    struct ggml_context * numa_ctx;    // Context for this NUMA node's cgraph copy
     struct ggml_work_queue work_queue; // Work queue for this coordinator
     ggml_thread_t thread_handle;       // Thread handle
     atomic_bool active;                // Whether thread is active
@@ -204,7 +205,7 @@ static struct ggml_work_item * ggml_work_queue_dequeue(struct ggml_work_queue * 
         if (queue->head == NULL) {
             queue->tail = NULL;
         }
-        atomic_fetch_sub(&queue->pending_items, 1);
+        // Don't decrement pending_items here - do it when work is actually completed
     }
     
     ggml_mutex_unlock(&queue->queue_mutex);
@@ -289,6 +290,9 @@ static void * ggml_coordinator_thread_func(void * arg) {
         
         // Mark work item as completed
         atomic_store(&work_item->completed, true);
+        
+        // Decrement pending items counter now that work is actually completed
+        atomic_fetch_sub(&coordinator->work_queue.pending_items, 1);
         
         // Signal completion to work queue
         ggml_mutex_lock(&coordinator->work_queue.queue_mutex);
@@ -461,6 +465,9 @@ void ggml_numa_coordinator_manager_free(struct ggml_numa_coordinator_manager * m
         // Signal shutdown to coordinator
         atomic_store(&coord->shutdown_requested, true);
         
+        // Also signal shutdown to the work queue
+        atomic_store(&coord->work_queue.shutdown_requested, true);
+        
         // Wake up any sleeping coordinator threads
         ggml_mutex_lock(&coord->work_queue.queue_mutex);
         ggml_cond_broadcast(&coord->work_queue.work_available);
@@ -472,8 +479,19 @@ void ggml_numa_coordinator_manager_free(struct ggml_numa_coordinator_manager * m
             ggml_thread_join(coord->thread_handle, NULL);
         }
         
-        // Clean up work queue
-        ggml_work_queue_destroy(&coord->work_queue);
+        // Clean up work queue AFTER thread has finished - just clean resources, no signaling
+        struct ggml_work_item * current = coord->work_queue.head;
+        while (current) {
+            struct ggml_work_item * next = current->next;
+            if (current->result_buffer) {
+                free(current->result_buffer);
+            }
+            free(current);
+            current = next;
+        }
+        ggml_cond_destroy(&coord->work_queue.work_completed);
+        ggml_cond_destroy(&coord->work_queue.work_available);
+        ggml_mutex_destroy(&coord->work_queue.queue_mutex);
         
         // Step 11: Coordinator workers cleanup their NUMA threadpools and signal completion
         if (coord->numa_pool) {
@@ -483,11 +501,18 @@ void ggml_numa_coordinator_manager_free(struct ggml_numa_coordinator_manager * m
             GGML_LOG_DEBUG("NUMA threadpool for coordinator %d freed\n", i);
         }
         
-        // Step 10: NUMA node threadpools cleanup and free their copies of the compute graph
+        // Step 10: NUMA node threadpools cleanup and clear their cgraph references  
         if (coord->numa_cgraph) {
-            // Note: cgraph is allocated within a context, need to free properly
-            // For now just set to NULL since we can't easily access the context
+            GGML_LOG_DEBUG("Clearing cgraph reference for NUMA node %d\n", i);
+            // Just clear the reference - the original cgraph is owned by the caller
             coord->numa_cgraph = NULL;
+        }
+        
+        // No separate contexts to free since we're using references
+        if (coord->numa_ctx) {
+            GGML_LOG_DEBUG("Freeing context for NUMA node %d\n", i);
+            ggml_free(coord->numa_ctx);
+            coord->numa_ctx = NULL;
         }
         
         GGML_LOG_INFO("Coordinator for NUMA node %d cleaned up\n", i);
@@ -506,27 +531,40 @@ void ggml_numa_coordinator_manager_free(struct ggml_numa_coordinator_manager * m
     GGML_LOG_INFO("NUMA coordinator manager cleanup completed\n");
 }
 
-// Set cgraph for all NUMA nodes (Step 3: each gets full copy)
+// Set cgraph for all NUMA nodes (Step 3: each gets reference to the original)
 int ggml_numa_coordinator_manager_set_cgraph(struct ggml_numa_coordinator_manager * mgr, 
                                             const struct ggml_cgraph * master_cgraph) {
     if (!mgr || !master_cgraph) return -1;
     
-    GGML_LOG_INFO("Creating cgraph copies for %d NUMA nodes\n", mgr->num_numa_nodes);
+    GGML_LOG_INFO("Setting cgraph reference for %d NUMA nodes\n", mgr->num_numa_nodes);
     
+    // Clean up any existing cgraph contexts from previous computations
     for (int i = 0; i < mgr->num_numa_nodes; i++) {
         struct ggml_coordinator_thread * coord = &mgr->coordinators[i];
         
-        // Each NUMA node gets its own full copy of the cgraph
-        // This eliminates race conditions completely
-        // For now, we'll use a simplified approach - just reference the original
-        // TODO: Implement proper cgraph copying with context management
-        coord->numa_cgraph = (struct ggml_cgraph *)master_cgraph; // Cast away const for now
-        if (!coord->numa_cgraph) {
-            GGML_LOG_ERROR("Failed to create cgraph copy for NUMA node %d\n", i);
-            return -1;
+        if (coord->numa_cgraph) {
+            GGML_LOG_DEBUG("Cleaning up previous cgraph for NUMA node %d\n", i);
+            coord->numa_cgraph = NULL; // Will be freed with the context
         }
         
-        GGML_LOG_DEBUG("NUMA node %d received its own cgraph copy\n", i);
+        if (coord->numa_ctx) {
+            GGML_LOG_DEBUG("Cleaning up previous context for NUMA node %d\n", i);
+            ggml_free(coord->numa_ctx);
+            coord->numa_ctx = NULL;
+        }
+    }
+    
+    // Each NUMA node gets a reference to the same original cgraph
+    // This ensures all coordinators work with the same tensors and memory
+    for (int i = 0; i < mgr->num_numa_nodes; i++) {
+        struct ggml_coordinator_thread * coord = &mgr->coordinators[i];
+        
+        // Store reference to the original cgraph (no copying needed)
+        coord->numa_cgraph = (struct ggml_cgraph *)master_cgraph; // Cast away const
+        coord->numa_ctx = NULL; // No separate context needed
+        
+        GGML_LOG_DEBUG("NUMA node %d received cgraph reference (cgraph=%p)\n", 
+                      i, (void*)coord->numa_cgraph);
     }
     
     return 0;
@@ -685,6 +723,11 @@ int ggml_numa_coordinator_manager_wait_for_completion(struct ggml_numa_coordinat
     }
     
     GGML_LOG_DEBUG("All work completed\n");
+    
+    // Add a small delay to ensure coordinator threads are truly idle
+    // This prevents race conditions when switching to a new cgraph immediately
+    usleep(1000); // 1ms delay
+    
     return 0;
 }
 

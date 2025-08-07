@@ -203,6 +203,7 @@ llama_build_and_test(test-deep-trace.cpp)
     # test-numa-data-arrays  
 set(LLAMA_TEST_NAME test-numa-data-arrays)
 llama_build_and_test(test-numa-data-arrays.cpp)
+target_link_libraries(${LLAMA_TEST_NAME} PRIVATE ggml-cpu ggml common)
 
     # test-tensor-allocation-only
 set(LLAMA_TEST_NAME test-tensor-allocation-only)
