@@ -221,6 +221,11 @@
 #define GGML_MAX_N_THREADS      512
 #define GGML_MAX_OP_PARAMS      64
 
+#ifdef GGML_NUMA_MIRROR
+    // maximum number of NUMA nodes for tensor data mirroring
+    #define GGML_NUMA_MAX_NODES     8
+#endif
+
 #ifndef GGML_MAX_NAME
 #   define GGML_MAX_NAME        64
 #endif
@@ -627,7 +632,7 @@ extern "C" {
         #ifdef __NVCC__
             void * data;
         #endif
-            void * __data[2];
+            void * __data[GGML_NUMA_MAX_NODES];
         };
 #else
         void * data;
@@ -638,7 +643,7 @@ extern "C" {
         void * extra; // extra things e.g. for ggml-cuda.cu
 
 #ifdef GGML_NUMA_MIRROR
-        char padding[10];
+        char padding[12]; // Adjusted for expanded __data array
 #else
 	char padding[8];
 #endif
@@ -650,8 +655,15 @@ extern "C" {
 
     static inline void * tensor_data(const struct ggml_tensor * tensor) {
 #ifdef GGML_NUMA_MIRROR
+        extern int ggml_numa_node_count(void);
         int n = ggml_current_numa_node;
         if (n == -1)
+            n = 0;
+        // Bounds check to prevent accessing beyond available nodes
+        int max_nodes = ggml_numa_node_count();
+        if (max_nodes > GGML_NUMA_MAX_NODES)
+            max_nodes = GGML_NUMA_MAX_NODES;
+        if (n >= max_nodes)
             n = 0;
         return tensor->__data[n];
 #else
@@ -661,31 +673,55 @@ extern "C" {
 
     static inline void tensor_set_data(struct ggml_tensor * tensor, void * data) {
 #ifdef GGML_NUMA_MIRROR
-        // Check if we should set up NUMA mirroring
-        bool should_setup_numa_mirrors = false;
+        extern bool ggml_is_numa(void);
+        extern int ggml_numa_node_count(void);
         
-        // Only set up NUMA mirrors for actual virtual memory addresses AND when NUMA is enabled
-        if ((uint64_t)data >= GGML_MMAP_VIRTUAL_MEMORY_BASE_OFFSET && 
-            (uint64_t)data < GGML_MMAP_VIRTUAL_MEMORY_BASE_OFFSET + GGML_MMAP_VIRTUAL_MEMORY_NUMA_INCREMENT) {
-            // This is potentially a virtual memory address - check if NUMA is enabled
-            extern bool ggml_is_numa(void);
-            extern int ggml_numa_node_count(void);
-            should_setup_numa_mirrors = ggml_is_numa();
+        // Check if NUMA is actually enabled
+        bool numa_is_active = ggml_is_numa() && ggml_numa_node_count() > 1;
+        
+        if (!numa_is_active) {
+            // NUMA is disabled - use simple assignment for all data pointers
+            for (int i = 0; i < GGML_NUMA_MAX_NODES; i++) {
+                tensor->__data[i] = data;
+            }
+            return;
         }
         
-        if ((uint64_t)data >= \
-                GGML_MMAP_VIRTUAL_MEMORY_BASE_OFFSET + \
-                GGML_MMAP_VIRTUAL_MEMORY_NUMA_INCREMENT && \
-            (uint64_t)data < GGML_MMAP_VIRTUAL_MEMORY_BASE_OFFSET + \
+        // NUMA is active - set up proper mirroring
+        bool should_setup_numa_mirrors = false;
+        
+        // Only set up NUMA mirrors for actual virtual memory addresses
+        if ((uint64_t)data >= GGML_MMAP_VIRTUAL_MEMORY_BASE_OFFSET && 
+            (uint64_t)data < GGML_MMAP_VIRTUAL_MEMORY_BASE_OFFSET + GGML_MMAP_VIRTUAL_MEMORY_NUMA_INCREMENT) {
+            should_setup_numa_mirrors = true;
+        }
+        
+        // Handle Range 2 addresses (normalize them to Range 1)
+        if ((uint64_t)data >= 
+                GGML_MMAP_VIRTUAL_MEMORY_BASE_OFFSET + 
+                GGML_MMAP_VIRTUAL_MEMORY_NUMA_INCREMENT && 
+            (uint64_t)data < GGML_MMAP_VIRTUAL_MEMORY_BASE_OFFSET + 
                 2 * GGML_MMAP_VIRTUAL_MEMORY_NUMA_INCREMENT) {
             data = (void*) ((uint64_t)data - GGML_MMAP_VIRTUAL_MEMORY_NUMA_INCREMENT);
         }
+        
+        // Get actual number of NUMA nodes, but don't exceed our array size
+        int num_nodes = ggml_numa_node_count();
+        if (num_nodes > GGML_NUMA_MAX_NODES) {
+            num_nodes = GGML_NUMA_MAX_NODES;
+        }
+        
+        // Set up data pointers for all nodes
         tensor->__data[0] = data;
-        if (should_setup_numa_mirrors) {
-            tensor->__data[1] = (void*) ((uint64_t)data + \
-                    GGML_MMAP_VIRTUAL_MEMORY_NUMA_INCREMENT);
-        } else {
-            tensor->__data[1] = data;
+        for (int i = 1; i < GGML_NUMA_MAX_NODES; i++) {
+            if (i < num_nodes && should_setup_numa_mirrors) {
+                // Create virtual memory address for this NUMA node
+                tensor->__data[i] = (void*) ((uint64_t)data + 
+                        (uint64_t)i * GGML_MMAP_VIRTUAL_MEMORY_NUMA_INCREMENT);
+            } else {
+                // Either beyond the number of nodes or NUMA not enabled - point to node 0
+                tensor->__data[i] = data;
+            }
         }
 #else
         tensor->data = data;

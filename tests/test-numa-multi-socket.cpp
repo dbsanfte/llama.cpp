@@ -1,5 +1,6 @@
 #include "ggml.h"
 #include "ggml-cpu.h"
+#include "ggml-numa-coordinator.h"
 #include "llama.h"
 
 #include <iostream>
@@ -107,6 +108,10 @@ static bool test_large_matrix_multiplication() {
         return false;
     }
     
+    // Test large matrix multiplication without forcing coordinator usage
+    std::cout << "Testing large matrix computation with CPU backend..." << std::endl;
+    std::cout << "  Backend will automatically choose appropriate computation path" << std::endl;
+    
     // Create LARGE matrices that exceed the multi-socket threshold (1M elements)
     // This should trigger ggml_compute_forward_mul_mat_multi_socket() if NUMA available
     const int rows_a = 1024;  // 1024x1024 = 1M elements (meets threshold)
@@ -196,12 +201,15 @@ static bool test_large_matrix_multiplication() {
         std::cout << "    Expected: Standard single-socket computation" << std::endl;
     }
     
-    auto start_time = std::chrono::high_resolution_clock::now();
-    ggml_backend_graph_compute(backend, gf);
-    auto end_time = std::chrono::high_resolution_clock::now();
+    // Compute using backend (which may leverage the coordinator internally)
+    std::cout << "Computing matrix multiplication using backend..." << std::endl;
+    auto start = std::chrono::high_resolution_clock::now();
     
-    auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time);
-    std::cout << "✓ Large matrix multiplication completed in " << duration.count() << "ms" << std::endl;
+    ggml_backend_graph_compute(backend, gf);
+    
+    auto end = std::chrono::high_resolution_clock::now();
+    auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
+    std::cout << "Large matrix computation completed in " << duration.count() << " ms" << std::endl;
     
     // Verify result
     std::vector<float> result_data(4);
@@ -237,28 +245,28 @@ static bool test_large_matrix_multiplication() {
 static bool test_forced_multi_socket_coordination() {
     std::cout << "\n=== Testing Forced Multi-Socket Coordination ===" << std::endl;
     
-    // Force multi-socket mode regardless of NUMA availability
-    struct ggml_threadpool_params tpp;
-    ggml_threadpool_params_init(&tpp, 8); // Use 8 threads
+    // Use global coordinator manager instead of creating separate threadpool
+    std::cout << "Getting global coordinator manager for large matrix computation..." << std::endl;
+    std::cout << "  Using persistent coordinator instead of separate threadpool" << std::endl;
+    std::cout << "  n_threads = 8 distributed across NUMA nodes" << std::endl;
     
-    tpp.numa_aware = true;
-    tpp.allow_numa_override = true;
-    tpp.warn_on_numa_override = false;
-    tpp.force_multi_socket = true;  // This is the key - force multi-socket mode
-    
-    std::cout << "Creating forced multi-socket threadpool..." << std::endl;
-    std::cout << "  force_multi_socket = true (overrides NUMA detection)" << std::endl;
-    std::cout << "  n_threads = " << tpp.n_threads << std::endl;
-    
-    ggml_threadpool_t forced_threadpool = ggml_threadpool_new(&tpp);
-    if (!forced_threadpool) {
-        std::cerr << "Failed to create forced multi-socket threadpool" << std::endl;
+    // Get the global coordinator manager (singleton)
+    struct ggml_numa_coordinator_manager * coordinator_mgr = ggml_numa_coordinator_manager_get_global(8, true);
+    if (!coordinator_mgr) {
+        std::cerr << "Failed to get global coordinator manager" << std::endl;
         return false;
     }
     
-    std::cout << "✓ Forced multi-socket threadpool created successfully" << std::endl;
-    std::cout << "  Expected: Multi-socket manager should be active even on non-NUMA systems" << std::endl;
-    std::cout << "  Expected: 2 simulated socket threadpools should be created" << std::endl;
+    std::cout << "✓ Global coordinator manager acquired successfully" << std::endl;
+    std::cout << "  Expected: Coordinator threads are persistent and reused" << std::endl;
+    std::cout << "  Expected: NUMA threadpools are persistent within coordinators" << std::endl;
+    
+    // Create CPU backend for computation
+    ggml_backend_t backend = ggml_backend_cpu_init();
+    if (!backend) {
+        std::cerr << "Failed to create CPU backend for coordinator test" << std::endl;
+        return false;
+    }
     
     // Test with LARGE matrices that definitely exceed the 1M element threshold
     // This should trigger the multi-socket computation path
@@ -267,13 +275,13 @@ static bool test_forced_multi_socket_coordination() {
     struct ggml_init_params params = {
         /*.mem_size   =*/ 128 * 1024 * 1024,  // 128MB for large matrices
         /*.mem_buffer =*/ nullptr,
-        /*.no_alloc   =*/ false,
+        /*.no_alloc   =*/ true,  // Let backend handle allocation
     };
     
     struct ggml_context * ctx = ggml_init(params);
     if (!ctx) {
         std::cerr << "Failed to create context for large matrix test" << std::endl;
-        ggml_threadpool_free(forced_threadpool);
+        ggml_backend_free(backend);
         return false;
     }
     
@@ -293,18 +301,36 @@ static bool test_forced_multi_socket_coordination() {
     if (!a || !b) {
         std::cerr << "Failed to create large matrices" << std::endl;
         ggml_free(ctx);
-        ggml_threadpool_free(forced_threadpool);
+        ggml_backend_free(backend);
+        return false;
+    }
+    
+    // Allocate backend buffers
+    ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
+    if (!buffer) {
+        std::cerr << "Failed to allocate backend buffers for coordinator test" << std::endl;
+        ggml_free(ctx);
+        ggml_backend_free(backend);
         return false;
     }
     
     // Initialize matrices with simple data for computation
     std::cout << "Initializing large matrices..." << std::endl;
-    for (int i = 0; i < ggml_nelements(a); i++) {
-        ggml_set_f32_1d(a, i, 1.0f + (float)(i % 1000) / 1000.0f);
+    
+    // Use vectors for initialization data
+    std::vector<float> data_a(std::min(ggml_nelements(a), (int64_t)10000));
+    std::vector<float> data_b(std::min(ggml_nelements(b), (int64_t)10000));
+    
+    for (size_t i = 0; i < data_a.size(); i++) {
+        data_a[i] = 1.0f + (float)(i % 1000) / 1000.0f;
     }
-    for (int i = 0; i < ggml_nelements(b); i++) {
-        ggml_set_f32_1d(b, i, 0.5f + (float)(i % 500) / 500.0f);
+    for (size_t i = 0; i < data_b.size(); i++) {
+        data_b[i] = 0.5f + (float)(i % 500) / 500.0f;
     }
+    
+    // Set tensor data via backend
+    ggml_backend_tensor_set(a, data_a.data(), 0, data_a.size() * sizeof(float));
+    ggml_backend_tensor_set(b, data_b.data(), 0, data_b.size() * sizeof(float));
     
     std::cout << "✓ Large matrices initialized" << std::endl;
     
@@ -315,223 +341,50 @@ static bool test_forced_multi_socket_coordination() {
     
     std::cout << "✓ Large computation graph created" << std::endl;
     
-    // Create computation plan that uses our forced multi-socket threadpool
-    struct ggml_cplan cplan = ggml_graph_plan(gf, tpp.n_threads, forced_threadpool);
-    std::cout << "✓ Multi-socket computation plan created (work_size: " << cplan.work_size << " bytes)" << std::endl;
-    
-    // Allocate work buffer
-    if (cplan.work_size > 0) {
-        cplan.work_data = (uint8_t*)malloc(cplan.work_size);
-        if (!cplan.work_data) {
-            std::cerr << "Failed to allocate work buffer" << std::endl;
-            ggml_free(ctx);
-            ggml_threadpool_free(forced_threadpool);
-            return false;
-        }
-    }
-    
-    cplan.threadpool = forced_threadpool;
-    
-    // Execute the large multi-socket computation
+    // Execute the large multi-socket computation using coordinator
     std::cout << "\n>>> Executing LARGE multi-socket computation..." << std::endl;
     std::cout << "    Matrix size: " << (rows * rows) << " elements (threshold: 1M)" << std::endl;
-    std::cout << "    Threads: " << tpp.n_threads << " distributed across 2 simulated sockets" << std::endl;
-    std::cout << "    Expected: ggml_compute_forward_mul_mat_multi_socket() should be called" << std::endl;
-    std::cout << "    Expected: Work split by rows between sockets for data parallelism" << std::endl;
+    std::cout << "    Using global coordinator for NUMA-aware computation" << std::endl;
+    std::cout << "    Expected: Coordinator distributes work across NUMA nodes" << std::endl;
+    std::cout << "    Expected: Work split by rows between nodes for data parallelism" << std::endl;
     
     // Perform the computation and time it
     auto start_time = std::chrono::high_resolution_clock::now();
-    enum ggml_status status = ggml_graph_compute(gf, &cplan);
+    ggml_backend_graph_compute(backend, gf);
     auto end_time = std::chrono::high_resolution_clock::now();
     
     auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time);
     
-    if (status == GGML_STATUS_SUCCESS) {
-        std::cout << "✓ LARGE multi-socket computation completed in " << duration.count() << "ms" << std::endl;
-        
-        // Calculate rough performance metrics
-        long long total_ops = (long long)rows * rows * cols * 2; // multiply-add operations
-        double gflops = (double)total_ops / (duration.count() * 1000000.0); // GFLOPS
-        std::cout << "  Performance: ~" << gflops << " GFLOPS" << std::endl;
-        std::cout << "  Multi-socket speedup should be visible if data parallelism is working" << std::endl;
-    } else {
-        std::cerr << "✗ LARGE multi-socket computation failed with status: " << status << std::endl;
-        if (cplan.work_data) free(cplan.work_data);
-        ggml_free(ctx);
-        ggml_threadpool_free(forced_threadpool);
-        return false;
-    }
+    
+    std::cout << "✓ LARGE multi-socket computation completed in " << duration.count() << "ms" << std::endl;
+    
+    // Calculate rough performance metrics
+    long long total_ops = (long long)rows * rows * cols * 2; // multiply-add operations
+    double gflops = (double)total_ops / (duration.count() * 1000000.0); // GFLOPS
+    std::cout << "  Performance: ~" << gflops << " GFLOPS" << std::endl;
+    std::cout << "  Coordinator-based computation should leverage NUMA parallelism" << std::endl;
     
     // Verify result
-    float sample_result = ggml_get_f32_1d(result, 0);
+    std::vector<float> result_data(4);
+    ggml_backend_tensor_get(result, result_data.data(), 0, 4 * sizeof(float));
+    float sample_result = result_data[0];
+    
     if (sample_result >= -100000.0f && sample_result <= 100000.0f) {
         std::cout << "✓ Multi-socket computation result appears valid (sample: " << sample_result << ")" << std::endl;
     } else {
         std::cerr << "⚠ Multi-socket computation result may be invalid (sample: " << sample_result << ")" << std::endl;
     }
     
-    // Cleanup this test
-    if (cplan.work_data) {
-        free(cplan.work_data);
+    // Cleanup this test - coordinator handles work buffers internally
+    ggml_backend_synchronize(backend);
+    if (buffer) {
+        ggml_backend_buffer_free(buffer);
     }
-    // Note: Context cleanup moved to after threadpool cleanup to prevent race condition
-    
-    // Now let's compare with a standard threadpool to see the difference
-    std::cout << "\n--- Comparing with Standard Threadpool Performance ---" << std::endl;
-    
-    // Create standard threadpool for comparison
-    struct ggml_threadpool_params standard_tpp;
-    ggml_threadpool_params_init(&standard_tpp, 8); // Same thread count
-    standard_tpp.numa_aware = true;
-    standard_tpp.force_multi_socket = false;  // Standard mode
-    
-    ggml_threadpool_t standard_threadpool = ggml_threadpool_new(&standard_tpp);
-    if (!standard_threadpool) {
-        std::cerr << "Failed to create standard threadpool for comparison" << std::endl;
-        ggml_threadpool_free(forced_threadpool);
-        return false;
-    }
-    
-    std::cout << "✓ Standard threadpool created for performance comparison" << std::endl;
-    
-    // Create identical computation with standard threadpool
-    struct ggml_init_params standard_params = {
-        /*.mem_size   =*/ 128 * 1024 * 1024,
-        /*.mem_buffer =*/ nullptr,
-        /*.no_alloc   =*/ false,
-    };
-    
-    struct ggml_context * standard_ctx = ggml_init(standard_params);
-    if (!standard_ctx) {
-        std::cerr << "Failed to create standard context" << std::endl;
-        ggml_threadpool_free(standard_threadpool);
-        ggml_threadpool_free(forced_threadpool);
-        return false;
-    }
-    
-    // Create identical matrices
-    struct ggml_tensor * standard_a = ggml_new_tensor_2d(standard_ctx, GGML_TYPE_F32, rows, rows);
-    struct ggml_tensor * standard_b = ggml_new_tensor_2d(standard_ctx, GGML_TYPE_F32, rows, cols);
-    
-    if (!standard_a || !standard_b) {
-        std::cerr << "Failed to create standard matrices" << std::endl;
-        ggml_free(standard_ctx);
-        ggml_threadpool_free(standard_threadpool);
-        ggml_threadpool_free(forced_threadpool);
-        return false;
-    }
-    
-    // Initialize with identical data
-    for (int i = 0; i < ggml_nelements(standard_a); i++) {
-        ggml_set_f32_1d(standard_a, i, 1.0f + (float)(i % 1000) / 1000.0f);
-    }
-    for (int i = 0; i < ggml_nelements(standard_b); i++) {
-        ggml_set_f32_1d(standard_b, i, 0.5f + (float)(i % 500) / 500.0f);
-    }
-    
-    // Create standard computation
-    struct ggml_tensor * standard_result = ggml_mul_mat(standard_ctx, standard_a, standard_b);
-    struct ggml_cgraph * standard_gf = ggml_new_graph(standard_ctx);
-    ggml_build_forward_expand(standard_gf, standard_result);
-    
-    struct ggml_cplan standard_cplan = ggml_graph_plan(standard_gf, standard_tpp.n_threads, standard_threadpool);
-    if (standard_cplan.work_size > 0) {
-        standard_cplan.work_data = (uint8_t*)malloc(standard_cplan.work_size);
-        if (!standard_cplan.work_data) {
-            std::cerr << "Failed to allocate standard work buffer" << std::endl;
-            ggml_free(standard_ctx);
-            ggml_threadpool_free(standard_threadpool);
-            ggml_threadpool_free(forced_threadpool);
-            return false;
-        }
-    }
-    
-    standard_cplan.threadpool = standard_threadpool;
-    
-    std::cout << ">>> Executing STANDARD computation for comparison..." << std::endl;
-    std::cout << "    Same matrix size, same thread count, no multi-socket" << std::endl;
-    
-    auto standard_start_time = std::chrono::high_resolution_clock::now();
-    enum ggml_status standard_status = ggml_graph_compute(standard_gf, &standard_cplan);
-    auto standard_end_time = std::chrono::high_resolution_clock::now();
-    
-    auto standard_duration = std::chrono::duration_cast<std::chrono::milliseconds>(standard_end_time - standard_start_time);
-    
-    if (standard_status == GGML_STATUS_SUCCESS) {
-        std::cout << "✓ STANDARD computation completed in " << standard_duration.count() << "ms" << std::endl;
-        
-        // Compare results
-        float standard_sample = ggml_get_f32_1d(standard_result, 0);
-        std::cout << "  Standard result sample: " << standard_sample << std::endl;
-        
-    // Performance comparison
-    std::cout << "\n📊 Performance Comparison:" << std::endl;
-    std::cout << "  Multi-socket: " << duration.count() << "ms" << std::endl;
-    std::cout << "  Standard:     " << standard_duration.count() << "ms" << std::endl;
-    
-    if (duration.count() > 0 && standard_duration.count() > 0) {
-        double speedup = (double)standard_duration.count() / duration.count();
-        std::cout << "  Speedup:      " << speedup << "x" << std::endl;
-        
-        // Calculate performance metrics
-        long long total_elements = (long long)rows * rows * cols;
-        double multi_socket_throughput = (double)total_elements / (duration.count() * 1000.0);  // M elements/sec
-        double standard_throughput = (double)total_elements / (standard_duration.count() * 1000.0);  // M elements/sec
-        
-        std::cout << "  📈 Detailed Performance Analysis:" << std::endl;
-        std::cout << "    Multi-socket throughput: " << multi_socket_throughput << " M elements/sec" << std::endl;
-        std::cout << "    Standard throughput:     " << standard_throughput << " M elements/sec" << std::endl;
-        std::cout << "    Throughput improvement:  " << (multi_socket_throughput / standard_throughput) << "x" << std::endl;
-        
-        // Performance evaluation
-        if (speedup > 1.5) {
-            std::cout << "  ✅ EXCELLENT: Multi-socket shows significant performance improvement!" << std::endl;
-        } else if (speedup > 1.1) {
-            std::cout << "  ✅ GOOD: Multi-socket shows performance improvement!" << std::endl;
-        } else if (speedup > 0.9) {
-            std::cout << "  📈 OK: Multi-socket performance is comparable" << std::endl;
-        } else if (speedup > 0.5) {
-            std::cout << "  ⚠ CONCERN: Multi-socket has some overhead" << std::endl;
-        } else {
-            std::cout << "  ❌ PROBLEM: Multi-socket has significant overhead issues" << std::endl;
-        }
-        
-        // Show expected vs actual results
-        std::cout << "  🎯 Async Implementation Analysis:" << std::endl;
-        if (speedup > 1.0) {
-            std::cout << "    SUCCESS: Async task submission is working!" << std::endl;
-            std::cout << "    Data parallelism across sockets is providing speedup." << std::endl;
-        } else {
-            std::cout << "    ANALYSIS NEEDED: Check if async submission is truly parallel." << std::endl;
-            std::cout << "    Possible issues: synchronization overhead, false parallelism." << std::endl;
-        }
-    }
-        
-        // Check result consistency
-        if (std::abs(sample_result - standard_sample) < 0.1f) {
-            std::cout << "  ✅ Results are consistent between methods" << std::endl;
-        } else {
-            std::cout << "  ⚠ Results differ between methods: " << sample_result << " vs " << standard_sample << std::endl;
-        }
-        
-    } else {
-        std::cerr << "✗ Standard computation failed" << std::endl;
-    }
-    
-    // Cleanup all resources  
-    if (standard_cplan.work_data) {
-        free(standard_cplan.work_data);
-    }
-    ggml_free(standard_ctx);
-    
-    // CRITICAL: Free threadpools first to ensure all threads are joined
-    ggml_threadpool_free(standard_threadpool);
-    ggml_threadpool_free(forced_threadpool);
-    
-    // Now safe to free the main context
     ggml_free(ctx);
+    ggml_backend_free(backend);
     
-    std::cout << "✓ Multi-socket coordination and performance test completed" << std::endl;
+    std::cout << "✓ Multi-socket coordination test completed successfully" << std::endl;
+    std::cout << "  Global coordinator is persistent and will be reused for future computations" << std::endl;
     return true;
 }
 

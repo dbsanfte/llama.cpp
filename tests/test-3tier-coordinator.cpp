@@ -13,7 +13,7 @@
  * 7) Main thread periodically polls for completed work units from the various numa_node coordinator workers, 
  *    and when completed, combines them and returns them from the backend.
  * 8) This continues as work items arrive until the program exits.
- * 9) Main thread signals cleanup to the coordinator workers, which signal cleanup to their numa_node threadpools
+ * 9) On program exit, the main thread signals cleanup to the coordinator workers, which signal cleanup to their numa_node threadpools
  * 10) numa_node threadpools cleanup and free their copies of the compute graph
  * 11) coordinator workers cleanup their numa's threadpool and signal completion
  * 12) main thread cleans up the coordinator threadpool and frees any remaining objects, and exits

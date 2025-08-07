@@ -2001,9 +2001,11 @@ static void* socket_thread_worker(void* arg) {
 // Function to compute matrix multiplication chunk with manual threading (no OpenMP)
 static void ggml_numa_socket_compute_mul_mat_chunk_with_manual_threading(struct socket_work_data * work) {
     // Set NUMA affinity for this work only if not in forced mode
+#if defined(__linux__) && defined(GGML_NUMA)
     if (!work->numa_mgr->is_forced_mode) {
         GGML_ASSERT(numa_run_on_node(work->socket_id) == 0);
     }
+#endif
     
     const int socket_thread_count = ggml_numa_socket_get_thread_count(work->socket_id, work->numa_mgr);
     const int64_t total_rows = work->row_end - work->row_start;
@@ -2060,9 +2062,11 @@ static void ggml_numa_socket_compute_mul_mat_chunk_with_manual_threading(struct 
 // Function to compute matrix multiplication chunk with explicit OpenMP affinity
 static void ggml_numa_socket_compute_mul_mat_chunk_with_affinity(struct socket_work_data * work) {
     // Set NUMA affinity for this work only if not in forced mode
+#if defined(__linux__) && defined(GGML_NUMA)
     if (!work->numa_mgr->is_forced_mode) {
         GGML_ASSERT(numa_run_on_node(work->socket_id) == 0);
     }
+#endif
     // In forced mode, we skip NUMA binding and just use the threadpool as-is
         
     // Create modified compute params for this socket with explicit OpenMP affinity
@@ -2135,9 +2139,11 @@ static void ggml_numa_socket_compute_mul_mat_chunk_with_affinity(struct socket_w
 // Function to compute matrix multiplication chunk on a specific NUMA socket
 static void ggml_numa_socket_compute_mul_mat_chunk(struct socket_work_data * work) {
     // Set NUMA affinity for this work only if not in forced mode
+#if defined(__linux__) && defined(GGML_NUMA)
     if (!work->numa_mgr->is_forced_mode) {
         GGML_ASSERT(numa_run_on_node(work->socket_id) == 0);
     }
+#endif
     // In forced mode, we skip NUMA binding and just use the threadpool as-is
         
     // Create modified compute params for this socket
@@ -3736,10 +3742,10 @@ void ggml_threadpool_free(struct ggml_threadpool* threadpool) {
 
     const int n_threads = threadpool->n_threads_max;
 
-    // STEP 1: Clean up coordinator manager first (if using 3-tier architecture)
+    // STEP 1: Release reference to global coordinator manager (don't free it)
     if (threadpool->use_coordinator && threadpool->coordinator_mgr) {
-        GGML_LOG_INFO("Cleaning up 3-tier NUMA coordinator manager\n");
-        ggml_numa_coordinator_manager_free(threadpool->coordinator_mgr);
+        GGML_LOG_INFO("Releasing reference to global 3-tier NUMA coordinator manager\n");
+        // Don't call ggml_numa_coordinator_manager_free() - it's a global singleton
         threadpool->coordinator_mgr = NULL;
         threadpool->use_coordinator = false;
         
@@ -4410,15 +4416,15 @@ static struct ggml_threadpool * ggml_threadpool_new_impl(
         threadpool->ec               = GGML_STATUS_SUCCESS;
     }
 
-    // NEW: Create 3-tier NUMA coordinator manager if conditions are met
-    // Use new coordinator for better stability and performance
+    // NEW: Use global singleton 3-tier NUMA coordinator manager if conditions are met
+    // This ensures coordinator persists for program lifetime and eliminates race conditions
     if ((ggml_is_numa() && tpp->numa_aware && tpp->n_threads >= 4) || tpp->force_multi_socket) {
-        GGML_LOG_INFO("Creating 3-tier NUMA coordinator manager\n");
-        threadpool->coordinator_mgr = ggml_numa_coordinator_manager_new(tpp->n_threads, tpp->force_multi_socket);
+        GGML_LOG_INFO("Using global singleton 3-tier NUMA coordinator manager\n");
+        threadpool->coordinator_mgr = ggml_numa_coordinator_manager_get_global(tpp->n_threads, tpp->force_multi_socket);
         
         if (threadpool->coordinator_mgr) {
             threadpool->use_coordinator = true;
-            GGML_LOG_INFO("3-tier NUMA coordinator manager created successfully\n");
+            GGML_LOG_INFO("Global 3-tier NUMA coordinator manager acquired successfully\n");
             
             // Set cgraph for all NUMA nodes (each gets its own copy)
             if (cgraph) {
@@ -4426,7 +4432,7 @@ static struct ggml_threadpool * ggml_threadpool_new_impl(
                 if (result == 0) {
                     GGML_LOG_INFO("Cgraph copies distributed to all NUMA nodes\n");
                     
-                    // Start coordinator threads
+                    // Start coordinator threads (safe for multiple calls)
                     result = ggml_numa_coordinator_manager_start(threadpool->coordinator_mgr);
                     if (result == 0) {
                         GGML_LOG_INFO("Coordinator threads started successfully\n");

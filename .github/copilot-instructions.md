@@ -123,7 +123,9 @@ taskset -cp $(pgrep llama-server)
 - Test Windows compatibility doesn't break
 
 ### Testing Guidelines
-CMake tests live in the `tests/` folder and are built into `build/bin/`
+CMake tests live in the `tests/` folder and are built into `build/bin/`. 
+
+Important: ALWAYS add tests to the `tests/` folder, never to the project root. Important: ALWAYS use the CMake test apparatus for testing.
 
 1. Write tests for your new features and add the `test-feature-name.cpp` to `tests/`
 2. Add the test to the end of `/tests/CMakeLists.txt`:

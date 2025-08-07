@@ -195,6 +195,30 @@ endif()
 # NUMA multi-socket testing
 if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     llama_build_and_test(test-numa-multi-socket.cpp LABEL "numa")
+
+# test-deep-trace
+set(LLAMA_TEST_NAME test-deep-trace)
+llama_build_and_test(test-deep-trace.cpp)
+
+    # test-numa-data-arrays  
+set(LLAMA_TEST_NAME test-numa-data-arrays)
+llama_build_and_test(test-numa-data-arrays.cpp)
+
+    # test-tensor-allocation-only
+set(LLAMA_TEST_NAME test-tensor-allocation-only)
+llama_build_and_test(test-tensor-allocation-only.cpp)
+target_link_libraries(${LLAMA_TEST_NAME} PRIVATE ggml ggml-cpu common)
+
+# test-coordinator-e2e
+set(LLAMA_TEST_NAME test-coordinator-e2e)
+llama_build_and_test(test-coordinator-e2e.cpp LABEL "numa")
+target_link_libraries(${LLAMA_TEST_NAME} PRIVATE ggml ggml-cpu common)
+
+# test-tensor-debug
+set(LLAMA_TEST_NAME test-tensor-debug)
+llama_build_and_test(test-tensor-debug.cpp)
+target_link_libraries(${LLAMA_TEST_NAME} PRIVATE ggml ggml-cpu common)
+    llama_build_and_test(test-coordinator-single.cpp LABEL "numa")
 endif()
 
 # llama_build_and_test(test-opt.cpp) # SLOW
