@@ -340,6 +340,17 @@ set(LLAMA_TEST_NAME test-cpu-mask-integration)
 llama_build_and_test(test-cpu-mask-integration.cpp)
 target_link_libraries(${LLAMA_TEST_NAME} PRIVATE ggml ggml-cpu common)
 
+# test-simple-baseline
+set(LLAMA_TEST_NAME test-simple-baseline)
+llama_build_and_test(test-simple-baseline.cpp)
+target_link_libraries(${LLAMA_TEST_NAME} PRIVATE ggml ggml-cpu common)
+
+# test-baseline-single-core
+set(LLAMA_TEST_NAME test-baseline-single-core)
+llama_build_and_test(test-baseline-single-core.cpp)
+target_link_libraries(${LLAMA_TEST_NAME} PRIVATE ggml ggml-cpu common)
+target_include_directories(${LLAMA_TEST_NAME} PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src)
+
 # test-comprehensive-numa-performance  
 set(LLAMA_TEST_NAME test-comprehensive-numa-performance)
 llama_build_and_test(test-comprehensive-numa-performance.cpp)
