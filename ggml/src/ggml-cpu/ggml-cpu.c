@@ -4419,12 +4419,12 @@ static struct ggml_threadpool * ggml_threadpool_new_impl(
     // NEW: Use global singleton 3-tier NUMA coordinator manager if conditions are met
     // This ensures coordinator persists for program lifetime and eliminates race conditions
     if ((ggml_is_numa() && tpp->numa_aware && tpp->n_threads >= 4) || tpp->force_multi_socket) {
-        GGML_LOG_INFO("Using global singleton 3-tier NUMA coordinator manager\n");
-        threadpool->coordinator_mgr = ggml_numa_coordinator_manager_get_global(tpp->n_threads, tpp->force_multi_socket);
+        GGML_LOG_INFO("Using global singleton 3-tier NUMA coordinator manager with CPU masks\n");
+        threadpool->coordinator_mgr = ggml_numa_coordinator_manager_get_global_with_params(tpp);
         
         if (threadpool->coordinator_mgr) {
             threadpool->use_coordinator = true;
-            GGML_LOG_INFO("Global 3-tier NUMA coordinator manager acquired successfully\n");
+            GGML_LOG_INFO("Global 3-tier NUMA coordinator manager acquired with custom CPU/NUMA masks\n");
             
             // Set cgraph for all NUMA nodes (each gets its own copy)
             if (cgraph) {

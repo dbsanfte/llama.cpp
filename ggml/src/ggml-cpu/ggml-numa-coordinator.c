@@ -24,6 +24,7 @@
 #include <stdatomic.h>
 #include <pthread.h>
 #include <time.h>
+//#include <math.h>
 
 #ifdef __linux__
 #include <sched.h>
@@ -47,6 +48,7 @@ typedef pthread_t ggml_thread_t;
 #define ggml_cond_init(c) pthread_cond_init(c, NULL)
 #define ggml_cond_destroy(c) pthread_cond_destroy(c)
 #define ggml_cond_wait(c, m) pthread_cond_wait(c, m)
+#define ggml_cond_timedwait(c, m, t) pthread_cond_timedwait(c, m, t)
 #define ggml_cond_signal(c) pthread_cond_signal(c)
 #define ggml_cond_broadcast(c) pthread_cond_broadcast(c)
 #define ggml_thread_create(t, a, f, d) pthread_create(t, a, f, d)
@@ -57,41 +59,64 @@ static inline size_t min_size_t(size_t a, size_t b) {
     return a < b ? a : b;
 }
 
-// Work item for coordinator thread work queue  
+// New graph-level NUMA coordination structures
+
+// Operation assignment for NUMA scheduling
+struct ggml_numa_operation_assignment {
+    struct ggml_tensor * operation;     // Complete operation to execute
+    int assigned_numa_node;             // Which NUMA node handles it (-1 for unassigned)
+    int64_t priority;                   // Scheduling priority (higher = earlier)
+    struct ggml_tensor ** dependencies; // Operations this depends on
+    int num_dependencies;               // Number of dependencies
+    atomic_bool dependencies_ready;     // All dependencies completed
+    atomic_bool completed;              // This operation completed
+    int64_t estimated_cost;             // Estimated computation cost
+    int64_t memory_requirement;         // Memory required (bytes)
+};
+
+// Graph scheduler for NUMA coordination
+struct ggml_numa_graph_scheduler {
+    struct ggml_numa_operation_assignment * assignments; // Operation assignments
+    int num_operations;                    // Number of operations in graph
+    int max_operations;                    // Maximum operations capacity
+    ggml_mutex_t scheduler_mutex;          // Synchronization for scheduler
+    ggml_cond_t operations_completed_cond; // Condition variable for operation completion
+    struct ggml_cgraph * original_graph;   // Reference to original compute graph
+    int num_numa_nodes;                    // Number of NUMA nodes available
+    atomic_int completed_operations;       // Number of completed operations
+    atomic_bool scheduler_completed;       // All operations completed
+    
+    // Load balancing state
+    int64_t numa_load[GGML_NUMA_MAX_NODES];   // Current load per NUMA node
+    int64_t numa_memory[GGML_NUMA_MAX_NODES]; // Memory usage per NUMA node
+};
+
+// Work item for graph-level operation execution (simplified from chunk-based)
 struct ggml_work_item {
-    struct ggml_tensor * tensor;       // Tensor to compute
-    int numa_node;                     // Assigned NUMA node (-1 for any)
-    int64_t chunk_start;               // Start of chunk (elements/rows depending on operation)
-    int64_t chunk_end;                 // End of chunk  
-    atomic_bool completed;             // Completion flag
-    void * result_buffer;              // Buffer for partial results
-    size_t result_size;                // Size of result buffer
-    struct ggml_work_item * next;      // Next item in queue
-    int work_id;                       // Unique work ID for tracking
-    
-    // Data parallelism support
-    int work_group_id;                 // Work group this item belongs to (-1 for single work)
-    int chunk_index;                   // Index of this chunk within work group (0-based)
-    int total_chunks;                  // Total number of chunks in work group
-    bool is_data_parallel;             // Whether this is part of data parallel work
-    struct ggml_tensor * original_tensor; // Reference to original tensor before chunking
-    
-    // Operation-specific information
-    enum ggml_op operation;            // The operation being performed
-    bool is_element_wise;              // Whether operation can be split by elements
-    bool is_row_wise;                  // Whether operation can be split by rows
+    struct ggml_tensor * operation;     // Complete operation (not chunk)
+    int assigned_numa_node;             // Target NUMA node
+    struct ggml_tensor ** dependencies; // Operations to wait for
+    int num_dependencies;               // Dependency count
+    atomic_bool dependencies_ready;     // All dependencies completed
+    atomic_bool completed;              // This operation completed
+    struct ggml_work_item * next;       // Next item in queue
+    int work_id;                        // Unique work ID for tracking
 };
 
 // Work group for data parallel operations
 struct ggml_work_group {
-    int group_id;                      // Unique group ID
+    int group_id;                         // Unique group ID
     struct ggml_tensor * original_tensor; // Original tensor being processed
-    struct ggml_work_item ** chunks;   // Array of work items (one per chunk)
-    int num_chunks;                    // Number of chunks
-    atomic_int completed_chunks;       // Number of completed chunks
-    atomic_bool group_completed;       // Whether entire group is completed
-    struct ggml_tensor * result_tensor; // Integrated result tensor
-    int64_t split_dimension;           // Which dimension was split (0=rows, 1=cols, etc.)
+    struct ggml_work_item ** chunks;      // Array of work items (one per chunk)
+    int num_chunks;                       // Number of chunks
+    atomic_int completed_chunks;          // Number of completed chunks
+    atomic_bool group_completed;          // Whether entire group is completed
+    struct ggml_tensor * result_tensor;   // Integrated result tensor
+    int64_t split_dimension;              // Which dimension was split (0=rows, 1=cols, etc.)
+    
+    // Synchronization for waiting on group completion
+    ggml_mutex_t completion_mutex;  // Mutex for completion waiting
+    ggml_cond_t completion_cond;    // Condition variable for completion
 };
 
 // Work group tracking in manager
@@ -115,15 +140,16 @@ struct ggml_work_queue {
 
 // Coordinator thread data (one per NUMA node)
 struct ggml_coordinator_thread {
-    int numa_node;                     // NUMA node this coordinator manages
-    struct ggml_threadpool * numa_pool;// NUMA-specific threadpool
-    struct ggml_cgraph * numa_cgraph;  // NUMA node's own copy of cgraph
-    struct ggml_context * numa_ctx;    // Context for this NUMA node's cgraph copy
-    struct ggml_work_queue work_queue; // Work queue for this coordinator
-    ggml_thread_t thread_handle;       // Thread handle
-    atomic_bool active;                // Whether thread is active
-    atomic_bool shutdown_requested;    // Shutdown request flag
-    atomic_bool thread_created;        // Whether thread was actually created
+    int numa_node;                                  // NUMA node this coordinator manages
+    int n_threads;                                  // Number of threads in this coordinator's pool
+    struct ggml_threadpool * numa_pool;             // NUMA-specific threadpool
+    struct ggml_cgraph * numa_cgraph;               // NUMA node's own copy of cgraph
+    struct ggml_context * numa_ctx;                 // Context for this NUMA node's cgraph copy
+    struct ggml_work_queue work_queue;              // Work queue for this coordinator
+    ggml_thread_t thread_handle;                    // Thread handle
+    atomic_bool active;                             // Whether thread is active
+    atomic_bool shutdown_requested;                 // Shutdown request flag
+    atomic_bool thread_created;                     // Whether thread was actually created
     struct ggml_numa_coordinator_manager * manager; // Reference to parent manager for callbacks
     
     // Performance tracking
@@ -134,8 +160,8 @@ struct ggml_coordinator_thread {
 // NUMA Multi-Socket Threadpool Manager (3-tier: main → coordinator → NUMA)
 struct ggml_numa_coordinator_manager {
     int num_numa_nodes;                                   // Number of NUMA nodes
-    struct ggml_coordinator_thread * coordinators;       // Array of coordinator threads (one per NUMA node)
-    struct ggml_work_queue global_work_queue;            // Global work queue from main thread
+    struct ggml_coordinator_thread * coordinators;        // Array of coordinator threads (one per NUMA node)
+    struct ggml_work_queue global_work_queue;             // Global work queue from main thread
     
     // Synchronization for main thread
     atomic_int total_work_items;                          // Total work items pending
@@ -146,17 +172,17 @@ struct ggml_numa_coordinator_manager {
     atomic_bool threads_started;                          // Whether coordinator threads have been started
     
     // Data parallelism support
-    struct ggml_work_group_tracker work_groups;          // Work group tracking
+    struct ggml_work_group_tracker work_groups;           // Work group tracking
     
     // Progress callback system
-    ggml_numa_progress_callback_t progress_callback;     // User progress callback function
-    void * progress_callback_user_data;                  // User data for callback
+    ggml_numa_progress_callback_t progress_callback;      // User progress callback function
+    void * progress_callback_user_data;                   // User data for callback
     
     // Performance profiling
     int64_t total_computations;                           // Total number of multi-socket computations
     int64_t total_async_time_us;                          // Total time spent in async execution (microseconds)
     int64_t total_sync_time_us;                           // Total time spent in synchronization (microseconds)
-    int64_t numa_times_us[GGML_NUMA_MAX_NODES];          // Individual NUMA node computation times
+    int64_t numa_times_us[GGML_NUMA_MAX_NODES];           // Individual NUMA node computation times
     int64_t last_computation_elements;                    // Elements in last computation (for throughput)
 };
 
@@ -178,310 +204,292 @@ static struct ggml_work_group * ggml_work_group_create(struct ggml_work_group_tr
 static void ggml_work_group_free(struct ggml_work_group * group);
 static int ggml_work_group_check_completion(struct ggml_work_group * group);
 static int ggml_operation_split_for_numa(struct ggml_tensor * tensor, int num_numa_nodes, struct ggml_work_item *** out_chunks);
-static int ggml_tensor_integrate_results(struct ggml_work_group * group);
-
-// Operation-specific NUMA chunk execution functions
-static enum ggml_status ggml_numa_execute_elementwise_chunk(
-    struct ggml_coordinator_thread * coordinator,
-    struct ggml_tensor * tensor,
-    int64_t chunk_start,
-    int64_t chunk_end,
-    void * result_buffer,
-    size_t result_size
-);
-
-static enum ggml_status ggml_numa_execute_matmul_chunk(
-    struct ggml_coordinator_thread * coordinator,
-    struct ggml_tensor * tensor,
-    int64_t chunk_start,
-    int64_t chunk_end,
-    void * result_buffer,
-    size_t result_size
-);
-
-static enum ggml_status ggml_numa_execute_unary_chunk(
-    struct ggml_coordinator_thread * coordinator,
-    struct ggml_tensor * tensor,
-    int64_t chunk_start,
-    int64_t chunk_end,
-    void * result_buffer,
-    size_t result_size
-);
-
-static enum ggml_status ggml_numa_execute_softmax_chunk(
-    struct ggml_coordinator_thread * coordinator,
-    struct ggml_tensor * tensor,
-    int64_t chunk_start,
-    int64_t chunk_end,
-    void * result_buffer,
-    size_t result_size
-);
 
 // Global coordinator management functions
 static struct ggml_numa_coordinator_manager * ggml_get_global_coordinator_manager(int n_threads, bool force_multi_socket);
 static struct ggml_numa_coordinator_manager * ggml_get_global_coordinator_manager_with_params(const struct ggml_threadpool_params * tpp);
 static void ggml_register_program_exit_cleanup(void);
 
+// New graph-level NUMA coordination functions
+static struct ggml_numa_graph_scheduler * ggml_numa_create_graph_scheduler(
+    struct ggml_cgraph * graph,
+    int num_numa_nodes
+);
+
+static void ggml_numa_free_graph_scheduler(struct ggml_numa_graph_scheduler * scheduler);
+
+static int ggml_numa_assign_operations_to_nodes(
+    struct ggml_numa_graph_scheduler * scheduler
+);
+
+static enum ggml_status ggml_numa_execute_assigned_operations(
+    struct ggml_numa_coordinator_manager * mgr,
+    struct ggml_numa_graph_scheduler * scheduler
+);
+
+static enum ggml_status ggml_numa_node_execute_operation(
+    struct ggml_coordinator_thread * coordinator,
+    struct ggml_tensor * operation
+);
+
+static bool ggml_numa_should_coordinate(
+    struct ggml_cgraph * cgraph,
+    int n_threads
+);
+
+// Operation-level NUMA parallelization using proper GGML compute functions
+static struct ggml_numa_coordinator_manager * ggml_get_global_coordinator_manager(int n_threads, bool force_multi_socket);
+static struct ggml_numa_coordinator_manager * ggml_get_global_coordinator_manager_with_params(const struct ggml_threadpool_params * tpp);
+static void ggml_register_program_exit_cleanup(void);
+
 // Operation-specific NUMA parallelization using proper GGML compute functions
-static enum ggml_status ggml_numa_execute_operation_chunk(
+// Execute complete operations on NUMA nodes using GGML's optimized functions
+static enum ggml_status ggml_numa_node_execute_operation(
     struct ggml_coordinator_thread * coordinator,
-    struct ggml_tensor * tensor,
-    int64_t chunk_start,
-    int64_t chunk_end,
-    void * result_buffer,
-    size_t result_size
+    struct ggml_tensor * operation
 ) {
-    if (!coordinator || !tensor || !result_buffer) return GGML_STATUS_FAILED;
+    if (!coordinator || !operation) return GGML_STATUS_FAILED;
     
-    GGML_LOG_DEBUG("NUMA%d: executing operation %s chunk %ld-%ld\n", 
-                   coordinator->numa_node, ggml_op_name(tensor->op), chunk_start, chunk_end);
+    GGML_LOG_DEBUG("NUMA%d: executing complete operation %s\n", 
+                   coordinator->numa_node, ggml_op_name(operation->op));
     
-    enum ggml_status status = GGML_STATUS_FAILED;
+    // Set up compute parameters for this NUMA node
+    struct ggml_compute_params params = {
+        .ith = 0,
+        .nth = coordinator->n_threads,  
+        .wsize = 0,
+        .wdata = NULL,
+        .threadpool = coordinator->numa_pool  
+    };
     
-    switch (tensor->op) {
+    // PROPER FIX: Execute MUL_MAT operations with full multi-threaded parallelization
+    // Instead of single-threaded workaround, use the NUMA threadpool's parallel execution
+    if (operation->op == GGML_OP_MUL_MAT) {
+        GGML_LOG_DEBUG("NUMA%d: MUL_MAT operation - using full threadpool parallelization\n", 
+                       coordinator->numa_node);
+        
+        // Use ggml_graph_compute with a single-node graph for this operation
+        // This leverages GGML's existing parallel execution infrastructure
+        struct ggml_context * temp_ctx = ggml_init((struct ggml_init_params) {
+            .mem_size = 1024 * 1024, // 1MB should be sufficient for graph metadata
+            .mem_buffer = NULL,
+            .no_alloc = true, // Don't allocate tensor data, just metadata
+        });
+        
+        if (!temp_ctx) {
+            GGML_LOG_ERROR("NUMA%d: Failed to create temporary context for MUL_MAT\n", coordinator->numa_node);
+            return GGML_STATUS_FAILED;
+        }
+        
+        // Create a computation graph containing just this operation
+        struct ggml_cgraph * temp_graph = ggml_new_graph(temp_ctx);
+        ggml_build_forward_expand(temp_graph, operation);
+        
+        // Create a computation plan using the coordinator's NUMA threadpool
+        struct ggml_cplan cplan = ggml_graph_plan(temp_graph, coordinator->n_threads, coordinator->numa_pool);
+        
+        // Execute the graph using the computation plan
+        enum ggml_status status = ggml_graph_compute(temp_graph, &cplan);
+        
+        // Clean up temporary context
+        ggml_free(temp_ctx);
+        
+        if (status == GGML_STATUS_SUCCESS) {
+            GGML_LOG_DEBUG("NUMA%d: MUL_MAT operation completed with full parallelization\n", coordinator->numa_node);
+        } else {
+            GGML_LOG_ERROR("NUMA%d: MUL_MAT operation failed with status %d\n", coordinator->numa_node, status);
+        }
+        
+        return status;
+    }
+    
+    // Use GGML's optimized compute functions directly - no chunking
+    enum ggml_status status = GGML_STATUS_SUCCESS;
+    
+    switch (operation->op) {
+        // Basic arithmetic operations (high frequency, good NUMA candidates)
         case GGML_OP_ADD:
-        case GGML_OP_MUL:
-        case GGML_OP_DIV:
+            ggml_compute_forward_add(&params, operation);
+            break;
+        case GGML_OP_ADD1:
+            ggml_compute_forward_add1(&params, operation);
+            break;
         case GGML_OP_SUB:
-            // Element-wise operations
-            status = ggml_numa_execute_elementwise_chunk(coordinator, tensor, chunk_start, chunk_end, result_buffer, result_size);
+            ggml_compute_forward_sub(&params, operation);
+            break;
+        case GGML_OP_MUL:
+            ggml_compute_forward_mul(&params, operation);
+            break;
+        case GGML_OP_DIV:
+            ggml_compute_forward_div(&params, operation);
             break;
             
+        // Matrix operations (highest impact for NUMA coordination)
         case GGML_OP_MUL_MAT:
-        case GGML_OP_MUL_MAT_ID:
-            // Matrix multiplication
-            status = ggml_numa_execute_matmul_chunk(coordinator, tensor, chunk_start, chunk_end, result_buffer, result_size);
+            ggml_compute_forward_mul_mat(&params, operation);
+            break;
+        case GGML_OP_OUT_PROD:
+            ggml_compute_forward_out_prod(&params, operation);
             break;
             
+        // Normalization operations (common in transformers, memory-intensive)
+        case GGML_OP_NORM:
+            ggml_compute_forward_norm(&params, operation);
+            break;
+        case GGML_OP_RMS_NORM:
+            ggml_compute_forward_rms_norm(&params, operation);
+            break;
+        case GGML_OP_RMS_NORM_BACK:
+            ggml_compute_forward_rms_norm_back(&params, operation);
+            break;
+        case GGML_OP_GROUP_NORM:
+            ggml_compute_forward_group_norm(&params, operation);
+            break;
+        case GGML_OP_L2_NORM:
+            ggml_compute_forward_l2_norm(&params, operation);
+            break;
+            
+        // Activation functions (frequent in neural networks)
         case GGML_OP_UNARY:
-            // Unary operations (GELU, SILU, RELU, etc.)
-            status = ggml_numa_execute_unary_chunk(coordinator, tensor, chunk_start, chunk_end, result_buffer, result_size);
+            ggml_compute_forward_unary(&params, operation);
+            break;
+        case GGML_OP_SILU_BACK:
+            ggml_compute_forward_silu_back(&params, operation);
+            break;
+        case GGML_OP_LEAKY_RELU:
+            ggml_compute_forward_leaky_relu(&params, operation);
             break;
             
+        // Attention and transformer-specific operations
         case GGML_OP_SOFT_MAX:
-            // Softmax
-            status = ggml_numa_execute_softmax_chunk(coordinator, tensor, chunk_start, chunk_end, result_buffer, result_size);
+            ggml_compute_forward_soft_max(&params, operation);
+            break;
+        case GGML_OP_SOFT_MAX_BACK:
+            ggml_compute_forward_soft_max_ext_back(&params, operation);
+            break;
+        case GGML_OP_ROPE:
+            ggml_compute_forward_rope(&params, operation);
+            break;
+        case GGML_OP_ROPE_BACK:
+            ggml_compute_forward_rope_back(&params, operation);
+            break;
+            
+        // Tensor manipulation (moderate impact, but common)
+        case GGML_OP_CPY:
+            ggml_compute_forward_cpy(&params, operation);
+            break;
+        case GGML_OP_DUP:
+            ggml_compute_forward_dup(&params, operation);
+            break;
+        case GGML_OP_CONT:
+            ggml_compute_forward_cont(&params, operation);
+            break;
+        case GGML_OP_RESHAPE:
+            ggml_compute_forward_reshape(&params, operation);
+            break;
+        case GGML_OP_PERMUTE:
+            ggml_compute_forward_permute(&params, operation);
+            break;
+        case GGML_OP_TRANSPOSE:
+            ggml_compute_forward_transpose(&params, operation);
+            break;
+        case GGML_OP_VIEW:
+            ggml_compute_forward_view(&params, operation);
+            break;
+        case GGML_OP_SCALE:
+            ggml_compute_forward_scale(&params, operation);
+            break;
+        case GGML_OP_SET:
+            ggml_compute_forward_set(&params, operation);
+            break;
+            
+        // Row/tensor operations  
+        case GGML_OP_GET_ROWS:
+            ggml_compute_forward_get_rows(&params, operation);
+            break;
+        case GGML_OP_GET_ROWS_BACK:
+            ggml_compute_forward_get_rows_back(&params, operation);
+            break;
+        case GGML_OP_SET_ROWS:
+            ggml_compute_forward_set_rows(&params, operation);
+            break;
+            
+        // Aggregation operations
+        case GGML_OP_SUM:
+            ggml_compute_forward_sum(&params, operation);
+            break;
+        case GGML_OP_SUM_ROWS:
+            ggml_compute_forward_sum_rows(&params, operation);
+            break;
+        case GGML_OP_MEAN:
+            ggml_compute_forward_mean(&params, operation);
+            break;
+        case GGML_OP_ARGMAX:
+            ggml_compute_forward_argmax(&params, operation);
+            break;
+        case GGML_OP_COUNT_EQUAL:
+            ggml_compute_forward_count_equal(&params, operation);
+            break;
+            
+        // Convolution operations (high computational cost when present)
+        case GGML_OP_CONV_2D:
+            ggml_compute_forward_conv_2d(&params, operation);
+            break;
+        case GGML_OP_IM2COL:
+            ggml_compute_forward_im2col(&params, operation);
+            break;
+        case GGML_OP_IM2COL_BACK:
+            ggml_compute_forward_im2col_back_f32(&params, operation);
+            break;
+        case GGML_OP_CONV_TRANSPOSE_1D:
+            ggml_compute_forward_conv_transpose_1d(&params, operation);
+            break;
+        case GGML_OP_CONV_TRANSPOSE_2D:
+            ggml_compute_forward_conv_transpose_2d(&params, operation);
+            break;
+        case GGML_OP_POOL_1D:
+            ggml_compute_forward_pool_1d(&params, operation);
+            break;
+        case GGML_OP_POOL_2D:
+            ggml_compute_forward_pool_2d(&params, operation);
+            break;
+            
+        // Miscellaneous operations
+        case GGML_OP_REPEAT:
+            ggml_compute_forward_repeat(&params, operation);
+            break;
+        case GGML_OP_REPEAT_BACK:
+            ggml_compute_forward_repeat_back(&params, operation);
+            break;
+        case GGML_OP_CONCAT:
+            ggml_compute_forward_concat(&params, operation);
+            break;
+        case GGML_OP_CLAMP:
+            ggml_compute_forward_clamp(&params, operation);
             break;
             
         default:
-            GGML_LOG_WARN("NUMA%d: Operation %s not supported for operation-level parallelism\n", 
-                         coordinator->numa_node, ggml_op_name(tensor->op));
-            return GGML_STATUS_FAILED;
-    }
-    
-    if (status != GGML_STATUS_SUCCESS) {
-        GGML_LOG_ERROR("NUMA%d: Failed to execute operation %s chunk %ld-%ld\n", 
-                       coordinator->numa_node, ggml_op_name(tensor->op), chunk_start, chunk_end);
-    }
-    
-    return status;
-}
-
-static enum ggml_status ggml_numa_execute_elementwise_chunk(
-    struct ggml_coordinator_thread * coordinator,
-    struct ggml_tensor * tensor,
-    int64_t chunk_start,
-    int64_t chunk_end,
-    void * result_buffer,
-    size_t result_size
-) {
-    if (!coordinator || !tensor || !result_buffer) return GGML_STATUS_FAILED;
-    
-    // For element-wise operations, we need to create a tensor view for the chunk
-    // This is complex because we need to handle tensor slicing properly
-    // For now, let's use the threadpool to compute the full tensor and extract the chunk
-    
-    GGML_LOG_DEBUG("NUMA%d: computing element-wise operation %s (elements %ld-%ld)\n", 
-                   coordinator->numa_node, ggml_op_name(tensor->op), chunk_start, chunk_end);
-    
-    // Create compute parameters
-    struct ggml_compute_params params = {
-        .ith = 0,
-        .nth = 1,
-        .wsize = 0,
-        .wdata = NULL,
-        .threadpool = coordinator->numa_pool
-    };
-    
-    // For this version, compute the full operation and extract the chunk
-    // TODO: Optimize this to only compute the required chunk
-    enum ggml_status status = GGML_STATUS_FAILED;
-    
-    switch (tensor->op) {
-        case GGML_OP_ADD:
-            ggml_compute_forward_add(&params, tensor);
-            status = GGML_STATUS_SUCCESS;
+            GGML_LOG_DEBUG("NUMA%d: Operation %s using public fallback execution\n", 
+                          coordinator->numa_node, ggml_op_name(operation->op));
+            // Use the public fallback function for operations not specifically handled
+            // This ensures operations are properly executed rather than silently skipped
+            status = ggml_numa_fallback_execute_operation(operation, &params);
+            if (status != GGML_STATUS_SUCCESS) {
+                GGML_LOG_WARN("NUMA%d: Fallback execution failed for operation %s\n",
+                             coordinator->numa_node, ggml_op_name(operation->op));
+            }
             break;
-        case GGML_OP_MUL:
-            ggml_compute_forward_mul(&params, tensor);
-            status = GGML_STATUS_SUCCESS;
-            break;
-        case GGML_OP_DIV:
-            ggml_compute_forward_div(&params, tensor);
-            status = GGML_STATUS_SUCCESS;
-            break;
-        case GGML_OP_SUB:
-            ggml_compute_forward_sub(&params, tensor);
-            status = GGML_STATUS_SUCCESS;
-            break;
-        default:
-            GGML_LOG_ERROR("Unsupported element-wise operation: %s\n", ggml_op_name(tensor->op));
-            return GGML_STATUS_FAILED;
     }
     
     if (status == GGML_STATUS_SUCCESS) {
-        // Extract the chunk from the computed result
-        size_t element_size = ggml_type_size(tensor->type);
-        size_t chunk_bytes = (chunk_end - chunk_start) * element_size;
-        size_t chunk_offset = chunk_start * element_size;
-        
-        if (chunk_bytes <= result_size) {
-            memcpy(result_buffer, (char*)ggml_get_data(tensor) + chunk_offset, chunk_bytes);
-        } else {
-            GGML_LOG_ERROR("Chunk size %zu exceeds result buffer size %zu\n", chunk_bytes, result_size);
-            status = GGML_STATUS_FAILED;
-        }
+        GGML_LOG_DEBUG("NUMA%d: Successfully executed operation %s\n", 
+                       coordinator->numa_node, ggml_op_name(operation->op));
+    } else {
+        GGML_LOG_ERROR("NUMA%d: Failed to execute operation %s\n", 
+                       coordinator->numa_node, ggml_op_name(operation->op));
     }
     
     return status;
-}
-
-static enum ggml_status ggml_numa_execute_matmul_chunk(
-    struct ggml_coordinator_thread * coordinator,
-    struct ggml_tensor * tensor,
-    int64_t chunk_start,
-    int64_t chunk_end,
-    void * result_buffer,
-    size_t result_size
-) {
-    if (!coordinator || !tensor || !result_buffer) return GGML_STATUS_FAILED;
-    
-    GGML_LOG_DEBUG("NUMA%d: computing matrix multiplication chunk (rows %ld-%ld)\n", 
-                   coordinator->numa_node, chunk_start, chunk_end);
-    
-    // Create compute parameters
-    struct ggml_compute_params params = {
-        .ith = 0,
-        .nth = 1,
-        .wsize = 0,
-        .wdata = NULL,
-        .threadpool = coordinator->numa_pool
-    };
-    
-    // For matrix multiplication, we would need to create tensor views for the chunk
-    // This is complex and requires understanding the exact tensor layout
-    // For now, compute full matrix and extract chunk
-    
-    enum ggml_status status = GGML_STATUS_FAILED;
-    
-    switch (tensor->op) {
-        case GGML_OP_MUL_MAT:
-            ggml_compute_forward_mul_mat(&params, tensor);
-            status = GGML_STATUS_SUCCESS;
-            break;
-        default:
-            GGML_LOG_ERROR("Unsupported matrix operation: %s\n", ggml_op_name(tensor->op));
-            return GGML_STATUS_FAILED;
-    }
-    
-    if (status == GGML_STATUS_SUCCESS) {
-        // Extract the chunk (rows chunk_start to chunk_end)
-        int64_t cols = tensor->ne[0];
-        size_t element_size = ggml_type_size(tensor->type);
-        size_t row_stride = cols * element_size;
-        size_t chunk_bytes = (chunk_end - chunk_start) * row_stride;
-        size_t chunk_offset = chunk_start * row_stride;
-        
-        if (chunk_bytes <= result_size) {
-            memcpy(result_buffer, (char*)ggml_get_data(tensor) + chunk_offset, chunk_bytes);
-        } else {
-            GGML_LOG_ERROR("Matrix chunk size %zu exceeds result buffer size %zu\n", chunk_bytes, result_size);
-            status = GGML_STATUS_FAILED;
-        }
-    }
-    
-    return status;
-}
-
-static enum ggml_status ggml_numa_execute_unary_chunk(
-    struct ggml_coordinator_thread * coordinator,
-    struct ggml_tensor * tensor,
-    int64_t chunk_start,
-    int64_t chunk_end,
-    void * result_buffer,
-    size_t result_size
-) {
-    if (!coordinator || !tensor || !result_buffer) return GGML_STATUS_FAILED;
-    
-    GGML_LOG_DEBUG("NUMA%d: computing unary operation chunk (elements %ld-%ld)\n", 
-                   coordinator->numa_node, chunk_start, chunk_end);
-    
-    // Create compute parameters
-    struct ggml_compute_params params = {
-        .ith = 0,
-        .nth = 1,
-        .wsize = 0,
-        .wdata = NULL,
-        .threadpool = coordinator->numa_pool
-    };
-    
-    // For unary operations, compute full tensor and extract chunk
-    ggml_compute_forward_unary(&params, tensor);
-    
-    // Extract the chunk
-    size_t element_size = ggml_type_size(tensor->type);
-    size_t chunk_bytes = (chunk_end - chunk_start) * element_size;
-    size_t chunk_offset = chunk_start * element_size;
-    
-    if (chunk_bytes <= result_size) {
-        memcpy(result_buffer, (char*)ggml_get_data(tensor) + chunk_offset, chunk_bytes);
-        return GGML_STATUS_SUCCESS;
-    } else {
-        GGML_LOG_ERROR("Unary chunk size %zu exceeds result buffer size %zu\n", chunk_bytes, result_size);
-        return GGML_STATUS_FAILED;
-    }
-}
-
-static enum ggml_status ggml_numa_execute_softmax_chunk(
-    struct ggml_coordinator_thread * coordinator,
-    struct ggml_tensor * tensor,
-    int64_t chunk_start,
-    int64_t chunk_end,
-    void * result_buffer,
-    size_t result_size
-) {
-    if (!coordinator || !tensor || !result_buffer) return GGML_STATUS_FAILED;
-    
-    GGML_LOG_DEBUG("NUMA%d: computing softmax chunk (rows %ld-%ld)\n", 
-                   coordinator->numa_node, chunk_start, chunk_end);
-    
-    // Create compute parameters
-    struct ggml_compute_params params = {
-        .ith = 0,
-        .nth = 1,
-        .wsize = 0,
-        .wdata = NULL,
-        .threadpool = coordinator->numa_pool
-    };
-    
-    // For softmax, each row is independent, so we can compute per-row chunks
-    // For now, compute full tensor and extract chunk
-    ggml_compute_forward_soft_max(&params, tensor);
-    
-    // Extract the chunk (rows chunk_start to chunk_end)
-    int64_t cols = tensor->ne[0];
-    size_t element_size = ggml_type_size(tensor->type);
-    size_t row_stride = cols * element_size;
-    size_t chunk_bytes = (chunk_end - chunk_start) * row_stride;
-    size_t chunk_offset = chunk_start * row_stride;
-    
-    if (chunk_bytes <= result_size) {
-        memcpy(result_buffer, (char*)ggml_get_data(tensor) + chunk_offset, chunk_bytes);
-        return GGML_STATUS_SUCCESS;
-    } else {
-        GGML_LOG_ERROR("Softmax chunk size %zu exceeds result buffer size %zu\n", chunk_bytes, result_size);
-        return GGML_STATUS_FAILED;
-    }
 }
 
 // Initialize work queue
@@ -509,9 +517,7 @@ static void ggml_work_queue_destroy(struct ggml_work_queue * queue) {
     struct ggml_work_item * current = queue->head;
     while (current) {
         struct ggml_work_item * next = current->next;
-        if (current->result_buffer) {
-            free(current->result_buffer);
-        }
+        // Note: No longer need to free result_buffer - operations work on full tensors
         free(current);
         current = next;
     }
@@ -609,6 +615,10 @@ static struct ggml_work_group * ggml_work_group_create(struct ggml_work_group_tr
     group->result_tensor = NULL;
     group->split_dimension = 0; // Default to row-wise split
     
+    // Initialize synchronization primitives
+    ggml_mutex_init(&group->completion_mutex);
+    ggml_cond_init(&group->completion_cond);
+    
     // Allocate chunks array
     group->chunks = malloc(sizeof(struct ggml_work_item *) * num_chunks);
     if (!group->chunks) {
@@ -651,290 +661,39 @@ static void ggml_work_group_free(struct ggml_work_group * group) {
         free(group->chunks);
     }
     
+    // Clean up synchronization primitives
+    ggml_mutex_destroy(&group->completion_mutex);
+    ggml_cond_destroy(&group->completion_cond);
+    
     // Note: We don't free result_tensor as it's typically owned by the caller
     // Note: We don't free original_tensor as it's owned by the caller
     
     free(group);
 }
 
-// Check if work group is completed and integrate results if so
+// Check work group completion and perform integration if needed
 static int ggml_work_group_check_completion(struct ggml_work_group * group) {
     if (!group) return -1;
     
-    if (atomic_load(&group->group_completed)) {
-        return 1; // Already completed
-    }
-    
-    int completed = atomic_load(&group->completed_chunks);
-    if (completed >= group->num_chunks) {
-        // All chunks completed, integrate results
-        int result = ggml_tensor_integrate_results(group);
-        if (result == 0) {
+    // Simple implementation: check if all chunks are completed
+    int completed_chunks = atomic_load(&group->completed_chunks);
+    if (completed_chunks >= group->num_chunks) {
+        // All chunks completed, mark group as completed
+        if (!atomic_load(&group->group_completed)) {
             atomic_store(&group->group_completed, true);
-            GGML_LOG_INFO("Work group %d completed and integrated\n", group->group_id);
-            return 1;
-        } else {
-            GGML_LOG_ERROR("Failed to integrate results for work group %d\n", group->group_id);
-            return -1;
+            
+            // Signal completion
+            ggml_mutex_lock(&group->completion_mutex);
+            ggml_cond_broadcast(&group->completion_cond);
+            ggml_mutex_unlock(&group->completion_mutex);
         }
+        return 1; // Successfully completed
     }
     
-    return 0; // Not yet completed
+    return 0; // Still in progress
 }
 
-// Split operation for NUMA parallel processing (operation-aware)
-static int ggml_operation_split_for_numa(struct ggml_tensor * tensor, int num_numa_nodes, struct ggml_work_item *** out_chunks) {
-    if (!tensor || num_numa_nodes <= 0 || !out_chunks) return -1;
-    
-    // Determine how to split based on the operation type
-    bool can_parallelize = false;
-    bool split_by_elements = false;  // For element-wise ops
-    bool split_by_rows = false;      // For matrix ops, softmax, etc.
-    int64_t total_work_units = 0;
-    
-    switch (tensor->op) {
-        case GGML_OP_ADD:
-        case GGML_OP_MUL:
-        case GGML_OP_DIV:
-        case GGML_OP_SUB:
-        case GGML_OP_UNARY:
-            // Element-wise operations - split by elements
-            can_parallelize = true;
-            split_by_elements = true;
-            total_work_units = ggml_nelements(tensor);
-            GGML_LOG_DEBUG("Operation %s: splitting %ld elements across %d NUMA nodes\n", 
-                           ggml_op_name(tensor->op), total_work_units, num_numa_nodes);
-            break;
-            
-        case GGML_OP_MUL_MAT:
-        case GGML_OP_MUL_MAT_ID:
-            // Matrix multiplication - split by output rows
-            can_parallelize = true;
-            split_by_rows = true;
-            total_work_units = tensor->ne[1]; // Number of rows in output matrix
-            GGML_LOG_DEBUG("Operation %s: splitting %ld rows across %d NUMA nodes\n", 
-                           ggml_op_name(tensor->op), total_work_units, num_numa_nodes);
-            break;
-            
-        case GGML_OP_SOFT_MAX:
-            // Softmax - split by rows (each row computed independently)
-            can_parallelize = true;
-            split_by_rows = true;
-            total_work_units = tensor->ne[1]; // Number of rows
-            GGML_LOG_DEBUG("Operation %s: splitting %ld rows across %d NUMA nodes\n", 
-                           ggml_op_name(tensor->op), total_work_units, num_numa_nodes);
-            break;
-            
-        default:
-            GGML_LOG_WARN("Operation %s not supported for NUMA parallelization\n", ggml_op_name(tensor->op));
-            return -1;
-    }
-    
-    if (!can_parallelize || total_work_units < num_numa_nodes) {
-        // Not enough work to split across all NUMA nodes
-        if (total_work_units > 0 && total_work_units < num_numa_nodes) {
-            num_numa_nodes = (int)total_work_units;
-        } else if (!can_parallelize) {
-            return -1;
-        }
-    }
-    
-    int64_t work_per_chunk = total_work_units / num_numa_nodes;
-    int64_t remaining_work = total_work_units % num_numa_nodes;
-    
-    GGML_LOG_DEBUG("Splitting operation %s: %ld work units into %d chunks (%ld per chunk, %ld remaining)\n", 
-                   ggml_op_name(tensor->op), total_work_units, num_numa_nodes, work_per_chunk, remaining_work);
-    
-    // Allocate array of work item pointers
-    struct ggml_work_item ** chunks = malloc(sizeof(struct ggml_work_item *) * num_numa_nodes);
-    if (!chunks) return -1;
-    
-    int64_t current_start = 0;
-    for (int i = 0; i < num_numa_nodes; i++) {
-        chunks[i] = malloc(sizeof(struct ggml_work_item));
-        if (!chunks[i]) {
-            // Cleanup on failure
-            for (int j = 0; j < i; j++) {
-                if (chunks[j]->result_buffer) free(chunks[j]->result_buffer);
-                free(chunks[j]);
-            }
-            free(chunks);
-            return -1;
-        }
-        
-        memset(chunks[i], 0, sizeof(struct ggml_work_item));
-        
-        // Calculate chunk size (give extra work to first chunks if uneven split)
-        int64_t chunk_work = work_per_chunk;
-        if (i < remaining_work) {
-            chunk_work++;
-        }
-        
-        // Set up work item
-        chunks[i]->tensor = tensor;
-        chunks[i]->original_tensor = tensor;
-        chunks[i]->numa_node = i; // Assign to specific NUMA node
-        chunks[i]->chunk_start = current_start;
-        chunks[i]->chunk_end = current_start + chunk_work;
-        chunks[i]->chunk_index = i;
-        chunks[i]->total_chunks = num_numa_nodes;
-        chunks[i]->is_data_parallel = true;
-        
-        // Operation-specific information
-        chunks[i]->operation = tensor->op;
-        chunks[i]->is_element_wise = split_by_elements;
-        chunks[i]->is_row_wise = split_by_rows;
-        
-        // Calculate result buffer size based on operation type
-        size_t chunk_bytes = 0;
-        if (split_by_elements) {
-            // Element-wise: chunk_work elements
-            chunk_bytes = chunk_work * ggml_type_size(tensor->type);
-        } else if (split_by_rows) {
-            // Row-wise: chunk_work rows × cols
-            int64_t cols = tensor->ne[0];
-            chunk_bytes = chunk_work * cols * ggml_type_size(tensor->type);
-        }
-        
-        chunks[i]->result_buffer = malloc(chunk_bytes);
-        chunks[i]->result_size = chunk_bytes;
-        
-        if (!chunks[i]->result_buffer) {
-            // Cleanup on failure
-            for (int j = 0; j <= i; j++) {
-                if (chunks[j]->result_buffer) free(chunks[j]->result_buffer);
-                free(chunks[j]);
-            }
-            free(chunks);
-            return -1;
-        }
-        
-        atomic_init(&chunks[i]->completed, false);
-        
-        if (split_by_elements) {
-            GGML_LOG_DEBUG("Chunk %d: elements %ld-%ld (%ld elements, %zu bytes) -> NUMA %d\n", 
-                           i, current_start, current_start + chunk_work - 1, chunk_work, chunk_bytes, i);
-        } else if (split_by_rows) {
-            GGML_LOG_DEBUG("Chunk %d: rows %ld-%ld (%ld rows, %zu bytes) -> NUMA %d\n", 
-                           i, current_start, current_start + chunk_work - 1, chunk_work, chunk_bytes, i);
-        }
-        
-        current_start += chunk_work;
-    }
-    
-    *out_chunks = chunks;
-    return num_numa_nodes;
-}
-
-// Integrate results from all chunks back into original tensor
-static int ggml_tensor_integrate_results(struct ggml_work_group * group) {
-    if (!group || !group->chunks || !group->original_tensor || group->num_chunks == 0) return -1;
-    
-    GGML_LOG_DEBUG("Integrating results for work group %d (%d chunks)\n", group->group_id, group->num_chunks);
-    
-    struct ggml_tensor * original = group->original_tensor;
-    char * original_data = (char *)ggml_get_data(original);
-    
-    if (!original_data) {
-        GGML_LOG_ERROR("Original tensor has no data pointer\n");
-        return -1;
-    }
-    
-    // Get operation type from first chunk
-    struct ggml_work_item * first_chunk = group->chunks[0];
-    if (!first_chunk) {
-        GGML_LOG_ERROR("No chunks found in work group\n");
-        return -1;
-    }
-    
-    enum ggml_op operation = first_chunk->operation;
-    bool is_element_wise = first_chunk->is_element_wise;
-    bool is_row_wise = first_chunk->is_row_wise;
-    
-    size_t element_size = ggml_type_size(original->type);
-    
-    GGML_LOG_DEBUG("Integration for operation %s (element_wise=%d, row_wise=%d)\n", 
-                   ggml_op_name(operation), is_element_wise, is_row_wise);
-    
-    // Verify all chunks are completed
-    for (int i = 0; i < group->num_chunks; i++) {
-        struct ggml_work_item * chunk = group->chunks[i];
-        if (!chunk || !atomic_load(&chunk->completed)) {
-            GGML_LOG_ERROR("Chunk %d not completed for work group %d\n", i, group->group_id);
-            return -1;
-        }
-        
-        if (!chunk->result_buffer) {
-            GGML_LOG_ERROR("Chunk %d has no result buffer for work group %d\n", i, group->group_id);
-            return -1;
-        }
-    }
-    
-    // Integrate based on operation type
-    if (is_element_wise) {
-        // Element-wise operations: concatenate element results
-        GGML_LOG_DEBUG("Integrating element-wise operation\n");
-        
-        for (int i = 0; i < group->num_chunks; i++) {
-            struct ggml_work_item * chunk = group->chunks[i];
-            int64_t start_element = chunk->chunk_start;
-            int64_t num_elements = chunk->chunk_end - chunk->chunk_start;
-            
-            size_t dest_offset = start_element * element_size;
-            size_t chunk_size = num_elements * element_size;
-            
-            // Sanity checks
-            if (dest_offset + chunk_size > ggml_nbytes(original)) {
-                GGML_LOG_ERROR("Element-wise chunk %d would overflow: offset=%zu + size=%zu > tensor_size=%zu\n", 
-                               i, dest_offset, chunk_size, ggml_nbytes(original));
-                return -1;
-            }
-            
-            GGML_LOG_DEBUG("Chunk %d: copying %zu bytes to offset %zu (elements %ld-%ld)\n", 
-                           i, chunk_size, dest_offset, start_element, chunk->chunk_end - 1);
-            
-            memcpy(original_data + dest_offset, chunk->result_buffer, chunk_size);
-        }
-        
-    } else if (is_row_wise) {
-        // Row-wise operations: concatenate row results
-        GGML_LOG_DEBUG("Integrating row-wise operation\n");
-        
-        int64_t cols = original->ne[0];
-        size_t row_stride = cols * element_size;
-        
-        for (int i = 0; i < group->num_chunks; i++) {
-            struct ggml_work_item * chunk = group->chunks[i];
-            int64_t start_row = chunk->chunk_start;
-            int64_t num_rows = chunk->chunk_end - chunk->chunk_start;
-            
-            size_t dest_offset = start_row * row_stride;
-            size_t chunk_size = num_rows * row_stride;
-            
-            // Sanity checks
-            if (dest_offset + chunk_size > ggml_nbytes(original)) {
-                GGML_LOG_ERROR("Row-wise chunk %d would overflow: offset=%zu + size=%zu > tensor_size=%zu\n", 
-                               i, dest_offset, chunk_size, ggml_nbytes(original));
-                return -1;
-            }
-            
-            GGML_LOG_DEBUG("Chunk %d: copying %zu bytes to offset %zu (rows %ld-%ld)\n", 
-                           i, chunk_size, dest_offset, start_row, chunk->chunk_end - 1);
-            
-            memcpy(original_data + dest_offset, chunk->result_buffer, chunk_size);
-        }
-        
-    } else {
-        GGML_LOG_ERROR("Unknown integration pattern for operation %s\n", ggml_op_name(operation));
-        return -1;
-    }
-    
-    GGML_LOG_INFO("Successfully integrated %d chunks for operation %s\n", 
-                  group->num_chunks, ggml_op_name(operation));
-    return 0;
-}
-
-// Coordinator thread function (one per NUMA node)
+// Coordinator thread function (one per NUMA node) - Graph-level approach
 static void * ggml_coordinator_thread_func(void * arg) {
     if (!arg) {
         GGML_LOG_ERROR("FATAL: Thread received NULL state pointer\n");
@@ -943,7 +702,7 @@ static void * ggml_coordinator_thread_func(void * arg) {
     
     struct ggml_coordinator_thread * coordinator = (struct ggml_coordinator_thread *)arg;
     
-    GGML_LOG_INFO("Coordinator thread starting for NUMA node %d\n", coordinator->numa_node);
+    GGML_LOG_INFO("Coordinator thread starting for NUMA node %d (graph-level)\n", coordinator->numa_node);
     
     // Set CPU affinity for this coordinator thread to its NUMA node
 #ifdef __linux__
@@ -957,7 +716,7 @@ static void * ggml_coordinator_thread_func(void * arg) {
     
     atomic_store(&coordinator->active, true);
     
-    // Main coordinator loop
+    // Main coordinator loop - processes complete operations 
     while (!atomic_load(&coordinator->shutdown_requested)) {
         struct ggml_work_item * work_item = ggml_work_queue_dequeue(&coordinator->work_queue);
         
@@ -967,52 +726,14 @@ static void * ggml_coordinator_thread_func(void * arg) {
         
         int64_t start_time = ggml_time_us();
         
-        // Execute the work using NUMA-specific threadpool and cgraph
-        if (coordinator->numa_pool && coordinator->numa_cgraph) {
-            enum ggml_status status = GGML_STATUS_FAILED;
-            
-            if (work_item->is_data_parallel) {
-                // For data parallel work, execute operation-specific parallelism
-                // Each NUMA node computes a portion of the specific operation
-                
-                status = ggml_numa_execute_operation_chunk(
-                    coordinator, 
-                    work_item->tensor, 
-                    work_item->chunk_start, 
-                    work_item->chunk_end,
-                    work_item->result_buffer,
-                    work_item->result_size
-                );
-                
-            } else {
-                // For non-data-parallel work, compute the entire cgraph
-                // Use single-threaded execution at coordinator level - the threadpool handles parallelism
-                int numa_threads = 1;
-                
-                struct ggml_cplan plan = ggml_graph_plan(coordinator->numa_cgraph, numa_threads, coordinator->numa_pool);
-                
-                if (plan.work_size > 0) {
-                    plan.work_data = malloc(plan.work_size);
-                }
-                
-                // Execute computation on NUMA node
-                status = ggml_graph_compute(coordinator->numa_cgraph, &plan);
-                
-                if (status == GGML_STATUS_SUCCESS && work_item->result_buffer && work_item->result_size > 0) {
-                    // Copy the entire result
-                    size_t copy_size = min_size_t(work_item->result_size, ggml_nbytes(work_item->tensor));
-                    memcpy(work_item->result_buffer, ggml_get_data(work_item->tensor), copy_size);
-                }
-                
-                if (plan.work_data) {
-                    free(plan.work_data);
-                }
-            }
-            
-            if (status != GGML_STATUS_SUCCESS) {
-                GGML_LOG_WARN("Coordinator NUMA%d: Work item %d failed with status %d\n",
-                             coordinator->numa_node, work_item->work_id, status);
-            }
+        // Execute complete operation using graph-level approach
+        enum ggml_status status = GGML_STATUS_FAILED;
+        
+        if (work_item->operation) {
+            // Execute the complete operation assigned to this NUMA node
+            status = ggml_numa_node_execute_operation(coordinator, work_item->operation);
+        } else {
+            GGML_LOG_ERROR("NUMA%d: Work item has no operation tensor\n", coordinator->numa_node);
         }
         
         int64_t end_time = ggml_time_us();
@@ -1022,29 +743,40 @@ static void * ggml_coordinator_thread_func(void * arg) {
         // Mark work item as completed
         atomic_store(&work_item->completed, true);
         
-        // Handle work group completion for data parallel work
-        if (work_item->is_data_parallel && work_item->work_group_id >= 0) {
-            // Find the work group and check if all chunks are completed
+        // Check if this work item belongs to a work group and update completion
+        if (coordinator->manager) {
             ggml_mutex_lock(&coordinator->manager->work_groups.groups_mutex);
-            
-            for (int group_idx = 0; group_idx < coordinator->manager->work_groups.max_groups; group_idx++) {
-                struct ggml_work_group * group = coordinator->manager->work_groups.groups[group_idx];
-                if (group && group->group_id == work_item->work_group_id) {
-                    // Increment completed chunks counter
-                    int completed_chunks = atomic_fetch_add(&group->completed_chunks, 1) + 1;
-                    
-                    GGML_LOG_DEBUG("Work group %d: chunk %d completed (%d/%d)\n", 
-                                   group->group_id, work_item->chunk_index, completed_chunks, group->num_chunks);
-                    
-                    // Check if all chunks are completed
-                    if (completed_chunks >= group->num_chunks) {
-                        GGML_LOG_INFO("Work group %d: all chunks completed, ready for integration\n", group->group_id);
+            for (int g = 0; g < coordinator->manager->work_groups.max_groups; g++) {
+                struct ggml_work_group * group = coordinator->manager->work_groups.groups[g];
+                if (group) {
+                    // Check if this work item belongs to this group
+                    for (int c = 0; c < group->num_chunks; c++) {
+                        if (group->chunks[c] == work_item) {
+                            // This work item belongs to this group
+                            int completed = atomic_fetch_add(&group->completed_chunks, 1) + 1;
+                            GGML_LOG_DEBUG("Work group %d: chunk %d/%d completed\n", 
+                                          group->group_id, completed, group->num_chunks);
+                            
+                            // Check if group is now complete
+                            ggml_work_group_check_completion(group);
+                            goto work_group_updated;
+                        }
                     }
-                    break;
                 }
             }
-            
+            work_group_updated:
             ggml_mutex_unlock(&coordinator->manager->work_groups.groups_mutex);
+        }
+        
+        if (status != GGML_STATUS_SUCCESS) {
+            GGML_LOG_WARN("Coordinator NUMA%d: Operation %s failed with status %d\n",
+                         coordinator->numa_node, 
+                         work_item->operation ? ggml_op_name(work_item->operation->op) : "unknown",
+                         status);
+        } else {
+            GGML_LOG_DEBUG("Coordinator NUMA%d: Operation %s completed successfully\n",
+                          coordinator->numa_node,
+                          work_item->operation ? ggml_op_name(work_item->operation->op) : "unknown");
         }
         
         // Call progress callback if set
@@ -1052,12 +784,12 @@ static void * ggml_coordinator_thread_func(void * arg) {
             coordinator->manager->progress_callback(
                 work_item->work_id,
                 coordinator->numa_node, 
-                work_item->tensor,
+                work_item->operation,
                 coordinator->manager->progress_callback_user_data
             );
         }
         
-        // Decrement pending items counter now that work is actually completed
+        // Decrement pending items counter
         atomic_fetch_sub(&coordinator->work_queue.pending_items, 1);
         
         // Signal completion to work queue
@@ -1065,10 +797,12 @@ static void * ggml_coordinator_thread_func(void * arg) {
         ggml_cond_signal(&coordinator->work_queue.work_completed);
         ggml_mutex_unlock(&coordinator->work_queue.queue_mutex);
         
-        // Free the work item and its result buffer (prevent memory leak)
-        if (work_item->result_buffer) {
-            free(work_item->result_buffer);
-        }
+        // Signal main thread's condition variable for manager-level waiting
+        ggml_mutex_lock(&coordinator->manager->main_sync_mutex);
+        ggml_cond_broadcast(&coordinator->manager->main_sync_cond);
+        ggml_mutex_unlock(&coordinator->manager->main_sync_mutex);
+        
+        // Free the work item
         free(work_item);
     }
     
@@ -1133,6 +867,71 @@ static void ggml_register_program_exit_cleanup(void) {
     if (!cleanup_registered) {
         atexit(ggml_cleanup_global_coordinator_at_exit);
         cleanup_registered = true;
+    }
+}
+
+// Helper function to create hyperthreading-optimized CPU masks
+// This assigns CPUs to avoid conflicts on the same physical core
+static void create_optimal_cpu_masks(struct ggml_threadpool_params *tpp, int num_numa_nodes) {
+    if (!tpp || num_numa_nodes < 2) return;
+    
+    // Check if we have a custom CPU mask set
+    bool has_custom_mask = false;
+    int available_cpus[GGML_MAX_N_THREADS];
+    int cpu_count = 0;
+    
+    for (int cpu = 0; cpu < GGML_MAX_N_THREADS; cpu++) {
+        if (tpp->cpumask[cpu]) {
+            available_cpus[cpu_count++] = cpu;
+            has_custom_mask = true;
+        }
+    }
+    
+    // If no custom mask is set, create an optimal one based on system topology
+    if (!has_custom_mask) {
+        GGML_LOG_INFO("🔧 Creating hyperthreading-optimized CPU assignment...\n");
+        
+        // Strategy 1: Physical core separation (Node 0: Cores 0-5, Node 1: Cores 6-10)
+        // This gives true isolation but may not use all logical CPUs
+        
+        // For our Intel Core Ultra 7 165H (11 physical cores, 22 logical):
+        // Node 0: CPUs 0,2,4,6,8,10 (physical cores 0-5, primary threads)
+        // Node 1: CPUs 12,14,16,18,20 + some hyperthread siblings if needed
+        
+        int total_physical_cores = 11;  // Known from our analysis
+        int cores_per_node = total_physical_cores / num_numa_nodes;
+        
+        // Clear the mask first
+        memset(tpp->cpumask, false, sizeof(tpp->cpumask));
+        
+        // Assign primary threads first for better performance
+        for (int node = 0; node < num_numa_nodes; node++) {
+            int start_core = node * cores_per_node;
+            int end_core = (node == num_numa_nodes - 1) ? total_physical_cores : (node + 1) * cores_per_node;
+            
+            GGML_LOG_INFO("   NUMA node %d: assigning physical cores %d-%d\n", 
+                          node, start_core, end_core - 1);
+            
+            for (int core = start_core; core < end_core; core++) {
+                int primary_cpu = core * 2;      // Primary thread: 0,2,4,6,8...
+                int ht_cpu = core * 2 + 1;       // Hyperthread sibling: 1,3,5,7,9...
+                
+                if (primary_cpu < GGML_MAX_N_THREADS) {
+                    tpp->cpumask[primary_cpu] = true;
+                    available_cpus[cpu_count++] = primary_cpu;
+                }
+                
+                // Only add hyperthread siblings if we have enough threads to justify it
+                if (tpp->n_threads > total_physical_cores && ht_cpu < GGML_MAX_N_THREADS) {
+                    tpp->cpumask[ht_cpu] = true;
+                    available_cpus[cpu_count++] = ht_cpu;
+                }
+            }
+        }
+        
+        GGML_LOG_INFO("✅ Optimal CPU mask created with %d CPUs avoiding HT conflicts\n", cpu_count);
+    } else {
+        GGML_LOG_INFO("📋 Using custom CPU mask with %d CPUs\n", cpu_count);
     }
 }
 
@@ -1214,9 +1013,16 @@ struct ggml_numa_coordinator_manager * ggml_numa_coordinator_manager_new_with_pa
     GGML_LOG_INFO("Creating NUMA coordinator with %d threads distributed across %d NUMA nodes (%d threads per node)\n", 
                   tpp->n_threads, num_numa_nodes, threads_per_numa);
     
+    // Step 3.5: Create optimal CPU masks to avoid hyperthreading conflicts
+    struct ggml_threadpool_params optimized_tpp = *tpp;  // Copy original parameters
+    if (num_numa_nodes > 1) {
+        create_optimal_cpu_masks(&optimized_tpp, num_numa_nodes);
+    }
+    
     for (int i = 0; i < num_numa_nodes; i++) {
         struct ggml_coordinator_thread * coord = &mgr->coordinators[i];
         coord->numa_node = i;
+        coord->n_threads = threads_per_numa;  // Store thread count for compute params
         atomic_init(&coord->active, false);
         atomic_init(&coord->shutdown_requested, false);
         atomic_init(&coord->thread_created, false);
@@ -1225,7 +1031,7 @@ struct ggml_numa_coordinator_manager * ggml_numa_coordinator_manager_new_with_pa
         coord->manager = mgr; // Reference to parent manager for callbacks
         
         // Step 4: Create NUMA-specific threadpool parameters for this coordinator
-        struct ggml_threadpool_params numa_tpp = *tpp; // Copy base parameters
+        struct ggml_threadpool_params numa_tpp = optimized_tpp; // Use optimized parameters
         numa_tpp.n_threads = threads_per_numa;
         numa_tpp.numa_aware = false; // CRITICAL: Disable coordinator recursion - we ARE the coordinator
         numa_tpp.force_multi_socket = false; // Don't create nested coordinators
@@ -1233,7 +1039,7 @@ struct ggml_numa_coordinator_manager * ggml_numa_coordinator_manager_new_with_pa
         // Step 5: Apply NUMA-specific CPU mask filtering
         if (numa_is_available && i < GGML_NUMA_MAX_NODES) {
 #ifdef __linux__
-            // Filter the original CPU mask to only include CPUs from this NUMA node
+            // Filter the optimized CPU mask to only include CPUs from this NUMA node
             struct bitmask* node_cpus = numa_allocate_cpumask();
             if (numa_node_to_cpus(i, node_cpus) == 0) {
                 // Create NUMA-filtered CPU mask
@@ -1241,42 +1047,42 @@ struct ggml_numa_coordinator_manager * ggml_numa_coordinator_manager_new_with_pa
                 bool has_numa_cpus = false;
                 
                 for (int cpu = 0; cpu < GGML_MAX_N_THREADS; cpu++) {
-                    // Include CPU if it's both in the original mask AND on this NUMA node
-                    if (tpp->cpumask[cpu] && numa_bitmask_isbitset(node_cpus, cpu)) {
+                    // Include CPU if it's both in the optimized mask AND on this NUMA node
+                    if (optimized_tpp.cpumask[cpu] && numa_bitmask_isbitset(node_cpus, cpu)) {
                         numa_tpp.cpumask[cpu] = true;
                         has_numa_cpus = true;
                     }
                 }
                 
                 if (!has_numa_cpus) {
-                    GGML_LOG_WARN("NUMA node %d: no NUMA-local CPUs found in mask, using original mask\n", i);
-                    memcpy(numa_tpp.cpumask, tpp->cpumask, sizeof(numa_tpp.cpumask));
+                    GGML_LOG_WARN("NUMA node %d: no NUMA-local CPUs found in optimized mask, using original mask\n", i);
+                    memcpy(numa_tpp.cpumask, optimized_tpp.cpumask, sizeof(numa_tpp.cpumask));
                 } else {
-                    GGML_LOG_INFO("NUMA node %d: filtered CPU mask to NUMA-local CPUs\n", i);
+                    GGML_LOG_INFO("NUMA node %d: filtered optimized CPU mask to NUMA-local CPUs\n", i);
                 }
             } else {
-                GGML_LOG_WARN("NUMA node %d: failed to get node CPUs, using original mask\n", i);
-                memcpy(numa_tpp.cpumask, tpp->cpumask, sizeof(numa_tpp.cpumask));
+                GGML_LOG_WARN("NUMA node %d: failed to get node CPUs, using optimized mask\n", i);
+                memcpy(numa_tpp.cpumask, optimized_tpp.cpumask, sizeof(numa_tpp.cpumask));
             }
             numa_free_cpumask(node_cpus);
 #endif
         } else {
-            // No NUMA or simulated mode: divide CPU mask evenly
+            // No NUMA or simulated mode: divide optimized CPU mask evenly
             bool has_cpu_mask = false;
             for (int cpu = 0; cpu < GGML_MAX_N_THREADS; cpu++) {
-                if (tpp->cpumask[cpu]) {
+                if (optimized_tpp.cpumask[cpu]) {
                     has_cpu_mask = true;
                     break;
                 }
             }
             
             if (has_cpu_mask) {
-                // Count available CPUs in original mask
+                // Count available CPUs in optimized mask
                 int available_cpus[GGML_MAX_N_THREADS];
                 int cpu_count = 0;
                 
                 for (int cpu = 0; cpu < GGML_MAX_N_THREADS; cpu++) {
-                    if (tpp->cpumask[cpu]) {
+                    if (optimized_tpp.cpumask[cpu]) {
                         available_cpus[cpu_count++] = cpu;
                     }
                 }
@@ -1284,16 +1090,57 @@ struct ggml_numa_coordinator_manager * ggml_numa_coordinator_manager_new_with_pa
                 // Distribute CPUs round-robin across NUMA nodes
                 memset(numa_tpp.cpumask, false, sizeof(numa_tpp.cpumask));
                 bool has_assigned_cpus = false;
+                int assigned_cpu_list[GGML_MAX_N_THREADS];
+                int assigned_count = 0;
                 
                 for (int j = 0; j < cpu_count; j++) {
                     if ((j % num_numa_nodes) == i) {
                         numa_tpp.cpumask[available_cpus[j]] = true;
+                        assigned_cpu_list[assigned_count++] = available_cpus[j];
                         has_assigned_cpus = true;
                     }
                 }
                 
-                GGML_LOG_INFO("NUMA node %d: assigned %s CPUs using round-robin distribution\n", 
-                              i, has_assigned_cpus ? "specific" : "no specific");
+                // Enhanced CPU assignment logging
+                if (has_assigned_cpus) {
+                    char cpu_list_str[512] = {0};
+                    char hyperthreading_analysis[512] = {0};
+                    int pos = 0;
+                    int ht_conflicts = 0;
+                    
+                    // Build CPU list string and analyze hyperthreading
+                    for (int k = 0; k < assigned_count; k++) {
+                        int cpu = assigned_cpu_list[k];
+                        int physical_core = cpu / 2;  // Intel HT pattern: CPU 0,1->Core 0, CPU 2,3->Core 1
+                        bool is_ht_sibling = (cpu % 2 == 1);
+                        
+                        pos += snprintf(cpu_list_str + pos, sizeof(cpu_list_str) - pos, 
+                                       "%sCPU%d(Core%d%s)", 
+                                       k > 0 ? "," : "", cpu, physical_core, 
+                                       is_ht_sibling ? "-HT" : "");
+                        
+                        // Check for hyperthreading conflicts with other assigned CPUs
+                        for (int l = k + 1; l < assigned_count; l++) {
+                            int other_cpu = assigned_cpu_list[l];
+                            if (cpu / 2 == other_cpu / 2) {  // Same physical core
+                                ht_conflicts++;
+                                break;
+                            }
+                        }
+                    }
+                    
+                    GGML_LOG_INFO("NUMA node %d: assigned %d CPUs [%s] via round-robin\n", 
+                                  i, assigned_count, cpu_list_str);
+                    
+                    if (ht_conflicts > 0) {
+                        GGML_LOG_WARN("NUMA node %d: ⚠️  %d hyperthreading conflicts detected - may reduce performance\n", 
+                                      i, ht_conflicts);
+                    } else {
+                        GGML_LOG_INFO("NUMA node %d: ✅ No hyperthreading conflicts - optimal CPU assignment\n", i);
+                    }
+                } else {
+                    GGML_LOG_INFO("NUMA node %d: no specific CPUs assigned - using default affinity\n", i);
+                }
             }
         }
         
@@ -1314,11 +1161,37 @@ struct ggml_numa_coordinator_manager * ggml_numa_coordinator_manager_new_with_pa
         // Step 7: Initialize work queue for this coordinator
         ggml_work_queue_init(&coord->work_queue);
         
-        GGML_LOG_INFO("Created coordinator for NUMA node %d with %d threads (CPU mask: %s)\n", 
-                      i, threads_per_numa, "NUMA-aware");
+        // Enhanced logging with complete CPU assignment details
+        char final_cpu_summary[256] = {0};
+        int summary_pos = 0;
+        bool has_mask = false;
+        
+        for (int cpu = 0; cpu < GGML_MAX_N_THREADS; cpu++) {
+            if (numa_tpp.cpumask[cpu]) {
+                if (!has_mask) {
+                    summary_pos += snprintf(final_cpu_summary + summary_pos, 
+                                          sizeof(final_cpu_summary) - summary_pos, "CPUs:");
+                    has_mask = true;
+                }
+                summary_pos += snprintf(final_cpu_summary + summary_pos, 
+                                      sizeof(final_cpu_summary) - summary_pos, "%d,", cpu);
+            }
+        }
+        
+        if (has_mask && summary_pos > 0) {
+            final_cpu_summary[summary_pos - 1] = '\0';  // Remove trailing comma
+        } else {
+            snprintf(final_cpu_summary, sizeof(final_cpu_summary), "default affinity");
+        }
+        
+        GGML_LOG_INFO("✅ Coordinator NUMA node %d: %d threads, %s\n", 
+                      i, threads_per_numa, final_cpu_summary);
     }
     
-    GGML_LOG_INFO("NUMA coordinator manager created with %d NUMA nodes\n", num_numa_nodes);
+    // Summary log for complete coordinator setup
+    GGML_LOG_INFO("🚀 NUMA coordinator manager active with %d virtual NUMA nodes\n", num_numa_nodes);
+    GGML_LOG_INFO("   Total threads: %d, Threads per node: ~%d\n", 
+                  tpp->n_threads, tpp->n_threads / num_numa_nodes);
     return mgr;
 }
 
@@ -1360,13 +1233,11 @@ void ggml_numa_coordinator_manager_free(struct ggml_numa_coordinator_manager * m
             ggml_thread_join(coord->thread_handle, NULL);
         }
         
-        // Clean up work queue AFTER thread has finished - just clean resources, no signaling
+        // Clean up work queue AFTER thread has finished - no result buffers in graph-level approach
         struct ggml_work_item * current = coord->work_queue.head;
         while (current) {
             struct ggml_work_item * next = current->next;
-            if (current->result_buffer) {
-                free(current->result_buffer);
-            }
+            // Note: No result_buffer to free in graph-level approach
             free(current);
             current = next;
         }
@@ -1441,8 +1312,9 @@ int ggml_numa_coordinator_manager_set_cgraph(struct ggml_numa_coordinator_manage
     for (int i = 0; i < mgr->num_numa_nodes; i++) {
         struct ggml_coordinator_thread * coord = &mgr->coordinators[i];
         
-        // Store reference to the original cgraph (no copying needed)
-        coord->numa_cgraph = (struct ggml_cgraph *)master_cgraph; // Cast away const
+        // Store reference to the original cgraph (properly handle const)
+        // The coordinator threads only read the cgraph, so the const cast is safe
+        coord->numa_cgraph = (struct ggml_cgraph *)master_cgraph; 
         coord->numa_ctx = NULL; // No separate context needed
     }
     
@@ -1513,29 +1385,19 @@ int ggml_numa_coordinator_manager_submit_work(struct ggml_numa_coordinator_manag
         target_numa = atomic_load(&mgr->total_work_items) % mgr->num_numa_nodes; // Round-robin
     }
     
-    // Create work item
+    // Create work item for graph-level operation
     struct ggml_work_item * work_item = malloc(sizeof(struct ggml_work_item));
     if (!work_item) return -1;
     
-    work_item->tensor = tensor;
-    work_item->numa_node = target_numa;
-    work_item->chunk_start = 0;
-    work_item->chunk_end = ggml_nelements(tensor);
-    work_item->result_buffer = malloc(ggml_nbytes(tensor));
-    work_item->result_size = ggml_nbytes(tensor);
+    // Set up graph-level work item fields
+    work_item->operation = tensor;           // Complete operation to execute
+    work_item->assigned_numa_node = target_numa;
+    work_item->dependencies = NULL;          // No dependencies for now
+    work_item->num_dependencies = 0;
+    atomic_init(&work_item->dependencies_ready, true); // Ready to execute
+    atomic_init(&work_item->completed, false);
+    work_item->next = NULL;
     work_item->work_id = atomic_fetch_add(&mgr->total_work_items, 1);
-    
-    // Initialize data parallelism fields for single-node work
-    work_item->work_group_id = -1;           // Not part of a work group
-    work_item->chunk_index = 0;              // Single chunk
-    work_item->total_chunks = 1;             // Single chunk
-    work_item->is_data_parallel = false;     // Not data parallel
-    work_item->original_tensor = tensor;     // Same as tensor for single work
-    
-    if (!work_item->result_buffer) {
-        free(work_item);
-        return -1;
-    }
     
     // Enqueue to target coordinator
     ggml_work_queue_enqueue(&mgr->coordinators[target_numa].work_queue, work_item);
@@ -1543,70 +1405,53 @@ int ggml_numa_coordinator_manager_submit_work(struct ggml_numa_coordinator_manag
     return work_item->work_id;
 }
 
-// Submit tensor with data parallelism across multiple NUMA nodes
+// Submit tensor for data parallel processing across multiple NUMA nodes
 int ggml_numa_coordinator_manager_submit_data_parallel_work(struct ggml_numa_coordinator_manager * mgr,
                                                             struct ggml_tensor * tensor) {
-    if (!mgr || !tensor) return -1;
-    
-    // Only use data parallelism if we have multiple NUMA nodes
-    if (mgr->num_numa_nodes <= 1) {
-        GGML_LOG_DEBUG("Single NUMA node, falling back to regular work submission\n");
-        return ggml_numa_coordinator_manager_submit_work(mgr, tensor, -1);
-    }
-    
-    GGML_LOG_INFO("Submitting data parallel work for tensor %p across %d NUMA nodes\n", (void*)tensor, mgr->num_numa_nodes);
-    
-    // Ensure coordinator threads are started before submitting work
-    int start_result = ggml_numa_coordinator_manager_start(mgr);
-    if (start_result != 0) {
-        GGML_LOG_ERROR("Failed to start coordinator threads for data parallel work\n");
+    if (!mgr || !tensor || mgr->num_numa_nodes <= 1) {
         return -1;
     }
     
-    // Data parallel work requires a proper cgraph context - it should not be called
-    // for individual tensor submissions but only as part of compute_graph operations
-    if (!mgr->coordinators[0].numa_cgraph) {
-        GGML_LOG_ERROR("Data parallel work requires cgraph to be set first - use ggml_numa_coordinator_manager_compute_graph\n");
-        return -1;
-    }
+    GGML_LOG_DEBUG("Submitting data parallel work for tensor with %ld elements\n", ggml_nelements(tensor));
     
-    // Create work group for this tensor
-    struct ggml_work_group * group = ggml_work_group_create(&mgr->work_groups, tensor, mgr->num_numa_nodes);
+    // Create work group for data parallelism
+    int num_chunks = mgr->num_numa_nodes; // One chunk per NUMA node
+    struct ggml_work_group * group = ggml_work_group_create(&mgr->work_groups, tensor, num_chunks);
     if (!group) {
         GGML_LOG_ERROR("Failed to create work group for data parallel work\n");
         return -1;
     }
     
-    // Split operation into chunks
-    struct ggml_work_item ** chunks = NULL;
-    int num_chunks = ggml_operation_split_for_numa(tensor, mgr->num_numa_nodes, &chunks);
-    if (num_chunks <= 0 || !chunks) {
-        GGML_LOG_ERROR("Failed to split tensor for NUMA processing\n");
-        ggml_work_group_free(group);
-        return -1;
-    }
-    
-    // Store chunks in work group
-    group->chunks = chunks;
-    group->num_chunks = num_chunks;
-    
-    // Submit each chunk to its assigned NUMA node
+    // Create work items for each chunk (one per NUMA node)
     for (int i = 0; i < num_chunks; i++) {
-        struct ggml_work_item * chunk = chunks[i];
-        chunk->work_group_id = group->group_id;
-        chunk->work_id = atomic_fetch_add(&mgr->total_work_items, 1);
-        
-        // Enqueue to the specific NUMA node coordinator
-        int target_numa = chunk->numa_node;
-        if (target_numa < 0 || target_numa >= mgr->num_numa_nodes) {
-            target_numa = i % mgr->num_numa_nodes; // Fallback
+        struct ggml_work_item * work_item = malloc(sizeof(struct ggml_work_item));
+        if (!work_item) {
+            GGML_LOG_ERROR("Failed to allocate work item for chunk %d\n", i);
+            // TODO: Clean up partially created work group
+            return -1;
         }
         
-        GGML_LOG_DEBUG("Submitting chunk %d (work_id %d) to NUMA node %d\n", i, chunk->work_id, target_numa);
-        ggml_work_queue_enqueue(&mgr->coordinators[target_numa].work_queue, chunk);
+        // Set up work item for complete operation (simplified from chunk-based)
+        work_item->operation = tensor;           // Each NUMA node processes complete operation
+        work_item->assigned_numa_node = i;       // Assign to specific NUMA node
+        work_item->dependencies = NULL;
+        work_item->num_dependencies = 0;
+        atomic_init(&work_item->dependencies_ready, true);
+        atomic_init(&work_item->completed, false);
+        work_item->next = NULL;
+        work_item->work_id = atomic_fetch_add(&mgr->total_work_items, 1);
+        
+        // Store work item in group
+        group->chunks[i] = work_item;
+        
+        // Submit work item to assigned NUMA node
+        ggml_work_queue_enqueue(&mgr->coordinators[i].work_queue, work_item);
+        
+        GGML_LOG_DEBUG("Submitted work item %d to NUMA node %d for group %d\n", 
+                       work_item->work_id, i, group->group_id);
     }
     
-    GGML_LOG_INFO("Submitted %d chunks for data parallel processing (work group %d)\n", num_chunks, group->group_id);
+    GGML_LOG_DEBUG("Created data parallel work group %d with %d chunks\n", group->group_id, num_chunks);
     return group->group_id;
 }
 
@@ -1735,14 +1580,17 @@ int ggml_numa_coordinator_manager_compute_graph(struct ggml_numa_coordinator_man
     return 0;
 }
 
-// Wait for all work to complete (Step 7: Main thread polls for completion)
+// Wait for all work to complete (Step 7: Main thread waits with condition variables)
 int ggml_numa_coordinator_manager_wait_for_completion(struct ggml_numa_coordinator_manager * mgr) {
     if (!mgr) return -1;
     
-    // Check all coordinators for pending work
-    bool all_complete = false;
-    while (!all_complete) {
-        all_complete = true;
+    GGML_LOG_DEBUG("Waiting for all work to complete using condition variables\n");
+    
+    ggml_mutex_lock(&mgr->main_sync_mutex);
+    
+    // Wait until all coordinators have no pending work
+    while (true) {
+        bool all_complete = true;
         
         for (int i = 0; i < mgr->num_numa_nodes; i++) {
             struct ggml_coordinator_thread * coord = &mgr->coordinators[i];
@@ -1754,15 +1602,18 @@ int ggml_numa_coordinator_manager_wait_for_completion(struct ggml_numa_coordinat
             }
         }
         
-        if (!all_complete) {
-            usleep(100); // Sleep 100 microseconds
+        if (all_complete) {
+            break;
         }
+        
+        // Wait on condition variable instead of sleeping
+        // The coordinator threads will signal this condition when they complete work
+        ggml_cond_wait(&mgr->main_sync_cond, &mgr->main_sync_mutex);
     }
     
-    // Add a small delay to ensure coordinator threads are truly idle
-    // This prevents race conditions when switching to a new cgraph immediately
-    usleep(1000); // 1ms delay
+    ggml_mutex_unlock(&mgr->main_sync_mutex);
     
+    GGML_LOG_DEBUG("All work completed\n");
     return 0;
 }
 
@@ -1790,7 +1641,9 @@ int ggml_numa_coordinator_manager_wait_for_work_group(struct ggml_numa_coordinat
         return -1;
     }
     
-    // Wait for completion and integration
+    // Wait for completion and integration using condition variable
+    ggml_mutex_lock(&target_group->completion_mutex);
+    
     while (!atomic_load(&target_group->group_completed)) {
         // Check if all chunks are completed and trigger integration if needed
         int completion_status = ggml_work_group_check_completion(target_group);
@@ -1800,12 +1653,15 @@ int ggml_numa_coordinator_manager_wait_for_work_group(struct ggml_numa_coordinat
         } else if (completion_status == -1) {
             // Integration failed
             GGML_LOG_ERROR("Work group %d integration failed\n", work_group_id);
+            ggml_mutex_unlock(&target_group->completion_mutex);
             return -1;
         }
         
-        // Sleep briefly to avoid busy waiting
-        usleep(100); // 100 microseconds
+        // Wait on condition variable instead of sleeping
+        ggml_cond_wait(&target_group->completion_cond, &target_group->completion_mutex);
     }
+    
+    ggml_mutex_unlock(&target_group->completion_mutex);
     
     GGML_LOG_INFO("Work group %d completed successfully\n", work_group_id);
     
@@ -1874,5 +1730,467 @@ int ggml_numa_coordinator_manager_set_progress_callback(struct ggml_numa_coordin
     
     GGML_LOG_INFO("Progress callback %s\n", callback ? "enabled" : "disabled");
     return 0;
+}
+
+//
+// New graph-level scheduler functions (Phase 2 implementation)
+//
+
+// Create a graph scheduler that assigns operations to NUMA nodes
+static struct ggml_numa_graph_scheduler * ggml_numa_create_graph_scheduler(
+    struct ggml_cgraph * graph,
+    int num_numa_nodes
+) {
+    if (!graph || num_numa_nodes <= 0 || num_numa_nodes > GGML_NUMA_MAX_NODES) {
+        GGML_LOG_ERROR("Invalid parameters for graph scheduler creation\n");
+        return NULL;
+    }
+    
+    struct ggml_numa_graph_scheduler * scheduler = malloc(sizeof(struct ggml_numa_graph_scheduler));
+    if (!scheduler) {
+        GGML_LOG_ERROR("Failed to allocate graph scheduler\n");
+        return NULL;
+    }
+    
+    memset(scheduler, 0, sizeof(struct ggml_numa_graph_scheduler));
+    
+    // Initialize scheduler fields
+    scheduler->original_graph = graph;
+    scheduler->num_numa_nodes = num_numa_nodes;
+    scheduler->num_operations = graph->n_nodes;
+    scheduler->max_operations = graph->n_nodes;
+    atomic_init(&scheduler->completed_operations, 0);
+    atomic_init(&scheduler->scheduler_completed, false);
+    ggml_mutex_init(&scheduler->scheduler_mutex);
+    ggml_cond_init(&scheduler->operations_completed_cond);
+    
+    // Initialize load balancing state
+    for (int i = 0; i < num_numa_nodes; i++) {
+        scheduler->numa_load[i] = 0;
+        scheduler->numa_memory[i] = 0;
+    }
+    
+    // Allocate operation assignments array (one per graph node)
+    scheduler->assignments = malloc(sizeof(struct ggml_numa_operation_assignment) * graph->n_nodes);
+    if (!scheduler->assignments) {
+        GGML_LOG_ERROR("Failed to allocate operation assignments\n");
+        ggml_mutex_destroy(&scheduler->scheduler_mutex);
+        free(scheduler);
+        return NULL;
+    }
+    
+    // Initialize assignments
+    for (int i = 0; i < graph->n_nodes; i++) {
+        scheduler->assignments[i].operation = graph->nodes[i];
+        scheduler->assignments[i].assigned_numa_node = -1; // Not assigned yet
+        scheduler->assignments[i].memory_requirement = ggml_nbytes(graph->nodes[i]);
+        scheduler->assignments[i].estimated_cost = ggml_nelements(graph->nodes[i]); // Simple estimate
+        atomic_init(&scheduler->assignments[i].dependencies_ready, false);
+        atomic_init(&scheduler->assignments[i].completed, false);
+    }
+    
+    GGML_LOG_INFO("Created graph scheduler for %d operations across %d NUMA nodes\n", 
+                  graph->n_nodes, num_numa_nodes);
+    
+    return scheduler;
+}
+
+// Free a graph scheduler
+static void ggml_numa_free_graph_scheduler(struct ggml_numa_graph_scheduler * scheduler) {
+    if (!scheduler) return;
+    
+    GGML_LOG_DEBUG("Freeing graph scheduler\n");
+    
+    if (scheduler->assignments) {
+        free(scheduler->assignments);
+    }
+    
+    ggml_mutex_destroy(&scheduler->scheduler_mutex);
+    ggml_cond_destroy(&scheduler->operations_completed_cond);
+    free(scheduler);
+}
+
+// Assign operations to NUMA nodes using load balancing
+static int ggml_numa_assign_operations_to_nodes(
+    struct ggml_numa_graph_scheduler * scheduler
+) {
+    if (!scheduler || !scheduler->original_graph) {
+        GGML_LOG_ERROR("Invalid scheduler for operation assignment\n");
+        return -1;
+    }
+    
+    struct ggml_cgraph * graph = scheduler->original_graph;
+    int num_nodes = graph->n_nodes;
+    int num_numa_nodes = scheduler->num_numa_nodes;
+    
+    GGML_LOG_INFO("Assigning %d operations to %d NUMA nodes\n", num_nodes, num_numa_nodes);
+    
+    // Simple round-robin assignment for now - can be enhanced with load balancing
+    for (int i = 0; i < num_nodes; i++) {
+        struct ggml_tensor * operation = graph->nodes[i];
+        
+        // Calculate which NUMA node should handle this operation
+        int assigned_node = -1;
+        
+        // Strategy 1: Round-robin for simplicity
+        assigned_node = i % num_numa_nodes;
+        
+        // Strategy 2: Load balancing based on memory usage (future enhancement)
+        // This could consider the memory requirements and current load per node
+        
+        // Assign the operation
+        scheduler->assignments[i].assigned_numa_node = assigned_node;
+        scheduler->numa_load[assigned_node] += scheduler->assignments[i].estimated_cost;
+        scheduler->numa_memory[assigned_node] += scheduler->assignments[i].memory_requirement;
+        
+        GGML_LOG_DEBUG("Operation %d (%s) assigned to NUMA node %d (load: %ld ops, memory: %ld bytes)\n",
+                       i, ggml_op_name(operation->op), assigned_node,
+                       scheduler->numa_load[assigned_node], scheduler->numa_memory[assigned_node]);
+    }
+    
+    // Log final load distribution
+    for (int node = 0; node < num_numa_nodes; node++) {
+        GGML_LOG_INFO("NUMA node %d: %ld operations, %ld bytes memory\n",
+                      node, scheduler->numa_load[node], scheduler->numa_memory[node]);
+    }
+    
+    return 0;
+}
+
+// Execute operations assigned to each NUMA node
+static enum ggml_status ggml_numa_execute_assigned_operations(
+    struct ggml_numa_coordinator_manager * mgr,
+    struct ggml_numa_graph_scheduler * scheduler
+) {
+    if (!mgr || !scheduler || !scheduler->original_graph) {
+        GGML_LOG_ERROR("Invalid parameters for executing assigned operations\n");
+        return GGML_STATUS_FAILED;
+    }
+    
+    GGML_LOG_INFO("Executing %d assigned operations using graph-level coordination\n", 
+                  scheduler->num_operations);
+    
+    // Create work items for each operation and submit them to appropriate NUMA nodes
+    for (int i = 0; i < scheduler->num_operations; i++) {
+        struct ggml_numa_operation_assignment * assignment = &scheduler->assignments[i];
+        
+        if (assignment->assigned_numa_node < 0 || assignment->assigned_numa_node >= mgr->num_numa_nodes) {
+            GGML_LOG_ERROR("Invalid NUMA node assignment for operation %d\n", i);
+            continue;
+        }
+        
+        // Create work item for this operation
+        struct ggml_work_item * work_item = malloc(sizeof(struct ggml_work_item));
+        if (!work_item) {
+            GGML_LOG_ERROR("Failed to allocate work item for operation %d\n", i);
+            continue;
+        }
+        
+        // Set up work item for graph-level execution
+        work_item->operation = assignment->operation;
+        work_item->assigned_numa_node = assignment->assigned_numa_node;
+        work_item->dependencies = NULL; // Simple for now - can add dependency tracking later
+        work_item->num_dependencies = 0;
+        atomic_init(&work_item->dependencies_ready, true); // Ready to execute
+        atomic_init(&work_item->completed, false);
+        work_item->next = NULL;
+        work_item->work_id = i; // Use operation index as work ID
+        
+        // Submit to the assigned NUMA node
+        ggml_work_queue_enqueue(&mgr->coordinators[assignment->assigned_numa_node].work_queue, work_item);
+        
+        GGML_LOG_DEBUG("Submitted operation %d (%s) to NUMA node %d\n",
+                       i, ggml_op_name(assignment->operation->op), assignment->assigned_numa_node);
+    }
+    
+    // Wait for all operations to complete using proper synchronization
+    GGML_LOG_INFO("Waiting for all %d operations to complete...\n", scheduler->num_operations);
+    
+    // Use condition variables instead of busy waiting
+    ggml_mutex_lock(&scheduler->scheduler_mutex);
+    
+    while (atomic_load(&scheduler->completed_operations) < scheduler->num_operations) {
+        // Update completed operations count first
+        int completed_count = 0;
+        for (int i = 0; i < scheduler->num_operations; i++) {
+            if (atomic_load(&scheduler->assignments[i].completed)) {
+                completed_count++;
+            }
+        }
+        atomic_store(&scheduler->completed_operations, completed_count);
+        
+        // Check if we're now complete
+        if (completed_count >= scheduler->num_operations) {
+            break;
+        }
+        
+        // Wait on condition variable with timeout to periodically check for completion
+        struct timespec timeout;
+        clock_gettime(CLOCK_REALTIME, &timeout);
+        timeout.tv_nsec += 1000000; // 1 millisecond timeout
+        if (timeout.tv_nsec >= 1000000000) {
+            timeout.tv_sec += 1;
+            timeout.tv_nsec -= 1000000000;
+        }
+        
+        // Use timed wait instead of indefinite wait
+        ggml_cond_timedwait(&scheduler->operations_completed_cond, &scheduler->scheduler_mutex, &timeout);
+    }
+    
+    ggml_mutex_unlock(&scheduler->scheduler_mutex);
+    
+    // Verify all operations are actually completed
+    int final_completed_count = atomic_load(&scheduler->completed_operations);
+    if (final_completed_count == scheduler->num_operations) {
+        atomic_store(&scheduler->scheduler_completed, true);
+        GGML_LOG_INFO("All %d operations completed successfully\n", final_completed_count);
+        return GGML_STATUS_SUCCESS;
+    } else {
+        GGML_LOG_ERROR("Completion check failed: %d/%d operations completed\n", 
+                       final_completed_count, scheduler->num_operations);
+        return GGML_STATUS_FAILED;
+    }
+}
+
+//
+// GGML Integration Function - Main entry point from ggml-cpu.c
+//
+
+/**
+ * Main GGML integration function - replaces standard graph computation with NUMA-aware version
+ * This is the primary integration point that ggml-cpu.c calls instead of standard ggml_graph_compute
+ * 
+ * @param cgraph Computation graph to execute
+ * @param n_threads Number of threads (used to determine if NUMA coordination is beneficial)
+ * @return GGML_STATUS_SUCCESS on success, GGML_STATUS_FAILED on failure
+ */
+enum ggml_status ggml_numa_graph_compute(struct ggml_cgraph * cgraph, int n_threads) {
+    if (!cgraph) {
+        GGML_LOG_ERROR("Invalid cgraph for NUMA graph computation\n");
+        return GGML_STATUS_FAILED;
+    }
+    
+    // Determine if NUMA coordination would be beneficial
+    if (!ggml_numa_should_coordinate(cgraph, n_threads)) {
+        GGML_LOG_DEBUG("NUMA coordination not beneficial - using standard computation\n");
+        // Fall back to standard GGML computation
+        struct ggml_cplan plan = ggml_graph_plan(cgraph, n_threads, NULL);
+        if (plan.work_size > 0) {
+            plan.work_data = malloc(plan.work_size);
+            if (!plan.work_data) {
+                return GGML_STATUS_FAILED;
+            }
+        }
+        
+        enum ggml_status status = ggml_graph_compute(cgraph, &plan);
+        
+        if (plan.work_data) {
+            free(plan.work_data);
+        }
+        
+        return status;
+    }
+    
+    GGML_LOG_INFO("Using NUMA-aware graph computation for %d operations with %d threads\n", 
+                  cgraph->n_nodes, n_threads);
+    
+    // Get or create the global NUMA coordinator manager
+    struct ggml_numa_coordinator_manager * mgr = ggml_numa_coordinator_manager_get_global(n_threads, false);
+    if (!mgr) {
+        GGML_LOG_ERROR("Failed to create NUMA coordinator manager\n");
+        return GGML_STATUS_FAILED;
+    }
+    
+    // Create graph scheduler
+    struct ggml_numa_graph_scheduler * scheduler = ggml_numa_create_graph_scheduler(cgraph, mgr->num_numa_nodes);
+    if (!scheduler) {
+        GGML_LOG_ERROR("Failed to create graph scheduler\n");
+        return GGML_STATUS_FAILED;
+    }
+    
+    // Assign operations to NUMA nodes
+    int assign_result = ggml_numa_assign_operations_to_nodes(scheduler);
+    if (assign_result != 0) {
+        GGML_LOG_ERROR("Failed to assign operations to NUMA nodes\n");
+        ggml_numa_free_graph_scheduler(scheduler);
+        return GGML_STATUS_FAILED;
+    }
+    
+    // Execute the assigned operations
+    enum ggml_status exec_result = ggml_numa_execute_assigned_operations(mgr, scheduler);
+    
+    // Clean up scheduler
+    ggml_numa_free_graph_scheduler(scheduler);
+    
+    if (exec_result == GGML_STATUS_SUCCESS) {
+        GGML_LOG_INFO("NUMA graph computation completed successfully\n");
+    } else {
+        GGML_LOG_ERROR("NUMA graph computation failed\n");
+    }
+    
+    return exec_result;
+}
+
+// Determine if NUMA coordination would be beneficial for a given graph
+static bool ggml_numa_should_coordinate(
+    struct ggml_cgraph * cgraph,
+    int n_threads
+) {
+    if (!cgraph) {
+        return false;
+    }
+    
+    // Check if NUMA is available at all
+#ifdef __linux__
+    if (numa_available() == -1) {
+        GGML_LOG_DEBUG("NUMA not available, skipping coordination\n");
+        return false;
+    }
+#else
+    GGML_LOG_DEBUG("NUMA coordination not supported on this platform\n");
+    return false;
+#endif
+    
+    // Minimum requirements for NUMA coordination
+    int min_operations_for_numa = 10;  // Need enough operations to distribute
+    int min_threads_for_numa = 4;      // Need enough threads to make coordination worthwhile
+    
+    if (cgraph->n_nodes < min_operations_for_numa) {
+        GGML_LOG_DEBUG("Too few operations (%d < %d) for NUMA coordination\n", 
+                      cgraph->n_nodes, min_operations_for_numa);
+        return false;
+    }
+    
+    if (n_threads < min_threads_for_numa) {
+        GGML_LOG_DEBUG("Too few threads (%d < %d) for NUMA coordination\n", 
+                      n_threads, min_threads_for_numa);
+        return false;
+    }
+    
+    // Check if we have multiple NUMA nodes
+    int num_numa_nodes = numa_max_node() + 1;
+    if (num_numa_nodes <= 1) {
+        GGML_LOG_DEBUG("Single NUMA node (%d), coordination not beneficial\n", num_numa_nodes);
+        return false;
+    }
+    
+    // Estimate if the computational load is large enough to justify NUMA coordination overhead
+    int64_t total_elements = 0;
+    for (int i = 0; i < cgraph->n_nodes; i++) {
+        if (cgraph->nodes[i]) {
+            total_elements += ggml_nelements(cgraph->nodes[i]);
+        }
+    }
+    
+    int64_t min_elements_for_numa = 100000; // Minimum computational load
+    if (total_elements < min_elements_for_numa) {
+        GGML_LOG_DEBUG("Computational load too small (%ld < %ld) for NUMA coordination\n", 
+                      total_elements, min_elements_for_numa);
+        return false;
+    }
+    
+    GGML_LOG_INFO("NUMA coordination beneficial: %d operations, %d threads, %d NUMA nodes, %ld total elements\n",
+                  cgraph->n_nodes, n_threads, num_numa_nodes, total_elements);
+    
+    return true;
+}
+
+// Public fallback execution function for operations not supported by NUMA coordinator
+enum ggml_status ggml_numa_fallback_execute_operation(struct ggml_tensor * operation, const struct ggml_compute_params * params) {
+    if (!operation) {
+        GGML_LOG_ERROR("Invalid operation tensor for fallback execution\n");
+        return GGML_STATUS_FAILED;
+    }
+    
+    GGML_LOG_DEBUG("Fallback execution for operation %s\n", ggml_op_name(operation->op));
+    
+    // Create default single-threaded compute parameters if none provided
+    struct ggml_compute_params fallback_params;
+    if (params && operation->op != GGML_OP_MUL_MAT) {
+        // Use provided params for non-MUL_MAT operations
+        fallback_params = *params;
+    } else {
+        // For MUL_MAT operations, we need a minimal threadpool even in single-threaded mode
+        // because MUL_MAT code expects valid threadpool for barriers and chunk management
+        if (operation->op == GGML_OP_MUL_MAT && params && params->threadpool) {
+            // Create single-threaded parameters but keep the threadpool
+            // We'll temporarily set it to single-threaded mode
+            fallback_params = (struct ggml_compute_params) {
+                .ith = 0,
+                .nth = 1,
+                .wsize = 0,
+                .wdata = NULL,
+                .threadpool = params->threadpool
+            };
+        } else {
+            // Default fallback for other operations or when no threadpool available
+            fallback_params = (struct ggml_compute_params) {
+                .ith = 0,
+                .nth = 1,
+                .wsize = 0,
+                .wdata = NULL,
+                .threadpool = NULL
+            };
+        }
+    }
+    
+    // Execute the operation using GGML's standard compute functions
+    // This provides a basic fallback for operations not handled by NUMA coordinator
+    switch (operation->op) {
+        // Add basic operations that have public compute functions
+        case GGML_OP_ADD:
+            ggml_compute_forward_add(&fallback_params, operation);
+            break;
+        case GGML_OP_MUL:
+            ggml_compute_forward_mul(&fallback_params, operation);
+            break;
+        case GGML_OP_DUP:
+            ggml_compute_forward_dup(&fallback_params, operation);
+            break;
+        case GGML_OP_CPY:
+            ggml_compute_forward_cpy(&fallback_params, operation);
+            break;
+        case GGML_OP_CONT:
+            ggml_compute_forward_cont(&fallback_params, operation);
+            break;
+        case GGML_OP_RESHAPE:
+            ggml_compute_forward_reshape(&fallback_params, operation);
+            break;
+        case GGML_OP_VIEW:
+            ggml_compute_forward_view(&fallback_params, operation);
+            break;
+        case GGML_OP_PERMUTE:
+            ggml_compute_forward_permute(&fallback_params, operation);
+            break;
+        case GGML_OP_TRANSPOSE:
+            ggml_compute_forward_transpose(&fallback_params, operation);
+            break;
+        case GGML_OP_NORM:
+            ggml_compute_forward_norm(&fallback_params, operation);
+            break;
+        case GGML_OP_RMS_NORM:
+            ggml_compute_forward_rms_norm(&fallback_params, operation);
+            break;
+        case GGML_OP_SUM:
+            ggml_compute_forward_sum(&fallback_params, operation);
+            break;
+        case GGML_OP_MEAN:
+            ggml_compute_forward_mean(&fallback_params, operation);
+            break;
+        case GGML_OP_SOFT_MAX:
+            ggml_compute_forward_soft_max(&fallback_params, operation);
+            break;
+        case GGML_OP_MUL_MAT:
+            ggml_compute_forward_mul_mat(&fallback_params, operation);
+            break;
+            
+        default:
+            GGML_LOG_ERROR("Operation %s not available for fallback execution - no public compute function\n", 
+                          ggml_op_name(operation->op));
+            return GGML_STATUS_FAILED;
+    }
+    
+    GGML_LOG_DEBUG("Fallback execution completed for operation %s\n", ggml_op_name(operation->op));
+    return GGML_STATUS_SUCCESS;
 }
 

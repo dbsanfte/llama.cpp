@@ -9,6 +9,7 @@
 
 #include "ggml.h"
 #include "ggml-impl.h"
+#include "ggml-cpu-impl.h"  // For ggml_compute_params structure
 
 #ifdef __cplusplus
 extern "C" {
@@ -168,6 +169,27 @@ struct ggml_numa_perf_stats {
 };
 
 struct ggml_numa_perf_stats ggml_numa_coordinator_manager_get_stats(struct ggml_numa_coordinator_manager * mgr, int numa_node);
+
+/**
+ * Execute a tensor operation using standard GGML fallback (single-threaded)
+ * This function provides a public fallback for operations not supported by NUMA coordinator
+ * 
+ * @param operation The tensor operation to execute
+ * @param params Compute parameters (optional, can be NULL for default single-threaded)
+ * @return GGML_STATUS_SUCCESS on success, GGML_STATUS_FAILED on failure
+ */
+enum ggml_status ggml_numa_fallback_execute_operation(struct ggml_tensor * operation, const struct ggml_compute_params * params);
+
+/**
+ * Main GGML integration function - NUMA-aware graph computation
+ * This is the primary integration point that replaces standard ggml_graph_compute
+ * when NUMA coordination is beneficial
+ * 
+ * @param cgraph Computation graph to execute
+ * @param n_threads Number of threads for computation
+ * @return GGML_STATUS_SUCCESS on success, GGML_STATUS_FAILED on failure
+ */
+enum ggml_status ggml_numa_graph_compute(struct ggml_cgraph * cgraph, int n_threads);
 
 #ifdef __cplusplus
 }

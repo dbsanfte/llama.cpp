@@ -251,3 +251,98 @@ set(LLAMA_TEST_NAME test-numa-data-parallelism)
 llama_build_and_test(test-numa-data-parallelism.cpp)
 target_link_libraries(${LLAMA_TEST_NAME} PRIVATE ggml ggml-cpu common)
 target_include_directories(${LLAMA_TEST_NAME} PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src)
+
+# NUMA coordinator functional tests
+set(LLAMA_TEST_NAME test-numa-coordinator-functional)
+llama_build_and_test(test-numa-coordinator-functional.cpp)
+target_link_libraries(${LLAMA_TEST_NAME} PRIVATE ggml ggml-cpu common)
+target_include_directories(${LLAMA_TEST_NAME} PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src)
+target_include_directories(${LLAMA_TEST_NAME} PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src/ggml-cpu)
+
+# NUMA coordinator instrumentation tests
+set(LLAMA_TEST_NAME test-numa-coordinator-instrumentation-simple)
+llama_build_and_test(test-numa-coordinator-instrumentation-simple.cpp)
+target_link_libraries(${LLAMA_TEST_NAME} PRIVATE ggml ggml-cpu common)
+target_include_directories(${LLAMA_TEST_NAME} PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src)
+target_include_directories(${LLAMA_TEST_NAME} PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src/ggml-cpu)
+
+# NUMA coordinator debug tests
+set(LLAMA_TEST_NAME test-numa-debug-simple)
+llama_build_and_test(test-numa-debug-simple.cpp)
+target_link_libraries(${LLAMA_TEST_NAME} PRIVATE ggml ggml-cpu common)
+target_include_directories(${LLAMA_TEST_NAME} PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src)
+target_include_directories(${LLAMA_TEST_NAME} PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src/ggml-cpu)
+
+# test-numa-mulmat-debug
+set(LLAMA_TEST_NAME test-numa-mulmat-debug)
+llama_build_and_test(test-numa-mulmat-debug.cpp)
+target_link_libraries(${LLAMA_TEST_NAME} PRIVATE ggml ggml-cpu common)
+target_include_directories(${LLAMA_TEST_NAME} PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src)
+target_include_directories(${LLAMA_TEST_NAME} PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src/ggml-cpu)
+
+# test-numa-fallback-debug
+set(LLAMA_TEST_NAME test-numa-fallback-debug)
+llama_build_and_test(test-numa-fallback-debug.cpp)
+target_link_libraries(${LLAMA_TEST_NAME} PRIVATE ggml ggml-cpu common)
+target_include_directories(${LLAMA_TEST_NAME} PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src)
+target_include_directories(${LLAMA_TEST_NAME} PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src/ggml-cpu)
+
+# test-basic-mulmat
+set(LLAMA_TEST_NAME test-basic-mulmat)
+llama_build_and_test(test-basic-mulmat.cpp)
+target_link_libraries(${LLAMA_TEST_NAME} PRIVATE ggml ggml-cpu common)
+
+# test-numa-work-distribution
+set(LLAMA_TEST_NAME test-numa-work-distribution)
+llama_build_and_test(test-numa-work-distribution.cpp)
+target_link_libraries(${LLAMA_TEST_NAME} PRIVATE ggml ggml-cpu common)
+target_include_directories(${LLAMA_TEST_NAME} PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src)
+target_include_directories(${LLAMA_TEST_NAME} PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src/ggml-cpu)
+
+# test-numa-operation-types  
+set(LLAMA_TEST_NAME test-numa-operation-types)
+llama_build_and_test(test-numa-operation-types.cpp)
+target_link_libraries(${LLAMA_TEST_NAME} PRIVATE ggml ggml-cpu common)
+target_include_directories(${LLAMA_TEST_NAME} PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src)
+target_include_directories(${LLAMA_TEST_NAME} PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src/ggml-cpu)
+
+# test-numa-coordinator-performance
+set(LLAMA_TEST_NAME test-numa-coordinator-performance)
+llama_build_and_test(test-numa-coordinator-performance.cpp)
+target_link_libraries(${LLAMA_TEST_NAME} PRIVATE ggml ggml-cpu common)
+target_include_directories(${LLAMA_TEST_NAME} PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src)
+target_include_directories(${LLAMA_TEST_NAME} PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src/ggml-cpu)
+
+# test-numa-workgroup-debug
+set(LLAMA_TEST_NAME test-numa-workgroup-debug)
+llama_build_and_test(test-numa-workgroup-debug.cpp)
+target_link_libraries(${LLAMA_TEST_NAME} PRIVATE ggml ggml-cpu common)
+target_include_directories(${LLAMA_TEST_NAME} PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src)
+target_include_directories(${LLAMA_TEST_NAME} PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src/ggml-cpu)
+
+# test-numa-hotspot-analysis
+set(LLAMA_TEST_NAME test-numa-hotspot-analysis)
+llama_build_and_test(test-numa-hotspot-analysis.cpp)
+target_link_libraries(${LLAMA_TEST_NAME} PRIVATE ggml ggml-cpu common)
+
+# test-numa-cpu-assignment
+set(LLAMA_TEST_NAME test-numa-cpu-assignment)
+llama_build_and_test(test-numa-cpu-assignment.cpp)
+target_link_libraries(${LLAMA_TEST_NAME} PRIVATE ggml ggml-cpu common)
+
+# test-numa-cpu-mask
+set(LLAMA_TEST_NAME test-numa-cpu-mask)
+llama_build_and_test(test-numa-cpu-mask.cpp)
+target_link_libraries(${LLAMA_TEST_NAME} PRIVATE ggml ggml-cpu common)
+
+# test-cpu-mask-integration
+set(LLAMA_TEST_NAME test-cpu-mask-integration)
+llama_build_and_test(test-cpu-mask-integration.cpp)
+target_link_libraries(${LLAMA_TEST_NAME} PRIVATE ggml ggml-cpu common)
+
+# test-comprehensive-numa-performance  
+set(LLAMA_TEST_NAME test-comprehensive-numa-performance)
+llama_build_and_test(test-comprehensive-numa-performance.cpp)
+target_link_libraries(${LLAMA_TEST_NAME} PRIVATE ggml ggml-cpu common)
+target_include_directories(${LLAMA_TEST_NAME} PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src)
+target_include_directories(${LLAMA_TEST_NAME} PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src/ggml-cpu)

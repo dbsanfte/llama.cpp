@@ -39,6 +39,16 @@ struct ggml_numa_coordinator_manager * ggml_numa_coordinator_manager_new(int n_t
 struct ggml_numa_coordinator_manager * ggml_numa_coordinator_manager_get_global(int n_threads, bool force_multi_socket);
 
 /**
+ * Get global singleton coordinator manager with threadpool parameters (preferred method)
+ * Creates the coordinator once with CPU/NUMA masks and reuses it for the program lifetime
+ * This version respects CPU masks and NUMA preferences from ggml-cpu.c
+ * 
+ * @param tpp Threadpool parameters including CPU masks and NUMA settings
+ * @return Global manager instance or NULL on failure
+ */
+struct ggml_numa_coordinator_manager * ggml_numa_coordinator_manager_get_global_with_params(const struct ggml_threadpool_params * tpp);
+
+/**
  * Free NUMA coordinator manager (hierarchical cleanup)
  * 
  * @param mgr Manager to free

@@ -6956,9 +6956,10 @@ void ggml_threadpool_params_init(struct ggml_threadpool_params * p, int n_thread
     p->paused     = false; // threads are ready to go
     
     // Unified CPU assignment defaults
-    p->numa_aware           = true;  // Enable NUMA-aware assignment by default
-    p->allow_numa_override  = true;  // Allow NUMA to override strict_cpu for locality
-    p->warn_on_numa_override = true; // Warn users when we override their settings
+    p->numa_aware            = true;  // Enable NUMA-aware assignment by default
+    p->allow_numa_override   = true;  // Allow NUMA to override strict_cpu for locality
+    p->warn_on_numa_override = true;  // Warn users when we override their settings
+    p->force_multi_socket    = false; // CRITICAL FIX: Initialize to false to prevent random coordinator activation
     
     memset(p->cpumask, 0, GGML_MAX_N_THREADS); // all-zero means use the default affinity (usually inherited)
 }
