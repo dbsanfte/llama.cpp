@@ -14,12 +14,18 @@
 #include "vec.h"
 #include "ops.h"
 #include "ggml.h"
-#include "ggml-numa-coordinator.h"   // NEW: 3-tier coordinator architecture
 
 #ifdef GGML_NUMA_MIRROR
-#include <numa.h>
-#include <numaif.h>
+#include "ggml-numa-coordinator.h"
 #endif
+
+// Global NUMA state for compatibility
+static struct {
+    bool initialized;
+    enum ggml_numa_strategy strategy;
+    int numa_nodes;
+    bool numa_enabled;
+} g_numa_state = { false, GGML_NUMA_STRATEGY_DISABLED, 1, false };
 
 #if defined(_MSC_VER) || defined(__MINGW32__)
 #include <malloc.h> // using malloc.h with MSC/MINGW
@@ -42,10 +48,6 @@
 #include <signal.h>
 #if defined(__gnu_linux__)
 #include <syscall.h>
-#endif
-#if defined(__linux__) || defined(__APPLE__) || defined(__unix__)
-#include <pthread.h>
-#include <sched.h>
 #endif
 
 #ifdef GGML_USE_OPENMP
@@ -446,7 +448,7 @@ struct ggml_threadpool {
     ggml_mutex_t mutex;       // mutex for cond.var
     ggml_cond_t  cond;        // cond.var for waiting for new work
 
-    struct ggml_cgraph_ref * cgraph_ref;  // Reference-counted cgraph pointer
+    struct ggml_cgraph * cgraph;
     struct ggml_cplan  * cplan;
 
     // synchronization primitives
@@ -466,76 +468,9 @@ struct ggml_threadpool {
 
     int32_t      prio;        // Scheduling priority
     uint32_t     poll;        // Polling level (0 - no polling)
-    
-    // Store threadpool parameters for unified CPU assignment
-    struct ggml_threadpool_params params;
-    
-    // Multi-socket NUMA manager (optional - legacy)
-    struct ggml_numa_threadpool_manager * numa_mgr;
-    
-    // NEW: 3-tier NUMA coordinator manager
-    struct ggml_numa_coordinator_manager * coordinator_mgr;
-    bool use_coordinator;           // Use new 3-tier coordinator architecture
 
     enum ggml_status ec;
 };
-
-// Thread-safe reference counting for cgraph
-struct ggml_cgraph_ref {
-    const struct ggml_cgraph * cgraph;  // Original cgraph pointer
-    ggml_mutex_t ref_mutex;             // Mutex protecting reference count
-    atomic_int ref_count;               // Atomic reference counter
-    atomic_bool is_valid;               // Flag indicating if cgraph is still valid
-};
-
-// Reference counting functions
-static struct ggml_cgraph_ref * ggml_cgraph_ref_create(const struct ggml_cgraph * cgraph) {
-    if (!cgraph) return NULL;
-    
-    struct ggml_cgraph_ref * ref = (struct ggml_cgraph_ref *) malloc(sizeof(struct ggml_cgraph_ref));
-    if (!ref) return NULL;
-    
-    ref->cgraph = cgraph;
-    ggml_mutex_init(&ref->ref_mutex);
-    atomic_store_explicit(&ref->ref_count, 1, memory_order_relaxed);
-    atomic_store_explicit(&ref->is_valid, true, memory_order_release);
-    
-    return ref;
-}
-
-static void ggml_cgraph_ref_acquire(struct ggml_cgraph_ref * ref) {
-    if (!ref) return;
-    atomic_fetch_add_explicit(&ref->ref_count, 1, memory_order_relaxed);
-}
-
-static void ggml_cgraph_ref_release(struct ggml_cgraph_ref * ref) {
-    if (!ref) return;
-    
-    int old_count = atomic_fetch_sub_explicit(&ref->ref_count, 1, memory_order_acq_rel);
-    if (old_count == 1) {
-        // Last reference - clean up
-        ggml_mutex_destroy(&ref->ref_mutex);
-        free(ref);
-    }
-}
-
-static const struct ggml_cgraph * ggml_cgraph_ref_get_safe(struct ggml_cgraph_ref * ref) {
-    if (!ref) return NULL;
-    
-    // Check if cgraph is still valid before returning it
-    if (!atomic_load_explicit(&ref->is_valid, memory_order_acquire)) {
-        return NULL;
-    }
-    
-    return ref->cgraph;
-}
-
-static void ggml_cgraph_ref_invalidate(struct ggml_cgraph_ref * ref) {
-    if (!ref) return;
-    
-    // Mark cgraph as invalid - threads will detect this and stop using it
-    atomic_store_explicit(&ref->is_valid, false, memory_order_release);
-}
 
 // Per-thread state
 struct ggml_compute_state {
@@ -547,7 +482,6 @@ struct ggml_compute_state {
 #endif
     struct ggml_threadpool * threadpool;
     int ith;
-    int numa_node;  // NUMA node this thread is bound to
 };
 
 // Helpers for polling loops
@@ -564,61 +498,12 @@ static inline void ggml_thread_cpu_relax(void) {;}
 #endif
 
 //
-// NUMA support
-//
-
-#define GGML_NUMA_MAX_NODES 8
-#define GGML_NUMA_MAX_CPUS 512
-
-struct ggml_numa_node {
-    uint32_t cpus[GGML_NUMA_MAX_CPUS]; // hardware threads on this node
-    uint32_t n_cpus;
-};
-
-struct ggml_numa_nodes {
-    enum ggml_numa_strategy numa_strategy;
-    struct ggml_numa_node nodes[GGML_NUMA_MAX_NODES];
-    uint32_t n_nodes;
-    uint32_t total_cpus; // hardware threads on system
-    uint32_t current_node; // node on which main process is execting
-#if defined(__gnu_linux__)
-    cpu_set_t cpuset; // cpuset from numactl
-#else
-    uint32_t cpuset; // no NUMA support outside of Linux at this time. Use a portable datatype
-#endif
-};
-
-//
 // ggml state
 //
 
 struct ggml_state {
-    struct ggml_numa_nodes numa;
-};
-
-// Multi-socket threadpool manager
-struct ggml_numa_threadpool_manager {
-    int n_numa_nodes;                                    // Number of NUMA nodes
-    struct ggml_threadpool* socket_pools[GGML_NUMA_MAX_NODES]; // One threadpool per socket
-    struct ggml_threadpool* coordinator_pool;             // Main coordinator threadpool
-    bool is_forced_mode;                                 // True if forced multi-socket mode (non-NUMA)
-    
-    // Inter-socket coordination
-    atomic_int sockets_completed;                         // Number of sockets that completed work
-    atomic_int current_socket_chunk[GGML_NUMA_MAX_NODES]; // Current chunk for each socket
-    ggml_mutex_t coordination_mutex;                      // Mutex for socket coordination
-    ggml_cond_t  coordination_cond;                       // Condition variable for socket coordination
-    
-    // Work decomposition
-    struct ggml_tensor* partial_results[GGML_NUMA_MAX_NODES]; // Partial results from each socket
-    bool enable_multi_socket;                             // Enable multi-socket processing
-    
-    // Performance profiling
-    int64_t total_computations;                           // Total number of multi-socket computations
-    int64_t total_async_time_us;                          // Total time spent in async execution (microseconds)
-    int64_t total_sync_time_us;                           // Total time spent in synchronization (microseconds)
-    int64_t socket_times_us[GGML_NUMA_MAX_NODES];         // Individual socket computation times
-    int64_t last_computation_elements;                    // Elements in last computation (for throughput)
+    // Placeholder for future state if needed
+    int initialized;
 };
 
 static struct ggml_state g_state = {0};
@@ -669,255 +554,43 @@ int ggml_threadpool_chunk_add(struct ggml_threadpool * tp, int value) {
     return atomic_fetch_add_explicit(&tp->current_chunk, value, memory_order_relaxed);
 }
 
-#if defined(__gnu_linux__)
-static cpu_set_t ggml_get_numa_affinity(void) {
-    cpu_set_t cpuset;
-    pthread_t thread;
-    thread = pthread_self();
-    CPU_ZERO(&cpuset);
-    pthread_getaffinity_np(thread, sizeof(cpu_set_t), &cpuset);
-    return cpuset;
-}
-#else
-static uint32_t ggml_get_numa_affinity(void) {
-    return 0; // no NUMA support
-}
-#endif
+//
+// NUMA Management Functions
+//
 
 void ggml_numa_init(enum ggml_numa_strategy numa_flag) {
-    if (g_state.numa.n_nodes > 0) {
-        fprintf(stderr, "ggml_numa_init: NUMA already initialized\n");
-
-        return;
-    }
-
-#if defined(__gnu_linux__)
-    struct stat st;
-    char path[256];
-    int rv;
-
-    // set numa scheme
-    g_state.numa.numa_strategy = numa_flag;
-
-    GGML_PRINT_DEBUG("numa strategy %u\n",g_state.numa.numa_strategy);
-
-    g_state.numa.cpuset = ggml_get_numa_affinity();
-
-    // enumerate nodes
-    while (g_state.numa.n_nodes < GGML_NUMA_MAX_NODES) {
-        rv = snprintf(path, sizeof(path), "/sys/devices/system/node/node%u", g_state.numa.n_nodes);
-        GGML_ASSERT(rv > 0 && (unsigned)rv < sizeof(path));
-        if (stat(path, &st) != 0) { break; }
-        ++g_state.numa.n_nodes;
-    }
-
-    // enumerate CPUs
-    while (g_state.numa.total_cpus < GGML_NUMA_MAX_CPUS) {
-        rv = snprintf(path, sizeof(path), "/sys/devices/system/cpu/cpu%u", g_state.numa.total_cpus);
-        GGML_ASSERT(rv > 0 && (unsigned)rv < sizeof(path));
-        if (stat(path, &st) != 0) { break; }
-        ++g_state.numa.total_cpus;
-    }
-
-    GGML_PRINT_DEBUG("found %u numa nodes, %u CPUs\n", g_state.numa.n_nodes, g_state.numa.total_cpus);
-
-    // figure out which node we're on
-    uint current_cpu;
-    int getcpu_ret = 0;
-#if __GLIBC__ > 2 || (__GLIBC__ == 2 && __GLIBC_MINOR__ > 33) || defined(__COSMOPOLITAN__)
-    getcpu_ret = getcpu(&current_cpu, &g_state.numa.current_node);
+    // Basic NUMA initialization - detect system capabilities
+    g_numa_state.strategy = numa_flag;
+    g_numa_state.initialized = true;
+    
+#ifdef GGML_NUMA_MIRROR
+    // When coordinator is available, we can detect actual NUMA nodes
+    // For now, we'll use simple detection
+    g_numa_state.numa_nodes = 1;  // Will be updated when coordinator provides real detection
+    g_numa_state.numa_enabled = (numa_flag != GGML_NUMA_STRATEGY_DISABLED);
 #else
-    // old glibc doesn't have a wrapper for this call. Fall back on direct syscall
-#   if !defined(SYS_getcpu) && defined(SYS_get_cpu)
-#       define SYS_getcpu SYS_get_cpu // some older glibc versions use this name
-#   endif
-    getcpu_ret = syscall(SYS_getcpu, &current_cpu, &g_state.numa.current_node);
-#endif
-
-    if (g_state.numa.n_nodes < 1 || g_state.numa.total_cpus < 1 || getcpu_ret != 0) {
-        g_state.numa.n_nodes = 0;
-        return;
-    }
-
-    GGML_PRINT_DEBUG("found our process on numa node %u, CPU %u\n", g_state.numa.current_node, current_cpu);
-
-    for (uint32_t n = 0; n < g_state.numa.n_nodes; ++n) {
-        struct ggml_numa_node * node = &g_state.numa.nodes[n];
-        GGML_PRINT_DEBUG("CPUs on node %u:", n);
-        node->n_cpus = 0;
-        for (uint32_t c = 0; c < g_state.numa.total_cpus; ++c) {
-            rv = snprintf(path, sizeof(path), "/sys/devices/system/node/node%u/cpu%u", n, c);
-            GGML_ASSERT(rv > 0 && (unsigned)rv < sizeof(path));
-            if (stat(path, &st) == 0) {
-                node->cpus[node->n_cpus++] = c;
-                GGML_PRINT_DEBUG(" %u", c);
-            }
-        }
-        GGML_PRINT_DEBUG("\n");
-    }
-
-#ifdef GGML_USE_OPENMP
-    // Configure OpenMP thread binding for NUMA awareness
-    if (ggml_is_numa()) {
-        // Check if OMP_PROC_BIND environment variable is set properly for NUMA
-        const char* current_bind_env = getenv("OMP_PROC_BIND");
-        if (!current_bind_env || (strcmp(current_bind_env, "close") != 0 && strcmp(current_bind_env, "true") != 0)) {
-            GGML_LOG_WARN("For optimal NUMA performance, consider setting: export OMP_PROC_BIND=close\n");
-            GGML_LOG_WARN("Current OMP_PROC_BIND: %s\n", current_bind_env ? current_bind_env : "(not set)");
-        } else {
-            GGML_PRINT_DEBUG("OpenMP thread binding configured for NUMA: OMP_PROC_BIND=%s\n", current_bind_env);
-        }
-    } else {
-        // For non-NUMA systems, we can allow more flexible thread movement
-        GGML_PRINT_DEBUG("Non-NUMA system detected, keeping default OpenMP proc_bind policy\n");
-    }
-#endif
-
-    if (ggml_is_numa()) {
-        FILE *fptr = fopen("/proc/sys/kernel/numa_balancing", "r");
-        if (fptr != NULL) {
-            char buf[42];
-            if (fgets(buf, sizeof(buf), fptr) && strncmp(buf, "0\n", sizeof(buf)) != 0) {
-                GGML_LOG_WARN("kernel NUMA balancing is enabled, this can interfere with llama.cpp's NUMA optimizations\n");
-                GGML_LOG_WARN("consider disabling it for better performance: echo 0 | sudo tee /proc/sys/kernel/numa_balancing\n");
-            }
-            fclose(fptr);
-        }
-    }
-#else
-    UNUSED(numa_flag);
-    // TODO
-#endif
-}
-
-void ggml_numa_init_with_node(enum ggml_numa_strategy numa_flag, int isolate_node) {
-    if (g_state.numa.n_nodes > 0) {
-        fprintf(stderr, "ggml_numa_init_with_node: NUMA already initialized\n");
-        return;
-    }
-
-#if defined(__gnu_linux__)
-    struct stat st;
-    char path[256];
-    int rv;
-
-    // set numa scheme
-    g_state.numa.numa_strategy = numa_flag;
-
-    GGML_PRINT_DEBUG("numa strategy %u, isolate_node %d\n", g_state.numa.numa_strategy, isolate_node);
-
-    g_state.numa.cpuset = ggml_get_numa_affinity();
-
-    // enumerate nodes
-    while (g_state.numa.n_nodes < GGML_NUMA_MAX_NODES) {
-        rv = snprintf(path, sizeof(path), "/sys/devices/system/node/node%u", g_state.numa.n_nodes);
-        GGML_ASSERT(rv > 0 && (unsigned)rv < sizeof(path));
-        if (stat(path, &st) != 0) { break; }
-        ++g_state.numa.n_nodes;
-    }
-
-    // enumerate CPUs
-    while (g_state.numa.total_cpus < GGML_NUMA_MAX_CPUS) {
-        rv = snprintf(path, sizeof(path), "/sys/devices/system/cpu/cpu%u", g_state.numa.total_cpus);
-        GGML_ASSERT(rv > 0 && (unsigned)rv < sizeof(path));
-        if (stat(path, &st) != 0) { break; }
-        ++g_state.numa.total_cpus;
-    }
-
-    GGML_PRINT_DEBUG("found %u numa nodes, %u CPUs\n", g_state.numa.n_nodes, g_state.numa.total_cpus);
-
-    // figure out which node we're on or use user-specified node
-    uint current_cpu;
-    int getcpu_ret = 0;
-#if __GLIBC__ > 2 || (__GLIBC__ == 2 && __GLIBC_MINOR__ > 33) || defined(__COSMOPOLITAN__)
-    getcpu_ret = getcpu(&current_cpu, &g_state.numa.current_node);
-#else
-    // old glibc doesn't have a wrapper for this call. Fall back on direct syscall
-#   if !defined(SYS_getcpu) && defined(SYS_get_cpu)
-#       define SYS_getcpu SYS_get_cpu // some older glibc versions use this name
-#   endif
-    getcpu_ret = syscall(SYS_getcpu, &current_cpu, &g_state.numa.current_node);
-#endif
-
-    if (g_state.numa.n_nodes < 1 || g_state.numa.total_cpus < 1 || getcpu_ret != 0) {
-        g_state.numa.n_nodes = 0;
-        return;
-    }
-
-#ifdef GGML_USE_OPENMP
-    // Configure OpenMP thread binding for NUMA awareness
-    if (ggml_is_numa()) {
-        // Check if OpenMP proc_bind is configured for NUMA locality
-        const char* proc_bind_env = getenv("OMP_PROC_BIND");
-        if (proc_bind_env && (strcmp(proc_bind_env, "close") == 0 || strcmp(proc_bind_env, "true") == 0)) {
-            GGML_PRINT_DEBUG("OpenMP proc_bind properly configured for NUMA locality on node %d: %s\n", numa_node, proc_bind_env);
-        } else {
-            GGML_LOG_WARN("OpenMP thread migration may affect NUMA performance. Consider setting OMP_PROC_BIND=close\n");
-            if (proc_bind_env) {
-                GGML_PRINT_DEBUG("Current OMP_PROC_BIND: %s\n", proc_bind_env);
-            }
-        }
-    } else {
-        // For non-NUMA systems, we can allow more flexible thread movement
-        GGML_PRINT_DEBUG("Non-NUMA system detected, keeping default OpenMP proc_bind policy\n");
-    }
-#endif
-
-    // If user specified a valid isolate node, use it; otherwise use current node
-    if (isolate_node >= 0 && isolate_node < (int)g_state.numa.n_nodes) {
-        g_state.numa.current_node = isolate_node;
-        GGML_PRINT_DEBUG("using user-specified isolate node %d\n", isolate_node);
-    } else if (isolate_node >= 0) {
-        GGML_LOG_WARN("invalid isolate node %d (max %u), using current node %u\n", 
-                      isolate_node, g_state.numa.n_nodes - 1, g_state.numa.current_node);
-    }
-
-    GGML_PRINT_DEBUG("found our process on numa node %u, CPU %u\n", g_state.numa.current_node, current_cpu);
-
-    for (uint32_t n = 0; n < g_state.numa.n_nodes; ++n) {
-        struct ggml_numa_node * node = &g_state.numa.nodes[n];
-        GGML_PRINT_DEBUG("CPUs on node %u:", n);
-        node->n_cpus = 0;
-        for (uint32_t c = 0; c < g_state.numa.total_cpus; ++c) {
-            rv = snprintf(path, sizeof(path), "/sys/devices/system/node/node%u/cpu%u", n, c);
-            GGML_ASSERT(rv > 0 && (unsigned)rv < sizeof(path));
-            if (stat(path, &st) == 0) {
-                node->cpus[node->n_cpus++] = c;
-                GGML_PRINT_DEBUG(" %u", c);
-            }
-        }
-        GGML_PRINT_DEBUG("\n");
-    }
-
-    if (ggml_is_numa()) {
-        FILE *fptr = fopen("/proc/sys/kernel/numa_balancing", "r");
-        if (fptr != NULL) {
-            char buf[42];
-            if (fgets(buf, sizeof(buf), fptr) && strncmp(buf, "0\n", sizeof(buf)) != 0) {
-                GGML_LOG_WARN("kernel NUMA balancing is enabled, this can interfere with llama.cpp's NUMA optimizations\n");
-                GGML_LOG_WARN("consider disabling it for better performance: echo 0 | sudo tee /proc/sys/kernel/numa_balancing\n");
-            }
-            fclose(fptr);
-        }
-    }
-#else
-    UNUSED(numa_flag);
-    UNUSED(isolate_node);
-    // TODO
+    // Default behavior: no NUMA support
+    g_numa_state.numa_nodes = 1;
+    g_numa_state.numa_enabled = false;
 #endif
 }
 
 bool ggml_is_numa(void) {
-    return g_state.numa.n_nodes > 1;
+    return g_numa_state.numa_enabled;
 }
 
-// Function to get NUMA node count
 int ggml_numa_node_count(void) {
-    return (int)g_state.numa.n_nodes;
+    return g_numa_state.numa_nodes;
 }
 
 enum ggml_numa_strategy ggml_get_numa_strategy(void) {
-    return g_state.numa.numa_strategy;
+    return g_numa_state.strategy;
+}
+
+void ggml_numa_init_with_node(enum ggml_numa_strategy numa_flag, int isolate_node) {
+    ggml_numa_init(numa_flag);
+    // isolate_node parameter is stored in strategy for now
+    UNUSED(isolate_node);
 }
 
 #if defined(__ARM_ARCH)
@@ -1634,575 +1307,6 @@ UseGgmlGemm2:;
     }
 }
 
-//
-// Multi-socket matrix multiplication structures
-//
-
-struct socket_work_data {
-    const struct ggml_compute_params * params;
-    struct ggml_tensor * dst;
-    const struct ggml_tensor * src0;
-    const struct ggml_tensor * src1;
-    int64_t row_start;
-    int64_t row_end;
-    struct ggml_numa_threadpool_manager * numa_mgr;
-    int socket_id;
-    ggml_mutex_t work_completed_mutex;
-    ggml_cond_t work_completed_cond;
-    bool work_completed;
-    pthread_t async_thread;  // Thread handle for async execution
-};
-
-// Forward declarations
-static void ggml_numa_socket_compute_mul_mat_chunk(struct socket_work_data * work);
-static void ggml_numa_socket_work_task(struct ggml_compute_state * state, void * user_data);
-static int ggml_numa_socket_get_thread_count(int socket_id, struct ggml_numa_threadpool_manager * numa_mgr);
-static void ggml_numa_socket_compute_mul_mat_chunk(struct socket_work_data * work);
-static void ggml_numa_socket_compute_mul_mat_chunk_with_affinity(struct socket_work_data * work);
-static void ggml_numa_socket_compute_mul_mat_chunk_with_manual_threading(struct socket_work_data * work);
-
-// Async worker function for socket-specific computation
-static void * ggml_numa_socket_async_worker(void * user_data) {
-    struct socket_work_data * work = (struct socket_work_data *)user_data;
-    
-    // Start timing this socket's work
-    struct timespec socket_start_time, socket_end_time;
-    clock_gettime(CLOCK_MONOTONIC, &socket_start_time);
-    
-#ifdef GGML_USE_OPENMP
-    // CRITICAL FIX: OpenMP environment variables must be set BEFORE any parallel regions
-    // Setting them in worker threads is too late - OpenMP runtime is already initialized
-    // The CPU binding should be done at the process level during threadpool creation
-    
-    // Instead, use direct CPU affinity for the pthread itself
-    struct ggml_threadpool * socket_pool = work->numa_mgr->socket_pools[work->socket_id];
-    if (socket_pool) {
-        // Check if cpumask has any CPUs assigned
-        bool has_cpus = false;
-        for (int cpu = 0; cpu < GGML_MAX_N_THREADS && !has_cpus; cpu++) {
-            if (socket_pool->params.cpumask[cpu]) {
-                has_cpus = true;
-            }
-        }
-        
-        if (has_cpus) {
-            cpu_set_t cpuset;
-            CPU_ZERO(&cpuset);
-            
-            for (int cpu = 0; cpu < GGML_MAX_N_THREADS; cpu++) {
-                if (socket_pool->params.cpumask[cpu]) {
-                    CPU_SET(cpu, &cpuset);
-                }
-            }
-            
-            if (CPU_COUNT(&cpuset) > 0) {
-#if defined(__linux__)
-                pthread_setaffinity_np(pthread_self(), sizeof(cpuset), &cpuset);
-                GGML_LOG_DEBUG("Socket %d: pthread bound to %d CPUs\n", work->socket_id, CPU_COUNT(&cpuset));
-                
-                // Show which CPUs were assigned for debugging
-                char cpu_list[256] = {0};
-                bool first = true;
-                for (int cpu = 0; cpu < GGML_MAX_N_THREADS; cpu++) {
-                    if (socket_pool->params.cpumask[cpu]) {
-                        if (!first) strcat(cpu_list, ",");
-                        char cpu_str[16];
-                        snprintf(cpu_str, sizeof(cpu_str), "%d", cpu);
-                        strcat(cpu_list, cpu_str);
-                        first = false;
-                    }
-                }
-                GGML_LOG_DEBUG("Socket %d: assigned CPUs {%s}\n", work->socket_id, cpu_list);
-#else
-                GGML_LOG_DEBUG("Socket %d: CPU affinity not supported on this platform\n", work->socket_id);
-#endif
-            }
-        }
-    }
-#endif // GGML_USE_OPENMP
-    
-    // Perform the socket-specific computation with manual threading (bypass OpenMP issues)
-    ggml_numa_socket_compute_mul_mat_chunk_with_manual_threading(work);
-    
-    // Record timing for this socket
-    clock_gettime(CLOCK_MONOTONIC, &socket_end_time);
-    int64_t socket_time_us = (socket_end_time.tv_sec - socket_start_time.tv_sec) * 1000000 + 
-                             (socket_end_time.tv_nsec - socket_start_time.tv_nsec) / 1000;
-    
-    // Store socket timing (thread-safe since each socket writes to its own slot)
-    work->numa_mgr->socket_times_us[work->socket_id] = socket_time_us;
-    
-    GGML_LOG_DEBUG("Socket %d completed work in %ld μs (rows %ld-%ld)\n", 
-                   work->socket_id, socket_time_us, work->row_start, work->row_end);
-    
-    // Signal completion atomically
-    atomic_fetch_add(&work->numa_mgr->sockets_completed, 1);
-    
-    return NULL;
-}
-
-static void ggml_compute_forward_mul_mat_multi_socket(
-              const struct ggml_compute_params * params,
-              struct ggml_tensor * dst,
-              struct ggml_numa_threadpool_manager * numa_mgr) {    if (!numa_mgr || !numa_mgr->enable_multi_socket) {
-        // Fall back to regular single-threaded approach
-        ggml_compute_forward_mul_mat(params, dst);
-        return;
-    }
-    
-    // Note: We allow multi-socket mode even with n_numa_nodes == 1 for testing purposes
-    // This enables testing the multi-socket code path independently of actual NUMA topology
-
-    const struct ggml_tensor * src0 = dst->src[0];
-    const struct ggml_tensor * src1 = dst->src[1];
-
-    GGML_TENSOR_BINARY_OP_LOCALS
-
-    const int64_t nr0 = ne0;  // rows in result
-    const int64_t nr1 = ne1 * ne2 * ne3;  // cols in result
-
-    // Only use multi-socket for large enough matrices to justify overhead
-    const int64_t min_elements_for_multi_socket = 1024 * 1024;  // 1M elements
-    if (nr0 * nr1 < min_elements_for_multi_socket) {
-        ggml_compute_forward_mul_mat(params, dst);
-        return;
-    }
-
-    GGML_LOG_INFO("Using multi-socket matrix multiplication: %ld x %ld matrix, %d sockets\n", 
-                 nr0, nr1, numa_mgr->n_numa_nodes);
-
-    // Split work by rows across sockets, similar to how GGML splits across threads
-    const int64_t dr0 = (nr0 + numa_mgr->n_numa_nodes - 1) / numa_mgr->n_numa_nodes;
-    
-    // Reset coordination state
-    atomic_store(&numa_mgr->sockets_completed, 0);
-
-    // Work data for each socket
-    struct socket_work_data work_data[GGML_NUMA_MAX_NODES];
-
-    // Create work packages for each socket using the same chunking logic as GGML
-    for (int socket = 0; socket < numa_mgr->n_numa_nodes; socket++) {
-        const int64_t ir0_start = dr0 * socket;
-        const int64_t ir0_end = MIN(ir0_start + dr0, nr0);
-        
-        if (ir0_start >= ir0_end) {
-            continue; // No work for this socket
-        }
-
-        work_data[socket].params = params;
-        work_data[socket].dst = dst;
-        work_data[socket].src0 = src0;
-        work_data[socket].src1 = src1;
-        work_data[socket].row_start = ir0_start;
-        work_data[socket].row_end = ir0_end;
-        work_data[socket].numa_mgr = numa_mgr;
-        work_data[socket].socket_id = socket;
-        work_data[socket].async_thread = 0;  // Initialize thread handle
-    }
-
-    // Launch ALL socket tasks ASYNCHRONOUSLY first, then wait
-    GGML_LOG_INFO("Launching %d socket tasks asynchronously...\n", numa_mgr->n_numa_nodes);
-    
-    // Performance profiling - start timing
-    struct timespec start_time, launch_complete_time, end_time;
-    clock_gettime(CLOCK_MONOTONIC, &start_time);
-    
-    // Update profiling counters
-    numa_mgr->total_computations++;
-    numa_mgr->last_computation_elements = nr0 * nr1;
-    
-    // Reset completion counter
-    atomic_store(&numa_mgr->sockets_completed, 0);
-    
-    // Reset individual socket timers
-    for (int i = 0; i < numa_mgr->n_numa_nodes; i++) {
-        numa_mgr->socket_times_us[i] = 0;
-    }
-    
-    for (int socket = 0; socket < numa_mgr->n_numa_nodes; socket++) {
-        ggml_threadpool_t socket_pool = numa_mgr->socket_pools[socket];
-        if (socket_pool) {
-            // Launch async task directly using pthread for this socket
-            if (pthread_create(&work_data[socket].async_thread, NULL, 
-                              (void*(*)(void*))ggml_numa_socket_async_worker, 
-                              &work_data[socket]) != 0) {
-                // Fallback to synchronous if thread creation fails
-                GGML_LOG_WARN("Failed to create async thread for socket %d, falling back to sync\n", socket);
-                ggml_numa_socket_compute_mul_mat_chunk(&work_data[socket]);
-                atomic_fetch_add(&numa_mgr->sockets_completed, 1);
-            }
-        } else {
-            // Fallback to synchronous if threadpool not available
-            ggml_numa_socket_compute_mul_mat_chunk(&work_data[socket]);
-            atomic_fetch_add(&numa_mgr->sockets_completed, 1);
-        }
-    }
-
-    // All async tasks launched - record launch completion time
-    clock_gettime(CLOCK_MONOTONIC, &launch_complete_time);
-    int64_t launch_time_us = (launch_complete_time.tv_sec - start_time.tv_sec) * 1000000 + 
-                             (launch_complete_time.tv_nsec - start_time.tv_nsec) / 1000;
-    
-    GGML_LOG_INFO("All %d socket tasks launched in %ld μs, waiting for completion...\n", 
-                  numa_mgr->n_numa_nodes, launch_time_us);
-
-    // Wait for all async socket tasks to complete
-    int completed_sockets = 0;
-    while (completed_sockets < numa_mgr->n_numa_nodes) {
-        completed_sockets = atomic_load(&numa_mgr->sockets_completed);
-        if (completed_sockets < numa_mgr->n_numa_nodes) {
-            ggml_thread_cpu_relax();
-        }
-    }
-    
-    // Join all async threads
-    for (int socket = 0; socket < numa_mgr->n_numa_nodes; socket++) {
-        if (numa_mgr->socket_pools[socket] && work_data[socket].async_thread != 0) {
-            pthread_join(work_data[socket].async_thread, NULL);
-        }
-    }
-
-    // Performance profiling - final timing and summary
-    clock_gettime(CLOCK_MONOTONIC, &end_time);
-    int64_t total_time_us = (end_time.tv_sec - start_time.tv_sec) * 1000000 + 
-                            (end_time.tv_nsec - start_time.tv_nsec) / 1000;
-    int64_t sync_time_us = (end_time.tv_sec - launch_complete_time.tv_sec) * 1000000 + 
-                           (end_time.tv_nsec - launch_complete_time.tv_nsec) / 1000;
-    
-    // Update profiling counters
-    numa_mgr->total_async_time_us += total_time_us;
-    numa_mgr->total_sync_time_us += sync_time_us;
-    
-    // Calculate performance metrics
-    double throughput_gflops = 0.0;
-    if (total_time_us > 0) {
-        // Approximate FLOPS: matrix multiply is 2 * M * N * K operations
-        int64_t total_flops = 2LL * nr0 * nr1 * ne00;  // 2 * rows * cols * inner_dim
-        throughput_gflops = (double)total_flops / (total_time_us * 1000.0);  // GFLOPS
-    }
-    
-    GGML_LOG_INFO("Multi-socket computation #%ld completed:\n", numa_mgr->total_computations);
-    GGML_LOG_INFO("  Elements: %ld x %ld = %ld\n", nr0, nr1, nr0 * nr1);
-    GGML_LOG_INFO("  Launch time: %ld μs\n", launch_time_us);
-    GGML_LOG_INFO("  Sync time: %ld μs\n", sync_time_us);
-    GGML_LOG_INFO("  Total time: %ld μs\n", total_time_us);
-    GGML_LOG_INFO("  Throughput: %.2f GFLOPS\n", throughput_gflops);
-    GGML_LOG_INFO("  Avg total time: %ld μs\n", numa_mgr->total_async_time_us / numa_mgr->total_computations);
-    GGML_LOG_INFO("  Sockets used: %d\n", numa_mgr->n_numa_nodes);
-
-    GGML_LOG_INFO("Multi-socket matrix multiplication completed\n");
-}
-
-// Task wrapper for socket-specific work to be executed by threadpool
-static void ggml_numa_socket_work_task(struct ggml_compute_state * state, void * user_data) {
-    (void)state; // Unused parameter - required by callback signature
-    struct socket_work_data * work = (struct socket_work_data *)user_data;
-    
-    // Execute the socket-specific computation
-    ggml_numa_socket_compute_mul_mat_chunk(work);
-    
-    // Signal completion
-    ggml_mutex_lock(&work->work_completed_mutex);
-    work->work_completed = true;
-    ggml_cond_broadcast(&work->work_completed_cond);
-    ggml_mutex_unlock(&work->work_completed_mutex);
-}
-
-// Function to set explicit CPU affinity within OpenMP threads
-static void set_openmp_thread_affinity(int socket_id) {
-#if defined(__linux__) && defined(GGML_USE_OPENMP)
-    cpu_set_t cpuset;
-    CPU_ZERO(&cpuset);
-    
-    if (socket_id == 0) {
-        // Socket 0: physical cores 0-4 (avoid hyperthreading siblings)
-        for (int i = 0; i <= 4; i++) {
-            CPU_SET(i, &cpuset);
-        }
-    } else {
-        // Socket 1: physical cores 5-10 (avoid hyperthreading siblings)
-        for (int i = 5; i <= 10; i++) {
-            CPU_SET(i, &cpuset);
-        }
-    }
-    
-    if (sched_setaffinity(0, sizeof(cpuset), &cpuset) != 0) {
-        // Don't log errors as this would spam the console
-        // GGML_LOG_WARN("Failed to set OpenMP thread affinity for socket %d\n", socket_id);
-    }
-#endif
-}
-
-// Manual threading structure for socket-specific computation
-struct socket_thread_data {
-    struct socket_work_data * work;
-    int thread_id;
-    int total_threads;
-    int socket_id;
-    int64_t row_start;
-    int64_t row_end;
-    pthread_t pthread_handle;
-};
-
-// Worker function for manual threading within socket
-static void* socket_thread_worker(void* arg) {
-    struct socket_thread_data* thread_data = (struct socket_thread_data*)arg;
-    struct socket_work_data* work = thread_data->work;
-    
-    // Set explicit CPU affinity for this thread
-    cpu_set_t cpuset;
-    CPU_ZERO(&cpuset);
-    
-    if (thread_data->socket_id == 0) {
-        // Socket 0: physical cores 0-4, assign threads to specific cores
-        int target_cpu = thread_data->thread_id % 5;  // cores 0-4
-        CPU_SET(target_cpu, &cpuset);
-    } else {
-        // Socket 1: physical cores 5-10, assign threads to specific cores
-        int target_cpu = 5 + (thread_data->thread_id % 6);  // cores 5-10
-        CPU_SET(target_cpu, &cpuset);
-    }
-    
-    if (sched_setaffinity(0, sizeof(cpuset), &cpuset) == 0) {
-        int current_cpu = sched_getcpu();
-        GGML_LOG_DEBUG("Socket %d thread %d bound to CPU %d, running on CPU %d\n", 
-                       thread_data->socket_id, thread_data->thread_id, 
-                       (thread_data->socket_id == 0) ? thread_data->thread_id % 5 : 5 + (thread_data->thread_id % 6),
-                       current_cpu);
-    }
-    
-    // Get tensor information
-    const struct ggml_tensor * src0 = work->src0;
-    const struct ggml_tensor * src1 = work->src1;
-    struct ggml_tensor * dst = work->dst;
-    
-    GGML_TENSOR_BINARY_OP_LOCALS
-    
-    // Process rows assigned to this thread
-    for (int64_t ir0 = thread_data->row_start; ir0 < thread_data->row_end; ir0++) {
-        for (int64_t ir1 = 0; ir1 < ne1 * ne2 * ne3; ir1++) {
-            // Determine vector dot configuration using GGML's type system
-            enum ggml_type vec_dot_type = type_traits_cpu[src0->type].vec_dot_type;
-            ggml_vec_dot_t const vec_dot_func = type_traits_cpu[vec_dot_type].vec_dot;
-            
-            // Get pointers for this specific element using GGML tensor accessors
-            const void * src0_row = (const char *)ggml_get_data(src0) + ir0 * nb01;
-            const void * src1_col = (const char *)ggml_get_data(src1) + ir1 * nb11;
-            float * dst_element = (float *)((char *)ggml_get_data(dst) + ir0 * nb1 + ir1 * nb0);
-            
-            // Perform dot product for this element
-            vec_dot_func(ne00, dst_element, 0, src0_row, 0, src1_col, 0, 1);
-        }
-    }
-    
-    return NULL;
-}
-
-// Function to compute matrix multiplication chunk with manual threading (no OpenMP)
-static void ggml_numa_socket_compute_mul_mat_chunk_with_manual_threading(struct socket_work_data * work) {
-    // Set NUMA affinity for this work only if not in forced mode
-#if defined(__linux__) && defined(GGML_NUMA)
-    if (!work->numa_mgr->is_forced_mode) {
-        GGML_ASSERT(numa_run_on_node(work->socket_id) == 0);
-    }
-#endif
-    
-    const int socket_thread_count = ggml_numa_socket_get_thread_count(work->socket_id, work->numa_mgr);
-    const int64_t total_rows = work->row_end - work->row_start;
-    
-    GGML_LOG_DEBUG("Socket %d: using manual threading with %d threads for %ld rows\n", 
-                   work->socket_id, socket_thread_count, total_rows);
-    
-    // Create thread data structures
-    struct socket_thread_data* thread_data = malloc(socket_thread_count * sizeof(struct socket_thread_data));
-    if (!thread_data) {
-        GGML_LOG_ERROR("Failed to allocate thread data for socket %d\n", work->socket_id);
-        return;
-    }
-    
-    // Distribute rows among threads
-    const int64_t rows_per_thread = total_rows / socket_thread_count;
-    const int64_t remaining_rows = total_rows % socket_thread_count;
-    
-    // Launch threads
-    for (int t = 0; t < socket_thread_count; t++) {
-        thread_data[t].work = work;
-        thread_data[t].thread_id = t;
-        thread_data[t].total_threads = socket_thread_count;
-        thread_data[t].socket_id = work->socket_id;
-        thread_data[t].row_start = work->row_start + t * rows_per_thread;
-        thread_data[t].row_end = thread_data[t].row_start + rows_per_thread;
-        
-        // Give extra rows to the last thread
-        if (t == socket_thread_count - 1) {
-            thread_data[t].row_end += remaining_rows;
-        }
-        
-        GGML_LOG_DEBUG("Socket %d thread %d: processing rows %ld-%ld\n", 
-                       work->socket_id, t, thread_data[t].row_start, thread_data[t].row_end);
-        
-        if (pthread_create(&thread_data[t].pthread_handle, NULL, socket_thread_worker, &thread_data[t]) != 0) {
-            GGML_LOG_ERROR("Failed to create thread %d for socket %d\n", t, work->socket_id);
-            free(thread_data);
-            return;
-        }
-    }
-    
-    // Wait for all threads to complete
-    for (int t = 0; t < socket_thread_count; t++) {
-        pthread_join(thread_data[t].pthread_handle, NULL);
-    }
-    
-    free(thread_data);
-    
-    // Signal completion for this socket
-    atomic_fetch_add(&work->numa_mgr->sockets_completed, 1);
-}
-
-// Function to compute matrix multiplication chunk with explicit OpenMP affinity
-static void ggml_numa_socket_compute_mul_mat_chunk_with_affinity(struct socket_work_data * work) {
-    // Set NUMA affinity for this work only if not in forced mode
-#if defined(__linux__) && defined(GGML_NUMA)
-    if (!work->numa_mgr->is_forced_mode) {
-        GGML_ASSERT(numa_run_on_node(work->socket_id) == 0);
-    }
-#endif
-    // In forced mode, we skip NUMA binding and just use the threadpool as-is
-        
-    // Create modified compute params for this socket with explicit OpenMP affinity
-    struct ggml_compute_params socket_params = *work->params;
-    socket_params.ith = 0;  // Main thread for this socket
-    socket_params.nth = ggml_numa_socket_get_thread_count(work->socket_id, work->numa_mgr);
-    socket_params.threadpool = work->numa_mgr->socket_pools[work->socket_id];
-    
-    // Get tensor information
-    const struct ggml_tensor * src0 = work->src0;
-    const struct ggml_tensor * src1 = work->src1;
-    struct ggml_tensor * dst = work->dst;
-    
-    GGML_TENSOR_BINARY_OP_LOCALS
-    
-    const int64_t nr1 = ne1 * ne2 * ne3;  // total columns
-    
-    // Use GGML's existing chunking logic but for our row range
-    const int64_t ir0_start = work->row_start;
-    const int64_t ir0_end = work->row_end;
-    const int64_t ir1_start = 0;      // We process all columns
-    const int64_t ir1_end = nr1;      // We process all columns
-    
-    // Determine vector dot configuration using GGML's type system
-    enum ggml_type           const vec_dot_type         = type_traits_cpu[src0->type].vec_dot_type;
-    int64_t                  const vec_dot_num_rows     = type_traits_cpu[src0->type].nrows;
-    
-    // Use single row processing for simplicity in multi-socket mode
-    int64_t num_rows_per_vec_dot = 1;
-    
-    // For complex cases, use the full row count as GGML does
-    if (vec_dot_num_rows > 1) {
-        num_rows_per_vec_dot = vec_dot_num_rows;
-    }
-    
-    // CRITICAL: Set OpenMP environment at the threadpool level to ensure it affects
-    // all parallel regions created by ggml_compute_forward_mul_mat_one_chunk
-    struct ggml_threadpool * socket_pool = socket_params.threadpool;
-    if (socket_pool) {
-        // Temporarily override OpenMP thread binding for this socket
-        #pragma omp parallel if(socket_params.nth > 1) num_threads(socket_params.nth)
-        {
-            // Set explicit CPU affinity for each OpenMP thread
-            set_openmp_thread_affinity(work->socket_id);
-            
-            // Synchronize all threads after setting affinity
-            #pragma omp barrier
-            
-            // Now perform the actual computation with properly bound threads
-            #pragma omp single
-            {
-                // Call the existing GGML matrix multiplication chunk function
-                // This is the core GGML function that does the actual computation
-                ggml_compute_forward_mul_mat_one_chunk(&socket_params, dst, vec_dot_type, 
-                                                      num_rows_per_vec_dot, ir0_start, ir0_end, 
-                                                      ir1_start, ir1_end);
-            }
-        }
-    } else {
-        // Fallback: call without OpenMP affinity if no threadpool
-        ggml_compute_forward_mul_mat_one_chunk(&socket_params, dst, vec_dot_type, 
-                                              num_rows_per_vec_dot, ir0_start, ir0_end, 
-                                              ir1_start, ir1_end);
-    }
-    
-    // Signal completion for this socket
-    atomic_fetch_add(&work->numa_mgr->sockets_completed, 1);
-}
-
-// Function to compute matrix multiplication chunk on a specific NUMA socket
-static void ggml_numa_socket_compute_mul_mat_chunk(struct socket_work_data * work) {
-    // Set NUMA affinity for this work only if not in forced mode
-#if defined(__linux__) && defined(GGML_NUMA)
-    if (!work->numa_mgr->is_forced_mode) {
-        GGML_ASSERT(numa_run_on_node(work->socket_id) == 0);
-    }
-#endif
-    // In forced mode, we skip NUMA binding and just use the threadpool as-is
-        
-    // Create modified compute params for this socket
-    struct ggml_compute_params socket_params = *work->params;
-    socket_params.ith = 0;  // Main thread for this socket
-    socket_params.nth = ggml_numa_socket_get_thread_count(work->socket_id, work->numa_mgr);
-    socket_params.threadpool = work->numa_mgr->socket_pools[work->socket_id];
-    
-    // Get tensor information
-    const struct ggml_tensor * src0 = work->src0;
-    const struct ggml_tensor * src1 = work->src1;
-    struct ggml_tensor * dst = work->dst;
-    
-    GGML_TENSOR_BINARY_OP_LOCALS
-    
-    const int64_t nr1 = ne1 * ne2 * ne3;  // total columns
-    
-    // Use GGML's existing chunking logic but for our row range
-    const int64_t ir0_start = work->row_start;
-    const int64_t ir0_end = work->row_end;
-    const int64_t ir1_start = 0;      // We process all columns
-    const int64_t ir1_end = nr1;      // We process all columns
-    
-    // Determine vector dot configuration using GGML's type system
-    enum ggml_type           const vec_dot_type         = type_traits_cpu[src0->type].vec_dot_type;
-    int64_t                  const vec_dot_num_rows     = type_traits_cpu[src0->type].nrows;
-    
-    // Use single row processing for simplicity in multi-socket mode
-    int64_t num_rows_per_vec_dot = 1;
-    
-    // For complex cases, use the full row count as GGML does
-    if (vec_dot_num_rows > 1) {
-        num_rows_per_vec_dot = vec_dot_num_rows;
-    }
-    
-    // Call the existing GGML matrix multiplication chunk function
-    // This is the core GGML function that does the actual computation
-    ggml_compute_forward_mul_mat_one_chunk(&socket_params, dst, vec_dot_type, 
-                                          num_rows_per_vec_dot, ir0_start, ir0_end, 
-                                          ir1_start, ir1_end);
-    
-    // Signal completion for this socket
-    atomic_fetch_add(&work->numa_mgr->sockets_completed, 1);
-}
-
-// Helper function to get thread count for a specific socket
-static int ggml_numa_socket_get_thread_count(int socket_id, struct ggml_numa_threadpool_manager * numa_mgr) {
-    // Validate inputs - these are programming errors that should abort
-    GGML_ASSERT(numa_mgr != NULL);
-    GGML_ASSERT(socket_id >= 0 && socket_id < numa_mgr->n_numa_nodes);
-    
-    // Get the socket-specific threadpool
-    struct ggml_threadpool * socket_pool = numa_mgr->socket_pools[socket_id];
-    GGML_ASSERT(socket_pool != NULL);
-    
-    // Return the actual thread count for this socket's threadpool
-    return socket_pool->n_threads_max;
-}
-
 // ggml_compute_forward_mul_mat_id
 
 #define MMID_MATRIX_ROW(row_id, i1) matrix_rows[(row_id)*ids->ne[0]*ids->ne[1] + (i1)]
@@ -2584,13 +1688,7 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             } break;
         case GGML_OP_MUL_MAT:
             {
-                // Check if we have a multi-socket NUMA manager and can use it
-                if (params->threadpool && params->threadpool->numa_mgr && 
-                    params->threadpool->numa_mgr->enable_multi_socket) {
-                    ggml_compute_forward_mul_mat_multi_socket(params, tensor, params->threadpool->numa_mgr);
-                } else {
-                    ggml_compute_forward_mul_mat(params, tensor);
-                }
+                ggml_compute_forward_mul_mat(params, tensor);
             } break;
         case GGML_OP_MUL_MAT_ID:
             {
@@ -2845,79 +1943,25 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
     }
 }
 
-// Android's libc implementation "bionic" does not support setting affinity
-#if defined(__gnu_linux__)
-static void set_numa_thread_affinity(int thread_n) {
-    if (!ggml_is_numa()) {
-        return;
-    }
-
-    int node_num;
-    int rv;
-    size_t setsize = CPU_ALLOC_SIZE(g_state.numa.total_cpus);
-
-    switch(g_state.numa.numa_strategy) {
-        case GGML_NUMA_STRATEGY_DISTRIBUTE:
-            // run thread on node_num thread_n / (threads per node)
-            node_num = thread_n % g_state.numa.n_nodes;
-            break;
-        case GGML_NUMA_STRATEGY_ISOLATE:
-            // run thread on current_node
-            node_num = g_state.numa.current_node;
-            break;
-        case GGML_NUMA_STRATEGY_NUMACTL:
-            // use the cpuset that numactl gave us
-            rv = pthread_setaffinity_np(pthread_self(), setsize, &g_state.numa.cpuset);
-            if (rv) {
-                fprintf(stderr, "warning: pthread_setaffinity_np() failed: %s\n",strerror(rv));
-            }
-            return;
-        default:
-            return;
-    }
-
-    struct ggml_numa_node * node = &g_state.numa.nodes[node_num];
-
-    cpu_set_t * cpus = CPU_ALLOC(g_state.numa.total_cpus);
-    CPU_ZERO_S(setsize, cpus);
-    for (size_t i = 0; i < node->n_cpus; ++i) {
-        CPU_SET_S(node->cpus[i], setsize, cpus);
-    }
-
-    rv = pthread_setaffinity_np(pthread_self(), setsize, cpus);
-    if (rv) {
-            fprintf(stderr, "warning: pthread_setaffinity_np() failed: %s\n", strerror(rv));
-    }
-
-    CPU_FREE(cpus);
+// NUMA thread affinity management
+// When GGML_NUMA_MIRROR is defined, this is handled by the coordinator
+static void set_numa_thread_affinity(int thread_n) { 
+#ifdef GGML_NUMA_MIRROR
+    // NUMA coordinator handles thread affinity
+    UNUSED(thread_n);
+#else
+    // No NUMA support in default mode
+    UNUSED(thread_n);
+#endif
 }
 
 static void clear_numa_thread_affinity(void) {
-    if (!ggml_is_numa()) {
-        return;
-    }
-
-    size_t setsize = CPU_ALLOC_SIZE(g_state.numa.total_cpus);
-
-    cpu_set_t * cpus = CPU_ALLOC(g_state.numa.total_cpus);
-    CPU_ZERO_S(setsize, cpus);
-    for (unsigned i = 0; i < g_state.numa.total_cpus; ++i) {
-        CPU_SET_S(i, setsize, cpus);
-    }
-
-    int rv = pthread_setaffinity_np(pthread_self(), setsize, cpus);
-    if (rv) {
-        fprintf(stderr, "warning: pthread_setaffinity_np() failed: %s\n", strerror(rv));
-    }
-
-    CPU_FREE(cpus);
-}
+#ifdef GGML_NUMA_MIRROR
+    // NUMA coordinator handles thread affinity
 #else
-// TODO: Windows etc.
-// (the linux implementation may also work on BSD, someone should test)
-static void set_numa_thread_affinity(int thread_n) { UNUSED(thread_n);  }
-static void clear_numa_thread_affinity(void) {}
+    // No NUMA support in default mode
 #endif
+}
 
 static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
     int n_tasks = 0;
@@ -3361,95 +2405,6 @@ static bool ggml_thread_cpumask_is_valid(const bool * mask) {
     return false;
 }
 
-// Unified CPU assignment function - resolves dual assignment problem
-static void ggml_thread_cpumask_unified(
-    const bool * global_mask,     // Available CPU mask from threadpool
-    bool * local_mask,            // Output: mask for this specific thread
-    int thread_id,                // Thread index
-    int total_threads,            // Total number of threads
-    bool user_strict,             // User's strict placement preference
-    bool numa_aware,              // Enable NUMA-aware assignment
-    bool allow_numa_override,     // Can NUMA override user strict setting?
-    bool warn_on_override,        // Should we warn about overrides?
-    int32_t* iter                 // Iterator for round-robin assignment
-) {
-    UNUSED(total_threads);  // Not currently used in implementation
-    memset(local_mask, 0, GGML_MAX_N_THREADS);
-    
-    bool effective_strict = user_strict;
-    bool override_occurred = false;
-    
-#ifdef GGML_NUMA_MIRROR
-    // Check if NUMA awareness should influence CPU assignment
-    if (numa_aware && numa_num_configured_nodes() > 1) {
-        int target_numa_node = thread_id % numa_num_configured_nodes();
-        
-        // Try NUMA-aware assignment
-        struct bitmask* node_cpus = numa_allocate_cpumask();
-        if (numa_node_to_cpus(target_numa_node, node_cpus) == 0) {
-            int assigned_cpu = -1;
-            
-            // Find available CPU on target NUMA node
-            for (int i = 0; i < GGML_MAX_N_THREADS; ++i) {
-                if (global_mask[i] && numa_bitmask_isbitset(node_cpus, i)) {
-                    if (!user_strict || !allow_numa_override) {
-                        // Non-strict or user doesn't allow override: add all CPUs on this node
-                        local_mask[i] = true;
-                    } else {
-                        // Strict placement: just take the first available CPU
-                        if (assigned_cpu == -1) {
-                            assigned_cpu = i;
-                        }
-                    }
-                }
-            }
-            
-            // If we found NUMA-local CPUs
-            if (assigned_cpu != -1 || !user_strict) {
-                numa_free_cpumask(node_cpus);
-                
-                if (user_strict && assigned_cpu != -1) {
-                    local_mask[assigned_cpu] = true;
-                }
-                
-                // Check if we overrode user preference
-                if (!user_strict && allow_numa_override) {
-                    effective_strict = true;  // We're effectively doing strict assignment
-                    override_occurred = true;
-                }
-                
-                if (override_occurred && warn_on_override) {
-                    GGML_LOG_WARN("NUMA: Overriding user --cpu-strict setting for NUMA locality (thread %d -> NUMA node %d)\n", 
-                                  thread_id, target_numa_node);
-                }
-                return;
-            }
-        }
-        numa_free_cpumask(node_cpus);
-    }
-#endif
-    
-    // Fallback to standard assignment (no NUMA or NUMA assignment failed)
-    if (effective_strict) {
-        // Strict assignment: each thread gets one CPU via round-robin
-        int32_t base_idx = *iter;
-        for (int32_t i = 0; i < GGML_MAX_N_THREADS; i++) {
-            int32_t idx = base_idx + i;
-            if (idx >= GGML_MAX_N_THREADS) {
-                idx -= GGML_MAX_N_THREADS;  // Cheaper than modulo
-            }
-            if (global_mask[idx]) {
-                local_mask[idx] = true;
-                *iter = idx + 1;
-                return;
-            }
-        }
-    } else {
-        // Non-strict assignment: all threads share the same CPU mask
-        memcpy(local_mask, global_mask, GGML_MAX_N_THREADS);
-    }
-}
-
 static void ggml_thread_cpumask_next(const bool * global_mask, bool * local_mask, bool strict, int32_t* iter) {
     if (!strict) {
         memcpy(local_mask, global_mask, GGML_MAX_N_THREADS);
@@ -3472,306 +2427,22 @@ static void ggml_thread_cpumask_next(const bool * global_mask, bool * local_mask
     }
 }
 
-//
-// Multi-socket NUMA threadpool manager functions
-//
-
-static struct ggml_numa_threadpool_manager * ggml_numa_threadpool_manager_new(bool force_multi_socket) {
-    // Check if we should create multi-socket manager
-    bool should_create = false;
-    int num_nodes = 1;  // Default for forced mode
-    
-    if (ggml_is_numa() && g_state.numa.n_nodes > 1) {
-        // Real NUMA system with multiple nodes
-        should_create = true;
-        num_nodes = g_state.numa.n_nodes;
-    } else if (force_multi_socket) {
-        // Force multi-socket mode for testing even on non-NUMA systems
-        should_create = true;
-        num_nodes = 2;  // Simulate 2 sockets for testing
-        GGML_LOG_INFO("Forcing multi-socket mode for testing (simulating %d sockets)\n", num_nodes);
-    }
-    
-    if (!should_create) {
-        return NULL;
-    }
-    
-    struct ggml_numa_threadpool_manager * mgr = 
-        ggml_aligned_malloc(sizeof(struct ggml_numa_threadpool_manager));
-    
-    mgr->n_numa_nodes = num_nodes;
-    mgr->coordinator_pool = NULL;
-    mgr->enable_multi_socket = true;
-    mgr->is_forced_mode = force_multi_socket;  // Track if this is forced mode
-    mgr->sockets_completed = 0;
-    
-    // Initialize socket-specific chunk counters
-    for (int i = 0; i < mgr->n_numa_nodes; i++) {
-        mgr->socket_pools[i] = NULL;
-        mgr->current_socket_chunk[i] = 0;
-        mgr->partial_results[i] = NULL;
-        mgr->socket_times_us[i] = 0;  // Initialize socket timing
-    }
-    
-    // Initialize performance profiling counters
-    mgr->total_computations = 0;
-    mgr->total_async_time_us = 0;
-    mgr->total_sync_time_us = 0;
-    mgr->last_computation_elements = 0;
-    
-    ggml_mutex_init(&mgr->coordination_mutex);
-    ggml_cond_init(&mgr->coordination_cond);
-    
-    GGML_LOG_INFO("Created multi-socket threadpool manager for %d nodes\n", mgr->n_numa_nodes);
-    
-    return mgr;
-}
-
-static void ggml_numa_threadpool_manager_free(struct ggml_numa_threadpool_manager * mgr) {
-    if (!mgr) return;
-    
-    // STEP 1: Signal all socket threadpools to stop (don't wait yet)
-    for (int i = 0; i < mgr->n_numa_nodes; i++) {
-        if (mgr->socket_pools[i]) {
-#ifndef GGML_USE_OPENMP
-            ggml_mutex_lock(&mgr->socket_pools[i]->mutex);
-            mgr->socket_pools[i]->stop = true;
-            mgr->socket_pools[i]->pause = false;
-            ggml_cond_broadcast(&mgr->socket_pools[i]->cond);
-            ggml_mutex_unlock(&mgr->socket_pools[i]->mutex);
-#endif
-        }
-    }
-    
-    if (mgr->coordinator_pool) {
-#ifndef GGML_USE_OPENMP
-        ggml_mutex_lock(&mgr->coordinator_pool->mutex);
-        mgr->coordinator_pool->stop = true;
-        mgr->coordinator_pool->pause = false;
-        ggml_cond_broadcast(&mgr->coordinator_pool->cond);
-        ggml_mutex_unlock(&mgr->coordinator_pool->mutex);
-#endif
-    }
-    
-    // STEP 2: Wait for all socket threadpool threads to finish
-    for (int i = 0; i < mgr->n_numa_nodes; i++) {
-        if (mgr->socket_pools[i]) {
-#ifndef GGML_USE_OPENMP
-            struct ggml_compute_state* workers = mgr->socket_pools[i]->workers;
-            int n_threads = mgr->socket_pools[i]->n_threads_max;
-            for (int j = 1; j < n_threads; j++) {
-                int32_t rc = ggml_thread_join(workers[j].thrd, NULL);
-                GGML_ASSERT(rc == GGML_EXIT_SUCCESS || rc == GGML_EXIT_ABORTED);
-                UNUSED(rc);
-            }
-#endif
-        }
-    }
-    
-    if (mgr->coordinator_pool) {
-#ifndef GGML_USE_OPENMP
-        struct ggml_compute_state* workers = mgr->coordinator_pool->workers;
-        int n_threads = mgr->coordinator_pool->n_threads_max;
-        for (int j = 1; j < n_threads; j++) {
-            int32_t rc = ggml_thread_join(workers[j].thrd, NULL);
-            GGML_ASSERT(rc == GGML_EXIT_SUCCESS || rc == GGML_EXIT_ABORTED);
-            UNUSED(rc);
-        }
-#endif
-    }
-    
-    // STEP 3: Now it's safe to invalidate cgraph references and free resources
-    for (int i = 0; i < mgr->n_numa_nodes; i++) {
-        if (mgr->socket_pools[i]) {
-            // Invalidate cgraph reference before freeing
-            if (mgr->socket_pools[i]->cgraph_ref) {
-                ggml_cgraph_ref_invalidate(mgr->socket_pools[i]->cgraph_ref);
-                ggml_cgraph_ref_release(mgr->socket_pools[i]->cgraph_ref);
-                mgr->socket_pools[i]->cgraph_ref = NULL;
-            }
-            
-#ifndef GGML_USE_OPENMP
-            ggml_mutex_destroy(&mgr->socket_pools[i]->mutex);
-            ggml_cond_destroy(&mgr->socket_pools[i]->cond);
-#endif
-            
-            const size_t workers_size = sizeof(struct ggml_compute_state) * mgr->socket_pools[i]->n_threads_max;
-            ggml_aligned_free(mgr->socket_pools[i]->workers, workers_size);
-            ggml_aligned_free(mgr->socket_pools[i], sizeof(struct ggml_threadpool));
-            mgr->socket_pools[i] = NULL;
-        }
-    }
-    
-    if (mgr->coordinator_pool) {
-        // Invalidate cgraph reference before freeing
-        if (mgr->coordinator_pool->cgraph_ref) {
-            ggml_cgraph_ref_invalidate(mgr->coordinator_pool->cgraph_ref);
-            ggml_cgraph_ref_release(mgr->coordinator_pool->cgraph_ref);
-            mgr->coordinator_pool->cgraph_ref = NULL;
-        }
-        
-#ifndef GGML_USE_OPENMP
-        ggml_mutex_destroy(&mgr->coordinator_pool->mutex);
-        ggml_cond_destroy(&mgr->coordinator_pool->cond);
-#endif
-        
-        const size_t workers_size = sizeof(struct ggml_compute_state) * mgr->coordinator_pool->n_threads_max;
-        ggml_aligned_free(mgr->coordinator_pool->workers, workers_size);
-        ggml_aligned_free(mgr->coordinator_pool, sizeof(struct ggml_threadpool));
-        mgr->coordinator_pool = NULL;
-    }
-    
-    ggml_mutex_destroy(&mgr->coordination_mutex);
-    ggml_cond_destroy(&mgr->coordination_cond);
-    
-    ggml_aligned_free(mgr, sizeof(struct ggml_numa_threadpool_manager));
-}
-
-static void ggml_numa_threadpool_manager_create_socket_pools(
-    struct ggml_numa_threadpool_manager * mgr,
-    const struct ggml_threadpool_params * base_params,
-    struct ggml_threadpool * main_threadpool) {
-    
-    if (!mgr || !base_params || !main_threadpool) return;
-    
-    // Calculate threads per socket
-    int total_threads = base_params->n_threads;
-    int threads_per_socket = total_threads / mgr->n_numa_nodes;
-    int remaining_threads = total_threads % mgr->n_numa_nodes;
-    
-    GGML_LOG_INFO("Creating socket threadpools: %d total threads, %d per socket, %d remaining\n", 
-                 total_threads, threads_per_socket, remaining_threads);
-    
-    for (int socket = 0; socket < mgr->n_numa_nodes; socket++) {
-        struct ggml_threadpool_params socket_params = *base_params;
-        
-        // Give extra threads to first sockets if there are remainders
-        socket_params.n_threads = threads_per_socket + (socket < remaining_threads ? 1 : 0);
-        
-        // Set NUMA-specific parameters
-        socket_params.numa_aware = true;
-        socket_params.allow_numa_override = true;
-        socket_params.force_multi_socket = false;  // IMPORTANT: Don't recurse into multi-socket for socket pools
-        
-        // Create CPU mask for this socket
-        memset(socket_params.cpumask, 0, sizeof(socket_params.cpumask));
-        
-        if (ggml_is_numa() && socket < (int)g_state.numa.n_nodes) {
-            // Real NUMA system - use actual CPU topology
-            struct ggml_numa_node * node = &g_state.numa.nodes[socket];
-            for (uint32_t i = 0; i < node->n_cpus; i++) {
-                if (node->cpus[i] < GGML_MAX_N_THREADS) {
-                    socket_params.cpumask[node->cpus[i]] = true;
-                }
-            }
-            GGML_LOG_INFO("Real NUMA socket %d: using %d dedicated CPUs from NUMA node\n", socket, node->n_cpus);
-        } else {
-            // Simulated multi-socket mode - partition available CPUs to avoid OpenMP contention
-            // CRITICAL: Account for hyperthreading to avoid physical core competition
-            int available_cpus = (int)sysconf(_SC_NPROCESSORS_ONLN);
-            
-            // Try to detect hyperthreading by checking if we have an even number of CPUs
-            // Most modern Intel/AMD CPUs with HT have 2 threads per core
-            int threads_per_core = 2;  // Assume hyperthreading (most common case)
-            int physical_cores = available_cpus / threads_per_core;
-            
-            // Partition by physical cores, not logical CPUs
-            int cores_per_socket = physical_cores / mgr->n_numa_nodes;
-            int start_core = socket * cores_per_socket;
-            int end_core = start_core + cores_per_socket;
-            
-            // Last socket gets any remaining cores
-            if (socket == mgr->n_numa_nodes - 1) {
-                end_core = physical_cores;
-            }
-            
-            // Map physical cores to logical CPUs (assuming consecutive pairing)
-            // Physical core N maps to logical CPUs [N*threads_per_core, N*threads_per_core + threads_per_core-1]
-            for (int core = start_core; core < end_core; core++) {
-                for (int thread = 0; thread < threads_per_core; thread++) {
-                    int logical_cpu = core * threads_per_core + thread;
-                    if (logical_cpu < GGML_MAX_N_THREADS && logical_cpu < available_cpus) {
-                        socket_params.cpumask[logical_cpu] = true;
-                    }
-                }
-            }
-            
-            GGML_LOG_INFO("Simulated socket %d: physical cores %d-%d = logical CPUs (avoiding HT competition)\n", 
-                         socket, start_core, end_core - 1);
-            
-            // Debug: show which logical CPUs were assigned
-            char cpu_list[256] = {0};
-            bool first = true;
-            for (int cpu = 0; cpu < available_cpus && cpu < GGML_MAX_N_THREADS; cpu++) {
-                if (socket_params.cpumask[cpu]) {
-                    if (!first) strcat(cpu_list, ",");
-                    char cpu_str[16];
-                    snprintf(cpu_str, sizeof(cpu_str), "%d", cpu);
-                    strcat(cpu_list, cpu_str);
-                    first = false;
-                }
-            }
-            GGML_LOG_INFO("  Logical CPUs: {%s}\n", cpu_list);
-        }
-        
-        mgr->socket_pools[socket] = ggml_threadpool_new(&socket_params);
-        if (!mgr->socket_pools[socket]) {
-            GGML_LOG_ERROR("Failed to create threadpool for socket %d\n", socket);
-            return;
-        }
-        
-        // Simple approach: socket threadpool gets direct cgraph pointer (same underlying data)
-        if (main_threadpool->cgraph_ref && main_threadpool->cgraph_ref->cgraph) {
-            // Release the NULL cgraph reference created by ggml_threadpool_new
-            if (mgr->socket_pools[socket]->cgraph_ref) {
-                ggml_cgraph_ref_release(mgr->socket_pools[socket]->cgraph_ref);
-                mgr->socket_pools[socket]->cgraph_ref = NULL;
-            }
-            // Create a fresh cgraph reference for this socket (no sharing)
-            mgr->socket_pools[socket]->cgraph_ref = ggml_cgraph_ref_create(main_threadpool->cgraph_ref->cgraph);
-            GGML_LOG_DEBUG("Socket %d threadpool received cgraph (no sharing)\n", socket);
-        }
-        
-        GGML_LOG_INFO("Created threadpool for socket %d with %d threads\n", 
-                     socket, socket_params.n_threads);
-    }
-}
-
 void ggml_threadpool_free(struct ggml_threadpool* threadpool) {
     if (!threadpool) return;
 
     const int n_threads = threadpool->n_threads_max;
 
-    // STEP 1: Release reference to global coordinator manager (don't free it)
-    if (threadpool->use_coordinator && threadpool->coordinator_mgr) {
-        GGML_LOG_INFO("Releasing reference to global 3-tier NUMA coordinator manager\n");
-        // Don't call ggml_numa_coordinator_manager_free() - it's a global singleton
-        threadpool->coordinator_mgr = NULL;
-        threadpool->use_coordinator = false;
-        
-        // Skip traditional threadpool cleanup when using coordinator
-        // (coordinator manages its own threads)
-        goto cleanup_threadpool_structure;
-    }
-
-    // STEP 1 (LEGACY): Signal all threadpools to stop
-    // First handle NUMA manager if it exists (signal all socket threadpools)
-    if (threadpool->numa_mgr) {
-        ggml_numa_threadpool_manager_free(threadpool->numa_mgr);
-        threadpool->numa_mgr = NULL;
-    }
-
 #ifndef GGML_USE_OPENMP
     struct ggml_compute_state* workers = threadpool->workers;
 
-    // Signal main threadpool to stop
     ggml_mutex_lock(&threadpool->mutex);
+
     threadpool->stop = true;
     threadpool->pause = false;
+
     ggml_cond_broadcast(&threadpool->cond);
     ggml_mutex_unlock(&threadpool->mutex);
 
-    // STEP 2: Wait for main threadpool threads to finish
     for (int j = 1; j < n_threads; j++) {
         int32_t rc = ggml_thread_join(workers[j].thrd, NULL);
         GGML_ASSERT(rc == GGML_EXIT_SUCCESS || rc == GGML_EXIT_ABORTED);
@@ -3782,18 +2453,8 @@ void ggml_threadpool_free(struct ggml_threadpool* threadpool) {
     ggml_cond_destroy(&threadpool->cond);
 #endif // GGML_USE_OPENMP
 
-cleanup_threadpool_structure:
-    // STEP 3: Invalidate cgraph reference and clean up
-    if (threadpool->cgraph_ref) {
-        ggml_cgraph_ref_invalidate(threadpool->cgraph_ref);
-        ggml_cgraph_ref_release(threadpool->cgraph_ref);
-        threadpool->cgraph_ref = NULL;
-    }
-
     const size_t workers_size = sizeof(struct ggml_compute_state) * n_threads;
-    if (threadpool->workers) {
-        ggml_aligned_free(threadpool->workers, workers_size);
-    }
+    ggml_aligned_free(threadpool->workers, workers_size);
     ggml_aligned_free(threadpool, sizeof(struct ggml_threadpool));
 }
 
@@ -4028,64 +2689,14 @@ struct ggml_cplan ggml_graph_plan(
     return cplan;
 }
 
-#ifdef GGML_NUMA_MIRROR
-static bool g_cpuset_isset = false;
-static cpu_set_t g_cpuset;
-#endif
-
 static thread_ret_t ggml_graph_compute_thread(void * data) {
     struct ggml_compute_state * state = (struct ggml_compute_state *) data;
-    
-    // Critical: Validate state before any access to prevent segfaults
-    if (!state) {
-        GGML_LOG_ERROR("FATAL: Thread received NULL state pointer\n");
-        return (thread_ret_t)(intptr_t)GGML_STATUS_FAILED;
-    }
-    
-    struct ggml_threadpool * tp = state->threadpool;
-    
-    // Critical: Validate threadpool before accessing its members
-    if (!tp) {
-        GGML_LOG_ERROR("FATAL: Thread %d: threadpool is NULL\n", state->ith);
-        return (thread_ret_t)(intptr_t)GGML_STATUS_FAILED;
-    }
+    struct ggml_threadpool    * tp    = state->threadpool;
 
-    const struct ggml_cgraph * cgraph = ggml_cgraph_ref_get_safe(tp->cgraph_ref);
-    
-    // Critical: Validate cgraph before ANY access
-    if (!cgraph) {
-        GGML_LOG_WARN("Thread %d: cgraph reference is invalid, likely computation completed - exiting gracefully\n", state->ith);
-        return (thread_ret_t)(intptr_t)GGML_STATUS_SUCCESS;
-    }
-    
-    // Additional corruption check - cgraph may be freed by main thread
-    if (cgraph->n_nodes <= 0 || cgraph->n_nodes > 1000000) {
-        GGML_LOG_WARN("Thread %d: cgraph corrupted (n_nodes=%d), likely freed - exiting gracefully\n", 
-                       state->ith, cgraph->n_nodes);
-        return (thread_ret_t)(intptr_t)GGML_STATUS_SUCCESS;
-    }
-    
-    if (!cgraph->nodes) {
-        GGML_LOG_WARN("Thread %d: cgraph->nodes is NULL (n_nodes=%d), likely freed - exiting gracefully\n", 
-                       state->ith, cgraph->n_nodes);
-        return (thread_ret_t)(intptr_t)GGML_STATUS_SUCCESS;
-    }
-    
-    const struct ggml_cplan * cplan = tp->cplan;
-    
-    // Validate cplan as well
-    if (!cplan) {
-        GGML_LOG_ERROR("FATAL: Thread %d: tp->cplan is NULL\n", state->ith);
-        return (thread_ret_t)(intptr_t)GGML_STATUS_FAILED;
-    }
+    const struct ggml_cgraph * cgraph = tp->cgraph;
+    const struct ggml_cplan  * cplan  = tp->cplan;
 
-    // Only use traditional NUMA affinity if unified assignment allows it
-    if (atomic_load_explicit(&tp->pause, memory_order_relaxed) || tp->params.allow_numa_override) {
-        set_numa_thread_affinity(state->ith);
-    } else if (tp->params.warn_on_numa_override) {
-        // Threadpool assignment takes precedence over NUMA affinity
-        GGML_LOG_WARN("NUMA affinity override blocked by user preference for thread %d\n", state->ith);
-    }
+    set_numa_thread_affinity(state->ith);
 
     struct ggml_compute_params params = {
         /*.ith       =*/ state->ith,
@@ -4095,132 +2706,8 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
         /*.threadpool=*/ tp,
     };
 
-#ifdef GGML_NUMA_MIRROR
-    if (ggml_is_numa() && ggml_current_numa_node == -1) {
-        int thread_id = state->ith;
-        int n_threads = atomic_load_explicit(&tp->n_threads_cur, memory_order_relaxed);
-        int cpuid = -1;
-
-        // Check if NUMA override is allowed by threadpool parameters
-        bool allow_numa_override = atomic_load_explicit(&tp->pause, memory_order_relaxed) || tp->params.allow_numa_override;
-        
-        if (allow_numa_override) {
-            // Use NUMA-aware assignment
-            int num_numa_nodes = numa_num_configured_nodes();
-            if (num_numa_nodes <= 0) num_numa_nodes = 1;
-            
-            // Calculate which NUMA node this thread should use
-            int target_numa_node = thread_id % num_numa_nodes;
-            
-            bool cpumask[GGML_MAX_N_THREADS];
-            memset(cpumask, 0, sizeof(bool) * GGML_MAX_N_THREADS);
-            for (int i = 0; i < GGML_MAX_N_THREADS; ++i) {
-                if (CPU_ISSET(i, &g_cpuset)) {
-                    cpumask[i] = true;
-                }
-            }
-
-            // Try to find a CPU on the target NUMA node
-            struct bitmask* node_cpus = numa_allocate_cpumask();
-            if (numa_node_to_cpus(target_numa_node, node_cpus) == 0) {
-                // Find the first available CPU on the target NUMA node that's also in our allowed set
-                for (int i = 0; i < GGML_MAX_N_THREADS; ++i) {
-                    if (cpumask[i] && numa_bitmask_isbitset(node_cpus, i)) {
-                        cpuid = i;
-                        break;
-                    }
-                }
-            }
-            numa_free_cpumask(node_cpus);
-
-            // Fail if we can't get a CPU on the target node:
-            GGML_ASSERT(cpuid >= 0);
-            
-            cpu_set_t cpuset;
-            CPU_ZERO(&cpuset);
-            CPU_SET(cpuid, &cpuset);
-            sched_setaffinity(gettid(), sizeof(cpuset), &cpuset);
-
-            GGML_LOG_INFO("NUMA override: thread_id = %02d, target_node = %d, cpuid = %02d, n_threads = %d\n", 
-                         thread_id, target_numa_node, cpuid, n_threads);
-        } else {
-            // Respect threadpool's CPU assignment - no override
-            if (tp->params.warn_on_numa_override) {
-                GGML_LOG_WARN("NUMA override blocked by user preference for thread %d\n", thread_id);
-            }
-        }
-
-        unsigned int numa_node = 0;
-        getcpu(NULL, &numa_node);
-        ggml_current_numa_node = numa_node;
-
-        struct bitmask* mask = numa_bitmask_alloc(numa_num_configured_nodes());
-        numa_bitmask_setbit(mask, ggml_current_numa_node);
-        numa_set_membind(mask);
-        numa_bitmask_free(mask);
-    }
-#endif // GGML_NUMA_MIRROR
-
-    // Validate cgraph pointer before use
-    if (!cgraph) {
-        GGML_LOG_ERROR("Thread %d: cgraph is NULL, aborting\n", state->ith);
-        return (thread_ret_t)(intptr_t)(-1);
-    }
-    
-    // Validate cgraph->nodes pointer and node count
-    if (!cgraph->nodes || cgraph->n_nodes <= 0) {
-        GGML_LOG_ERROR("Thread %d: cgraph has invalid nodes (ptr=%s, count=%d), aborting\n", 
-                      state->ith, cgraph->nodes ? "non-null" : "null", cgraph->n_nodes);
-        return (thread_ret_t)(intptr_t)(-1);
-    }
-
-    for (int node_n = 0; ; node_n++) {
-        // Re-validate cgraph reference on each iteration to ensure thread safety
-        const struct ggml_cgraph * current_cgraph = ggml_cgraph_ref_get_safe(tp->cgraph_ref);
-        if (!current_cgraph) {
-            GGML_LOG_WARN("Thread %d: cgraph reference became invalid at node %d, breaking gracefully\n", 
-                          state->ith, node_n);
-            break;
-        }
-        
-        // Check if threadpool is stopping - critical for preventing cleanup race condition
-        if (tp->stop) {
-            GGML_LOG_DEBUG("Thread %d: threadpool stop requested at node %d, exiting computation\n", 
-                          state->ith, node_n);
-            break;
-        }
-        
-        // Check abort condition 
-        if (atomic_load_explicit(&tp->abort, memory_order_relaxed) == node_n) {
-            break;
-        }
-        
-        // Check bounds AFTER validating cgraph
-        if (node_n >= current_cgraph->n_nodes) {
-            break; // Normal completion
-        }
-        
-        // Additional safety check before accessing array
-        if (node_n < 0) {
-            GGML_LOG_WARN("Thread %d: Negative node index %d, breaking\n", state->ith, node_n);
-            break;
-        }
-        
-        // Re-validate cgraph reference immediately before accessing nodes array to prevent TOCTOU race
-        const struct ggml_cgraph * nodes_cgraph = ggml_cgraph_ref_get_safe(tp->cgraph_ref);
-        if (!nodes_cgraph) {
-            GGML_LOG_WARN("Thread %d: cgraph reference became invalid before accessing node %d, exiting\n", 
-                          state->ith, node_n);
-            break;
-        }
-        
-        struct ggml_tensor * node = nodes_cgraph->nodes[node_n];
-        
-        // Validate individual node
-        if (!node) {
-            GGML_LOG_WARN("Thread %d: Node %d is NULL, skipping\n", state->ith, node_n);
-            continue;
-        }
+    for (int node_n = 0; node_n < cgraph->n_nodes && atomic_load_explicit(&tp->abort, memory_order_relaxed) != node_n; node_n++) {
+        struct ggml_tensor * node = cgraph->nodes[node_n];
 
         ggml_compute_forward(&params, node);
 
@@ -4395,7 +2882,7 @@ static struct ggml_threadpool * ggml_threadpool_new_impl(
     struct ggml_threadpool * threadpool =
         ggml_aligned_malloc(sizeof(struct ggml_threadpool));
     {
-        threadpool->cgraph_ref       = ggml_cgraph_ref_create(cgraph);
+        threadpool->cgraph           = cgraph;
         threadpool->cplan            = cplan;
         threadpool->n_graph          = 0;
         threadpool->n_barrier        = 0;
@@ -4409,62 +2896,7 @@ static struct ggml_threadpool * ggml_threadpool_new_impl(
         threadpool->n_threads_cur    = tpp->n_threads;
         threadpool->poll             = tpp->poll;
         threadpool->prio             = tpp->prio;
-        threadpool->params           = *tpp;  // Store parameters for unified CPU assignment
-        threadpool->numa_mgr         = NULL; // Initialize to NULL (legacy)
-        threadpool->coordinator_mgr  = NULL; // Initialize to NULL (new 3-tier)
-        threadpool->use_coordinator  = false; // Default to legacy mode
         threadpool->ec               = GGML_STATUS_SUCCESS;
-    }
-
-    // NEW: Use global singleton 3-tier NUMA coordinator manager if conditions are met
-    // This ensures coordinator persists for program lifetime and eliminates race conditions
-    if ((ggml_is_numa() && tpp->numa_aware && tpp->n_threads >= 4) || tpp->force_multi_socket) {
-        GGML_LOG_INFO("Using global singleton 3-tier NUMA coordinator manager with CPU masks\n");
-        threadpool->coordinator_mgr = ggml_numa_coordinator_manager_get_global_with_params(tpp);
-        
-        if (threadpool->coordinator_mgr) {
-            threadpool->use_coordinator = true;
-            GGML_LOG_INFO("Global 3-tier NUMA coordinator manager acquired with custom CPU/NUMA masks\n");
-            
-            // Set cgraph for all NUMA nodes (each gets its own copy)
-            if (cgraph) {
-                int result = ggml_numa_coordinator_manager_set_cgraph(threadpool->coordinator_mgr, cgraph);
-                if (result == 0) {
-                    GGML_LOG_INFO("Cgraph copies distributed to all NUMA nodes\n");
-                    
-                    // Start coordinator threads (safe for multiple calls)
-                    result = ggml_numa_coordinator_manager_start(threadpool->coordinator_mgr);
-                    if (result == 0) {
-                        GGML_LOG_INFO("Coordinator threads started successfully\n");
-                        
-                        // Skip traditional threadpool setup when using coordinator
-                        return threadpool;
-                    } else {
-                        GGML_LOG_ERROR("Failed to start coordinator threads\n");
-                        ggml_numa_coordinator_manager_free(threadpool->coordinator_mgr);
-                        threadpool->coordinator_mgr = NULL;
-                        threadpool->use_coordinator = false;
-                    }
-                } else {
-                    GGML_LOG_ERROR("Failed to set cgraph for coordinator\n");
-                    ggml_numa_coordinator_manager_free(threadpool->coordinator_mgr);
-                    threadpool->coordinator_mgr = NULL;
-                    threadpool->use_coordinator = false;
-                }
-            }
-        } else {
-            GGML_LOG_WARN("Failed to create 3-tier coordinator, falling back to legacy NUMA manager\n");
-        }
-    }
-
-    // LEGACY: Create multi-socket NUMA manager if 3-tier coordinator not available
-    if (!threadpool->use_coordinator && 
-        ((ggml_is_numa() && tpp->numa_aware && tpp->n_threads >= 4) || tpp->force_multi_socket)) {
-        threadpool->numa_mgr = ggml_numa_threadpool_manager_new(tpp->force_multi_socket);
-        if (threadpool->numa_mgr) {
-            ggml_numa_threadpool_manager_create_socket_pools(threadpool->numa_mgr, tpp, threadpool);
-            GGML_LOG_INFO("Created legacy multi-socket NUMA manager for threadpool\n");
-        }
     }
 
     // Allocate and init workers state
@@ -4484,39 +2916,18 @@ static struct ggml_threadpool * ggml_threadpool_new_impl(
     ggml_cond_init(&threadpool->cond);
 
     // Spin the threads for all workers, and update CPU placements.
-    // Use unified CPU assignment to avoid dual assignment problem
-    
+    // Place the main thread last (towards the higher numbered CPU cores).
+
     int32_t cpumask_iter = 0;
 
     for (int j = 1; j < tpp->n_threads; j++) {
-        ggml_thread_cpumask_unified(
-            tpp->cpumask,                 // Available CPU mask
-            workers[j].cpumask,           // Output mask for this thread
-            j,                            // Thread index
-            tpp->n_threads,               // Total threads
-            tpp->strict_cpu,              // User's strict preference
-            tpp->numa_aware,              // NUMA awareness enabled
-            tpp->allow_numa_override,     // Allow NUMA to override strict
-            tpp->warn_on_numa_override,   // Warn on override
-            &cpumask_iter                 // Round-robin iterator
-        );
+        ggml_thread_cpumask_next(tpp->cpumask, workers[j].cpumask, tpp->strict_cpu, &cpumask_iter);
 
         int32_t rc = ggml_thread_create(&workers[j].thrd, NULL, ggml_graph_compute_secondary_thread, &workers[j]);
         GGML_ASSERT(rc == 0);
     }
 
-    // Assign CPU mask for main thread (thread 0)
-    ggml_thread_cpumask_unified(
-        tpp->cpumask,                 // Available CPU mask
-        workers[0].cpumask,           // Output mask for main thread
-        0,                            // Thread index (main thread)
-        tpp->n_threads,               // Total threads
-        tpp->strict_cpu,              // User's strict preference
-        tpp->numa_aware,              // NUMA awareness enabled
-        tpp->allow_numa_override,     // Allow NUMA to override strict
-        tpp->warn_on_numa_override,   // Warn on override
-        &cpumask_iter                 // Round-robin iterator
-    );
+    ggml_thread_cpumask_next(tpp->cpumask, workers[0].cpumask, tpp->strict_cpu, &cpumask_iter);
 
     if (!threadpool->pause) {
         // Update main thread prio and affinity at the start, otherwise we'll do it in resume
@@ -4555,26 +2966,12 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
     } else {
         // Reset some of the parameters that need resetting
         // No worker threads should be accessing the parameters below at this stage
-        
-        // Invalidate old cgraph reference and create new one
-        if (threadpool->cgraph_ref) {
-            ggml_cgraph_ref_invalidate(threadpool->cgraph_ref);
-            ggml_cgraph_ref_release(threadpool->cgraph_ref);
-        }
-        threadpool->cgraph_ref       = ggml_cgraph_ref_create(cgraph);
+        threadpool->cgraph           = cgraph;
         threadpool->cplan            = cplan;
         threadpool->current_chunk    = 0;
         threadpool->abort            = -1;
         threadpool->ec               = GGML_STATUS_SUCCESS;
     }
-    
-#ifdef GGML_NUMA_MIRROR
-    if (!g_cpuset_isset) {
-        CPU_ZERO(&g_cpuset);
-        sched_getaffinity(getpid(), sizeof(g_cpuset), &g_cpuset);
-        g_cpuset_isset = true;
-    }
-#endif
 
 #ifdef GGML_USE_OPENMP
     if (n_threads > 1) {
@@ -4587,14 +2984,7 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
                 atomic_store_explicit(&threadpool->n_threads_cur, n_threads, memory_order_relaxed);
             }
 
-            int thread_id = omp_get_thread_num();
-            // Bounds check to prevent segfault
-            if (thread_id >= threadpool->n_threads_max) {
-                GGML_LOG_WARN("OpenMP thread ID %d exceeds allocated workers %d, using worker 0\n", 
-                              thread_id, threadpool->n_threads_max);
-                thread_id = 0;
-            }
-            ggml_graph_compute_thread(&threadpool->workers[thread_id]);
+            ggml_graph_compute_thread(&threadpool->workers[omp_get_thread_num()]);
         }
     } else {
         atomic_store_explicit(&threadpool->n_threads_cur, 1, memory_order_relaxed);
