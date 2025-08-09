@@ -8,8 +8,8 @@
 #define GGML_NUMA_COORDINATOR_H
 
 #include "ggml.h"
-#include "ggml-impl.h"
-#include "ggml-cpu-impl.h"  // For ggml_compute_params structure
+// Note: Minimal includes to avoid path issues from tests
+// Full implementation includes are in the .c file
 
 #ifdef __cplusplus
 extern "C" {
@@ -20,6 +20,41 @@ struct ggml_numa_coordinator_manager;
 struct ggml_work_item;
 struct ggml_work_queue;
 struct ggml_coordinator_thread;
+struct ggml_compute_params;  // Forward declaration to avoid include path issues
+
+/**
+ * Memory management strategy for the NUMA coordinator
+ */
+enum ggml_numa_memory_strategy {
+    GGML_NUMA_STRATEGY_AUTO,        // Adaptive strategy selection based on workload (default)
+    GGML_NUMA_STRATEGY_MATRIX_REDUCTION,  // Reduce matrix dimensions to fit memory (better scaling measurement)
+    GGML_NUMA_STRATEGY_CHUNKED_PROCESSING, // Process in chunks with full matrices (better throughput)
+    GGML_NUMA_STRATEGY_HYBRID       // Dynamic switching based on runtime conditions
+};
+
+/**
+ * CPU cache hierarchy information
+ */
+struct ggml_numa_cache_info {
+    int64_t l1_cache_size;           // L1 cache size in bytes (per core)
+    int64_t l2_cache_size;           // L2 cache size in bytes (per core) 
+    int64_t l3_cache_size;           // L3 cache size in bytes (shared)
+    int cache_line_size;             // Cache line size in bytes (usually 64)
+    int l3_sharing_cores;            // Number of cores sharing L3 cache
+    bool cache_detection_successful; // Whether cache detection succeeded
+};
+
+/**
+ * Workload characteristics for strategy selection (enhanced with cache awareness)
+ */
+struct ggml_numa_workload_info {
+    int64_t matrix_dim;              // Matrix dimension (for MxM operations)
+    int batch_size;                  // Batch size being processed
+    int64_t available_memory_gb;     // Available system memory in GB
+    bool prioritize_scaling_accuracy; // Whether to prioritize batch scaling measurement over throughput
+    enum ggml_numa_memory_strategy user_override; // User-specified strategy override
+    struct ggml_numa_cache_info cache_info; // CPU cache hierarchy information
+};
 
 /**
  * Create NUMA coordinator manager with 3-tier architecture
@@ -190,6 +225,82 @@ enum ggml_status ggml_numa_fallback_execute_operation(struct ggml_tensor * opera
  * @return GGML_STATUS_SUCCESS on success, GGML_STATUS_FAILED on failure
  */
 enum ggml_status ggml_numa_graph_compute(struct ggml_cgraph * cgraph, int n_threads);
+
+/**
+ * Set memory management strategy for the coordinator
+ * 
+ * @param mgr Manager instance
+ * @param strategy Strategy to use (AUTO for adaptive selection)
+ * @return 0 on success, -1 on failure
+ */
+int ggml_numa_coordinator_manager_set_strategy(struct ggml_numa_coordinator_manager * mgr, enum ggml_numa_memory_strategy strategy);
+
+/**
+ * Get current memory management strategy
+ * 
+ * @param mgr Manager instance
+ * @return Current strategy
+ */
+enum ggml_numa_memory_strategy ggml_numa_coordinator_manager_get_strategy(struct ggml_numa_coordinator_manager * mgr);
+
+/**
+ * Choose optimal memory management strategy based on workload characteristics
+ * This function implements the adaptive strategy selection logic based on A/B test results
+ * 
+ * @param workload Workload characteristics
+ * @return Recommended strategy
+ */
+enum ggml_numa_memory_strategy ggml_numa_choose_strategy(const struct ggml_numa_workload_info * workload);
+
+/**
+ * Submit tensor with adaptive strategy selection
+ * This extends the data parallel work submission with intelligent strategy selection
+ * 
+ * @param mgr Manager instance
+ * @param tensor Tensor to process
+ * @param workload Workload characteristics for strategy selection
+ * @return Work group ID on success, -1 on failure
+ */
+int ggml_numa_coordinator_manager_submit_adaptive_work(struct ggml_numa_coordinator_manager * mgr,
+                                                       struct ggml_tensor * tensor,
+                                                       const struct ggml_numa_workload_info * workload);
+
+/**
+ * Detect CPU cache hierarchy information
+ * This function reads cache information from the system and populates the cache_info structure
+ * 
+ * @param cache_info Output structure to populate with cache information
+ * @return 0 on success, -1 on failure
+ */
+int ggml_numa_detect_cache_info(struct ggml_numa_cache_info * cache_info);
+
+/**
+ * Calculate optimal matrix tile size based on cache characteristics
+ * This function determines the best matrix tile dimensions for cache-friendly operations
+ * 
+ * @param cache_info Cache hierarchy information
+ * @param element_size Size of each matrix element in bytes
+ * @param cache_level Target cache level (1 for L1, 2 for L2, 3 for L3)
+ * @return Optimal tile dimension (for square tiles)
+ */
+int64_t ggml_numa_optimal_tile_size(const struct ggml_numa_cache_info * cache_info, 
+                                     int element_size, 
+                                     int cache_level);
+
+/**
+ * Calculate cache-aware chunk size for matrix operations
+ * This function determines optimal chunk boundaries based on L3 cache sharing
+ * 
+ * @param cache_info Cache hierarchy information
+ * @param matrix_dim Matrix dimension
+ * @param batch_size Batch size
+ * @param element_size Size of each element
+ * @return Optimal chunk size
+ */
+int64_t ggml_numa_cache_aware_chunk_size(const struct ggml_numa_cache_info * cache_info,
+                                          int64_t matrix_dim,
+                                          int batch_size,
+                                          int element_size);
 
 #ifdef __cplusplus
 }
