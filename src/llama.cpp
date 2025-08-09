@@ -85,6 +85,16 @@ void llama_numa_init_with_node(enum ggml_numa_strategy numa, int isolate_node) {
     }
 }
 
+void llama_numa_init_with_threadpool_params(enum ggml_numa_strategy numa, const struct ggml_threadpool_params * tpp) {
+    if (numa != GGML_NUMA_STRATEGY_DISABLED) {
+        auto * dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+        GGML_ASSERT(dev && "CPU backend is not loaded");
+        auto * reg = ggml_backend_dev_backend_reg(dev);
+        auto * numa_init_fn = (decltype(ggml_numa_init_with_threadpool_params) *) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cpu_numa_init_with_threadpool_params");
+        numa_init_fn(numa, tpp);
+    }
+}
+
 void llama_backend_free(void) {
     ggml_quantize_free();
 }

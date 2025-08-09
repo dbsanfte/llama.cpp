@@ -25,7 +25,18 @@ static struct {
     enum ggml_numa_strategy strategy;
     int numa_nodes;
     bool numa_enabled;
-} g_numa_state = { false, GGML_NUMA_STRATEGY_DISABLED, 1, false };
+    struct ggml_numa_coordinator_manager * coordinator;  // Coordinator manager instance
+    struct ggml_threadpool_params threadpool_params;     // Stored threadpool params
+    bool threadpool_params_valid;                        // Whether params are valid
+} g_numa_state = { 
+    .initialized = false, 
+    .strategy = GGML_NUMA_STRATEGY_DISABLED, 
+    .numa_nodes = 1, 
+    .numa_enabled = false,
+    .coordinator = NULL,
+    .threadpool_params = {0},
+    .threadpool_params_valid = false 
+};
 
 #if defined(_MSC_VER) || defined(__MINGW32__)
 #include <malloc.h> // using malloc.h with MSC/MINGW
@@ -558,28 +569,97 @@ int ggml_threadpool_chunk_add(struct ggml_threadpool * tp, int value) {
 // NUMA Management Functions
 //
 
-void ggml_numa_init(enum ggml_numa_strategy numa_flag) {
-    // Basic NUMA initialization - detect system capabilities
-    g_numa_state.strategy = numa_flag;
-    g_numa_state.initialized = true;
-    
+static enum ggml_numa_memory_strategy ggml_numa_strategy_to_coordinator_strategy(enum ggml_numa_strategy strategy) {
+    switch (strategy) {
+        case GGML_NUMA_STRATEGY_DISABLED:
+            return GGML_NUMA_STRATEGY_AUTO;  // Use default if not disabled
+        case GGML_NUMA_STRATEGY_DISTRIBUTE:
+            return GGML_NUMA_STRATEGY_AUTO;  // Auto-selection works well for distribute
+        case GGML_NUMA_STRATEGY_ISOLATE:
+            return GGML_NUMA_STRATEGY_MATRIX_REDUCTION;  // Better for isolation
+        case GGML_NUMA_STRATEGY_NUMACTL:
+            return GGML_NUMA_STRATEGY_HYBRID;  // Respect numactl settings with hybrid approach
+        default:
+            return GGML_NUMA_STRATEGY_AUTO;
+    }
+}
+
+static void ggml_numa_init_coordinator(enum ggml_numa_strategy numa_strategy, const struct ggml_threadpool_params * tpp) {
 #ifdef GGML_NUMA_MIRROR
-    // When coordinator is available, we can detect actual NUMA nodes
-    // For now, we'll use simple detection
-    g_numa_state.numa_nodes = 1;  // Will be updated when coordinator provides real detection
-    g_numa_state.numa_enabled = (numa_flag != GGML_NUMA_STRATEGY_DISABLED);
+    if (numa_strategy == GGML_NUMA_STRATEGY_DISABLED) {
+        return;  // Don't create coordinator for disabled NUMA
+    }
+
+    // Create coordinator with threadpool parameters
+    g_numa_state.coordinator = ggml_numa_coordinator_manager_get_global_with_params(tpp);
+    
+    if (g_numa_state.coordinator) {
+        // Set the appropriate memory strategy
+        enum ggml_numa_memory_strategy coord_strategy = ggml_numa_strategy_to_coordinator_strategy(numa_strategy);
+        ggml_numa_coordinator_manager_set_strategy(g_numa_state.coordinator, coord_strategy);
+        
+        // Query actual NUMA capabilities from coordinator
+        // TODO: Add functions to query coordinator for node count and NUMA status
+        // For now, assume NUMA is enabled if coordinator was created successfully
+        g_numa_state.numa_enabled = true;
+        g_numa_state.numa_nodes = 2;  // TODO: Query from coordinator
+    } else {
+        // Coordinator creation failed, fall back to no NUMA
+        g_numa_state.numa_enabled = false;
+        g_numa_state.numa_nodes = 1;
+    }
 #else
-    // Default behavior: no NUMA support
-    g_numa_state.numa_nodes = 1;
+    // No coordinator available
+    UNUSED(numa_strategy);
+    UNUSED(tpp);
     g_numa_state.numa_enabled = false;
+    g_numa_state.numa_nodes = 1;
 #endif
 }
 
+void ggml_numa_init_with_threadpool_params(enum ggml_numa_strategy numa_strategy, const struct ggml_threadpool_params * tpp) {
+    g_numa_state.strategy = numa_strategy;
+    g_numa_state.initialized = true;
+    
+    if (tpp) {
+        g_numa_state.threadpool_params = *tpp;
+        g_numa_state.threadpool_params_valid = true;
+    }
+    
+    // Initialize coordinator with full context
+    ggml_numa_init_coordinator(numa_strategy, tpp);
+}
+
+void ggml_numa_init(enum ggml_numa_strategy numa_flag) {
+    // Legacy initialization - use threadpool params if available, otherwise basic init
+    if (g_numa_state.threadpool_params_valid) {
+        ggml_numa_init_coordinator(numa_flag, &g_numa_state.threadpool_params);
+    } else {
+        // Fallback: create basic threadpool params
+        struct ggml_threadpool_params tpp;
+        ggml_threadpool_params_init(&tpp, -1);  // Use default thread count
+        ggml_numa_init_coordinator(numa_flag, &tpp);
+    }
+    
+    g_numa_state.strategy = numa_flag;
+    g_numa_state.initialized = true;
+}
+
 bool ggml_is_numa(void) {
+#ifdef GGML_NUMA_MIRROR
+    if (g_numa_state.coordinator) {
+        return g_numa_state.numa_enabled;
+    }
+#endif
     return g_numa_state.numa_enabled;
 }
 
 int ggml_numa_node_count(void) {
+#ifdef GGML_NUMA_MIRROR
+    if (g_numa_state.coordinator) {
+        return g_numa_state.numa_nodes;
+    }
+#endif
     return g_numa_state.numa_nodes;
 }
 
@@ -588,9 +668,24 @@ enum ggml_numa_strategy ggml_get_numa_strategy(void) {
 }
 
 void ggml_numa_init_with_node(enum ggml_numa_strategy numa_flag, int isolate_node) {
-    ggml_numa_init(numa_flag);
-    // isolate_node parameter is stored in strategy for now
-    UNUSED(isolate_node);
+    // For node isolation, we need to modify threadpool params if available
+    if (g_numa_state.threadpool_params_valid) {
+        struct ggml_threadpool_params tpp = g_numa_state.threadpool_params;
+        // TODO: Apply isolate_node configuration to threadpool params
+        ggml_numa_init_coordinator(numa_flag, &tpp);
+    } else {
+        // Fallback: create basic threadpool params with node isolation
+        struct ggml_threadpool_params tpp;
+        ggml_threadpool_params_init(&tpp, -1);
+        // TODO: Configure tpp for node isolation
+        ggml_numa_init_coordinator(numa_flag, &tpp);
+    }
+    
+    // isolate_node parameter handling
+    UNUSED(isolate_node);  // TODO: Use this in coordinator configuration
+    
+    g_numa_state.strategy = numa_flag;
+    g_numa_state.initialized = true;
 }
 
 #if defined(__ARM_ARCH)

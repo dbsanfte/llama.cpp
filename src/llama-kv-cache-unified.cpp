@@ -105,7 +105,15 @@ llama_kv_cache_unified::llama_kv_cache_unified(
 
         const char * dev_name = "CPU";
 
-        ggml_backend_buffer_type_t buft = ggml_backend_cpu_buffer_type();
+        ggml_backend_buffer_type_t buft;
+        if (ggml_is_numa()) {
+            // Use NUMA-aware buffer type for better memory locality on multi-NUMA systems
+            buft = ggml_backend_cpu_numa_buffer_type();
+            dev_name = "CPU_NUMA";
+        } else {
+            // Fallback to standard CPU buffer type
+            buft = ggml_backend_cpu_buffer_type();
+        }
 
         if (offload) {
             auto * dev = model.dev_layer(il);

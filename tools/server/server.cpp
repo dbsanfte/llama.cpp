@@ -3685,10 +3685,19 @@ int main(int argc, char ** argv) {
     // Print comprehensive topology if NUMA is enabled (before NUMA allocation begins)
     common_numa_print_topology_if_enabled(params);
     
-    if (params.numa == GGML_NUMA_STRATEGY_ISOLATE && params.numa_isolate_node >= 0) {
-        llama_numa_init_with_node(params.numa, params.numa_isolate_node);
-    } else {
-        llama_numa_init(params.numa);
+    // Use new NUMA initialization with full threadpool parameters
+    if (params.numa != GGML_NUMA_STRATEGY_DISABLED) {
+        // Convert CPU params to threadpool params for coordinator
+        struct ggml_threadpool_params tpp = ggml_threadpool_params_from_cpu_params(params.cpuparams);
+        
+        if (params.numa == GGML_NUMA_STRATEGY_ISOLATE && params.numa_isolate_node >= 0) {
+            // For isolate strategy with specific node, use the legacy function for now
+            // TODO: Implement node isolation in the threadpool params
+            llama_numa_init_with_node(params.numa, params.numa_isolate_node);
+        } else {
+            // Use new function with full threadpool configuration
+            llama_numa_init_with_threadpool_params(params.numa, &tpp);
+        }
     }
 
     LOG_INF("system info: n_threads = %d, n_threads_batch = %d, total_threads = %d\n", params.cpuparams.n_threads, params.cpuparams_batch.n_threads, std::thread::hardware_concurrency());

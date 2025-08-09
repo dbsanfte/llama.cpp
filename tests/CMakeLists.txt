@@ -261,3 +261,25 @@ llama_build_and_test(test-cache-optimization.cpp)
 target_link_libraries(${LLAMA_TEST_NAME} PRIVATE ggml ggml-cpu common)
 target_include_directories(${LLAMA_TEST_NAME} PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src)
 target_include_directories(${LLAMA_TEST_NAME} PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src/ggml-cpu)
+
+# test-numa-coordinator-integration
+set(LLAMA_TEST_NAME test-numa-coordinator-integration)
+llama_build_and_test(test-numa-coordinator-integration.cpp)
+target_link_libraries(${LLAMA_TEST_NAME} PRIVATE ggml ggml-cpu common)
+target_include_directories(${LLAMA_TEST_NAME} PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src)
+target_include_directories(${LLAMA_TEST_NAME} PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src/ggml-cpu)
+
+# test-kv-cache-numa-analysis
+set(LLAMA_TEST_NAME test-kv-cache-numa-analysis)
+add_executable(${LLAMA_TEST_NAME} test-kv-cache-numa-analysis.cpp)
+target_link_libraries(${LLAMA_TEST_NAME} PRIVATE numa)
+
+# test-numa-buffer-integration
+set(LLAMA_TEST_NAME test-numa-buffer-integration)
+llama_build_and_test(test-numa-buffer-integration.cpp)
+target_link_libraries(${LLAMA_TEST_NAME} PRIVATE ggml ggml-cpu common)
+
+# test-kv-cache-numa-integration
+set(LLAMA_TEST_NAME test-kv-cache-numa-integration)
+llama_build_and_test(test-kv-cache-numa-integration.cpp)
+target_link_libraries(${LLAMA_TEST_NAME} PRIVATE llama ggml ggml-cpu common)
