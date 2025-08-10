@@ -141,6 +141,16 @@ struct ggml_numa_perf_stats {
 
 struct ggml_numa_perf_stats ggml_numa_coordinator_manager_get_stats(struct ggml_numa_coordinator_manager * mgr, int numa_node);
 
+/**
+ * Get the NUMA nodes that the coordinator is actively using
+ * 
+ * @param mgr Manager instance (NULL for global singleton)
+ * @param nodes Array to store NUMA node IDs
+ * @param max_nodes Maximum number of nodes to store
+ * @return Number of NUMA nodes being used, or -1 on error
+ */
+int ggml_numa_coordinator_get_active_nodes(struct ggml_numa_coordinator_manager * mgr, int * nodes, int max_nodes);
+
 #ifdef __cplusplus
 }
 #endif

@@ -35,6 +35,8 @@ struct llama_cparams {
     bool op_offload;
     bool kv_unified;
 
+    enum llama_numa_cache_strategy numa_cache_strategy;
+
     enum llama_pooling_type pooling_type;
 
     ggml_backend_sched_eval_callback cb_eval;

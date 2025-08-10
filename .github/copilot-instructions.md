@@ -41,24 +41,30 @@ Note: Never limit the threads count of `--parallel`, just let cmake autodetect t
 ## 🧠 Key Areas of Focus
 
 ### 1. NUMA Memory Management
-**Files**: `ggml/src/ggml-cpu.c`, `src/llama-mmap.cpp`
+**Files**: `ggml/src/ggml-cpu.c`, `src/llama-mmap.cpp`, `ggml/src/ggml-numa-coordinator.c`, `ggml/src/ggml-cpu-numa-buffer.cpp`
 
-- **NUMA mirroring**: Model weights duplicated across NUMA nodes
-- **Thread-to-NUMA mapping**: Each thread accesses local memory
+- **NUMA mirroring**: `tensor_data()` and `tensor_set_data()` in `ggml/src/ggml.h` to handle numa-aware tensor data access and mirror across nodes, and numa-aware cache mirroring in `ggml-cpu-numa-buffer.cpp`
+- **Thread-to-NUMA mapping**: In the numa coordinator, each worker threadpool gets assigned to its own numa node
 - **Memory allocation**: `numa_alloc_onnode()` for local allocation
 
 ### 2. CPU Topology Detection
-**Files**: `common/common.cpp`, `common/common.h`
+**Files**: `common/common.cpp`, `common/common.h`, `ggml/src/ggml-numa-coordinator.c`
 
-- **Linux-specific**: Reads `/sys/devices/system/cpu/` topology
+- **Linux-specific**: `common.cpp` strategy reads `/sys/devices/system/cpu/` 
 - **Hyperthreading detection**: Groups sibling threads correctly
 - **Intel hybrid support**: Distinguishes P-cores from E-cores
+- **NUMA awareness**: Incorporates NUMA node information into thread scheduling in `ggml-numa-coordinator.c`
 
-Key functions:
+Key functions in `common`:
 ```cpp
 detect_cpu_topology()           // Main topology detection
 cpu_count_math_cpus()          // Count available CPUs with options
 cpu_print_topology_info()     // Debug information display
+```
+
+Key functions in `ggml`:
+```cpp
+
 ```
 
 ### 3. Command-Line Interface
@@ -115,7 +121,7 @@ taskset -cp $(pgrep llama-server)
 
 ### Error Handling
 - Always check return values for system calls
-- Use `LOG_WRN()` for warnings, `LOG_ERR()` for errors, `GGML_ASSERT()` for assertions.
+- Use `LOG_WRN()` / `GGML_LOG_WARNING()` for warnings, `LOG_ERR()` / `GGML_LOG_ERROR()` for errors, `GGML_ASSERT()` for assertions.
 
 ### Platform Compatibility
 - NUMA features are Linux-specific (`#if defined(__x86_64__) && defined(__linux__)`)
@@ -185,4 +191,4 @@ Remember: NUMA and CPU topology changes can have subtle effects. Always validate
 
 ## Changelog
 
-After each task is complete, document what you did in a new markdown file in `.devcontainer/changelog`. You can also search through markdown files in this folder for records of other similar past changes if you want to check past actions for more context on a task.
+After each task is complete, document what you did in a new markdown file in `.devcontainer/changelog`. Always look up the current date and include that in the filename. You can also search through markdown files in this folder for records of other similar past changes if you want to check past actions for more context on a task.

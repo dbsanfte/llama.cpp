@@ -2563,3 +2563,28 @@ int64_t ggml_numa_cache_aware_chunk_size(const struct ggml_numa_cache_info * cac
     return max_chunk_size;
 }
 
+/**
+ * Get the NUMA nodes that the coordinator is actively using
+ */
+int ggml_numa_coordinator_get_active_nodes(struct ggml_numa_coordinator_manager * mgr, int * nodes, int max_nodes) {
+    // If no manager specified, use the global singleton
+    if (mgr == NULL) {
+        mgr = g_global_coordinator_manager;
+    }
+    
+    if (mgr == NULL || nodes == NULL || max_nodes <= 0) {
+        return -1;
+    }
+    
+    int count = 0;
+    
+    // Get the NUMA nodes from the coordinator threads
+    for (int i = 0; i < mgr->num_numa_nodes && count < max_nodes; i++) {
+        if (mgr->coordinators && mgr->coordinators[i].numa_node >= 0) {
+            nodes[count++] = mgr->coordinators[i].numa_node;
+        }
+    }
+    
+    return count;
+}
+

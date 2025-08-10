@@ -283,3 +283,28 @@ target_link_libraries(${LLAMA_TEST_NAME} PRIVATE ggml ggml-cpu common)
 set(LLAMA_TEST_NAME test-kv-cache-numa-integration)
 llama_build_and_test(test-kv-cache-numa-integration.cpp)
 target_link_libraries(${LLAMA_TEST_NAME} PRIVATE llama ggml ggml-cpu common)
+
+# test-numa-command-line-options
+set(LLAMA_TEST_NAME test-numa-command-line-options)
+llama_build_and_test(test-numa-command-line-options.cpp)
+target_link_libraries(${LLAMA_TEST_NAME} PRIVATE common)
+
+# test-runtime-numa-mirroring
+set(LLAMA_TEST_NAME test-runtime-numa-mirroring)
+llama_build_and_test(test-runtime-numa-mirroring.cpp)
+target_link_libraries(${LLAMA_TEST_NAME} PRIVATE ggml ggml-cpu common)
+
+# test-cache-strategy-integration
+set(LLAMA_TEST_NAME test-cache-strategy-integration)
+llama_build_and_test(test-cache-strategy-integration.cpp)
+target_link_libraries(${LLAMA_TEST_NAME} PRIVATE ggml ggml-cpu common)
+
+# test-buffer-allocation-strategies
+set(LLAMA_TEST_NAME test-buffer-allocation-strategies)
+llama_build_and_test(test-buffer-allocation-strategies.cpp)
+target_link_libraries(${LLAMA_TEST_NAME} PRIVATE ggml ggml-cpu common)
+
+# test-coordinator-buffer-integration
+set(LLAMA_TEST_NAME test-coordinator-buffer-integration)
+llama_build_and_test(test-coordinator-buffer-integration.cpp)
+target_link_libraries(${LLAMA_TEST_NAME} PRIVATE ggml ggml-cpu common)

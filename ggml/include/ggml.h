@@ -651,10 +651,19 @@ extern "C" {
 
 #ifdef GGML_NUMA_MIRROR
     extern __thread int ggml_current_numa_node;
+    // Function to check if NUMA mirroring should be active at runtime
+    extern bool ggml_numa_should_mirror(void);
 #endif
 
     static inline void * tensor_data(const struct ggml_tensor * tensor) {
 #ifdef GGML_NUMA_MIRROR
+        // Check if mirroring is actually enabled at runtime
+        if (!ggml_numa_should_mirror()) {
+            // Mirroring disabled - just return the first data pointer
+            return tensor->__data[0];
+        }
+        
+        // Mirroring enabled - use NUMA-aware access
         extern int ggml_numa_node_count(void);
         int n = ggml_current_numa_node;
         if (n == -1)
@@ -673,6 +682,16 @@ extern "C" {
 
     static inline void tensor_set_data(struct ggml_tensor * tensor, void * data) {
 #ifdef GGML_NUMA_MIRROR
+        // Check if mirroring should be active at runtime
+        if (!ggml_numa_should_mirror()) {
+            // Mirroring disabled - all data pointers point to the same data
+            for (int i = 0; i < GGML_NUMA_MAX_NODES; i++) {
+                tensor->__data[i] = data;
+            }
+            return;
+        }
+        
+        // Mirroring enabled - set up NUMA-aware data pointers
         extern bool ggml_is_numa(void);
         extern int ggml_numa_node_count(void);
         

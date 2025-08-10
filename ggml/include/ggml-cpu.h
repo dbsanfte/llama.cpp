@@ -45,6 +45,10 @@ extern "C" {
     GGML_BACKEND_API void    ggml_numa_init_with_threadpool_params(enum ggml_numa_strategy numa, const struct ggml_threadpool_params * tpp); // call once with full threadpool configuration
     GGML_BACKEND_API bool    ggml_is_numa(void); // true if init detected that system has >1 NUMA node
     GGML_BACKEND_API enum ggml_numa_strategy ggml_get_numa_strategy(void); // get current NUMA strategy
+    
+    // NUMA cache strategy management
+    GGML_BACKEND_API void    ggml_numa_set_cache_strategy(int cache_strategy); // set NUMA cache replication strategy
+    GGML_BACKEND_API int     ggml_numa_get_cache_strategy(void); // get current NUMA cache replication strategy
 
     GGML_BACKEND_API struct ggml_tensor * ggml_new_i32(struct ggml_context * ctx, int32_t value);
     GGML_BACKEND_API struct ggml_tensor * ggml_new_f32(struct ggml_context * ctx, float value);

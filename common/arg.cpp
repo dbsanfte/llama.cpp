@@ -2344,6 +2344,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         "- isolate: only spawn threads on CPUs on the node that execution started on\n"
         "- isolate N: only spawn threads on CPUs on NUMA node N (if valid)\n"
         "- numactl: use the CPU map provided by numactl\n"
+        "- mirror: enable coordinator data parallelism with NUMA-aware KV cache\n"
         "if run without this previously, it is recommended to drop the system page cache before using this\n"
         "see https://github.com/ggml-org/llama.cpp/issues/1437",
         [](common_params & params, const std::string & value) {
@@ -2367,9 +2368,29 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
                 }
             }
             else if (value == "numactl") { params.numa = GGML_NUMA_STRATEGY_NUMACTL; }
+            else if (value == "mirror") { params.numa = GGML_NUMA_STRATEGY_MIRROR; }
             else { throw std::invalid_argument("invalid value"); }
         }
     ).set_env("LLAMA_ARG_NUMA"));
+    add_opt(common_arg(
+        {"--numa-cache-strategy"}, "STRATEGY",
+        "cache replication strategy for NUMA distribute mode\n"
+        "- disabled: no cache replication (default)\n"
+        "- eager: immediate replication across all nodes\n"
+        "- lazy: on-demand replication when accessed\n"
+        "- delta: incremental updates only\n"
+        "- partial: replicate working set only",
+        [](common_params & params, const std::string & value) {
+            /**/ if (value == "disabled" || value == "") { 
+                params.numa_cache_strategy = NUMA_CACHE_STRATEGY_DISABLED; 
+            }
+            else if (value == "eager") { params.numa_cache_strategy = NUMA_CACHE_STRATEGY_EAGER; }
+            else if (value == "lazy") { params.numa_cache_strategy = NUMA_CACHE_STRATEGY_LAZY; }
+            else if (value == "delta") { params.numa_cache_strategy = NUMA_CACHE_STRATEGY_DELTA; }
+            else if (value == "partial") { params.numa_cache_strategy = NUMA_CACHE_STRATEGY_PARTIAL; }
+            else { throw std::invalid_argument("invalid cache strategy"); }
+        }
+    ).set_env("LLAMA_ARG_NUMA_CACHE_STRATEGY"));
 #endif // GGML_NUMA_MIRROR
     add_opt(common_arg(
         {"-dev", "--device"}, "<dev1,dev2,..>",

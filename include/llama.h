@@ -180,6 +180,15 @@ extern "C" {
         LLAMA_ATTENTION_TYPE_NON_CAUSAL  = 1,
     };
 
+    enum llama_numa_cache_strategy {
+        LLAMA_NUMA_CACHE_STRATEGY_DISABLED = 0,  // No cache replication
+        LLAMA_NUMA_CACHE_STRATEGY_EAGER    = 1,  // Immediate replication across all nodes
+        LLAMA_NUMA_CACHE_STRATEGY_LAZY     = 2,  // On-demand replication when accessed
+        LLAMA_NUMA_CACHE_STRATEGY_DELTA    = 3,  // Incremental updates only
+        LLAMA_NUMA_CACHE_STRATEGY_PARTIAL  = 4,  // Replicate working set only
+        LLAMA_NUMA_CACHE_STRATEGY_COUNT
+    };
+
     enum llama_split_mode {
         LLAMA_SPLIT_MODE_NONE  = 0, // single GPU
         LLAMA_SPLIT_MODE_LAYER = 1, // split layers and KV across GPUs
@@ -338,6 +347,8 @@ extern "C" {
         bool kv_unified;  // use a unified buffer across the input sequences when computing the attention
                           // try to disable when n_seq_max > 1 for improved performance when the sequences do not share a large prefix
                           // ref: https://github.com/ggml-org/llama.cpp/pull/14363
+
+        enum llama_numa_cache_strategy numa_cache_strategy; // NUMA cache replication strategy
     };
 
     // model quantization parameters

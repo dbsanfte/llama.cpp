@@ -20,6 +20,16 @@
 #define die(msg)          do { fputs("error: " msg "\n", stderr);                exit(1); } while (0)
 #define die_fmt(fmt, ...) do { fprintf(stderr, "error: " fmt "\n", __VA_ARGS__); exit(1); } while (0)
 
+// NUMA cache replication strategies
+enum numa_cache_strategy {
+    NUMA_CACHE_STRATEGY_DISABLED = 0,  // No cache replication
+    NUMA_CACHE_STRATEGY_EAGER    = 1,  // Immediate replication across all nodes
+    NUMA_CACHE_STRATEGY_LAZY     = 2,  // On-demand replication when accessed
+    NUMA_CACHE_STRATEGY_DELTA    = 3,  // Incremental updates only
+    NUMA_CACHE_STRATEGY_PARTIAL  = 4,  // Replicate working set only
+    NUMA_CACHE_STRATEGY_COUNT
+};
+
 #define print_build_info() do {                                                                     \
     fprintf(stderr, "%s: build = %d (%s)\n",      __func__, LLAMA_BUILD_NUMBER, LLAMA_COMMIT);      \
     fprintf(stderr, "%s: built with %s for %s\n", __func__, LLAMA_COMPILER, LLAMA_BUILD_TARGET);    \
@@ -318,6 +328,7 @@ struct common_params {
 
     ggml_numa_strategy numa = GGML_NUMA_STRATEGY_DISABLED;
     int                numa_isolate_node = -1; // -1 = use current node, >= 0 = use specified node
+    enum numa_cache_strategy numa_cache_strategy = NUMA_CACHE_STRATEGY_DISABLED; // Cache replication strategy for distributed NUMA
 
     enum llama_rope_scaling_type rope_scaling_type = LLAMA_ROPE_SCALING_TYPE_UNSPECIFIED;
     enum llama_pooling_type      pooling_type      = LLAMA_POOLING_TYPE_UNSPECIFIED; // pooling type for embeddings

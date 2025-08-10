@@ -7,6 +7,8 @@
 #include "llama-mmap.h"
 #include "llama-model.h"
 
+#include "ggml-cpu.h"
+
 #include <cinttypes>
 #include <cstring>
 #include <limits>
@@ -102,6 +104,10 @@ llama_context::llama_context(
 
     cparams.op_offload = params.op_offload;
     cparams.kv_unified = params.kv_unified;
+    cparams.numa_cache_strategy = (llama_numa_cache_strategy)params.numa_cache_strategy;
+    
+    // Pass NUMA cache strategy to GGML layer
+    ggml_numa_set_cache_strategy((int)cparams.numa_cache_strategy);
 
     {
         const char * LLAMA_SET_ROWS = getenv("LLAMA_SET_ROWS");
@@ -2248,6 +2254,7 @@ llama_context_params llama_context_default_params() {
         /*.op_offload                  =*/ true,
         /*.swa_full                    =*/ true,
         /*.kv_unified                  =*/ false,
+        /*.numa_cache_strategy         =*/ LLAMA_NUMA_CACHE_STRATEGY_DISABLED,
     };
 
     return result;

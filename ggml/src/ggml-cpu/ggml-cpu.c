@@ -28,6 +28,9 @@ static struct {
     struct ggml_numa_coordinator_manager * coordinator;  // Coordinator manager instance
     struct ggml_threadpool_params threadpool_params;     // Stored threadpool params
     bool threadpool_params_valid;                        // Whether params are valid
+    
+    // Cache strategy for NUMA buffer allocation
+    int cache_strategy;                                   // Current NUMA cache strategy (maps to llama_numa_cache_strategy)
 } g_numa_state = { 
     .initialized = false, 
     .strategy = GGML_NUMA_STRATEGY_DISABLED, 
@@ -35,7 +38,8 @@ static struct {
     .numa_enabled = false,
     .coordinator = NULL,
     .threadpool_params = {0},
-    .threadpool_params_valid = false 
+    .threadpool_params_valid = false,
+    .cache_strategy = 0  // DISABLED by default
 };
 
 #if defined(_MSC_VER) || defined(__MINGW32__)
@@ -579,6 +583,8 @@ static enum ggml_numa_memory_strategy ggml_numa_strategy_to_coordinator_strategy
             return GGML_NUMA_STRATEGY_MATRIX_REDUCTION;  // Better for isolation
         case GGML_NUMA_STRATEGY_NUMACTL:
             return GGML_NUMA_STRATEGY_HYBRID;  // Respect numactl settings with hybrid approach
+        case GGML_NUMA_STRATEGY_MIRROR:
+            return GGML_NUMA_STRATEGY_AUTO;  // Mirror uses auto-selection with coordinator data parallelism
         default:
             return GGML_NUMA_STRATEGY_AUTO;
     }
@@ -663,8 +669,30 @@ int ggml_numa_node_count(void) {
     return g_numa_state.numa_nodes;
 }
 
+#ifdef GGML_NUMA_MIRROR
+bool ggml_numa_should_mirror(void) {
+    // Only enable mirroring if:
+    // 1. NUMA is initialized and enabled
+    // 2. Strategy is specifically MIRROR
+    // 3. We have multiple NUMA nodes
+    return g_numa_state.initialized && 
+           g_numa_state.numa_enabled &&
+           g_numa_state.strategy == GGML_NUMA_STRATEGY_MIRROR &&
+           g_numa_state.numa_nodes > 1;
+}
+#endif
+
 enum ggml_numa_strategy ggml_get_numa_strategy(void) {
     return g_numa_state.strategy;
+}
+
+// Cache strategy management functions
+void ggml_numa_set_cache_strategy(int cache_strategy) {
+    g_numa_state.cache_strategy = cache_strategy;
+}
+
+int ggml_numa_get_cache_strategy(void) {
+    return g_numa_state.cache_strategy;
 }
 
 void ggml_numa_init_with_node(enum ggml_numa_strategy numa_flag, int isolate_node) {
