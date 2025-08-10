@@ -13,6 +13,12 @@
 #include "ggml-alloc.h"
 #include "ggml-impl.h"
 
+#ifdef GGML_NUMA_MIRROR
+#include <numa.h>
+#include <numaif.h>
+#include <sched.h>
+#endif
+
 #include <assert.h>
 #include <limits.h>
 #include <stdarg.h>
@@ -1884,6 +1890,13 @@ static void ggml_backend_cpu_buffer_free_buffer(ggml_backend_buffer_t buffer) {
     ggml_aligned_free(buffer->context, buffer->size);
 }
 
+#ifdef GGML_NUMA_MIRROR
+// NUMA-aware free function for CPU buffers allocated with numa_alloc_onnode
+static void ggml_backend_cpu_buffer_free_buffer_numa(ggml_backend_buffer_t buffer) {
+    numa_free(buffer->context, buffer->size);
+}
+#endif
+
 static void ggml_backend_cpu_buffer_memset_tensor(ggml_backend_buffer_t buffer, struct ggml_tensor * tensor, uint8_t value, size_t offset, size_t size) {
     memset((char *)tensor_data(tensor) + offset, value, size);
 
@@ -1951,14 +1964,59 @@ static const char * ggml_backend_cpu_buffer_type_get_name(ggml_backend_buffer_ty
 }
 
 static ggml_backend_buffer_t ggml_backend_cpu_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
-    void * data = ggml_aligned_malloc(size);
+    void * data = NULL;
+    bool used_numa_allocation = false;
+    
+#ifdef GGML_NUMA_MIRROR
+    // Try NUMA allocation first if NUMA is available
+    if (numa_available() != -1) {
+        // Get preferred NUMA node based on current CPU
+        int numa_node = 0;
+        int max_node = numa_max_node();
+        if (max_node >= 0) {
+            // Use current CPU's NUMA node for optimal locality
+            numa_node = numa_node_of_cpu(sched_getcpu());
+            if (numa_node < 0 || numa_node > max_node) {
+                numa_node = 0; // fallback to node 0
+            }
+        }
+        
+        // Try NUMA allocation with proper alignment
+        data = numa_alloc_onnode(size, numa_node);
+        if (data) {
+            // Verify alignment for NUMA allocated memory
+            if ((uintptr_t)data % TENSOR_ALIGNMENT != 0) {
+                // NUMA allocation not properly aligned, fall back
+                numa_free(data, size);
+                data = NULL;
+            } else {
+                used_numa_allocation = true;
+            }
+        }
+    }
+#endif
+    
+    // Fall back to regular aligned allocation if NUMA failed or not available
+    if (data == NULL) {
+        data = ggml_aligned_malloc(size);
+        used_numa_allocation = false;
+    }
 
     if (data == NULL) {
         GGML_LOG_ERROR("%s: failed to allocate buffer of size %zu\n", __func__, size);
         return NULL;
     }
 
-    return ggml_backend_buffer_init(buft, ggml_backend_cpu_buffer_i, data, size);
+    ggml_backend_buffer_t buffer = ggml_backend_buffer_init(buft, ggml_backend_cpu_buffer_i, data, size);
+    
+#ifdef GGML_NUMA_MIRROR
+    // If we used NUMA allocation, override the free function
+    if (used_numa_allocation && buffer) {
+        buffer->iface.free_buffer = ggml_backend_cpu_buffer_free_buffer_numa;
+    }
+#endif
+    
+    return buffer;
 }
 
 static size_t ggml_backend_cpu_buffer_type_get_alignment(ggml_backend_buffer_type_t buft) {

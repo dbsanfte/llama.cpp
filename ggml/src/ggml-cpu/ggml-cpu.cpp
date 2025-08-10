@@ -18,9 +18,6 @@
 #    include "kleidiai/kleidiai.h"
 #endif
 
-// Forward declaration for NUMA buffer type
-extern "C" ggml_backend_buffer_type_t ggml_backend_cpu_numa_buffer_type(void);
-
 #if defined(_WIN32)
 #    define WIN32_LEAN_AND_MEAN
 #    ifndef NOMINMAX
@@ -59,11 +56,6 @@ std::vector<ggml_backend_buffer_type_t>& ggml_backend_cpu_get_extra_buffers_type
             bufts.push_back(ggml_backend_cpu_repack_buffer_type());
         }
 #endif
-
-        // Add NUMA-aware buffer type when NUMA coordinator is available
-        if (ggml_backend_cpu_numa_buffer_type()) {
-            bufts.push_back(ggml_backend_cpu_numa_buffer_type());
-        }
 
         bufts.push_back(NULL);
 

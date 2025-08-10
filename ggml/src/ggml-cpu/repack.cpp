@@ -19,6 +19,12 @@
 
 #include "repack.h"
 
+#ifdef GGML_NUMA_MIRROR
+#include <numa.h>
+#include <numaif.h>
+#include <sched.h>
+#endif
+
 #if defined(__GNUC__)
 #pragma GCC diagnostic ignored "-Woverlength-strings"
 #endif
@@ -1484,13 +1490,42 @@ static const char * ggml_backend_cpu_repack_buffer_type_get_name(ggml_backend_bu
 }
 
 static ggml_backend_buffer_t ggml_backend_cpu_repack_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
-    ggml_backend_buffer_t buffer = ggml_backend_buft_alloc_buffer(ggml_backend_cpu_buffer_type(), size);
-
-    if (buffer == nullptr) {
-        return nullptr;
+    // Enhanced CPU_REPACK buffer with direct NUMA allocation support
+    ggml_backend_buffer_t buffer = nullptr;
+    
+#ifdef GGML_NUMA_MIRROR
+    // Try NUMA allocation first if NUMA is available
+    if (numa_available() != -1) {
+        // Get preferred NUMA node (for now, use node 0 - could be enhanced with smarter selection)
+        int numa_node = 0;
+        int max_node = numa_max_node();
+        if (max_node >= 0) {
+            // Simple round-robin allocation or use current CPU's node
+            numa_node = numa_node_of_cpu(sched_getcpu()) % (max_node + 1);
+        }
+        
+        void* numa_data = numa_alloc_onnode(size, numa_node);
+        if (numa_data) {
+            buffer = ggml_backend_cpu_buffer_from_ptr(numa_data, size);
+            if (buffer) {
+                // Override the buffer type to indicate this is enhanced CPU_REPACK
+                buffer->buft = buft;
+                return buffer;
+            } else {
+                // If buffer creation failed, free the NUMA memory
+                numa_free(numa_data, size);
+            }
+        }
+    }
+#endif
+    
+    // Fall back to regular CPU buffer if NUMA allocation failed or not available  
+    buffer = ggml_backend_buft_alloc_buffer(ggml_backend_cpu_buffer_type(), size);
+    if (buffer) {
+        buffer->buft = buft;
     }
 
-    buffer->buft              = buft;
+    return buffer;
     buffer->iface.init_tensor = ggml_backend_cpu_repack_buffer_init_tensor;
     buffer->iface.set_tensor  = ggml_backend_cpu_repack_buffer_set_tensor;
     buffer->iface.get_tensor  = nullptr;
@@ -1499,9 +1534,13 @@ static ggml_backend_buffer_t ggml_backend_cpu_repack_buffer_type_alloc_buffer(gg
 }
 
 static size_t ggml_backend_cpu_repack_buffer_type_get_alignment(ggml_backend_buffer_type_t buft) {
-    return TENSOR_ALIGNMENT;
-
     GGML_UNUSED(buft);
+    return TENSOR_ALIGNMENT;
+}
+
+static bool ggml_backend_cpu_repack_buffer_type_is_host(ggml_backend_buffer_type_t buft) {
+    GGML_UNUSED(buft);
+    return true; // CPU_REPACK buffers are host-accessible but should be compatible with mmap
 }
 
 namespace ggml::cpu::repack {
@@ -1561,7 +1600,7 @@ ggml_backend_buffer_type_t ggml_backend_cpu_repack_buffer_type(void) {
                            /* .get_alignment    = */ ggml_backend_cpu_repack_buffer_type_get_alignment,
                            /* .get_max_size     = */ nullptr,  // defaults to SIZE_MAX
                            /* .get_alloc_size   = */ nullptr,  // defaults to ggml_nbytes
-                           /* .is_host          = */ nullptr,
+                           /* .is_host          = */ ggml_backend_cpu_repack_buffer_type_is_host,
                            },
         /* .device  = */ ggml_backend_reg_dev_get(ggml_backend_cpu_reg(), 0),
         /* .context = */ new ggml::cpu::repack::extra_buffer_type(),

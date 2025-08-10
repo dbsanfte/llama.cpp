@@ -207,7 +207,7 @@ static void ggml_work_group_tracker_destroy(struct ggml_work_group_tracker * tra
 static struct ggml_work_group * ggml_work_group_create(struct ggml_work_group_tracker * tracker, struct ggml_tensor * tensor, int num_chunks);
 static void ggml_work_group_free(struct ggml_work_group * group);
 static int ggml_work_group_check_completion(struct ggml_work_group * group);
-static int ggml_operation_split_for_numa(struct ggml_tensor * tensor, int num_numa_nodes, struct ggml_work_item *** out_chunks);
+// static int ggml_operation_split_for_numa(struct ggml_tensor * tensor, int num_numa_nodes, struct ggml_work_item *** out_chunks); // Unused for now
 
 // Global coordinator management functions
 static struct ggml_numa_coordinator_manager * ggml_get_global_coordinator_manager(int n_threads, bool force_multi_socket);
@@ -883,6 +883,7 @@ static void create_optimal_cpu_masks(struct ggml_threadpool_params *tpp, int num
     bool has_custom_mask = false;
     int available_cpus[GGML_MAX_N_THREADS];
     int cpu_count = 0;
+    GGML_UNUSED(available_cpus); // May be set but not used in all code paths
     
     for (int cpu = 0; cpu < GGML_MAX_N_THREADS; cpu++) {
         if (tpp->cpumask[cpu]) {
@@ -1115,6 +1116,7 @@ struct ggml_numa_coordinator_manager * ggml_numa_coordinator_manager_new_with_pa
                     char hyperthreading_analysis[512] = {0};
                     int pos = 0;
                     int ht_conflicts = 0;
+                    GGML_UNUSED(hyperthreading_analysis); // May not be used in all debug builds
                     
                     // Build CPU list string and analyze hyperthreading
                     for (int k = 0; k < assigned_count; k++) {
@@ -2265,8 +2267,8 @@ enum ggml_numa_memory_strategy ggml_numa_choose_strategy(const struct ggml_numa_
     
     // Cache-aware strategy selection
     const size_t matrix_bytes = workload->matrix_dim * workload->matrix_dim * sizeof(float);
-    const bool fits_in_l3 = cache_info.l3_cache_size > 0 && matrix_bytes <= cache_info.l3_cache_size;
-    const bool fits_in_l2 = cache_info.l2_cache_size > 0 && matrix_bytes <= cache_info.l2_cache_size;
+    const bool fits_in_l3 = cache_info.l3_cache_size > 0 && matrix_bytes <= (size_t)cache_info.l3_cache_size;
+    const bool fits_in_l2 = cache_info.l2_cache_size > 0 && matrix_bytes <= (size_t)cache_info.l2_cache_size;
     
     // Very small matrices that fit in L2 cache: optimize for cache locality
     if (fits_in_l2 && workload->matrix_dim <= 256) {
@@ -2530,6 +2532,7 @@ int64_t ggml_numa_cache_aware_chunk_size(const struct ggml_numa_cache_info * cac
     // Calculate memory required for one matrix operation
     int64_t matrix_memory = matrix_dim * matrix_dim * element_size;
     int64_t batch_memory = matrix_memory * batch_size;
+    GGML_UNUSED(batch_memory); // May be used for future batch optimization
     
     // Use L3 cache as the target for chunk sizing since it's shared across cores
     int64_t target_memory = cache_info->l3_cache_size;

@@ -32,9 +32,17 @@ cmake --build build --parallel
 
 # Run a test (if your test is e.g. tests/test-my-feature.cpp)
 ./build/bin/test-my-feature
+
+# ^^ Note: Never limit the threads count of `--parallel`, just let cmake autodetect the number of cores and choose the max threadcount itself.
 ```
 
-Note: Never limit the threads count of `--parallel`, just let cmake autodetect the number of cores and choose the max threadcount itself.
+
+### Quick sanity check against a real model:
+```bash
+# Test the app against a real model for sanity, should exit with code 0
+wget -c -O ./.devcontainer/qwen2.5-0.5b-instruct-q8_0.gguf https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF/resolve/main/qwen2.5-0.5b-instruct-q8_0.gguf
+./build/bin/llama-cli -m ./.devcontainer/qwen2.5-0.5b-instruct-q8_0.gguf -v -no-cnv -n 1 -p "Repeat after me: Hello, world!" || echo "failed!"
+```
 
 ## 🧠 Key Areas of Focus
 
