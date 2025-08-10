@@ -24,16 +24,14 @@ This is a fork of llama.cpp with **NUMA-aware improvements** for better CPU thre
 ### Quick Build Commands
 
 ```bash
-# Debug build
+# Debug build - configure (pick up new tests)
 cmake -B build -DCMAKE_BUILD_TYPE=Debug -DCMAKE_EXPORT_COMPILE_COMMANDS=ON -DGGML_NUMA_MIRROR=ON -DGGML_OPENMP=ON
-# Or equivalently: -DGGML_NUMA=ON (both flags are synonyms)
+
+# Debug build - build
 cmake --build build --parallel
 
-# Run tests
-ctest --list --output-on-failure
-
-# Troubleshoot a segfault
-gdb --batch --ex run --ex bt --ex quit --args ./build/bin/${testFileName}
+# Run a test (if your test is e.g. tests/test-my-feature.cpp)
+./build/bin/test-my-feature
 ```
 
 Note: Never limit the threads count of `--parallel`, just let cmake autodetect the number of cores and choose the max threadcount itself.
@@ -55,17 +53,6 @@ Note: Never limit the threads count of `--parallel`, just let cmake autodetect t
 - **Intel hybrid support**: Distinguishes P-cores from E-cores
 - **NUMA awareness**: Incorporates NUMA node information into thread scheduling in `ggml-numa-coordinator.c`
 
-Key functions in `common`:
-```cpp
-detect_cpu_topology()           // Main topology detection
-cpu_count_math_cpus()          // Count available CPUs with options
-cpu_print_topology_info()     // Debug information display
-```
-
-Key functions in `ggml`:
-```cpp
-
-```
 
 ### 3. Command-Line Interface
 **Files**: `common/arg.cpp`
@@ -84,54 +71,39 @@ New command-line arguments for `llama-server` should be added to the file above.
 
 ### Common Edit Patterns
 
-#### Adding New CPU Parameters
-1. Update `cpu_params` struct in `common/common.h`
+#### Adding New Command-line Params to llama-server
+1. Update structs in `common/common.h`
 2. Add argument parsing in `common/arg.cpp`
-3. Update `cpu_count_math_cpus()` logic in `common/common.cpp`
-4. Test with `--cpu-topology` flag
+3. Update logic in `common/common.cpp`
+4. Test with `--your-param` flag
 
 #### Modifying NUMA Logic
-1. Check `ggml-cpu.c` for thread computation changes
-2. Update `llama-mmap.cpp` for memory allocation
-3. Test on multi-NUMA system or simulate with `numactl`
-
-#### CLI Changes
-1. Add/modify arguments in `common/arg.cpp`
-2. Update help text and descriptions
-3. Test argument parsing with `--help`
+1. Check `ggml-cpu.c`, `ggml-numa-coordinator.c` for thread computation changes
+2. Update `llama-mmap.cpp`, `ggml-cpu-numa-buffer.cpp` for memory allocation
+3. Test on multi-NUMA system ideally, or in dev container as tests will mimic "virtual numas" by splitting up physical cores into numa-like compute groups
 
 ### Debugging Approach
 
 ```bash
-# Debug build for better symbols
-cmake -B build -DCMAKE_BUILD_TYPE=Debug
-cmake --build build
-
-# Use GDB with VS Code integration
-# Set breakpoints in VS Code, use "Debug llama-server" launch config
-
-# Monitor system calls
-strace -e sched_setaffinity,numa_alloc_onnode ./build/bin/llama-server 
-
-# Check CPU affinity assignment
-taskset -cp $(pgrep llama-server)
+# Troubleshoot a segfault with gdb
+gdb --batch --ex run --ex bt --ex quit --args ./build/bin/${testFileName}
 ```
 
 ## 📝 Code Standards
 
 ### Error Handling
 - Always check return values for system calls
-- Use `LOG_WRN()` / `GGML_LOG_WARNING()` for warnings, `LOG_ERR()` / `GGML_LOG_ERROR()` for errors, `GGML_ASSERT()` for assertions.
+- Use `LOG_WRN()` / `GGML_LOG_WARN()` for warnings, `LOG_ERR()` / `GGML_LOG_ERROR()` for errors, `GGML_ASSERT()` for assertions.
 
 ### Platform Compatibility
 - NUMA features are Linux-specific (`#if defined(__x86_64__) && defined(__linux__)`)
 - Provide fallbacks for other platforms
-- Test Windows compatibility doesn't break
 
 ### Testing Guidelines
-CMake tests live in the `tests/` folder and are built into `build/bin/`. 
+CMake tests live in the `tests/` folder and are built into `build/bin/`. Build and run tests as above.
 
-Important: ALWAYS add tests to the `tests/` folder, never to the project root. Important: ALWAYS use the CMake test apparatus for testing.
+Important: ALWAYS add tests to the `tests/` folder, never to the project root. 
+Important: ALWAYS use the CMake test apparatus for testing.
 
 1. Write tests for your new features and add the `test-feature-name.cpp` to `tests/`
 2. Add the test to the end of `/tests/CMakeLists.txt`:
@@ -166,9 +138,8 @@ cmake --build build --parallel --verbose
 
 ## 📚 Key Documentation Files
 
-- `NUMA_IMPROVEMENTS.md` - Comprehensive technical documentation
+- `.devcontainer/changelog/*.md` - Changelog and comprehensive technical documentation
 - `.devcontainer/README.md` - Dev container usage guide
-- `.devcontainer/changelog/` - Change log folder for development tasks
 - `docs/build.md` - Official build instructions
 
 ## 🎯 Success Criteria for Changes
