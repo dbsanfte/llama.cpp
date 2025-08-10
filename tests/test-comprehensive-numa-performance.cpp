@@ -55,6 +55,11 @@
 #include "common.h"
 #include "log.h"  // For controlling log verbosity
 
+#ifdef GGML_NUMA_MIRROR
+#include <numa.h>
+#include <numaif.h>
+#endif
+
 // Test configuration structure
 struct TestConfig {
     // Test mode
@@ -195,6 +200,7 @@ struct PerformanceResult {
     double throughput_gbps;         // Gigabytes per second
     double scaling_efficiency;      // vs single-thread baseline
     double numa_efficiency;        // vs single-NUMA baseline
+    double absolute_speedup;       // vs single-core baseline
     
     // Resource utilization
     double cpu_utilization;
@@ -1263,6 +1269,8 @@ public:
                 grouped_results["Hyperthreading-Comparison"].push_back(&result);
             } else if (result.test_name.find("Scaling-") == 0) {
                 grouped_results["Batch-Size-Scaling"].push_back(&result);
+            } else if (result.test_name.find("NUMA-") == 0 && result.test_name.find("-Nodes") != std::string::npos) {
+                grouped_results["NUMA-Scaling"].push_back(&result);
             }
         }
         
@@ -1431,12 +1439,66 @@ public:
             }
         }
         
+        // NUMA Scaling Analysis Section
+        if (grouped_results.count("NUMA-Scaling")) {
+            auto numa_scaling_results = grouped_results["NUMA-Scaling"];
+            printf("NUMA SCALING ANALYSIS:\n");
+            
+            // Find best NUMA configuration
+            auto best_numa = std::max_element(numa_scaling_results.begin(), numa_scaling_results.end(),
+                [](const PerformanceResult* a, const PerformanceResult* b) {
+                    return a->throughput_gops < b->throughput_gops;
+                });
+            
+            if (best_numa != numa_scaling_results.end()) {
+                printf("  Best NUMA config: %d nodes (%.2f GOPS, %.1f%% efficiency)\n",
+                       (*best_numa)->numa_nodes, (*best_numa)->throughput_gops, (*best_numa)->numa_efficiency);
+            }
+            
+            // Scaling efficiency analysis
+            double total_efficiency = 0.0;
+            int efficiency_count = 0;
+            bool good_scaling_found = false;
+            
+            for (auto result : numa_scaling_results) {
+                if (result->numa_nodes > 1) {  // Only multi-NUMA configs
+                    total_efficiency += result->numa_efficiency;
+                    efficiency_count++;
+                    if (result->numa_efficiency > 70.0) {
+                        good_scaling_found = true;
+                    }
+                }
+            }
+            
+            if (efficiency_count > 0) {
+                double avg_efficiency = total_efficiency / efficiency_count;
+                printf("  Average multi-NUMA efficiency: %.1f%%\n", avg_efficiency);
+                printf("  Scaling quality: %s\n", 
+                       good_scaling_found ? "Good (>70% efficiency)" : 
+                       avg_efficiency > 50.0 ? "Moderate (50-70% efficiency)" : "Poor (<50% efficiency)");
+            }
+            
+            // NUMA recommendations
+            printf("  NUMA Recommendations:\n");
+            if (good_scaling_found) {
+                printf("    ✅ Multi-NUMA deployment beneficial for this workload\n");
+                printf("    📈 Consider scaling to multiple NUMA nodes for large datasets\n");
+            } else {
+                printf("    ⚠️  Limited NUMA scaling benefits - single node may be optimal\n");
+                printf("    🔧 Consider larger batch sizes or different workload characteristics\n");
+            }
+            printf("\n");
+        }
+        
         printf("KEY FINDINGS:\n");
         printf("• CPU mask configurations enable fine-tuned performance optimization\n");
         printf("• Large batch sizes are essential for data parallelism benefits\n");
         printf("• NUMA coordinator scales effectively with proper CPU assignments\n");
         printf("• Matrix multiplication shows strong parallelization at substantial workloads\n");
         printf("• Hyperthreading provides significant benefits for compute-intensive workloads\n");
+        if (grouped_results.count("NUMA-Scaling")) {
+            printf("• NUMA scaling effectiveness varies by workload size and system topology\n");
+        }
         printf("\n");
     }
 
@@ -1594,6 +1656,521 @@ public:
         
         printf("\nCompleted cache-aware strategy selection tests.\n\n");
     }
+
+    // Test 5: NUMA Scaling Comparison
+    void test_numa_scaling_comparison() {
+        printf("Test 5: NUMA Scaling Comparison\n");
+        printf("================================\n");
+        printf("Testing performance scaling with different NUMA node counts.\n");
+        printf("Compares 1, 2, and 4 NUMA nodes vs single-core baseline.\n\n");
+        
+        // Suppress coordinator logging during benchmarks for cleaner output
+        suppress_coordinator_logging();
+        
+        // Detect if we have real NUMA or need to simulate
+        bool has_real_numa = false;
+        int real_numa_nodes = 1;
+        
+#ifdef GGML_NUMA_MIRROR
+        real_numa_nodes = numa_num_configured_nodes();
+        has_real_numa = (real_numa_nodes > 1);
+#endif
+        
+        if (has_real_numa) {
+            printf("🖥️  Real NUMA system detected with %d nodes - using actual NUMA topology\n", real_numa_nodes);
+        } else {
+            printf("🖥️  Single-node system detected - simulating virtual NUMA nodes by dividing cores\n");
+            printf("    Cores will be divided into virtual NUMA groups for scaling analysis\n");
+        }
+        printf("\n");
+        
+        // Test configurations: 1, 2, and 4 NUMA nodes
+        std::vector<int> numa_configs = {1, 2, 4};
+        
+        // Use medium batch size for consistency across tests
+        int test_batch_size = g_test_config.quick_mode ? 32 : 64;
+        int64_t test_tensor_size = g_test_config.quick_mode ? 256 * 256 : 512 * 512;
+        int test_iterations = g_test_config.quick_mode ? 2 : 3;
+        
+        printf("Test parameters:\n");
+        printf("  Matrix size: %dx%d\n", (int)sqrt(test_tensor_size), (int)sqrt(test_tensor_size));
+        printf("  Batch size: %d\n", test_batch_size);
+        printf("  Iterations per test: %d\n", test_iterations);
+        printf("\n");
+        
+        struct NumaScalingResult {
+            int numa_nodes;
+            int total_threads;
+            double avg_time_ms;
+            double throughput_gops;
+            double scaling_efficiency;  // vs single NUMA
+            double absolute_speedup;    // vs single-core baseline
+            bool success;
+        };
+        
+        std::vector<NumaScalingResult> numa_results;
+        
+        // Find single-core baseline from earlier tests for comparison
+        double single_core_baseline_gops = 0.0;
+        for (const auto& result : results) {
+            if (result.test_name.find("Matrix") == 0 && result.total_threads == 1) {
+                single_core_baseline_gops = std::max(single_core_baseline_gops, result.throughput_gops);
+            }
+        }
+        
+        if (single_core_baseline_gops == 0.0) {
+            printf("⚠️  Warning: No single-core baseline found - using 1.0 GOPS as reference\n");
+            single_core_baseline_gops = 1.0;
+        }
+        
+        printf("Single-core baseline reference: %.3f GOPS\n\n", single_core_baseline_gops);
+        
+        // Test each NUMA configuration
+        for (int numa_count : numa_configs) {
+            printf("Testing %d NUMA node%s... ", numa_count, numa_count == 1 ? "" : "s");
+            fflush(stdout);
+            
+            auto numa_result = benchmark_numa_scaling(numa_count, test_batch_size, test_tensor_size, test_iterations, has_real_numa);
+            
+            // Calculate scaling metrics
+            if (numa_result.success && numa_result.throughput_gops > 0) {
+                // Find single NUMA result for efficiency calculation
+                double single_numa_gops = numa_result.throughput_gops; // Default to self
+                for (const auto& prev_result : numa_results) {
+                    if (prev_result.numa_nodes == 1 && prev_result.success) {
+                        single_numa_gops = prev_result.throughput_gops;
+                        break;
+                    }
+                }
+                
+                // Create NumaScalingResult from PerformanceResult 
+                NumaScalingResult scaling_result;
+                scaling_result.numa_nodes = numa_count;
+                scaling_result.total_threads = numa_result.total_threads;
+                scaling_result.avg_time_ms = numa_result.execution_time_ms;
+                scaling_result.throughput_gops = numa_result.throughput_gops;
+                scaling_result.scaling_efficiency = (numa_result.throughput_gops / single_numa_gops) / numa_count * 100.0;
+                scaling_result.absolute_speedup = numa_result.throughput_gops / single_core_baseline_gops;
+                scaling_result.success = numa_result.success;
+                
+                numa_results.push_back(scaling_result);
+            } else {
+                NumaScalingResult scaling_result;
+                scaling_result.numa_nodes = numa_count;
+                scaling_result.total_threads = 0;
+                scaling_result.avg_time_ms = 0;
+                scaling_result.throughput_gops = 0;
+                scaling_result.scaling_efficiency = 0;
+                scaling_result.absolute_speedup = 0;
+                scaling_result.success = false;
+                
+                numa_results.push_back(scaling_result);
+            }
+
+            if (numa_result.success) {
+                printf("%.2f GOPS (%.1f threads, %.2fx vs baseline, %.1f%% efficiency)\n",
+                       numa_result.throughput_gops,
+                       (double)numa_result.total_threads,
+                       numa_result.throughput_gops / single_core_baseline_gops,
+                       numa_results.back().scaling_efficiency);
+            } else {
+                printf("FAILED\n");
+            }
+        }
+        
+        // Restore logging
+        restore_coordinator_logging();
+        
+        // Print NUMA scaling analysis
+        printf("\nNUMA Scaling Analysis:\n");
+        printf("======================\n");
+        printf("NUMA Nodes | Threads | Time(ms) | GOPS    | Speedup | Efficiency\n");
+        printf("-----------|---------|----------|---------|---------|----------\n");
+        
+        for (const auto& result : numa_results) {
+            if (result.success) {
+                printf("%-10d | %-7d | %-8.2f | %-7.2f | %-7.2fx | %-8.1f%%\n",
+                       result.numa_nodes,
+                       result.total_threads,
+                       result.avg_time_ms,
+                       result.throughput_gops,
+                       result.absolute_speedup,
+                       result.scaling_efficiency);
+            } else {
+                printf("%-10d | %-7s | %-8s | %-7s | %-7s | %-8s\n",
+                       result.numa_nodes, "FAIL", "FAIL", "FAIL", "FAIL", "FAIL");
+            }
+        }
+        
+        // Calculate overall scaling characteristics
+        bool found_good_scaling = false;
+        double best_efficiency = 0.0;
+        int optimal_numa_count = 1;
+        
+        for (const auto& result : numa_results) {
+            if (result.success && result.numa_nodes > 1) {
+                if (result.scaling_efficiency > best_efficiency) {
+                    best_efficiency = result.scaling_efficiency;
+                    optimal_numa_count = result.numa_nodes;
+                }
+                if (result.scaling_efficiency > 70.0) {  // Good scaling threshold
+                    found_good_scaling = true;
+                }
+            }
+        }
+        
+        printf("\nNUMA Scaling Summary:\n");
+        if (found_good_scaling) {
+            printf("✅ Good NUMA scaling achieved (>70%% efficiency)\n");
+        } else {
+            printf("⚠️  Limited NUMA scaling benefits observed\n");
+        }
+        printf("📊 Best configuration: %d NUMA nodes with %.1f%% scaling efficiency\n", 
+               optimal_numa_count, best_efficiency);
+        
+        // Store results for overall summary
+        for (auto& result : numa_results) {
+            if (result.success) {
+                PerformanceResult perf_result = {};
+                perf_result.test_name = "NUMA-" + std::to_string(result.numa_nodes) + "-Nodes";
+                perf_result.cpu_config = std::to_string(result.numa_nodes) + " NUMA nodes";
+                perf_result.numa_nodes = result.numa_nodes;
+                perf_result.total_threads = result.total_threads;
+                perf_result.batch_size = test_batch_size;
+                perf_result.tensor_elements = test_tensor_size;
+                perf_result.execution_time_ms = result.avg_time_ms;
+                perf_result.throughput_gops = result.throughput_gops;
+                perf_result.scaling_efficiency = result.scaling_efficiency;
+                perf_result.numa_efficiency = result.scaling_efficiency;
+                perf_result.success = true;
+                results.push_back(perf_result);
+            }
+        }
+        
+        printf("\nCompleted NUMA scaling comparison tests.\n\n");
+    }
+
+private:
+    // Create virtual NUMA CPU mask for simulated NUMA testing (single node assignment)
+    void create_virtual_numa_mask(bool cpumask[GGML_MAX_N_THREADS], int numa_node, int total_numa_nodes) {
+        memset(cpumask, false, sizeof(bool) * GGML_MAX_N_THREADS);
+        
+        // Get CPU topology to understand physical cores and hyperthreads
+        auto cpu_topology = get_cpu_topology();
+        if (cpu_topology.empty()) {
+            // Fallback: simple division
+            int cores_per_numa = max_physical_cores / total_numa_nodes;
+            int start_core = numa_node * cores_per_numa;
+            int end_core = std::min((numa_node + 1) * cores_per_numa, max_physical_cores);
+            
+            for (int core = start_core; core < end_core; core++) {
+                if (core * 2 < GGML_MAX_N_THREADS) {
+                    cpumask[core * 2] = true;      // Primary thread
+                    cpumask[core * 2 + 1] = true;  // Hyperthread sibling
+                }
+            }
+            return;
+        }
+        
+        // Divide physical cores across virtual NUMA nodes
+        // Group cores by physical core (collect all hyperthreads for each core)
+        std::vector<std::vector<int>> physical_cores;
+        std::set<int> processed_cpus;
+        
+        for (const auto& cpu_info : cpu_topology) {
+            if (processed_cpus.count(cpu_info.first)) continue;
+            
+            std::vector<int> core_group;
+            core_group.push_back(cpu_info.first);
+            
+            // Find hyperthreaded siblings
+            for (const auto& other_cpu : cpu_topology) {
+                if (other_cpu.first != cpu_info.first && 
+                    other_cpu.second && // is hyperthread
+                    other_cpu.first / 2 == cpu_info.first / 2) { // same physical core
+                    core_group.push_back(other_cpu.first);
+                }
+            }
+            
+            // Mark all CPUs in this core group as processed
+            for (int cpu : core_group) {
+                processed_cpus.insert(cpu);
+            }
+            
+            physical_cores.push_back(core_group);
+        }
+        
+        // Assign physical cores to this virtual NUMA node
+        int cores_per_numa = (physical_cores.size() + total_numa_nodes - 1) / total_numa_nodes;
+        int start_core_idx = numa_node * cores_per_numa;
+        int end_core_idx = std::min((numa_node + 1) * cores_per_numa, (int)physical_cores.size());
+        
+        for (int core_idx = start_core_idx; core_idx < end_core_idx; core_idx++) {
+            for (int cpu : physical_cores[core_idx]) {
+                if (cpu < GGML_MAX_N_THREADS) {
+                    cpumask[cpu] = true;
+                }
+            }
+        }
+    }
+
+    // Create combined virtual NUMA CPU mask that uses ALL cores organized by NUMA count
+    void create_combined_virtual_numa_mask(bool cpumask[GGML_MAX_N_THREADS], int total_numa_nodes) {
+        memset(cpumask, false, sizeof(bool) * GGML_MAX_N_THREADS);
+        
+        // Get CPU topology 
+        auto cpu_topology = get_cpu_topology();
+        if (cpu_topology.empty()) {
+            // Fallback: use all available CPUs
+            for (int i = 0; i < max_logical_cpus && i < GGML_MAX_N_THREADS; i++) {
+                cpumask[i] = true;
+            }
+            return;
+        }
+        
+        // Group CPUs by physical core (collect hyperthreads for each physical core)
+        std::vector<std::vector<int>> physical_cores;
+        std::set<int> processed_cpus;
+        
+        for (const auto& cpu_info : cpu_topology) {
+            if (processed_cpus.count(cpu_info.first)) continue;
+            
+            std::vector<int> core_group;
+            core_group.push_back(cpu_info.first);
+            
+            // Find hyperthreaded siblings for this physical core
+            for (const auto& other_cpu : cpu_topology) {
+                if (other_cpu.first != cpu_info.first && 
+                    other_cpu.second && // is hyperthread
+                    other_cpu.first / 2 == cpu_info.first / 2) { // same physical core
+                    core_group.push_back(other_cpu.first);
+                }
+            }
+            
+            // Mark all CPUs in this core group as processed
+            for (int cpu : core_group) {
+                processed_cpus.insert(cpu);
+            }
+            
+            physical_cores.push_back(core_group);
+        }
+        
+        // Enable ALL physical cores across ALL virtual NUMA nodes
+        // This keeps total thread count constant while organizing into NUMA groups
+        for (const auto& core_group : physical_cores) {
+            for (int cpu : core_group) {
+                if (cpu < GGML_MAX_N_THREADS) {
+                    cpumask[cpu] = true;
+                }
+            }
+        }
+    }
+
+    // Create virtual NUMA CPU mask with constant thread count per configuration
+    void create_virtual_numa_with_constant_threads(bool cpumask[GGML_MAX_N_THREADS], int numa_nodes) {
+        memset(cpumask, false, sizeof(bool) * GGML_MAX_N_THREADS);
+        
+        // Get CPU topology to identify physical cores and their hyperthreaded pairs
+        auto cpu_topology = get_cpu_topology();
+        if (cpu_topology.empty()) {
+            // Fallback: simple assignment
+            // 1 NUMA = 4 threads, 2 NUMA = 8 threads, 4 NUMA = 16 threads
+            int threads_per_numa = 4;
+            int threads_to_use = numa_nodes * threads_per_numa;
+            for (int i = 0; i < threads_to_use && i < GGML_MAX_N_THREADS; i++) {
+                cpumask[i] = true;
+            }
+            return;
+        }
+        
+        // Group physical cores with their hyperthreaded pairs
+        std::vector<std::vector<int>> physical_cores; // Each element = [physical_core, hyperthread_pair]
+        std::set<int> processed_cpus;
+        
+        for (const auto& cpu_info : cpu_topology) {
+            if (processed_cpus.count(cpu_info.first)) continue;
+            if (cpu_info.second) continue; // Skip hyperthreads in initial scan
+            
+            std::vector<int> core_group = {cpu_info.first}; // Start with physical core
+            
+            // Find its hyperthreaded pair
+            for (const auto& ht_info : cpu_topology) {
+                if (ht_info.second && ht_info.first == cpu_info.first + 1) {
+                    core_group.push_back(ht_info.first);
+                    processed_cpus.insert(ht_info.first);
+                    break;
+                }
+            }
+            
+            processed_cpus.insert(cpu_info.first);
+            physical_cores.push_back(core_group);
+        }
+        
+        // Calculate cores needed: Base 4 cores, then scale by numa_nodes
+        // 1 NUMA = 4 cores, 2 NUMA = 8 cores, 4 NUMA = 16 cores
+        int base_cores_per_numa = 4;  // Base allocation per NUMA as requested
+        int total_physical_cores = physical_cores.size();
+        int physical_cores_per_numa = std::max(1, base_cores_per_numa / 2); // 2 physical cores per NUMA (+ hyperthreads = 4 total)
+        int total_cores_to_enable = numa_nodes * physical_cores_per_numa;
+        total_cores_to_enable = std::min(total_cores_to_enable, total_physical_cores);
+        
+        printf("  Virtual NUMA constant-thread setup:\n");
+        printf("    Total system: %d physical cores (%d logical CPUs)\n", 
+               total_physical_cores, max_logical_cpus);
+        printf("    Base allocation: %d cores per virtual NUMA (physical + hyperthreads)\n", base_cores_per_numa);
+        printf("    Testing %d virtual NUMA nodes × %d cores = %d total cores\n", 
+               numa_nodes, base_cores_per_numa, numa_nodes * base_cores_per_numa);
+        
+        // Enable the required physical cores and their hyperthreaded pairs
+        for (int i = 0; i < total_cores_to_enable && i < (int)physical_cores.size(); i++) {
+            for (int cpu : physical_cores[i]) {
+                if (cpu < GGML_MAX_N_THREADS) {
+                    cpumask[cpu] = true;
+                }
+            }
+        }
+    }
+
+    // Benchmark NUMA scaling with specific node count
+    PerformanceResult benchmark_numa_scaling(int numa_nodes, int batch_size, int64_t tensor_size, 
+                                            int iterations, bool use_real_numa) {
+        PerformanceResult result = {};
+        result.test_name = "NUMA-Scaling-" + std::to_string(numa_nodes);
+        result.cpu_config = std::to_string(numa_nodes) + " NUMA nodes";
+        result.numa_nodes = numa_nodes;
+        result.batch_size = batch_size;
+        result.tensor_elements = tensor_size;
+        result.operations_count = iterations;
+        result.success = false;
+        
+        auto total_start = get_time();
+        
+        try {
+            // Calculate matrix dimension and memory requirements
+            int matrix_dim = static_cast<int>(std::sqrt(tensor_size));
+            
+            // Create GGML context
+            ggml_init_params params = {
+                /*.mem_size   =*/ 512*1024*1024, // 512MB
+                /*.mem_buffer =*/ NULL,
+                /*.no_alloc   =*/ false,
+            };
+            
+            ggml_context* ctx = ggml_init(params);
+            if (!ctx) {
+                return result;
+            }
+            
+            // Set up threadpool parameters for NUMA coordinator
+            struct ggml_threadpool_params tpp;
+            ggml_threadpool_params_init(&tpp, -1); // Auto-detect threads
+            
+            bool can_use_real_numa = false;
+#ifdef GGML_NUMA_MIRROR
+            can_use_real_numa = (numa_available() >= 0) && (numa_nodes <= numa_num_configured_nodes());
+#endif
+
+            if (use_real_numa && can_use_real_numa) {
+                // Use real NUMA - let coordinator handle it naturally
+                tpp.force_multi_socket = true;
+                memset(tpp.cpumask, false, sizeof(tpp.cpumask)); // Auto-optimization
+            } else {
+                // Virtual NUMA simulation with constant thread count approach
+                tpp.force_multi_socket = true;
+                
+                // Use constant thread allocation for ALL virtual NUMA configurations
+                create_virtual_numa_with_constant_threads(tpp.cpumask, numa_nodes);
+                
+                // Count enabled CPUs
+                result.total_threads = 0;
+                for (int i = 0; i < GGML_MAX_N_THREADS; i++) {
+                    if (tpp.cpumask[i]) result.total_threads++;
+                }
+            }
+            
+            // Create NUMA coordinator manager
+            struct ggml_numa_coordinator_manager* mgr = 
+                ggml_numa_coordinator_manager_new_with_params(&tpp);
+            
+            if (!mgr) {
+                ggml_free(ctx);
+                return result;
+            }
+            
+            // Create test matrices
+            struct ggml_tensor* a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, matrix_dim, matrix_dim);
+            struct ggml_tensor* b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, matrix_dim, matrix_dim);
+            
+            fill_tensor_random(a);
+            fill_tensor_random(b);
+            
+            // Create computation graph with batch of operations
+            struct ggml_cgraph* graph = ggml_new_graph(ctx);
+            std::vector<struct ggml_tensor*> results_tensors;
+            
+            for (int i = 0; i < batch_size; i++) {
+                struct ggml_tensor* result_tensor = ggml_mul_mat(ctx, a, b);
+                ggml_build_forward_expand(graph, result_tensor);
+                results_tensors.push_back(result_tensor);
+            }
+            
+            // Set graph for coordinator
+            int cgraph_result = ggml_numa_coordinator_manager_set_cgraph(mgr, graph);
+            if (cgraph_result != 0) {
+                ggml_numa_coordinator_manager_free(mgr);
+                ggml_free(ctx);
+                return result;
+            }
+            
+            // Benchmark execution
+            std::vector<double> times;
+            times.reserve(iterations);
+            
+            for (int iter = 0; iter < iterations; iter++) {
+                auto iter_start = get_time();
+                
+                int compute_result = ggml_numa_coordinator_manager_compute_graph(mgr, graph);
+                if (compute_result == 0) {
+                    ggml_numa_coordinator_manager_wait_for_completion(mgr);
+                }
+                
+                auto iter_end = get_time();
+                
+                if (compute_result == 0) {
+                    times.push_back(time_diff_ms(iter_start, iter_end));
+                } else {
+                    break; // Failed iteration
+                }
+            }
+            
+            ggml_numa_coordinator_manager_free(mgr);
+            ggml_free(ctx);
+            
+            if (!times.empty()) {
+                // Calculate performance metrics
+                double avg_time = 0.0;
+                for (double time : times) {
+                    avg_time += time;
+                }
+                avg_time /= times.size();
+                
+                // Calculate GOPS
+                int64_t ops_per_matrix = static_cast<int64_t>(matrix_dim) * matrix_dim * matrix_dim * 2; // Multiply-add
+                int64_t total_ops = ops_per_matrix * batch_size;
+                double gops = (total_ops / 1e9) / (avg_time / 1000.0);
+                
+                result.execution_time_ms = avg_time;
+                result.total_time_ms = time_diff_ms(total_start, get_time());
+                result.throughput_gops = gops;
+                result.success = true;
+            }
+            
+        } catch (const std::exception& e) {
+            printf("Exception in NUMA scaling benchmark: %s\n", e.what());
+        }
+        
+        return result;
+    }
 };
 
 // Help function
@@ -1602,7 +2179,15 @@ static void print_help(const char* program_name) {
     printf("Usage: %s [OPTIONS]\n", program_name);
     printf("\n");
     printf("This test suite validates NUMA coordinator performance benefits with configurable\n");
-    printf("CPU mask handling, hyperthreading comparisons, and batch size analysis.\n");
+    printf("CPU mask handling, hyperthreading comparisons, batch size analysis, and NUMA scaling.\n");
+    printf("\n");
+    printf("Tests included:\n");
+    printf("  1. Single-core baseline performance reference\n");
+    printf("  2. CPU mask configuration impact analysis\n");
+    printf("  3. Hyperthreading vs primary-only core comparison\n");
+    printf("  4. Batch size scaling performance analysis\n");
+    printf("  5. Cache-aware strategy selection A/B testing\n");
+    printf("  6. NUMA scaling comparison (1, 2, 4 NUMA nodes)\n");
     printf("\n");
     printf("Options:\n");
     printf("  --quick                 Run quick test mode (small matrices, few iterations)\n");
@@ -1722,6 +2307,7 @@ int main(int argc, char* argv[]) {
     tester.test_hyperthreading_comparison();  
     tester.test_batch_size_scaling();
     tester.test_cache_aware_strategy_selection(); // New cache-aware A/B test
+    tester.test_numa_scaling_comparison(); // NEW: NUMA scaling comparison test
     
     // Print comprehensive summary
     tester.print_results_summary();
