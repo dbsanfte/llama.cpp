@@ -104,6 +104,7 @@ int32_t cpu_get_num_math();
 int32_t cpu_get_num_math_from_params(const cpu_params & params);
 void cpu_print_topology_info();
 void cpu_print_comprehensive_topology(const cpu_params & params);
+void cpu_print_comprehensive_topology(const cpu_params & params, const common_params & full_params);  // NUMA-strategy aware version
 void cpu_print_comprehensive_topology_with_gpu(const cpu_params & params, const common_params & full_params);
 std::vector<gpu_numa_info> detect_gpu_numa_affinity();
 void print_gpu_numa_topology(const std::vector<gpu_numa_info> & gpu_info, const common_params & params);
@@ -637,6 +638,7 @@ struct common_init_result     common_init_from_params(common_params & params);
 struct llama_model_params     common_model_params_to_llama  (      common_params & params);
 struct llama_context_params   common_context_params_to_llama(const common_params & params);
 struct ggml_threadpool_params ggml_threadpool_params_from_cpu_params(const cpu_params & params);
+void                          ggml_threadpool_params_configure_numa_isolation(struct ggml_threadpool_params * tpp, int isolate_node);
 
 // clear LoRA adapters from context, then apply new list of adapters
 void common_set_adapter_lora(struct llama_context * ctx, std::vector<common_adapter_lora_info> & lora);

@@ -1438,7 +1438,18 @@ int ggml_numa_coordinator_manager_submit_data_parallel_work(struct ggml_numa_coo
         struct ggml_work_item * work_item = malloc(sizeof(struct ggml_work_item));
         if (!work_item) {
             GGML_LOG_ERROR("Failed to allocate work item for chunk %d\n", i);
-            // TODO: Clean up partially created work group
+            
+            // Clean up partially created work group
+            // First free any already created work items
+            for (int j = 0; j < i; j++) {
+                if (group->chunks[j]) {
+                    free(group->chunks[j]);
+                    group->chunks[j] = NULL;
+                }
+            }
+            
+            // Then free the work group itself
+            ggml_work_group_free(group);
             return -1;
         }
         
@@ -2232,6 +2243,14 @@ enum ggml_numa_memory_strategy ggml_numa_coordinator_manager_get_strategy(struct
     ggml_mutex_unlock(&mgr->strategy_mutex);
     
     return strategy;
+}
+
+int ggml_numa_coordinator_manager_get_num_nodes(struct ggml_numa_coordinator_manager * mgr) {
+    if (!mgr) {
+        return 1; // Fallback to single node if no manager
+    }
+    
+    return mgr->num_numa_nodes;
 }
 
 enum ggml_numa_memory_strategy ggml_numa_choose_strategy(const struct ggml_numa_workload_info * workload) {

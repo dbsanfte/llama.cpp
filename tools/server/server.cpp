@@ -3691,13 +3691,12 @@ int main(int argc, char ** argv) {
         struct ggml_threadpool_params tpp = ggml_threadpool_params_from_cpu_params(params.cpuparams);
         
         if (params.numa == GGML_NUMA_STRATEGY_ISOLATE && params.numa_isolate_node >= 0) {
-            // For isolate strategy with specific node, use the legacy function for now
-            // TODO: Implement node isolation in the threadpool params
-            llama_numa_init_with_node(params.numa, params.numa_isolate_node);
-        } else {
-            // Use new function with full threadpool configuration
-            llama_numa_init_with_threadpool_params(params.numa, &tpp);
+            // Configure threadpool params for node isolation
+            ggml_threadpool_params_configure_numa_isolation(&tpp, params.numa_isolate_node);
         }
+        
+        // Use threadpool-based NUMA initialization for all strategies
+        llama_numa_init_with_threadpool_params(params.numa, &tpp);
     }
 
     LOG_INF("system info: n_threads = %d, n_threads_batch = %d, total_threads = %d\n", params.cpuparams.n_threads, params.cpuparams_batch.n_threads, std::thread::hardware_concurrency());

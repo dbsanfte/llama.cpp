@@ -1435,6 +1435,66 @@ struct ggml_threadpool_params ggml_threadpool_params_from_cpu_params(const cpu_p
     return tpp;
 }
 
+void ggml_threadpool_params_configure_numa_isolation(struct ggml_threadpool_params * tpp, int isolate_node) {
+    if (!tpp || isolate_node < 0) {
+        return;
+    }
+    
+#ifdef GGML_NUMA_MIRROR
+    // Check if NUMA is available and node exists
+    if (numa_available() == -1) {
+        LOG_WRN("NUMA not available, ignoring node isolation request for node %d\n", isolate_node);
+        return;
+    }
+    
+    int max_nodes = numa_max_node() + 1;
+    if (isolate_node >= max_nodes) {
+        LOG_WRN("NUMA node %d not available (max: %d), falling back to default configuration\n", 
+                isolate_node, max_nodes - 1);
+        return;
+    }
+    
+    // Clear existing CPU mask
+    memset(tpp->cpumask, 0, sizeof(tpp->cpumask));
+    
+    // Get CPUs for the specified NUMA node
+    struct bitmask* node_cpus = numa_allocate_cpumask();
+    if (node_cpus) {
+        int result = numa_node_to_cpus(isolate_node, node_cpus);
+        if (result == 0) {
+            int cpu_count = 0;
+            for (int cpu = 0; cpu < numa_num_possible_cpus() && cpu < GGML_MAX_N_THREADS; cpu++) {
+                if (numa_bitmask_isbitset(node_cpus, cpu)) {
+                    tpp->cpumask[cpu] = true;
+                    cpu_count++;
+                }
+            }
+            
+            // If user didn't specify thread count or requested more than available,
+            // limit to CPUs available on this node
+            if (tpp->n_threads <= 0 || tpp->n_threads > cpu_count) {
+                tpp->n_threads = cpu_count;
+            }
+            
+            // Enable strict CPU placement for isolation
+            tpp->strict_cpu = true;
+            tpp->numa_aware = true;
+            
+            LOG_INF("Configured threadpool for NUMA node %d: %d threads on %d CPUs\n", 
+                    isolate_node, tpp->n_threads, cpu_count);
+        } else {
+            LOG_WRN("Failed to get CPUs for NUMA node %d\n", isolate_node);
+        }
+        numa_free_cpumask(node_cpus);
+    } else {
+        LOG_WRN("Failed to allocate CPU mask for NUMA node %d\n", isolate_node);
+    }
+#else
+    (void)isolate_node;
+    LOG_WRN("NUMA support not compiled in, ignoring node isolation request\n");
+#endif
+}
+
 //
 // Batch utils
 //
@@ -2247,6 +2307,16 @@ void print_gpu_numa_topology(const std::vector<gpu_numa_info> & gpu_info, const 
  * Print comprehensive CPU/GPU/NUMA topology and threading plan
  */
 void cpu_print_comprehensive_topology(const cpu_params & params) {
+    // Call the NUMA-strategy aware version with default (disabled) NUMA strategy
+    common_params default_params = {};
+    default_params.numa = GGML_NUMA_STRATEGY_DISABLED;
+    cpu_print_comprehensive_topology(params, default_params);
+}
+
+/**
+ * Print comprehensive CPU/GPU/NUMA topology and threading plan (NUMA-strategy aware)
+ */
+void cpu_print_comprehensive_topology(const cpu_params & params, const common_params & full_params) {
     LOG_INF("\n");
     LOG_INF("╔══════════════════════════════════════════════════════════════════════════════════╗\n");
     LOG_INF("║                    CPU/GPU/NUMA TOPOLOGY & THREADING PLAN                        ║\n");
@@ -2262,14 +2332,54 @@ void cpu_print_comprehensive_topology(const cpu_params & params) {
     LOG_INF("   - Total physical cores: %d\n", total_physical);
     LOG_INF("   - Hyperthreading: %s\n", (total_logical > total_physical) ? "Available" : "Not available");
     
-    // NUMA information
+    // NUMA information - show both hardware and effective configuration
     bool numa_available = false;
     int numa_nodes = 0;
+    int effective_numa_nodes = 0;
+    
 #ifdef GGML_NUMA_MIRROR
     numa_nodes = numa_num_configured_nodes();
     numa_available = numa_nodes > 1;
     
-    LOG_INF("   - NUMA nodes: %d %s\n", numa_nodes, numa_available ? "(multi-node system)" : "(single-node system)");
+    // Determine effective NUMA nodes based on user strategy
+    switch (full_params.numa) {
+        case GGML_NUMA_STRATEGY_DISABLED:
+            effective_numa_nodes = 1;
+            break;
+        case GGML_NUMA_STRATEGY_ISOLATE:
+            effective_numa_nodes = 1;  // Always 1 when isolating to a specific node
+            break;
+        case GGML_NUMA_STRATEGY_DISTRIBUTE:
+        case GGML_NUMA_STRATEGY_MIRROR:
+        case GGML_NUMA_STRATEGY_NUMACTL:
+        default:
+            effective_numa_nodes = numa_available ? numa_nodes : 1;
+            break;
+    }
+    
+    LOG_INF("   - NUMA nodes (hardware): %d %s\n", numa_nodes, numa_available ? "(multi-node system)" : "(single-node system)");
+    
+    // Show NUMA strategy and effective configuration
+    const char* numa_strategy_name;
+    switch (full_params.numa) {
+        case GGML_NUMA_STRATEGY_DISABLED:   numa_strategy_name = "disabled"; break;
+        case GGML_NUMA_STRATEGY_DISTRIBUTE: numa_strategy_name = "distribute"; break;
+        case GGML_NUMA_STRATEGY_ISOLATE:    
+            if (full_params.numa_isolate_node >= 0) {
+                static char isolate_name[64];
+                snprintf(isolate_name, sizeof(isolate_name), "isolate (node %d)", full_params.numa_isolate_node);
+                numa_strategy_name = isolate_name;
+            } else {
+                numa_strategy_name = "isolate (auto)";
+            }
+            break;
+        case GGML_NUMA_STRATEGY_NUMACTL:    numa_strategy_name = "numactl"; break;
+        case GGML_NUMA_STRATEGY_MIRROR:     numa_strategy_name = "mirror"; break;
+        default:                           numa_strategy_name = "unknown"; break;
+    }
+    
+    LOG_INF("   - NUMA strategy: %s\n", numa_strategy_name);
+    LOG_INF("   - NUMA nodes (effective): %d\n", effective_numa_nodes);
     
     if (numa_available) {
         LOG_INF("\n[+] NUMA NODE DETAILS:\n");
@@ -2278,6 +2388,16 @@ void cpu_print_comprehensive_topology(const cpu_params & params) {
             if (numa_node_to_cpus(node, node_cpus) == 0) {
                 std::ostringstream cpu_list;
                 cpu_list << "   Node " << node << " CPUs: ";
+                
+                // Highlight if this node is being used based on strategy
+                bool node_active = true;
+                if (full_params.numa == GGML_NUMA_STRATEGY_ISOLATE && full_params.numa_isolate_node >= 0) {
+                    node_active = (node == full_params.numa_isolate_node);
+                }
+                
+                if (!node_active) {
+                    cpu_list << "[UNUSED] ";
+                }
                 bool first = true;
                 for (int cpu = 0; cpu < total_logical; cpu++) {
                     if (numa_bitmask_isbitset(node_cpus, cpu)) {
@@ -2322,19 +2442,54 @@ void cpu_print_comprehensive_topology(const cpu_params & params) {
     
     // Thread distribution plan
     LOG_INF("\n[>] THREAD DISTRIBUTION PLAN:\n");
-    if (numa_available) {
-        int threads_per_node = (actual_threads + numa_nodes - 1) / numa_nodes;
+    if (effective_numa_nodes > 1) {
+        int threads_per_node = (actual_threads + effective_numa_nodes - 1) / effective_numa_nodes;
         int remaining_threads = actual_threads;
         
-        LOG_INF("   - Distribution strategy: Round-robin across NUMA nodes\n");
-        for (int node = 0; node < numa_nodes && remaining_threads > 0; node++) {
+        const char* distribution_desc;
+        switch (full_params.numa) {
+            case GGML_NUMA_STRATEGY_DISTRIBUTE:
+                distribution_desc = "Round-robin across NUMA nodes"; 
+                break;
+            case GGML_NUMA_STRATEGY_MIRROR:
+                distribution_desc = "NUMA-aware data parallelism with mirroring";
+                break;
+            case GGML_NUMA_STRATEGY_NUMACTL:
+                distribution_desc = "Using numactl CPU map";
+                break;
+            default:
+                distribution_desc = "Multi-NUMA node distribution";
+                break;
+        }
+        
+        LOG_INF("   - Distribution strategy: %s\n", distribution_desc);
+        for (int node = 0; node < effective_numa_nodes && remaining_threads > 0; node++) {
             int node_threads = std::min(threads_per_node, remaining_threads);
-            LOG_INF("   - NUMA node %d: %d threads\n", node, node_threads);
+            
+            // For isolate strategy, show which specific node
+            if (full_params.numa == GGML_NUMA_STRATEGY_ISOLATE && full_params.numa_isolate_node >= 0) {
+                LOG_INF("   - NUMA node %d: %d threads\n", full_params.numa_isolate_node, node_threads);
+            } else {
+                LOG_INF("   - NUMA node %d: %d threads\n", node, node_threads);
+            }
             remaining_threads -= node_threads;
         }
     } else {
-        LOG_INF("   - Distribution strategy: Single NUMA node\n");
-        LOG_INF("   - Node 0: %d threads\n", actual_threads);
+        const char* strategy_desc;
+        if (full_params.numa == GGML_NUMA_STRATEGY_DISABLED) {
+            strategy_desc = "NUMA disabled - single node";
+        } else if (full_params.numa == GGML_NUMA_STRATEGY_ISOLATE) {
+            strategy_desc = "NUMA isolate - single node";
+        } else {
+            strategy_desc = "Single NUMA node";
+        }
+        
+        LOG_INF("   - Distribution strategy: %s\n", strategy_desc);
+        int display_node = 0;
+        if (full_params.numa == GGML_NUMA_STRATEGY_ISOLATE && full_params.numa_isolate_node >= 0) {
+            display_node = full_params.numa_isolate_node;
+        }
+        LOG_INF("   - Node %d: %d threads\n", display_node, actual_threads);
     }
     
     // Performance recommendations
@@ -2402,8 +2557,8 @@ void cpu_print_comprehensive_topology(const cpu_params & params) {
  * Enhanced comprehensive topology that includes GPU-NUMA considerations
  */
 void cpu_print_comprehensive_topology_with_gpu(const cpu_params & params, const common_params & full_params) {
-    // Print CPU topology first
-    cpu_print_comprehensive_topology(params);
+    // Print CPU topology first with NUMA strategy awareness
+    cpu_print_comprehensive_topology(params, full_params);
     
     // Then print GPU-NUMA topology
     std::vector<gpu_numa_info> gpu_info = detect_gpu_numa_affinity();

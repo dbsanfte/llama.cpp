@@ -244,6 +244,14 @@ int ggml_numa_coordinator_manager_set_strategy(struct ggml_numa_coordinator_mana
 enum ggml_numa_memory_strategy ggml_numa_coordinator_manager_get_strategy(struct ggml_numa_coordinator_manager * mgr);
 
 /**
+ * Get the number of NUMA nodes that the coordinator is managing
+ * 
+ * @param mgr Manager instance
+ * @return Number of NUMA nodes (1 if NUMA not available or mgr is NULL)
+ */
+int ggml_numa_coordinator_manager_get_num_nodes(struct ggml_numa_coordinator_manager * mgr);
+
+/**
  * Choose optimal memory management strategy based on workload characteristics
  * This function implements the adaptive strategy selection logic based on A/B test results
  * 
