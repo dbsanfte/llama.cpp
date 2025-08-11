@@ -116,6 +116,7 @@ void bind_thread_to_gpu_numa_node(int gpu_id, const std::vector<gpu_numa_info> &
 void* allocate_gpu_numa_local_memory(size_t size, int numa_node);
 void free_gpu_numa_local_memory(void* ptr, size_t size);
 bool monitor_cross_socket_gpu_traffic(const std::vector<gpu_numa_info> & gpu_infos);
+bool bind_current_thread_to_gpu_numa(int device_id);
 
 //
 // Common params

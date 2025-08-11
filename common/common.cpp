@@ -22,6 +22,7 @@
 #include <iomanip>
 #include <iostream>
 #include <iterator>
+#include <mutex>
 #include <regex>
 #include <sstream>
 #include <string>
@@ -2592,4 +2593,53 @@ bool monitor_cross_socket_gpu_traffic(const std::vector<gpu_numa_info> & gpu_inf
 #endif
     
     return !potential_cross_socket_traffic;
+}
+
+/**
+ * Bind current thread to GPU's NUMA node by device ID
+ * This is a simplified interface for GPU backends to use
+ */
+bool bind_current_thread_to_gpu_numa(int device_id) {
+    static std::vector<gpu_numa_info> cached_gpu_infos;
+    static std::once_flag gpu_info_init_flag;
+    
+    // Initialize GPU info cache once
+    std::call_once(gpu_info_init_flag, []() {
+        cached_gpu_infos = detect_gpu_numa_affinity();
+    });
+    
+    // Find GPU info for this device
+    for (const auto & gpu_info : cached_gpu_infos) {
+        if (gpu_info.gpu_id == device_id && gpu_info.backend_available) {
+            // Set thread-local NUMA node for tensor_data() access
+#ifdef GGML_NUMA_MIRROR
+            extern __thread int ggml_current_numa_node;
+            if (gpu_info.affinity_detected && !gpu_info.is_virtual_gpu) {
+                ggml_current_numa_node = gpu_info.numa_node;
+            } else {
+                ggml_current_numa_node = 0; // Default to node 0 for virtual/unknown GPUs
+            }
+#endif
+            
+            // Bind thread CPU affinity and memory policy
+            bool cpu_ok = enforce_gpu_cpu_numa_affinity(device_id, gpu_info);
+            bool mem_ok = verify_gpu_numa_memory_locality(device_id, gpu_info);
+            
+            if (cpu_ok && mem_ok && gpu_info.affinity_detected) {
+                LOG_DBG("Thread bound to NUMA node %d for GPU %d\n", 
+                       gpu_info.numa_node, device_id);
+                return true;
+            } else if (gpu_info.is_virtual_gpu) {
+                LOG_DBG("Virtual GPU %d detected - no NUMA binding needed\n", device_id);
+                return true;
+            } else {
+                LOG_WRN("Incomplete NUMA binding for GPU %d (CPU: %s, Memory: %s)\n", 
+                       device_id, cpu_ok ? "OK" : "FAILED", mem_ok ? "OK" : "FAILED");
+                return false;
+            }
+        }
+    }
+    
+    LOG_WRN("GPU device %d not found in NUMA topology - no binding applied\n", device_id);
+    return false;
 }

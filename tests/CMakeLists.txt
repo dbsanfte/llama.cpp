@@ -309,3 +309,8 @@ llama_build_and_test(test-numa-coordinator-repack-integration.cpp)
 target_link_libraries(${LLAMA_TEST_NAME} PRIVATE ggml ggml-cpu common numa)
 target_include_directories(${LLAMA_TEST_NAME} PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src)
 target_include_directories(${LLAMA_TEST_NAME} PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src/ggml-cpu)
+
+# test-gpu-numa-binding
+set(LLAMA_TEST_NAME test-gpu-numa-binding)
+llama_build_and_test(test-gpu-numa-binding.cpp)
+target_link_libraries(${LLAMA_TEST_NAME} PRIVATE ggml ggml-cpu common numa)
