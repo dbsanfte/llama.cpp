@@ -581,7 +581,7 @@ static enum ggml_numa_memory_strategy ggml_numa_strategy_to_coordinator_strategy
         case GGML_NUMA_STRATEGY_DISABLED:
             return GGML_NUMA_STRATEGY_AUTO;  // Use default if not disabled
         case GGML_NUMA_STRATEGY_DISTRIBUTE:
-            return GGML_NUMA_STRATEGY_AUTO;  // Auto-selection works well for distribute
+            return GGML_NUMA_STRATEGY_CHUNKED_PROCESSING;  // Better for distributed data access patterns
         case GGML_NUMA_STRATEGY_ISOLATE:
             return GGML_NUMA_STRATEGY_MATRIX_REDUCTION;  // Better for isolation
         case GGML_NUMA_STRATEGY_NUMACTL:

@@ -291,19 +291,158 @@ struct llama_mmap::impl {
         std::string path;
     };
     std::vector<numa_mapping> numa_mappings;
+    
+    // Helper function for distributed NUMA allocation
+    void init_distributed_numa_mapping(struct llama_file * file, size_t prefetch) {
+        GGML_UNUSED(prefetch);  // Prefetch not used in distributed mode
+        size = file->size();
+        int fd = file->file_id();
+        
+        // Get NUMA information
+        int num_nodes = numa_num_configured_nodes();
+        if (num_nodes <= 1) {
+            LLAMA_LOG_WARN("Only %d NUMA nodes detected, falling back to regular mmap\n", num_nodes);
+            addr = mmap(nullptr, file->size(), PROT_READ, MAP_PRIVATE, fd, 0);
+            if (addr == MAP_FAILED) {
+                throw std::runtime_error(format("mmap failed: %s", strerror(errno)));
+            }
+            return;
+        }
+        
+        LLAMA_LOG_INFO("Distributing %zu bytes across %d NUMA nodes\n", size, num_nodes);
+        
+        // Calculate chunk size for distribution (round up to page boundary)
+        size_t page_size = sysconf(_SC_PAGESIZE);
+        size_t chunk_size = ((size + num_nodes - 1) / num_nodes);  // Divide across nodes
+        chunk_size = ((chunk_size + page_size - 1) / page_size) * page_size;  // Round up to page size
+        
+        // Set up the base virtual address
+        addr = (void*)(GGML_MMAP_VIRTUAL_MEMORY_BASE_OFFSET + base_address_offset);
+        
+        // Store old NUMA policy to restore later
+        int oldpolicy;
+        struct bitmask* oldmask = numa_allocate_nodemask();
+        if (get_mempolicy(&oldpolicy, oldmask->maskp, oldmask->size + 1, 0, 0) < 0) {
+            LLAMA_LOG_WARN("get_mempolicy failed, errno=%d %s\n", errno, strerror(errno));
+            oldpolicy = MPOL_DEFAULT;
+        }
+        
+        size_t total_allocated = 0;
+        size_t file_offset = 0;
+        
+        for (int node = 0; node < num_nodes; ++node) {
+            // Calculate how much to allocate on this node
+            size_t remaining = size - file_offset;
+            size_t node_size = (remaining < chunk_size) ? remaining : chunk_size;
+            if (node_size == 0) break;
+            
+            // Set NUMA policy for this node
+            numa_set_preferred(node);
+            
+            // Calculate the virtual address for this chunk
+            uintptr_t node_address = (uintptr_t)addr + file_offset;
+            
+            LLAMA_LOG_INFO("Allocating %zu bytes on NUMA node %d at offset %zu\n", 
+                          node_size, node, file_offset);
+            
+            // Try NUMA-aware allocation first
+            void* node_mem = numa_alloc_onnode(node_size, node);
+            if (node_mem) {
+                // Read data from file into NUMA-local memory
+                if (pread(fd, node_mem, node_size, file_offset) != (ssize_t)node_size) {
+                    LLAMA_LOG_ERROR("Failed to read data for NUMA node %d\n", node);
+                    numa_free(node_mem, node_size);
+                    throw std::runtime_error(format("pread failed: %s", strerror(errno)));
+                }
+                
+                // Map the NUMA-local memory to the expected virtual address
+                void* mapped_addr = mmap((void*)node_address, node_size, PROT_READ | PROT_WRITE, 
+                                        MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+                if (mapped_addr == MAP_FAILED) {
+                    LLAMA_LOG_ERROR("Failed to map virtual address for NUMA node %d\n", node);
+                    numa_free(node_mem, node_size);
+                    throw std::runtime_error(format("mmap virtual address failed: %s", strerror(errno)));
+                }
+                
+                // Copy data to the mapped address
+                memcpy(mapped_addr, node_mem, node_size);
+                
+                // Free the temporary NUMA allocation
+                numa_free(node_mem, node_size);
+                
+                // Store mapping info for cleanup
+                numa_mappings.push_back({mapped_addr, node_size, ""});
+                
+            } else {
+                // Fallback: direct mmap from file
+                LLAMA_LOG_WARN("NUMA allocation failed for node %d, using regular mmap\n", node);
+                void* mapped_addr = mmap((void*)node_address, node_size, PROT_READ, 
+                                        MAP_PRIVATE, fd, file_offset);
+                if (mapped_addr == MAP_FAILED) {
+                    throw std::runtime_error(format("fallback mmap failed: %s", strerror(errno)));
+                }
+                numa_mappings.push_back({mapped_addr, node_size, ""});
+            }
+            
+            file_offset += node_size;
+            total_allocated += node_size;
+        }
+        
+        // Restore original NUMA policy
+        if (oldpolicy == MPOL_DEFAULT) {
+            numa_set_localalloc();
+        } else {
+            set_mempolicy(oldpolicy, oldmask->maskp, oldmask->size + 1);
+        }
+        numa_free_nodemask(oldmask);
+        
+        LLAMA_LOG_INFO("Successfully distributed %zu bytes across %d NUMA nodes (total allocated: %zu)\n", 
+                      size, num_nodes, total_allocated);
+                      
+        // Update global offset
+        base_address_offset += ((size + GGML_MMAP_HUGEPAGESZ - 1) / GGML_MMAP_HUGEPAGESZ) * GGML_MMAP_HUGEPAGESZ;
+    }
 #endif
 
     impl(struct llama_file * file, size_t prefetch, bool numa) {
 #ifdef GGML_NUMA_MIRROR
-        // Check if we're in isolate mode - if so, don't mirror data across NUMA nodes
-        bool should_mirror = numa;
-        if (numa && ggml_get_numa_strategy() == GGML_NUMA_STRATEGY_ISOLATE) {
-            should_mirror = false;
-            LLAMA_LOG_INFO("NUMA isolate mode detected - allocating memory only on target node, no mirroring\n");
+        // Determine memory allocation strategy based on NUMA strategy
+        enum ggml_numa_strategy strategy = numa ? ggml_get_numa_strategy() : GGML_NUMA_STRATEGY_DISABLED;
+        bool should_mirror = false;
+        bool should_distribute = false;
+        
+        if (numa) {
+            switch (strategy) {
+                case GGML_NUMA_STRATEGY_ISOLATE:
+                    should_mirror = false;
+                    should_distribute = false;
+                    LLAMA_LOG_INFO("NUMA isolate mode - allocating memory only on target node\n");
+                    break;
+                case GGML_NUMA_STRATEGY_DISTRIBUTE:
+                    should_mirror = false;
+                    should_distribute = true;
+                    LLAMA_LOG_INFO("NUMA distribute mode - distributing model data across NUMA nodes\n");
+                    break;
+                case GGML_NUMA_STRATEGY_MIRROR:
+                    should_mirror = true;
+                    should_distribute = false;
+                    LLAMA_LOG_INFO("NUMA mirror mode - replicating model data on each NUMA node\n");
+                    break;
+                default:
+                    should_mirror = true;  // Default to mirroring for other strategies
+                    should_distribute = false;
+                    break;
+            }
+        }
+        
+        if (should_distribute) {
+            // Implement distributed allocation across NUMA nodes
+            init_distributed_numa_mapping(file, prefetch);
+            return;
         }
         
         if (!should_mirror) {
-            // Use regular mmap for isolate mode
+            // Use regular mmap for isolate mode or non-NUMA
             GGML_UNUSED(prefetch);
             size = file->size();
             int fd = file->file_id();
