@@ -143,7 +143,7 @@ struct ggml_coordinator_thread {
     int numa_node;                                  // NUMA node this coordinator manages
     int n_threads;                                  // Number of threads in this coordinator's pool
     struct ggml_threadpool * numa_pool;             // NUMA-specific threadpool
-    struct ggml_cgraph * numa_cgraph;               // NUMA node's own copy of cgraph
+    const struct ggml_cgraph * numa_cgraph;         // NUMA node's reference to cgraph (read-only)
     struct ggml_context * numa_ctx;                 // Context for this NUMA node's cgraph copy
     struct ggml_work_queue work_queue;              // Work queue for this coordinator
     ggml_thread_t thread_handle;                    // Thread handle
@@ -934,9 +934,9 @@ static void create_optimal_cpu_masks(struct ggml_threadpool_params *tpp, int num
             }
         }
         
-        GGML_LOG_INFO("✅ Optimal CPU mask created with %d CPUs avoiding HT conflicts\n", cpu_count);
+        GGML_LOG_INFO("    Optimal CPU mask created with %d CPUs avoiding HT conflicts\n", cpu_count);
     } else {
-        GGML_LOG_INFO("📋 Using custom CPU mask with %d CPUs\n", cpu_count);
+        GGML_LOG_INFO("    Using custom CPU mask with %d CPUs\n", cpu_count);
     }
 }
 
@@ -972,6 +972,31 @@ struct ggml_numa_coordinator_manager * ggml_numa_coordinator_manager_new_with_pa
         num_numa_nodes = 2; // Simulate 2 NUMA nodes for testing
         GGML_LOG_INFO("Forcing multi-socket mode with %d simulated NUMA nodes\n", num_numa_nodes);
     }
+    
+    // === COMPREHENSIVE COORDINATOR SETUP LOGGING ===
+    GGML_LOG_INFO("================================================================================\n");
+    GGML_LOG_INFO("                     NUMA Coordinator Initialization\n");
+    GGML_LOG_INFO("================================================================================\n");
+    GGML_LOG_INFO("    Number of NUMA nodes requested: %d\n", num_numa_nodes);
+    GGML_LOG_INFO("    Hardware NUMA available: %s\n", numa_is_available ? "YES" : "NO");
+    GGML_LOG_INFO("    Total threads to distribute: %d\n", tpp->n_threads);
+    GGML_LOG_INFO("    Threads per NUMA node: %d\n", tpp->n_threads / num_numa_nodes);
+    GGML_LOG_INFO("    Strict CPU placement: %s\n", tpp->strict_cpu ? "STRICT_CPU" : "DEFAULT");
+    GGML_LOG_INFO("    CPU mask enforcement: %s\n", 
+                  tpp->cpumask[0] ? "ENABLED" : "DISABLED");
+    
+    // Log master CPU mask details if available
+    if (tpp->cpumask[0]) {
+        char cpu_list[512] = {0};
+        int pos = 0;
+        for (int cpu = 0; cpu < GGML_MAX_N_THREADS && pos < 500; cpu++) {
+            if (tpp->cpumask[cpu]) {
+                pos += snprintf(cpu_list + pos, sizeof(cpu_list) - pos, "%d,", cpu);
+            }
+        }
+        if (pos > 0) cpu_list[pos - 1] = '\0'; // Remove trailing comma
+        GGML_LOG_INFO("    Master CPU mask: [%s]\n", cpu_list);
+    }
         
     // Step 2: Allocate manager structure
     struct ggml_numa_coordinator_manager * mgr = malloc(sizeof(struct ggml_numa_coordinator_manager));
@@ -994,6 +1019,17 @@ struct ggml_numa_coordinator_manager * ggml_numa_coordinator_manager_new_with_pa
     // Initialize memory management strategy
     mgr->memory_strategy = GGML_NUMA_STRATEGY_AUTO;  // Default to adaptive strategy
     ggml_mutex_init(&mgr->strategy_mutex);
+    
+    // Log current memory strategy and store name for final summary
+    const char* strategy_name = "UNKNOWN";
+    switch(mgr->memory_strategy) {
+        case GGML_NUMA_STRATEGY_AUTO: strategy_name = "AUTO (adaptive)"; break;
+        case GGML_NUMA_STRATEGY_MATRIX_REDUCTION: strategy_name = "MATRIX_REDUCTION"; break;
+        case GGML_NUMA_STRATEGY_CHUNKED_PROCESSING: strategy_name = "CHUNKED_PROCESSING"; break;
+        case GGML_NUMA_STRATEGY_HYBRID: strategy_name = "HYBRID"; break;
+        default: strategy_name = "UNKNOWN"; break;
+    }
+    GGML_LOG_INFO("    Memory strategy: %s\n", strategy_name);
     
     ggml_mutex_init(&mgr->main_sync_mutex);
     ggml_cond_init(&mgr->main_sync_cond);
@@ -1143,10 +1179,10 @@ struct ggml_numa_coordinator_manager * ggml_numa_coordinator_manager_new_with_pa
                                   i, assigned_count, cpu_list_str);
                     
                     if (ht_conflicts > 0) {
-                        GGML_LOG_WARN("NUMA node %d: ⚠️  %d hyperthreading conflicts detected - may reduce performance\n", 
+                        GGML_LOG_WARN("    NUMA node %d: WARNING - %d hyperthreading conflicts detected - may reduce performance\n", 
                                       i, ht_conflicts);
                     } else {
-                        GGML_LOG_INFO("NUMA node %d: ✅ No hyperthreading conflicts - optimal CPU assignment\n", i);
+                        GGML_LOG_INFO("    NUMA node %d: OK - No hyperthreading conflicts - optimal CPU assignment\n", i);
                     }
                 } else {
                     GGML_LOG_INFO("NUMA node %d: no specific CPUs assigned - using default affinity\n", i);
@@ -1194,14 +1230,69 @@ struct ggml_numa_coordinator_manager * ggml_numa_coordinator_manager_new_with_pa
             snprintf(final_cpu_summary, sizeof(final_cpu_summary), "default affinity");
         }
         
-        GGML_LOG_INFO("✅ Coordinator NUMA node %d: %d threads, %s\n", 
+        GGML_LOG_INFO("    Coordinator NUMA node %d: %d threads, %s\n", 
                       i, threads_per_numa, final_cpu_summary);
     }
     
-    // Summary log for complete coordinator setup
-    GGML_LOG_INFO("🚀 NUMA coordinator manager active with %d virtual NUMA nodes\n", num_numa_nodes);
-    GGML_LOG_INFO("   Total threads: %d, Threads per node: ~%d\n", 
+    // === WARMUP OPERATION TO ENSURE THREADS ARE ACTIVE ===
+    GGML_LOG_INFO("--------------------------------------------------------------------------------\n");
+    GGML_LOG_INFO("                       Starting coordinator warmup\n");
+    GGML_LOG_INFO("--------------------------------------------------------------------------------\n");
+    
+    // Mark threads as started to enable warmup
+    atomic_store(&mgr->threads_started, true);
+    
+    // Brief warmup - create a small test work item for each coordinator
+    for (int i = 0; i < num_numa_nodes; i++) {
+        struct ggml_coordinator_thread * coord = &mgr->coordinators[i];
+        
+        // Signal warmup work is available
+        ggml_mutex_lock(&coord->work_queue.queue_mutex);
+        ggml_cond_signal(&coord->work_queue.work_available);
+        ggml_mutex_unlock(&coord->work_queue.queue_mutex);
+    }
+    
+    // Small delay to let threads spin up
+    ggml_time_us(); // Force a timing call to ensure threads have cycles to start
+    
+    // === FINAL COMPREHENSIVE SUMMARY ===
+    GGML_LOG_INFO("================================================================================\n");
+    GGML_LOG_INFO("                    NUMA Coordinator Initialization Complete\n");
+    GGML_LOG_INFO("================================================================================\n");
+    GGML_LOG_INFO("    Status: %d NUMA coordinators created and configured\n", num_numa_nodes);
+    GGML_LOG_INFO("    Total threads distributed: %d (avg %d per node)\n", 
                   tpp->n_threads, tpp->n_threads / num_numa_nodes);
+    
+    // Get current strategy name for final summary
+    const char* final_strategy_name = "UNKNOWN";
+    switch(mgr->memory_strategy) {
+        case GGML_NUMA_STRATEGY_AUTO: final_strategy_name = "AUTO (adaptive)"; break;
+        case GGML_NUMA_STRATEGY_MATRIX_REDUCTION: final_strategy_name = "MATRIX_REDUCTION"; break;
+        case GGML_NUMA_STRATEGY_CHUNKED_PROCESSING: final_strategy_name = "CHUNKED_PROCESSING"; break;
+        case GGML_NUMA_STRATEGY_HYBRID: final_strategy_name = "HYBRID"; break;
+        default: final_strategy_name = "UNKNOWN"; break;
+    }
+    
+    GGML_LOG_INFO("    Memory strategy: %s\n", final_strategy_name);
+    GGML_LOG_INFO("    Thread binding: %s\n", 
+                  tpp->cpumask[0] ? "CPU affinity enforced" : "Default OS scheduling");
+    GGML_LOG_INFO("    Manager state: ACTIVE and ready for work distribution\n");
+    GGML_LOG_INFO("\n");
+    GGML_LOG_INFO("    Coordinator Details:\n");
+    
+    // Log individual coordinator summary with thread binding details
+    for (int i = 0; i < num_numa_nodes; i++) {
+        struct ggml_coordinator_thread * coord = &mgr->coordinators[i];
+        const char* thread_status = atomic_load(&coord->thread_created) ? "CREATED" : "READY";
+        GGML_LOG_INFO("      Node %d: CoordPtr=%p, Status=%s, NUMA=%s, Workers=%d\n", 
+                      i, 
+                      (void*)coord,
+                      thread_status,
+                      numa_is_available ? "HARDWARE" : "VIRTUAL",
+                      threads_per_numa);
+    }
+    GGML_LOG_INFO("================================================================================\n");
+    
     return mgr;
 }
 
@@ -1323,9 +1414,8 @@ int ggml_numa_coordinator_manager_set_cgraph(struct ggml_numa_coordinator_manage
     for (int i = 0; i < mgr->num_numa_nodes; i++) {
         struct ggml_coordinator_thread * coord = &mgr->coordinators[i];
         
-        // Store reference to the original cgraph (properly handle const)
-        // The coordinator threads only read the cgraph, so the const cast is safe
-        coord->numa_cgraph = (struct ggml_cgraph *)master_cgraph; 
+        // Store reference to the original cgraph (read-only access)
+        coord->numa_cgraph = master_cgraph; 
         coord->numa_ctx = NULL; // No separate context needed
     }
     

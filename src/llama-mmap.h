@@ -45,6 +45,9 @@ struct llama_mmap {
 
     size_t size() const;
     void * addr() const;
+    
+    // NUMA-aware address retrieval for mirror mode
+    void * numa_addr(size_t offset, int numa_node = -1) const;
 
     void unmap_fragment(size_t first, size_t last);
 

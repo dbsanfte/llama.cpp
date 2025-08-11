@@ -14,6 +14,11 @@
 #include "../ggml/src/ggml-cpu/ggml-numa-coordinator.h"
 #include "common.h"
 
+// Function declarations
+void test_threadpool_with_custom_cpu_mask();
+void test_threadpool_with_default_cpu_mask();
+void test_direct_coordinator_integration();
+
 void test_threadpool_with_custom_cpu_mask() {
     printf("🧪 Testing Threadpool → Coordinator CPU Mask Integration\n");
     printf("======================================================\n\n");

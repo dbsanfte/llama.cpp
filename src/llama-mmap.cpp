@@ -278,7 +278,6 @@ void llama_file::write_u32(uint32_t val) const { pimpl->write_u32(val); }
 
 #ifdef GGML_NUMA_MIRROR
 static uintptr_t base_address_offset = 0;
-static int file_name_offset = 0;
 #endif
 
 struct llama_mmap::impl {
@@ -309,23 +308,12 @@ struct llama_mmap::impl {
             return;
         }
         
-        LLAMA_LOG_INFO("Distributing %zu bytes across %d NUMA nodes\n", size, num_nodes);
+        LLAMA_LOG_INFO("Distributing %zu bytes across %d NUMA nodes using numa_alloc_onnode\n", size, num_nodes);
         
         // Calculate chunk size for distribution (round up to page boundary)
         size_t page_size = sysconf(_SC_PAGESIZE);
         size_t chunk_size = ((size + num_nodes - 1) / num_nodes);  // Divide across nodes
         chunk_size = ((chunk_size + page_size - 1) / page_size) * page_size;  // Round up to page size
-        
-        // Set up the base virtual address
-        addr = (void*)(GGML_MMAP_VIRTUAL_MEMORY_BASE_OFFSET + base_address_offset);
-        
-        // Store old NUMA policy to restore later
-        int oldpolicy;
-        struct bitmask* oldmask = numa_allocate_nodemask();
-        if (get_mempolicy(&oldpolicy, oldmask->maskp, oldmask->size + 1, 0, 0) < 0) {
-            LLAMA_LOG_WARN("get_mempolicy failed, errno=%d %s\n", errno, strerror(errno));
-            oldpolicy = MPOL_DEFAULT;
-        }
         
         size_t total_allocated = 0;
         size_t file_offset = 0;
@@ -336,71 +324,46 @@ struct llama_mmap::impl {
             size_t node_size = (remaining < chunk_size) ? remaining : chunk_size;
             if (node_size == 0) break;
             
-            // Set NUMA policy for this node
-            numa_set_preferred(node);
-            
-            // Calculate the virtual address for this chunk
-            uintptr_t node_address = (uintptr_t)addr + file_offset;
-            
-            LLAMA_LOG_INFO("Allocating %zu bytes on NUMA node %d at offset %zu\n", 
+            LLAMA_LOG_INFO("Allocating %zu bytes on NUMA node %d at file offset %zu\n", 
                           node_size, node, file_offset);
             
-            // Try NUMA-aware allocation first
+            // Allocate memory directly on the NUMA node
             void* node_mem = numa_alloc_onnode(node_size, node);
-            if (node_mem) {
-                // Read data from file into NUMA-local memory
-                if (pread(fd, node_mem, node_size, file_offset) != (ssize_t)node_size) {
-                    LLAMA_LOG_ERROR("Failed to read data for NUMA node %d\n", node);
-                    numa_free(node_mem, node_size);
-                    throw std::runtime_error(format("pread failed: %s", strerror(errno)));
+            if (!node_mem) {
+                LLAMA_LOG_ERROR("Failed to allocate %zu bytes on NUMA node %d\n", node_size, node);
+                // Clean up any previous allocations
+                for (auto& mapping : numa_mappings) {
+                    numa_free(mapping.addr, mapping.size);
                 }
-                
-                // Map the NUMA-local memory to the expected virtual address
-                void* mapped_addr = mmap((void*)node_address, node_size, PROT_READ | PROT_WRITE, 
-                                        MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
-                if (mapped_addr == MAP_FAILED) {
-                    LLAMA_LOG_ERROR("Failed to map virtual address for NUMA node %d\n", node);
-                    numa_free(node_mem, node_size);
-                    throw std::runtime_error(format("mmap virtual address failed: %s", strerror(errno)));
-                }
-                
-                // Copy data to the mapped address
-                memcpy(mapped_addr, node_mem, node_size);
-                
-                // Free the temporary NUMA allocation
-                numa_free(node_mem, node_size);
-                
-                // Store mapping info for cleanup
-                numa_mappings.push_back({mapped_addr, node_size, ""});
-                
-            } else {
-                // Fallback: direct mmap from file
-                LLAMA_LOG_WARN("NUMA allocation failed for node %d, using regular mmap\n", node);
-                void* mapped_addr = mmap((void*)node_address, node_size, PROT_READ, 
-                                        MAP_PRIVATE, fd, file_offset);
-                if (mapped_addr == MAP_FAILED) {
-                    throw std::runtime_error(format("fallback mmap failed: %s", strerror(errno)));
-                }
-                numa_mappings.push_back({mapped_addr, node_size, ""});
+                throw std::runtime_error(format("numa_alloc_onnode failed for node %d", node));
             }
+            
+            // Read data from file directly into NUMA-local memory
+            if (pread(fd, node_mem, node_size, file_offset) != (ssize_t)node_size) {
+                LLAMA_LOG_ERROR("Failed to read data for NUMA node %d\n", node);
+                numa_free(node_mem, node_size);
+                // Clean up any previous allocations
+                for (auto& mapping : numa_mappings) {
+                    numa_free(mapping.addr, mapping.size);
+                }
+                throw std::runtime_error(format("pread failed: %s", strerror(errno)));
+            }
+            
+            // Store the NUMA allocation directly
+            numa_mappings.push_back({node_mem, node_size, ""});
             
             file_offset += node_size;
             total_allocated += node_size;
+            
+            LLAMA_LOG_INFO("NUMA node %d: allocated and loaded %zu bytes at %p\n", 
+                          node, node_size, node_mem);
         }
         
-        // Restore original NUMA policy
-        if (oldpolicy == MPOL_DEFAULT) {
-            numa_set_localalloc();
-        } else {
-            set_mempolicy(oldpolicy, oldmask->maskp, oldmask->size + 1);
-        }
-        numa_free_nodemask(oldmask);
+        // Set addr to the first allocation for compatibility
+        addr = numa_mappings.empty() ? nullptr : numa_mappings[0].addr;
         
         LLAMA_LOG_INFO("Successfully distributed %zu bytes across %d NUMA nodes (total allocated: %zu)\n", 
                       size, num_nodes, total_allocated);
-                      
-        // Update global offset
-        base_address_offset += ((size + GGML_MMAP_HUGEPAGESZ - 1) / GGML_MMAP_HUGEPAGESZ) * GGML_MMAP_HUGEPAGESZ;
     }
 #endif
 
@@ -498,126 +461,52 @@ struct llama_mmap::impl {
             LLAMA_LOG_WARN("numa_num_configured_nodes returned %d, defaulting to 1\n", num_nodes);
             num_nodes = 1;
         }
-        LLAMA_LOG_INFO("Detected %d NUMA nodes\n", num_nodes);
+        LLAMA_LOG_INFO("Detected %d NUMA nodes for mirror mode\n", num_nodes);
 
         size_t total_size = file->size();
-        char path[128];
-        std::vector<bool> is_new_mem(num_nodes, false);
-        int i;
         
-        // Set addr to the first mapping for node 0
-        addr = (void*)(GGML_MMAP_VIRTUAL_MEMORY_BASE_OFFSET + base_address_offset);
-        
-        // Calculate number of hugepages needed and total mapping size
-        size_t hugepages_needed = (total_size + GGML_MMAP_HUGEPAGESZ - 1) / GGML_MMAP_HUGEPAGESZ;
-        size_t total_mapping_size = hugepages_needed * GGML_MMAP_HUGEPAGESZ;
-        
-        LLAMA_LOG_INFO("Creating %zu hugepages (%zu bytes total) for %zu bytes of model data\n", 
-                      hugepages_needed, total_mapping_size, total_size);
+        LLAMA_LOG_INFO("Creating NUMA mirrors with numa_alloc_onnode: %zu bytes per node\n", total_size);
 
+        // Allocate and populate memory on each NUMA node using numa_alloc_onnode
         for (int node = 0; node < num_nodes; ++node) {
             numa_set_preferred(node);
-            LLAMA_LOG_INFO("numa_set_preferred(%d) - creating single large mapping\n", node);
-
-            // Create one large hugepage file for this entire NUMA node
-            sprintf(path, "/dev/hugepages/llama-node%d-unified-%d", node, file_name_offset);
-            if (!is_new_mem[node]) {
-                is_new_mem[node] = access(path, F_OK) != 0;
-            }
-            
-            int hugefd = open(path, O_CREAT | O_RDWR, 0600);
-            if (hugefd < 0) {
-                // Clean up any mappings we've already created before throwing
+            LLAMA_LOG_INFO("Allocating mirror on NUMA node %d\n", node);
+                                   
+            // Allocate NUMA-local memory
+            void* node_mem = numa_alloc_onnode(total_size, node);
+            if (!node_mem) {
+                // Clean up any previous allocations before throwing
                 for (const auto& mapping : numa_mappings) {
                     munmap(mapping.addr, mapping.size);
-                    unlink(mapping.path.c_str());
                 }
-                LLAMA_LOG_WARN("failed to open hugepage fd %s: %d %s\n",
-                        path, errno, strerror(errno));
-                throw std::runtime_error(format("failed to open hugepage fd: %s", strerror(errno)));
+                LLAMA_LOG_ERROR("Failed to allocate %zu bytes on NUMA node %d\n", total_size, node);
+                throw std::runtime_error(format("numa_alloc_onnode failed for node %d: %s", node, strerror(errno)));
             }
-
-            // Resize the hugepage file to accommodate the entire mapping
-            if (ftruncate(hugefd, total_mapping_size) != 0) {
-                close(hugefd);
-                unlink(path);
-                // Clean up any mappings we've already created before throwing
+            
+            LLAMA_LOG_INFO("NUMA node %d: allocated %zu bytes at %p\n", node, total_size, node_mem);
+            
+            // Read model data from file directly into NUMA-local memory
+            if (pread(fd, node_mem, total_size, 0) != (ssize_t)total_size) {
+                LLAMA_LOG_ERROR("Failed to read model data for NUMA node %d\n", node);
+                numa_free(node_mem, total_size);
+                // Clean up any previous allocations
                 for (const auto& mapping : numa_mappings) {
-                    munmap(mapping.addr, mapping.size);
-                    unlink(mapping.path.c_str());
+                    numa_free(mapping.addr, mapping.size);
                 }
-                LLAMA_LOG_WARN("failed to resize hugepage file %s: %d %s\n",
-                        path, errno, strerror(errno));
-                throw std::runtime_error(format("ftruncate failed: %s", strerror(errno)));
-            }
-
-            // Create one large mapping for the entire model on this NUMA node
-            uintptr_t address = GGML_MMAP_VIRTUAL_MEMORY_BASE_OFFSET + 
-                               node * GGML_MMAP_VIRTUAL_MEMORY_NUMA_INCREMENT + 
-                               base_address_offset;
-                               
-            void* mm = mmap((void*)address, total_mapping_size, PROT_READ | PROT_WRITE,
-                           MAP_SHARED | MAP_HUGETLB | MAP_POPULATE, hugefd, 0);
-            close(hugefd);
-            
-            LLAMA_LOG_INFO("mmap(%s) desire=%p size=%zu result=%p is_new_mem[%d]=%s\n",
-                          path, (void*)address, total_mapping_size, mm, node, is_new_mem[node] ? "yes" : "no");
-            
-            if (((uintptr_t)mm) != address) {
-                // If mmap failed completely, delete the file we just created
-                if (mm == MAP_FAILED) {
-                    unlink(path);
-                }
-                
-                // Clean up any mappings we've already created before throwing
-                for (const auto& mapping : numa_mappings) {
-                    munmap(mapping.addr, mapping.size);
-                    unlink(mapping.path.c_str());
-                }
-                LLAMA_LOG_WARN("unable to mmap memory: %d %s\n", errno, strerror(errno));
-                throw std::runtime_error(format("mmap failed: %s", strerror(errno)));
+                throw std::runtime_error(format("pread failed: %s", strerror(errno)));
             }
             
-            // Store the single large mapping
-            numa_mappings.push_back({mm, total_mapping_size, std::string(path)});
+            LLAMA_LOG_INFO("NUMA node %d: loaded %zu bytes from file at %p\n", node, total_size, node_mem);
             
-            if (is_new_mem[node]) {
-                memset(mm, 0, total_mapping_size);
-            }
+            // Store the NUMA allocation directly
+            numa_mappings.push_back({node_mem, total_size, ""});
         }
+
+        // Set addr to the first allocation for compatibility
+        addr = numa_mappings.empty() ? nullptr : numa_mappings[0].addr;
         
-        // Update global offset tracking
-        i = hugepages_needed;
-        base_address_offset += i * GGML_MMAP_HUGEPAGESZ;
-        file_name_offset += i;
-        if (is_new_mem[0]) {
-            LLAMA_LOG_INFO("begin to copy from disk to mem ...\n");
-            size_t n = 0;
-            while (n < total_size) {
-                int nn = read(fd, (void*)((uintptr_t)addr + n), 1024 * 1024);
-                if (nn < 0) {
-                    LLAMA_LOG_WARN("unable to read from file: %d %s\n", errno, strerror(errno));
-                    throw std::runtime_error(format("read failed: %s", strerror(errno)));
-                }
-                n += nn;
-            }
-        }
-        for (int node = 1; node < num_nodes; ++node) {
-            if (is_new_mem[node]) {
-                LLAMA_LOG_INFO("begin to copy from numa0 to numa%d ...\n", node);
-                memcpy((void*)((uintptr_t)addr + \
-                            node * GGML_MMAP_VIRTUAL_MEMORY_NUMA_INCREMENT), \
-                        addr, total_size);
-            }
-        }
-
-        if (oldpolicy == MPOL_DEFAULT) {
-            numa_set_localalloc();
-        } else {
-            set_mempolicy(oldpolicy, oldmask->maskp,
-                          oldmask->size + 1);
-        }
-        numa_free_cpumask(oldmask);
+        LLAMA_LOG_INFO("NUMA mirror mode: successfully created %d copies of %zu bytes\n", 
+                      num_nodes, total_size);
 #endif // GGML_NUMA_MIRROR
 
 #ifndef GGML_NUMA_MIRROR
@@ -697,14 +586,6 @@ struct llama_mmap::impl {
         }
         size = total_size;
         
-        int oldpolicy;
-        struct bitmask* oldmask = numa_allocate_nodemask();
-        if (get_mempolicy(&oldpolicy, oldmask->maskp,
-                          oldmask->size + 1, 0, 0) < 0) {
-            LLAMA_LOG_WARN("get_mempolicy failed, errno=%d %s\n", errno, strerror(errno));
-            oldpolicy = MPOL_DEFAULT;
-        }
-
         // Get the number of NUMA nodes
         int num_nodes = numa_num_configured_nodes();
         if (num_nodes <= 0) {
@@ -714,132 +595,61 @@ struct llama_mmap::impl {
         LLAMA_LOG_INFO("Detected %d NUMA nodes for unified multi-part mapping\n", num_nodes);
         LLAMA_LOG_INFO("Total unified model size: %zu bytes across %zu files\n", total_size, files.size());
 
-        char path[128];
-        std::vector<bool> is_new_mem(num_nodes, false);
-        int i;
-        
-        // Set addr to the first mapping for node 0
-        addr = (void*)(GGML_MMAP_VIRTUAL_MEMORY_BASE_OFFSET + base_address_offset);
-        
-        // Calculate number of hugepages needed and total mapping size
-        size_t hugepages_needed = (total_size + GGML_MMAP_HUGEPAGESZ - 1) / GGML_MMAP_HUGEPAGESZ;
-        size_t total_mapping_size = hugepages_needed * GGML_MMAP_HUGEPAGESZ;
-        
-        LLAMA_LOG_INFO("Creating unified mapping: %zu hugepages (%zu bytes total) for %zu bytes across %zu files\n", 
-                      hugepages_needed, total_mapping_size, total_size, files.size());
+        LLAMA_LOG_INFO("Creating NUMA mirrors with numa_alloc_onnode: %zu bytes per node for %zu files\n", 
+                      total_size, files.size());
 
+        // Allocate and populate memory on each NUMA node using numa_alloc_onnode
         for (int node = 0; node < num_nodes; ++node) {
-            numa_set_preferred(node);
-            LLAMA_LOG_INFO("numa_set_preferred(%d) - creating single unified mapping\n", node);
-
-            // Create one large hugepage file for this entire unified mapping
-            sprintf(path, "/dev/hugepages/llama-unified-node%d-%d", node, file_name_offset);
-            if (!is_new_mem[node]) {
-                is_new_mem[node] = access(path, F_OK) != 0;
-            }
-            
-            int hugefd = open(path, O_CREAT | O_RDWR, 0600);
-            if (hugefd < 0) {
-                // Clean up any mappings we've already created before throwing
-                for (const auto& mapping : numa_mappings) {
-                    munmap(mapping.addr, mapping.size);
-                    unlink(mapping.path.c_str());
-                }
-                LLAMA_LOG_WARN("failed to open hugepage fd %s: %d %s\n",
-                        path, errno, strerror(errno));
-                throw std::runtime_error(format("failed to open hugepage fd: %s", strerror(errno)));
-            }
-
-            // Resize the hugepage file to accommodate the entire unified mapping
-            if (ftruncate(hugefd, total_mapping_size) != 0) {
-                close(hugefd);
-                unlink(path);
-                // Clean up any mappings we've already created before throwing
-                for (const auto& mapping : numa_mappings) {
-                    munmap(mapping.addr, mapping.size);
-                    unlink(mapping.path.c_str());
-                }
-                LLAMA_LOG_WARN("failed to resize hugepage file %s: %d %s\n",
-                        path, errno, strerror(errno));
-                throw std::runtime_error(format("ftruncate failed: %s", strerror(errno)));
-            }
-
-            // Create one large mapping for the entire unified model on this NUMA node
-            uintptr_t address = GGML_MMAP_VIRTUAL_MEMORY_BASE_OFFSET + 
-                               node * GGML_MMAP_VIRTUAL_MEMORY_NUMA_INCREMENT + 
-                               base_address_offset;
-                               
-            void* mm = mmap((void*)address, total_mapping_size, PROT_READ | PROT_WRITE,
-                           MAP_SHARED | MAP_HUGETLB | MAP_POPULATE, hugefd, 0);
-            close(hugefd);
-            
-            LLAMA_LOG_INFO("mmap(%s) desire=%p size=%zu result=%p is_new_mem[%d]=%s\n",
-                          path, (void*)address, total_mapping_size, mm, node, is_new_mem[node] ? "yes" : "no");
-            
-            if (((uintptr_t)mm) != address) {
-                // If mmap failed completely, delete the file we just created
-                if (mm == MAP_FAILED) {
-                    unlink(path);
-                }
-                
-                // Clean up any mappings we've already created before throwing
-                for (const auto& mapping : numa_mappings) {
-                    munmap(mapping.addr, mapping.size);
-                    unlink(mapping.path.c_str());
-                }
-                LLAMA_LOG_WARN("unable to mmap memory: %d %s\n", errno, strerror(errno));
-                throw std::runtime_error(format("mmap failed: %s", strerror(errno)));
-            }
-            
-            // Store the single large mapping
-            numa_mappings.push_back({mm, total_mapping_size, std::string(path)});
-            
-            if (is_new_mem[node]) {
-                memset(mm, 0, total_mapping_size);
-            }
-        }
-        
-        // Update global offset tracking
-        i = hugepages_needed;
-        base_address_offset += i * GGML_MMAP_HUGEPAGESZ;
-        file_name_offset += i;
-        
-        if (is_new_mem[0]) {
-            LLAMA_LOG_INFO("begin to copy unified model data from disk to mem...\n");
-            size_t offset = 0;
-            for (const auto * file : files) {
-                LLAMA_LOG_INFO("copying file data at offset %zu, size %zu\n", offset, file->size());
-                int fd = file->file_id();
-                size_t file_size = file->size();
-                size_t n = 0;
-                while (n < file_size) {
-                    int nn = read(fd, (void*)((uintptr_t)addr + offset + n), std::min(size_t(1024 * 1024), file_size - n));
-                    if (nn < 0) {
-                        LLAMA_LOG_WARN("unable to read from file: %d %s\n", errno, strerror(errno));
-                        throw std::runtime_error(format("read failed: %s", strerror(errno)));
+            void* node_addr = numa_alloc_onnode(total_size, node);
+            if (!node_addr) {
+                LLAMA_LOG_ERROR("Failed to allocate %zu bytes on NUMA node %d\n", total_size, node);
+                // Clean up any previous allocations
+                for (int cleanup_node = 0; cleanup_node < node; ++cleanup_node) {
+                    for (auto& mapping : numa_mappings) {
+                        if (mapping.addr) {
+                            numa_free(mapping.addr, mapping.size);
+                        }
                     }
-                    n += nn;
                 }
-                offset += file_size;
+                throw std::runtime_error(format("Failed to allocate memory on NUMA node %d", node));
             }
+            
+            // Store the mapping
+            numa_mappings.push_back({node_addr, total_size, ""});
+            
+            LLAMA_LOG_INFO("NUMA node %d: allocated %zu bytes at %p\n", node, total_size, node_addr);
         }
         
-        for (int node = 1; node < num_nodes; ++node) {
-            if (is_new_mem[node]) {
-                LLAMA_LOG_INFO("begin to copy unified model from numa0 to numa%d...\n", node);
-                memcpy((void*)((uintptr_t)addr + \
-                            node * GGML_MMAP_VIRTUAL_MEMORY_NUMA_INCREMENT), \
-                        addr, total_size);
+        // Copy data from files to first NUMA node
+        LLAMA_LOG_INFO("Loading data from files to NUMA node 0...\n");
+        size_t offset = 0;
+        for (const auto * file : files) {
+            LLAMA_LOG_INFO("Copying file data at offset %zu, size %zu\n", offset, file->size());
+            int fd = file->file_id();
+            size_t file_size = file->size();
+            size_t n = 0;
+            while (n < file_size) {
+                int nn = read(fd, (char*)numa_mappings[0].addr + offset + n, 
+                             std::min(size_t(1024 * 1024), file_size - n));
+                if (nn < 0) {
+                    LLAMA_LOG_WARN("Unable to read from file: %d %s\n", errno, strerror(errno));
+                    throw std::runtime_error(format("read failed: %s", strerror(errno)));
+                }
+                n += nn;
             }
+            offset += file_size;
+        }
+        
+        // Copy data from first NUMA node to other nodes
+        for (int node = 1; node < num_nodes; ++node) {
+            LLAMA_LOG_INFO("Copying model data from NUMA node 0 to node %d...\n", node);
+            memcpy(numa_mappings[node].addr, numa_mappings[0].addr, total_size);
         }
 
-        if (oldpolicy == MPOL_DEFAULT) {
-            numa_set_localalloc();
-        } else {
-            set_mempolicy(oldpolicy, oldmask->maskp,
-                          oldmask->size + 1);
-        }
-        numa_free_cpumask(oldmask);
+        
+        // Set addr to first node's allocation for compatibility
+        addr = numa_mappings[0].addr;
+        size = total_size;
 #else
         // For non-NUMA case, fall back to individual file mappings
         // This is a simplified version - in practice you'd want to create
@@ -938,15 +748,10 @@ struct llama_mmap::impl {
 
     ~impl() {
 #ifdef GGML_NUMA_MIRROR
-        // Unmap all NUMA hugepage mappings
+        // Free all NUMA memory allocations
         for (const auto& mapping : numa_mappings) {
-            if (munmap(mapping.addr, mapping.size)) {
-                LLAMA_LOG_WARN("warning: failed to munmap NUMA hugepage: %s\n", strerror(errno));
-            }
-            // Delete the hugepage file
-            if (unlink(mapping.path.c_str())) {
-                LLAMA_LOG_WARN("warning: failed to unlink hugepage file %s: %s\n", 
-                              mapping.path.c_str(), strerror(errno));
+            if (mapping.addr) {
+                numa_free(mapping.addr, mapping.size);
             }
         }
 #else
@@ -1104,6 +909,54 @@ llama_mmap::~llama_mmap() = default;
 
 size_t llama_mmap::size() const { return pimpl->size; }
 void * llama_mmap::addr() const { return pimpl->addr; }
+
+void * llama_mmap::numa_addr(size_t offset, int numa_node) const {
+#ifdef GGML_NUMA_MIRROR
+    if (numa_node == -1) {
+        numa_node = ggml_current_numa_node;
+        if (numa_node == -1) numa_node = 0;
+    }
+    
+    // For NUMA mappings, check if we have multiple nodes
+    if (!pimpl->numa_mappings.empty()) {
+        // Check if this looks like mirror mode (all nodes have same size)
+        bool is_mirror_mode = true;
+        if (pimpl->numa_mappings.size() > 1) {
+            size_t first_size = pimpl->numa_mappings[0].size;
+            for (size_t i = 1; i < pimpl->numa_mappings.size(); i++) {
+                if (pimpl->numa_mappings[i].size != first_size) {
+                    is_mirror_mode = false;
+                    break;
+                }
+            }
+        }
+        
+        if (is_mirror_mode) {
+            // Mirror mode: each node has the full data, return node's address + offset
+            if (numa_node < 0 || numa_node >= (int)pimpl->numa_mappings.size()) {
+                numa_node = 0;
+            }
+            return (char*)pimpl->numa_mappings[numa_node].addr + offset;
+        } else {
+            // Distribute mode: data is split across nodes, find which node contains this offset
+            size_t current_offset = 0;
+            for (size_t i = 0; i < pimpl->numa_mappings.size(); i++) {
+                if (offset >= current_offset && offset < current_offset + pimpl->numa_mappings[i].size) {
+                    // This node contains the requested offset
+                    return (char*)pimpl->numa_mappings[i].addr + (offset - current_offset);
+                }
+                current_offset += pimpl->numa_mappings[i].size;
+            }
+            // If we get here, offset is beyond the data - return first node
+            return pimpl->numa_mappings[0].addr;
+        }
+    }
+#else
+    GGML_UNUSED(numa_node);
+#endif
+    // Fallback to regular addressing
+    return (char*)pimpl->addr + offset;
+}
 
 void llama_mmap::unmap_fragment(size_t first, size_t last) { pimpl->unmap_fragment(first, last); }
 

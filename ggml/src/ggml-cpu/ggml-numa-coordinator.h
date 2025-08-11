@@ -310,6 +310,16 @@ int64_t ggml_numa_cache_aware_chunk_size(const struct ggml_numa_cache_info * cac
                                           int batch_size,
                                           int element_size);
 
+/**
+ * Get list of active NUMA nodes from coordinator manager
+ * 
+ * @param mgr Manager instance (NULL for global singleton)
+ * @param nodes Output array to fill with active node IDs
+ * @param max_nodes Maximum number of nodes to return
+ * @return Number of active nodes, or -1 on error
+ */
+int ggml_numa_coordinator_get_active_nodes(struct ggml_numa_coordinator_manager * mgr, int * nodes, int max_nodes);
+
 #ifdef __cplusplus
 }
 #endif

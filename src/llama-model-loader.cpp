@@ -1002,7 +1002,28 @@ void llama_model_loader::load_data_for(struct ggml_tensor * cur) const {
             
             const auto & mapping = mappings[0];
             if (tensor_data(cur) == nullptr) {
+#ifdef GGML_NUMA_MIRROR
+                // For NUMA mirror mode, set up all node addresses
+                if (ggml_numa_should_mirror()) {
+                    // Set up tensor data pointers for all NUMA nodes
+                    cur->__data[0] = (uint8_t *)mapping->numa_addr(unified_offset, 0);
+                    int num_nodes = ggml_numa_node_count();
+                    if (num_nodes > GGML_NUMA_MAX_NODES) {
+                        num_nodes = GGML_NUMA_MAX_NODES;
+                    }
+                    for (int i = 1; i < GGML_NUMA_MAX_NODES; i++) {
+                        if (i < num_nodes) {
+                            cur->__data[i] = (uint8_t *)mapping->numa_addr(unified_offset, i);
+                        } else {
+                            cur->__data[i] = cur->__data[0];
+                        }
+                    }
+                } else {
+                    tensor_set_data(cur, (uint8_t *)mapping->addr() + unified_offset);
+                }
+#else
                 tensor_set_data(cur, (uint8_t *)mapping->addr() + unified_offset);
+#endif
             } else {
                 memcpy(tensor_data(cur), (uint8_t *)mapping->addr() + unified_offset, ggml_nbytes(cur));
             }
@@ -1011,7 +1032,27 @@ void llama_model_loader::load_data_for(struct ggml_tensor * cur) const {
             // Original per-file mapping logic
             const auto & mapping = mappings.at(w.idx);
             if (tensor_data(cur) == nullptr) {
+#ifdef GGML_NUMA_MIRROR
+                // For NUMA mirror mode, set up all node addresses  
+                if (ggml_numa_should_mirror()) {
+                    cur->__data[0] = (uint8_t *)mapping->numa_addr(w.offs, 0);
+                    int num_nodes = ggml_numa_node_count();
+                    if (num_nodes > GGML_NUMA_MAX_NODES) {
+                        num_nodes = GGML_NUMA_MAX_NODES;
+                    }
+                    for (int i = 1; i < GGML_NUMA_MAX_NODES; i++) {
+                        if (i < num_nodes) {
+                            cur->__data[i] = (uint8_t *)mapping->numa_addr(w.offs, i);
+                        } else {
+                            cur->__data[i] = cur->__data[0];
+                        }
+                    }
+                } else {
+                    tensor_set_data(cur, (uint8_t *)mapping->addr() + w.offs);
+                }
+#else
                 tensor_set_data(cur, (uint8_t *)mapping->addr() + w.offs);
+#endif
             } else {
                 memcpy(tensor_data(cur), (uint8_t *)mapping->addr() + w.offs, ggml_nbytes(cur));
             }

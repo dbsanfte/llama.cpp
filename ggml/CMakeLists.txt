@@ -355,33 +355,16 @@ if (GGML_NUMA_MIRROR)
     endif()
     message(STATUS "libnuma: ${NUMA_LIBRARY}")
 
-    if (NOT DEFINED GGML_MMAP_VIRTUAL_MEMORY_BASE_OFFSET)
-        set(GGML_MMAP_VIRTUAL_MEMORY_BASE_OFFSET "0x200000000000ULL")
-    endif()
-    if (NOT DEFINED GGML_MMAP_VIRTUAL_MEMORY_NUMA_INCREMENT)
-        set(GGML_MMAP_VIRTUAL_MEMORY_NUMA_INCREMENT "0x200000000000ULL")
-    endif()
-    if (NOT DEFINED GGML_MMAP_HUGEPAGESZ)
-        set(GGML_MMAP_HUGEPAGESZ "1073741824ULL")
-    endif()
-
     message(STATUS
             "-----------------\n"
             "Enabling GGML_NUMA_MIRROR (GGML_NUMA compatibility enabled)\n"
-            "Hugepages must be reserved properly,\n"
-            "and your program should have write access to /dev/hugepages\n"
-            "GGML_MMAP_VIRTUAL_MEMORY_BASE_OFFSET    = ${GGML_MMAP_VIRTUAL_MEMORY_BASE_OFFSET}\n"
-            "GGML_MMAP_VIRTUAL_MEMORY_NUMA_INCREMENT = ${GGML_MMAP_VIRTUAL_MEMORY_NUMA_INCREMENT}\n"
-            "GGML_MMAP_HUGEPAGESZ                    = ${GGML_MMAP_HUGEPAGESZ}")
+            "Uses numa_alloc_onnode() for reliable NUMA-aware memory allocation")
     message(STATUS
             "-----------------")
 
     foreach(lib "ggml" "ggml-base")
         target_compile_definitions(${lib} PUBLIC GGML_NUMA_MIRROR)
         target_compile_definitions(${lib} PUBLIC GGML_NUMA)
-        target_compile_definitions(${lib} PUBLIC GGML_MMAP_VIRTUAL_MEMORY_BASE_OFFSET=${GGML_MMAP_VIRTUAL_MEMORY_BASE_OFFSET})
-        target_compile_definitions(${lib} PUBLIC GGML_MMAP_VIRTUAL_MEMORY_NUMA_INCREMENT=${GGML_MMAP_VIRTUAL_MEMORY_NUMA_INCREMENT})
-        target_compile_definitions(${lib} PUBLIC GGML_MMAP_HUGEPAGESZ=${GGML_MMAP_HUGEPAGESZ})
         target_link_libraries(${lib} PUBLIC ${NUMA_LIBRARY})
     endforeach()
 endif()

@@ -40,7 +40,7 @@ static struct {
     .numa_nodes = 1, 
     .numa_enabled = false,
     .coordinator = NULL,
-    .threadpool_params = {0},
+    .threadpool_params = {{0}},  // Proper nested braces for struct initialization
     .threadpool_params_valid = false,
     .cache_strategy = 0  // DISABLED by default
 };
@@ -524,7 +524,7 @@ struct ggml_state {
     int initialized;
 };
 
-static struct ggml_state g_state = {0};
+// Note: g_state removed as it was unused
 
 void ggml_barrier(struct ggml_threadpool * tp) {
     int n_threads = atomic_load_explicit(&tp->n_threads_cur, memory_order_relaxed);
