@@ -383,6 +383,31 @@ public:
                 baseline_results.push_back(result);
                 printf("   ✅ Batch %d: %.2f ms average, %.3f GOPS\n", 
                        batch_size, result.avg_time_ms, result.gflops);
+                
+                // Convert to PerformanceResult and add to global results for NUMA scaling comparison
+                PerformanceResult perf_result = {};
+                perf_result.test_name = "Baseline-SingleCore-B" + std::to_string(batch_size);
+                perf_result.cpu_config = "Single-Core";
+                perf_result.numa_nodes = 1;
+                perf_result.total_threads = 1;  // KEY: This makes it findable by NUMA scaling test
+                perf_result.tensor_elements = g_test_config.tensor_size;
+                perf_result.batch_size = batch_size;
+                perf_result.operations_count = batch_size * 3; // A + B + Result operations
+                perf_result.setup_time_ms = 0;
+                perf_result.execution_time_ms = result.avg_time_ms;
+                perf_result.cleanup_time_ms = 0;
+                perf_result.total_time_ms = result.avg_time_ms;
+                perf_result.throughput_gops = result.gflops;
+                perf_result.throughput_gbps = (result.gflops * sizeof(float)) / 1e9;
+                perf_result.scaling_efficiency = 1.0; // This IS the baseline
+                perf_result.numa_efficiency = 1.0;
+                perf_result.absolute_speedup = 1.0; // This IS the baseline
+                perf_result.cpu_utilization = 100.0 / max_logical_cpus; // Single core usage
+                perf_result.active_cores = 1;
+                perf_result.success = true;
+                
+                // Add to global results so NUMA scaling test can find it
+                results.push_back(perf_result);
             } else {
                 printf("   ❌ Batch %d: Test failed\n", batch_size);
             }
@@ -872,10 +897,11 @@ public:
                 return result;
             }
             
-            struct ggml_init_params init_params = {0};
-            init_params.mem_size = static_cast<size_t>(required_memory);
-            init_params.mem_buffer = nullptr;
-            init_params.no_alloc = false;
+            struct ggml_init_params init_params = {
+                static_cast<size_t>(required_memory), // mem_size
+                nullptr,                              // mem_buffer
+                false                                 // no_alloc
+            };
             
             struct ggml_context * ctx = ggml_init(init_params);
             if (!ctx) {
@@ -897,11 +923,14 @@ public:
             // without actually creating a coordinator manager, since that requires thread pool setup
             
             // Create workload info for strategy selection
-            struct ggml_numa_workload_info workload = {0};
-            workload.matrix_dim = static_cast<int>(matrix_dim);
-            workload.batch_size = batch_size;
-            workload.available_memory_gb = 32;
-            workload.prioritize_scaling_accuracy = false;
+            struct ggml_numa_workload_info workload = {
+                static_cast<int>(matrix_dim), // matrix_dim
+                batch_size,                   // batch_size
+                32,                          // available_memory_gb
+                false,                       // prioritize_scaling_accuracy
+                GGML_NUMA_STRATEGY_AUTO,     // user_override
+                {}                           // cache_info (empty)
+            };
             
             enum ggml_numa_memory_strategy chosen_strategy;
             
@@ -917,6 +946,9 @@ public:
                     chosen_strategy = GGML_NUMA_STRATEGY_MATRIX_REDUCTION;
                 }
             }
+            
+            // Strategy chosen for cache-aware analysis (used for validation)
+            (void)chosen_strategy; // Suppress unused variable warning
             
             // For this test, we'll use standard ggml computation without the coordinator
             // The performance difference should be visible in the strategy choice and tile sizing
@@ -1557,12 +1589,14 @@ public:
                     "Cache-Aware", batch_size, tensor_size, iterations, true);
                     
                 // Show which strategy was chosen for cache-aware
-                struct ggml_numa_workload_info workload = {0};
-                workload.matrix_dim = matrix_dim;
-                workload.batch_size = batch_size;
-                workload.available_memory_gb = 32;
-                workload.prioritize_scaling_accuracy = false;
-                workload.user_override = GGML_NUMA_STRATEGY_AUTO;
+                struct ggml_numa_workload_info workload = {
+                    matrix_dim,                  // matrix_dim
+                    batch_size,                  // batch_size  
+                    32,                         // available_memory_gb
+                    false,                      // prioritize_scaling_accuracy
+                    GGML_NUMA_STRATEGY_AUTO,    // user_override
+                    {}                          // cache_info (empty)
+                };
                 enum ggml_numa_memory_strategy cache_strategy = ggml_numa_choose_strategy(&workload);
                 
                 const char* strategy_names[] = {"AUTO", "MATRIX_REDUCTION", "CHUNKED_PROCESSING", "HYBRID"};
@@ -1713,7 +1747,8 @@ public:
         // Find single-core baseline from earlier tests for comparison
         double single_core_baseline_gops = 0.0;
         for (const auto& result : results) {
-            if (result.test_name.find("Matrix") == 0 && result.total_threads == 1) {
+            // Look for baseline single-core tests added by test_single_core_baseline()
+            if ((result.test_name.find("Baseline-SingleCore") == 0 || result.test_name.find("Matrix") == 0) && result.total_threads == 1) {
                 single_core_baseline_gops = std::max(single_core_baseline_gops, result.throughput_gops);
             }
         }
@@ -1916,6 +1951,7 @@ private:
 
     // Create combined virtual NUMA CPU mask that uses ALL cores organized by NUMA count
     void create_combined_virtual_numa_mask(bool cpumask[GGML_MAX_N_THREADS], int total_numa_nodes) {
+        (void)total_numa_nodes; // Suppress unused parameter warning
         memset(cpumask, false, sizeof(bool) * GGML_MAX_N_THREADS);
         
         // Get CPU topology 
