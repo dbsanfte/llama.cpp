@@ -6980,3 +6980,20 @@ bool ggml_threadpool_params_match(const struct ggml_threadpool_params * p0, cons
     if (p0->warn_on_numa_override != p1->warn_on_numa_override) return false;
     return memcmp(p0->cpumask, p1->cpumask, GGML_MAX_N_THREADS) == 0;
 }
+
+// NUMA function stubs - these provide default implementations when CPU backend is not available
+// The real implementations in ggml-cpu.c will override these when CPU backend is linked
+
+#ifdef GGML_NUMA_MIRROR
+__attribute__((weak)) bool ggml_numa_should_mirror(void) {
+    return false;  // NUMA mirroring disabled by default
+}
+#endif
+
+__attribute__((weak)) bool ggml_is_numa(void) {
+    return false;  // NUMA not available by default
+}
+
+__attribute__((weak)) int ggml_numa_node_count(void) {
+    return 1;  // Default to single node
+}

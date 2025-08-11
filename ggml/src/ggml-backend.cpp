@@ -1970,27 +1970,38 @@ static ggml_backend_buffer_t ggml_backend_cpu_buffer_type_alloc_buffer(ggml_back
 #ifdef GGML_NUMA_MIRROR
     // Try NUMA allocation first if NUMA is available
     if (numa_available() != -1) {
-        // Get preferred NUMA node based on current CPU
-        int numa_node = 0;
+        // Eagerly distribute across all available NUMA nodes for optimal load balancing
         int max_node = numa_max_node();
-        if (max_node >= 0) {
-            // Use current CPU's NUMA node for optimal locality
-            numa_node = numa_node_of_cpu(sched_getcpu());
-            if (numa_node < 0 || numa_node > max_node) {
-                numa_node = 0; // fallback to node 0
+        if (max_node > 0) {
+            // Use simple round-robin across all available nodes
+            static int allocation_counter = 0;
+            int numa_node = allocation_counter % (max_node + 1);
+            allocation_counter++;
+            
+            // Try NUMA allocation with proper alignment
+            data = numa_alloc_onnode(size, numa_node);
+            if (data) {
+                // Verify alignment for NUMA allocated memory
+                if ((uintptr_t)data % TENSOR_ALIGNMENT != 0) {
+                    // NUMA allocation not properly aligned, fall back
+                    numa_free(data, size);
+                    data = NULL;
+                } else {
+                    used_numa_allocation = true;
+                }
             }
-        }
-        
-        // Try NUMA allocation with proper alignment
-        data = numa_alloc_onnode(size, numa_node);
-        if (data) {
-            // Verify alignment for NUMA allocated memory
-            if ((uintptr_t)data % TENSOR_ALIGNMENT != 0) {
-                // NUMA allocation not properly aligned, fall back
-                numa_free(data, size);
-                data = NULL;
-            } else {
-                used_numa_allocation = true;
+        } else {
+            // Single NUMA node system - allocate locally
+            data = numa_alloc_local(size);
+            if (data) {
+                // Verify alignment for NUMA allocated memory
+                if ((uintptr_t)data % TENSOR_ALIGNMENT != 0) {
+                    // NUMA allocation not properly aligned, fall back
+                    numa_free(data, size);
+                    data = NULL;
+                } else {
+                    used_numa_allocation = true;
+                }
             }
         }
     }

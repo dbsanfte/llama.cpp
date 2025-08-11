@@ -288,6 +288,11 @@ set(LLAMA_TEST_NAME test-cpu-numa-enhancement)
 llama_build_and_test(test-cpu-numa-enhancement.cpp)
 target_link_libraries(${LLAMA_TEST_NAME} PRIVATE ggml ggml-cpu common numa)
 
+# test-dual-numa-buffer-allocation
+set(LLAMA_TEST_NAME test-dual-numa-buffer-allocation)
+llama_build_and_test(test-dual-numa-buffer-allocation.cpp)
+target_link_libraries(${LLAMA_TEST_NAME} PRIVATE ggml ggml-cpu common numa)
+
 # test-cpu-numa-enhancement-simple
 set(LLAMA_TEST_NAME test-cpu-numa-enhancement-simple)
 llama_build_and_test(test-cpu-numa-enhancement-simple.cpp)
@@ -297,3 +302,10 @@ target_link_libraries(${LLAMA_TEST_NAME} PRIVATE ggml ggml-cpu common numa)
 set(LLAMA_TEST_NAME test-cpu-buffer-direct)
 llama_build_and_test(test-cpu-buffer-direct.cpp)
 target_link_libraries(${LLAMA_TEST_NAME} PRIVATE ggml ggml-cpu common numa)
+
+# test-numa-coordinator-repack-integration  
+set(LLAMA_TEST_NAME test-numa-coordinator-repack-integration)
+llama_build_and_test(test-numa-coordinator-repack-integration.cpp)
+target_link_libraries(${LLAMA_TEST_NAME} PRIVATE ggml ggml-cpu common numa)
+target_include_directories(${LLAMA_TEST_NAME} PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src)
+target_include_directories(${LLAMA_TEST_NAME} PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src/ggml-cpu)
