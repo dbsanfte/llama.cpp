@@ -173,6 +173,130 @@ public:
     }
 };
 
+// Global results collection for summary table
+struct TestResult {
+    std::string test_name;
+    std::string matrix_config;  // e.g., "1024x1024x1024" or "batch=8"
+    int numa_nodes;
+    double time_ms;
+    double gflops;
+    double memory_bw_gb_s;
+    double speedup;
+    
+    TestResult(const std::string& name, const std::string& config, int nodes, 
+               double time, double gf, double bw, double sp = 1.0)
+        : test_name(name), matrix_config(config), numa_nodes(nodes), 
+          time_ms(time), gflops(gf), memory_bw_gb_s(bw), speedup(sp) {}
+};
+
+class SummaryCollector {
+public:
+    static std::vector<TestResult> all_results;
+    
+    static void add_result(const TestResult& result) {
+        all_results.push_back(result);
+    }
+    
+    static void display_final_summary();
+};
+
+std::vector<TestResult> SummaryCollector::all_results;
+
+void SummaryCollector::display_final_summary() {
+    if (all_results.empty()) {
+        std::cout << "\n❌ No results collected for summary" << std::endl;
+        return;
+    }
+    
+    std::cout << "\n" << std::string(100, '=') << std::endl;
+    std::cout << "🏆 COMPREHENSIVE NUMA PERFORMANCE SUMMARY" << std::endl;
+    std::cout << std::string(100, '=') << std::endl;
+    
+    // Group results by test name
+    std::map<std::string, std::vector<TestResult>> grouped_results;
+    for (const auto& result : all_results) {
+        grouped_results[result.test_name].push_back(result);
+    }
+    
+    // Display summary table
+    std::cout << std::left;
+    std::cout << std::setw(35) << "Test Name" 
+              << std::setw(20) << "Matrix Config"
+              << std::setw(6) << "NUMA"
+              << std::setw(12) << "Time (ms)"
+              << std::setw(10) << "GFLOPS"
+              << std::setw(12) << "Memory BW"
+              << std::setw(10) << "Speedup" << std::endl;
+    std::cout << std::string(100, '-') << std::endl;
+    
+    for (const auto& [test_name, results] : grouped_results) {
+        bool first_in_group = true;
+        for (const auto& result : results) {
+            std::cout << std::setw(35) << (first_in_group ? test_name : "")
+                      << std::setw(20) << (first_in_group ? result.matrix_config : "")
+                      << std::setw(6) << result.numa_nodes
+                      << std::setw(12) << std::fixed << std::setprecision(1) << result.time_ms
+                      << std::setw(10) << std::fixed << std::setprecision(1) << result.gflops
+                      << std::setw(12) << std::fixed << std::setprecision(1) << result.memory_bw_gb_s << " GB/s"
+                      << std::setw(10) << std::fixed << std::setprecision(2) << result.speedup << "x" << std::endl;
+            first_in_group = false;
+        }
+        std::cout << std::string(100, '-') << std::endl;
+    }
+    
+    // Performance analysis
+    std::cout << "\n📈 OVERALL PERFORMANCE ANALYSIS:" << std::endl;
+    std::cout << std::string(50, '-') << std::endl;
+    
+    // Find best speedups for each test
+    for (const auto& [test_name, results] : grouped_results) {
+        if (results.size() <= 1) continue;
+        
+        auto best_result = std::max_element(results.begin(), results.end(),
+            [](const TestResult& a, const TestResult& b) {
+                return a.speedup < b.speedup;
+            });
+        
+        std::cout << "• " << test_name << ":" << std::endl;
+        std::cout << "  Best speedup: " << std::fixed << std::setprecision(2) 
+                  << best_result->speedup << "x with " << best_result->numa_nodes << " NUMA nodes" << std::endl;
+        
+        if (best_result->speedup > 1.5) {
+            std::cout << "  ✅ Excellent NUMA scaling!" << std::endl;
+        } else if (best_result->speedup > 1.2) {
+            std::cout << "  ✅ Good NUMA scaling" << std::endl;
+        } else if (best_result->speedup > 1.1) {
+            std::cout << "  ⚠️  Modest NUMA benefit" << std::endl;
+        } else {
+            std::cout << "  ❌ Limited NUMA benefit - investigate bottlenecks" << std::endl;
+        }
+        std::cout << std::endl;
+    }
+    
+    // Overall statistics
+    double total_tests = all_results.size();
+    double avg_speedup = 0.0;
+    double max_speedup = 0.0;
+    int best_numa_nodes = 1;
+    
+    for (const auto& result : all_results) {
+        avg_speedup += result.speedup;
+        if (result.speedup > max_speedup) {
+            max_speedup = result.speedup;
+            best_numa_nodes = result.numa_nodes;
+        }
+    }
+    avg_speedup /= total_tests;
+    
+    std::cout << "🔍 SUMMARY STATISTICS:" << std::endl;
+    std::cout << "   Total test configurations: " << static_cast<int>(total_tests) << std::endl;
+    std::cout << "   Average speedup across all tests: " << std::fixed << std::setprecision(2) << avg_speedup << "x" << std::endl;
+    std::cout << "   Maximum speedup achieved: " << std::fixed << std::setprecision(2) << max_speedup << "x" << std::endl;
+    std::cout << "   Best performing configuration: " << best_numa_nodes << " NUMA nodes" << std::endl;
+    
+    std::cout << std::string(100, '=') << std::endl;
+}
+
 // Matrix multiplication benchmark runner
 class MatrixBenchmark {
 private:
@@ -349,64 +473,95 @@ public:
     // Run comprehensive benchmark comparing different NUMA configurations
     void run_comprehensive_benchmark() {
         std::cout << "\n🧪 Real NUMA Hardware Performance Benchmark" << std::endl;
-        std::cout << "=============================================" << std::endl;
+        std::cout << "Collecting results for final summary table..." << std::endl;
         
-        // Determine which NUMA configurations to test
-        std::vector<int> numa_configs_to_test;
-        numa_configs_to_test.push_back(1); // Always test single NUMA node
+        // Test configurations
+        std::vector<std::pair<int, int>> numa_configs;
+        if (topology.total_numa_nodes >= 1) numa_configs.push_back({1, 1});
+        if (topology.total_numa_nodes >= 2) numa_configs.push_back({2, 2});  
+        if (topology.total_numa_nodes >= 4) numa_configs.push_back({4, 4});
+        if (topology.total_numa_nodes >= 8) numa_configs.push_back({8, 8});
         
-        if (topology.total_numa_nodes >= 2) {
-            numa_configs_to_test.push_back(2);
+        // Matrix multiplication tests
+        struct MatrixTest {
+            int m, n, k;
+            std::string description;
+        };
+        
+        std::vector<MatrixTest> matrix_tests;
+        
+        if (config.quick_mode) {
+            matrix_tests = {
+                {512, 512, 512, "Medium Square (512x512)"}
+            };
+        } else {
+            matrix_tests = {
+                {1024, 1024, 1024, "Large Square (1024x1024)"},
+                {2048, 512, 1024, "Wide Matrix (2048x512)"},
+                {512, 2048, 1024, "Tall Matrix (512x2048)"}
+            };
         }
-        if (topology.total_numa_nodes >= 4) {
-            numa_configs_to_test.push_back(4);
-        }
         
-        std::cout << "Testing NUMA configurations: ";
-        for (size_t i = 0; i < numa_configs_to_test.size(); i++) {
-            std::cout << numa_configs_to_test[i];
-            if (i < numa_configs_to_test.size() - 1) std::cout << ", ";
-        }
-        std::cout << " nodes" << std::endl << std::endl;
-        
-        // Run tests for each matrix configuration
-        for (const auto& matrix_test : config.matrix_tests) {
-            std::cout << "📊 Testing: " << matrix_test.description << std::endl;
-            std::cout << "   Matrix dimensions: " << matrix_test.m << "x" << matrix_test.n 
-                      << " = " << matrix_test.m << "x" << matrix_test.k 
-                      << " * " << matrix_test.k << "x" << matrix_test.n << std::endl;
+        // Run matrix tests
+        for (const auto& matrix_test : matrix_tests) {
+            std::cout << "\n📊 Testing " << matrix_test.description << "..." << std::endl;
             
-            if (!matrix_test.test_batching) {
-                // Single matrix test
+            if (numa_configs.size() > 1) {
                 std::map<int, BenchmarkResult> results;
-                
-                for (int numa_nodes : numa_configs_to_test) {
+                for (const auto& [max_nodes, numa_nodes] : numa_configs) {
+                    std::cout << "   Running with " << numa_nodes << " NUMA nodes..." << std::endl;
                     results[numa_nodes] = run_matrix_multiply(matrix_test.m, matrix_test.n, matrix_test.k, numa_nodes);
                 }
                 
-                // Display results
-                display_results(results, matrix_test.description);
-            } else {
-                // Batch size scaling test
-                std::cout << "   Testing batch size scaling..." << std::endl;
-                
-                for (int batch_size : config.batch_sizes) {
-                    std::cout << "\n   📦 Batch size: " << batch_size << std::endl;
+                // Store results in global collector
+                store_results_for_summary(results, matrix_test.description, 
+                    std::to_string(matrix_test.m) + "x" + std::to_string(matrix_test.n) + "x" + std::to_string(matrix_test.k));
+            }
+            
+            // Batch processing tests  
+            if (!config.quick_mode && numa_configs.size() > 1) {
+                for (int batch_size : {4, 8}) {
+                    std::cout << "   Testing batch size " << batch_size << "..." << std::endl;
                     std::map<int, BenchmarkResult> batch_results;
-                    
-                    for (int numa_nodes : numa_configs_to_test) {
+                    for (const auto& [max_nodes, numa_nodes] : numa_configs) {
                         batch_results[numa_nodes] = run_matrix_multiply(matrix_test.m, matrix_test.n, matrix_test.k, numa_nodes, batch_size);
                     }
                     
-                    display_results(batch_results, "Batch size " + std::to_string(batch_size));
+                    // Store batch results in global collector
+                    store_results_for_summary(batch_results, matrix_test.description + " (batch=" + std::to_string(batch_size) + ")",
+                        std::to_string(matrix_test.m) + "x" + std::to_string(matrix_test.n) + "x" + std::to_string(matrix_test.k) + " batch=" + std::to_string(batch_size));
                 }
             }
-            
-            std::cout << std::endl;
         }
     }
-    
+
 private:
+    // Store results in global collector for final summary
+    void store_results_for_summary(const std::map<int, BenchmarkResult>& results, 
+                                   const std::string& test_name, const std::string& matrix_config) {
+        double baseline_time = 0.0;
+        bool first = true;
+        
+        for (const auto& [numa_nodes, result] : results) {
+            if (first) {
+                baseline_time = result.avg_time_ms;
+                first = false;
+            }
+            
+            double speedup = baseline_time / result.avg_time_ms;
+            
+            SummaryCollector::add_result(TestResult(
+                test_name,
+                matrix_config,
+                numa_nodes,
+                result.avg_time_ms,
+                result.gflops,
+                result.memory_bandwidth_gb_s,
+                speedup
+            ));
+        }
+    }
+
     void display_results(const std::map<int, BenchmarkResult>& results, const std::string& test_name) {
         std::cout << "\n   Results for " << test_name << ":" << std::endl;
         std::cout << "   " << std::string(60, '-') << std::endl;
@@ -536,6 +691,9 @@ int run_real_numa_performance_test(int argc, char** argv) {
     // Run benchmarks
     MatrixBenchmark benchmark(config, topology, force_virtual_numa);
     benchmark.run_comprehensive_benchmark();
+    
+    // Display final comprehensive summary
+    SummaryCollector::display_final_summary();
     
     std::cout << "\n🎯 Test Complete!" << std::endl;
     std::cout << "\nIf you see limited NUMA scaling benefits, consider:" << std::endl;
