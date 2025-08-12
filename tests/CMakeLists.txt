@@ -241,6 +241,12 @@ target_link_libraries(${LLAMA_TEST_NAME} PRIVATE ggml ggml-cpu common)
 target_include_directories(${LLAMA_TEST_NAME} PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src)
 target_include_directories(${LLAMA_TEST_NAME} PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src/ggml-cpu)
 
+# test-real-numa-performance  
+llama_build_and_test(test-real-numa-performance.cpp)
+target_link_libraries(test-real-numa-performance PRIVATE ggml ggml-cpu common)
+target_include_directories(test-real-numa-performance PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src)
+target_include_directories(test-real-numa-performance PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src/ggml-cpu)
+
 # test-chunking-ab-comparison
 set(LLAMA_TEST_NAME test-chunking-ab-comparison)
 llama_build_and_test(test-chunking-ab-comparison.cpp)
