@@ -895,7 +895,21 @@ static void create_optimal_cpu_masks(struct ggml_threadpool_params *tpp, int num
     // If no custom mask is set, create an optimal one based on system topology
     if (!has_custom_mask) {
         GGML_LOG_INFO("🔧 Creating NUMA-aware CPU assignment based on real topology...\n");
-        GGML_LOG_INFO("   Target: %d total threads across %d NUMA nodes\n", tpp->n_threads, num_numa_nodes);
+        
+        // Handle auto-detection (-1) case
+        int target_threads = tpp->n_threads;
+        if (target_threads <= 0) {
+            // Auto-detect: use all available logical CPUs
+#ifdef __linux__
+            target_threads = numa_num_configured_cpus();
+#else
+            target_threads = std::thread::hardware_concurrency();
+#endif
+            GGML_LOG_INFO("   Auto-detected %d threads (was %d)\n", target_threads, tpp->n_threads);
+            tpp->n_threads = target_threads; // Update the threadpool params
+        }
+        
+        GGML_LOG_INFO("   Target: %d total threads across %d NUMA nodes\n", target_threads, num_numa_nodes);
         
         // Clear the mask first
         memset(tpp->cpumask, false, sizeof(tpp->cpumask));
@@ -930,10 +944,10 @@ static void create_optimal_cpu_masks(struct ggml_threadpool_params *tpp, int num
         
         GGML_LOG_INFO("   CPU scanning range: 0 to %d (total CPUs: %d, max CPU number: %d)\n", 
                      cpu_scan_limit - 1, total_cpus, max_cpu_found);
-        int threads_per_node = tpp->n_threads / num_numa_nodes;
+        int threads_per_node = target_threads / num_numa_nodes;
         
         GGML_LOG_INFO("Distributing %d threads across %d NUMA nodes (%d per node)\n", 
-                     tpp->n_threads, num_numa_nodes, threads_per_node);
+                     target_threads, num_numa_nodes, threads_per_node);
         
         for (int node = 0; node < num_numa_nodes; node++) {
             struct bitmask* node_cpus = numa_allocate_cpumask();
@@ -950,11 +964,11 @@ static void create_optimal_cpu_masks(struct ggml_threadpool_params *tpp, int num
                 
                 // Assign threads to this node intelligently
                 int assigned = 0;
-                int target_threads = (node == num_numa_nodes - 1) ? 
-                    (tpp->n_threads - (threads_per_node * (num_numa_nodes - 1))) : threads_per_node;
+                int target_threads_node = (node == num_numa_nodes - 1) ? 
+                    (target_threads - (threads_per_node * (num_numa_nodes - 1))) : threads_per_node;
                 
                 GGML_LOG_INFO("NUMA node %d: has %d CPUs, assigning %d threads\n", 
-                             node, node_cpu_count, target_threads);
+                             node, node_cpu_count, target_threads_node);
                 
                 // Debug: Log which CPUs are available for this node
                 char available_cpu_str[512] = {0};
@@ -1006,7 +1020,7 @@ static void create_optimal_cpu_masks(struct ggml_threadpool_params *tpp, int num
                              primary_count, hyperthread_count);
                 
                 // First pass: assign primary cores
-                for (int i = 0; i < primary_count && assigned < target_threads; i++) {
+                for (int i = 0; i < primary_count && assigned < target_threads_node; i++) {
                     int cpu = primary_cpus[i];
                     tpp->cpumask[cpu] = true;
                     available_cpus[cpu_count++] = cpu;
@@ -1015,7 +1029,7 @@ static void create_optimal_cpu_masks(struct ggml_threadpool_params *tpp, int num
                 }
                 
                 // Second pass: assign hyperthreads if needed
-                for (int i = 0; i < hyperthread_count && assigned < target_threads; i++) {
+                for (int i = 0; i < hyperthread_count && assigned < target_threads_node; i++) {
                     int cpu = hyperthread_cpus[i];
                     tpp->cpumask[cpu] = true;
                     available_cpus[cpu_count++] = cpu;
@@ -1028,7 +1042,7 @@ static void create_optimal_cpu_masks(struct ggml_threadpool_params *tpp, int num
 #else
         // Fallback for non-Linux systems
         GGML_LOG_WARN("Non-Linux system: using simple round-robin CPU assignment\n");
-        for (int i = 0; i < tpp->n_threads && i < GGML_MAX_N_THREADS; i++) {
+        for (int i = 0; i < target_threads && i < GGML_MAX_N_THREADS; i++) {
             tpp->cpumask[i] = true;
             available_cpus[cpu_count++] = i;
         }
