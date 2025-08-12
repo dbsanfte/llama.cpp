@@ -10265,7 +10265,6 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
 
     // Bind current thread to GPU's NUMA node for optimal memory access
 #if defined(__x86_64__) && defined(__linux__)
-    extern bool bind_current_thread_to_gpu_numa(int device_id);
     static bool numa_binding_attempted = false;
     if (!numa_binding_attempted && backend->device) {
         ggml_backend_vk_device_context * dev_ctx = (ggml_backend_vk_device_context *)backend->device->context;

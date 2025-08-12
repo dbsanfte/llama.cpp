@@ -2884,7 +2884,6 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
 
     // Bind current thread to GPU's NUMA node for optimal memory access
 #if defined(__x86_64__) && defined(__linux__)
-    extern bool bind_current_thread_to_gpu_numa(int device_id);
     static bool numa_binding_attempted = false;
     if (!numa_binding_attempted) {
         bind_current_thread_to_gpu_numa(cuda_ctx->device);

@@ -345,6 +345,9 @@ extern "C" {
     GGML_API enum ggml_status ggml_backend_tensor_alloc(ggml_backend_buffer_t buffer, struct ggml_tensor * tensor, void * addr);
     GGML_API enum ggml_status ggml_backend_view_init(struct ggml_tensor * tensor);
 
+    // GPU NUMA binding for backends
+    GGML_BACKEND_API bool bind_current_thread_to_gpu_numa(int device_id);
+
     // CPU buffer types are always available
     GGML_API ggml_backend_buffer_t      ggml_backend_cpu_buffer_from_ptr(void * ptr, size_t size);
     GGML_API ggml_backend_buffer_type_t ggml_backend_cpu_buffer_type(void);

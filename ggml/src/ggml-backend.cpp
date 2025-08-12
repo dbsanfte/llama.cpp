@@ -2086,3 +2086,42 @@ ggml_backend_buffer_t ggml_backend_cpu_buffer_from_ptr(void * ptr, size_t size) 
     GGML_ASSERT((uintptr_t)ptr % TENSOR_ALIGNMENT == 0 && "buffer pointer must be aligned");
     return ggml_backend_buffer_init(ggml_backend_cpu_buffer_from_ptr_type(), ggml_backend_cpu_buffer_from_ptr_i, ptr, size);
 }
+
+// GPU NUMA binding function for backends
+#if defined(__x86_64__) && defined(__linux__)
+bool bind_current_thread_to_gpu_numa(int device_id) {
+    // Simplified implementation for backends - just set the NUMA node for tensor_data()
+#ifdef GGML_NUMA_MIRROR
+    extern __thread int ggml_current_numa_node;
+    
+    // Simple heuristic: assume GPU device_id maps to NUMA node
+    // This can be overridden by a more sophisticated implementation in common library
+    static bool initialization_attempted = false;
+    if (!initialization_attempted) {
+        // Try to determine NUMA node for this GPU device
+        // For now, use a simple mapping: device_id % numa_max_node()
+        if (numa_available() != -1) {
+            int numa_nodes = numa_max_node() + 1;
+            if (numa_nodes > 1) {
+                ggml_current_numa_node = device_id % numa_nodes;
+            } else {
+                ggml_current_numa_node = 0;
+            }
+        } else {
+            ggml_current_numa_node = 0;
+        }
+        initialization_attempted = true;
+    }
+#else
+    (void)device_id; // Suppress unused parameter warning
+#endif
+    
+    return true; // Always return success for basic implementation
+}
+#else
+// Non-Linux or non-x86_64 stub
+bool bind_current_thread_to_gpu_numa(int device_id) {
+    (void)device_id;
+    return true;
+}
+#endif
