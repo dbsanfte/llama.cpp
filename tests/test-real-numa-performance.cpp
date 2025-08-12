@@ -226,8 +226,10 @@ public:
             std::vector<ggml_tensor*> tensors_a, tensors_b, tensors_c;
             
             for (int batch_idx = 0; batch_idx < batch_size; batch_idx++) {
+                // Create tensors following GGML convention: C[m,n] = A[m,k] * B[k,n]
+                // A is (k, m) and B is (k, n) where k is the shared inner dimension (width)
                 struct ggml_tensor* a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, m);
-                struct ggml_tensor* b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n, k);  
+                struct ggml_tensor* b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);  
                 struct ggml_tensor* c = ggml_mul_mat(ctx, a, b);
                 
                 tensors_a.push_back(a);
