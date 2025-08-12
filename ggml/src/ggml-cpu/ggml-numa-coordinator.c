@@ -894,47 +894,109 @@ static void create_optimal_cpu_masks(struct ggml_threadpool_params *tpp, int num
     
     // If no custom mask is set, create an optimal one based on system topology
     if (!has_custom_mask) {
-        GGML_LOG_INFO("🔧 Creating hyperthreading-optimized CPU assignment...\n");
-        
-        // Strategy 1: Physical core separation (Node 0: Cores 0-5, Node 1: Cores 6-10)
-        // This gives true isolation but may not use all logical CPUs
-        
-        // For our Intel Core Ultra 7 165H (11 physical cores, 22 logical):
-        // Node 0: CPUs 0,2,4,6,8,10 (physical cores 0-5, primary threads)
-        // Node 1: CPUs 12,14,16,18,20 + some hyperthread siblings if needed
-        
-        int total_physical_cores = 11;  // Known from our analysis
-        int cores_per_node = total_physical_cores / num_numa_nodes;
+        GGML_LOG_INFO("🔧 Creating NUMA-aware CPU assignment based on real topology...\n");
         
         // Clear the mask first
         memset(tpp->cpumask, false, sizeof(tpp->cpumask));
+        cpu_count = 0;
         
-        // Assign primary threads first for better performance
+#ifdef __linux__
+        // Use real NUMA topology instead of hardcoded assumptions
+        int total_cpus = numa_num_configured_cpus();
+        int threads_per_node = tpp->n_threads / num_numa_nodes;
+        
+        GGML_LOG_INFO("Distributing %d threads across %d NUMA nodes (%d per node)\n", 
+                     tpp->n_threads, num_numa_nodes, threads_per_node);
+        
         for (int node = 0; node < num_numa_nodes; node++) {
-            int start_core = node * cores_per_node;
-            int end_core = (node == num_numa_nodes - 1) ? total_physical_cores : (node + 1) * cores_per_node;
-            
-            GGML_LOG_INFO("   NUMA node %d: assigning physical cores %d-%d\n", 
-                          node, start_core, end_core - 1);
-            
-            for (int core = start_core; core < end_core; core++) {
-                int primary_cpu = core * 2;      // Primary thread: 0,2,4,6,8...
-                int ht_cpu = core * 2 + 1;       // Hyperthread sibling: 1,3,5,7,9...
+            struct bitmask* node_cpus = numa_allocate_cpumask();
+            if (numa_node_to_cpus(node, node_cpus) == 0) {
+                int node_cpu_list[GGML_MAX_N_THREADS];
+                int node_cpu_count = 0;
                 
-                if (primary_cpu < GGML_MAX_N_THREADS) {
-                    tpp->cpumask[primary_cpu] = true;
-                    available_cpus[cpu_count++] = primary_cpu;
+                // Collect all CPUs for this node
+                for (int cpu = 0; cpu < GGML_MAX_N_THREADS && cpu < total_cpus; cpu++) {
+                    if (numa_bitmask_isbitset(node_cpus, cpu)) {
+                        node_cpu_list[node_cpu_count++] = cpu;
+                    }
                 }
                 
-                // Only add hyperthread siblings if we have enough threads to justify it
-                if (tpp->n_threads > total_physical_cores && ht_cpu < GGML_MAX_N_THREADS) {
-                    tpp->cpumask[ht_cpu] = true;
-                    available_cpus[cpu_count++] = ht_cpu;
+                // Assign threads to this node intelligently
+                int assigned = 0;
+                int target_threads = (node == num_numa_nodes - 1) ? 
+                    (tpp->n_threads - (threads_per_node * (num_numa_nodes - 1))) : threads_per_node;
+                
+                GGML_LOG_INFO("NUMA node %d: has %d CPUs, assigning %d threads\n", 
+                             node, node_cpu_count, target_threads);
+                
+                // Sort CPUs by core topology: first physical cores, then hyperthreads
+                int primary_cpus[GGML_MAX_N_THREADS];
+                int hyperthread_cpus[GGML_MAX_N_THREADS];
+                int primary_count = 0, hyperthread_count = 0;
+                
+                for (int i = 0; i < node_cpu_count; i++) {
+                    int cpu = node_cpu_list[i];
+                    
+                    // Try to detect primary vs hyperthread by checking core_id
+                    // For most Intel systems, CPU 0,2,4... or similar patterns are primary
+                    // But we need a more robust detection method
+                    char thread_siblings_path[256];
+                    snprintf(thread_siblings_path, sizeof(thread_siblings_path), 
+                             "/sys/devices/system/cpu/cpu%d/topology/thread_siblings_list", cpu);
+                    
+                    FILE* siblings_file = fopen(thread_siblings_path, "r");
+                    bool is_primary = true; // Default assumption
+                    
+                    if (siblings_file) {
+                        char siblings_line[256];
+                        if (fgets(siblings_line, sizeof(siblings_line), siblings_file)) {
+                            // Parse thread siblings (e.g., "0,56" or "28,84")
+                            // The first number in the list is typically the primary thread
+                            int first_sibling = -1;
+                            sscanf(siblings_line, "%d", &first_sibling);
+                            is_primary = (cpu == first_sibling);
+                        }
+                        fclose(siblings_file);
+                    }
+                    
+                    if (is_primary) {
+                        primary_cpus[primary_count++] = cpu;
+                    } else {
+                        hyperthread_cpus[hyperthread_count++] = cpu;
+                    }
+                }
+                
+                GGML_LOG_INFO("   Primary cores: %d, Hyperthreads: %d\n", 
+                             primary_count, hyperthread_count);
+                
+                // First pass: assign primary cores
+                for (int i = 0; i < primary_count && assigned < target_threads; i++) {
+                    int cpu = primary_cpus[i];
+                    tpp->cpumask[cpu] = true;
+                    available_cpus[cpu_count++] = cpu;
+                    assigned++;
+                }
+                
+                // Second pass: assign hyperthreads if needed
+                for (int i = 0; i < hyperthread_count && assigned < target_threads; i++) {
+                    int cpu = hyperthread_cpus[i];
+                    tpp->cpumask[cpu] = true;
+                    available_cpus[cpu_count++] = cpu;
+                    assigned++;
                 }
             }
+            numa_free_cpumask(node_cpus);
         }
+#else
+        // Fallback for non-Linux systems
+        GGML_LOG_WARN("Non-Linux system: using simple round-robin CPU assignment\n");
+        for (int i = 0; i < tpp->n_threads && i < GGML_MAX_N_THREADS; i++) {
+            tpp->cpumask[i] = true;
+            available_cpus[cpu_count++] = i;
+        }
+#endif
         
-        GGML_LOG_INFO("    Optimal CPU mask created with %d CPUs avoiding HT conflicts\n", cpu_count);
+        GGML_LOG_INFO("    Created NUMA-aware CPU mask with %d CPUs\n", cpu_count);
     } else {
         GGML_LOG_INFO("    Using custom CPU mask with %d CPUs\n", cpu_count);
     }
