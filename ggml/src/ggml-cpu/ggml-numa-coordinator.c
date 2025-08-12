@@ -904,6 +904,32 @@ static void create_optimal_cpu_masks(struct ggml_threadpool_params *tpp, int num
 #ifdef __linux__
         // Use real NUMA topology instead of hardcoded assumptions
         int total_cpus = numa_num_configured_cpus();
+        int max_cpu_num = total_cpus - 1; // numa_num_configured_cpus() returns count, not max number
+        
+        // For systems with gaps in CPU numbering, we need to scan higher
+        // Your system: 112 CPUs numbered 0-27,56-83,28-55,84-111  
+        // So max CPU number is 111, but total_cpus is 112
+        int cpu_scan_limit = GGML_MAX_N_THREADS;
+        
+#ifdef __linux__
+        // Find the actual highest CPU number on the system
+        int max_cpu_found = 0;
+        for (int node = 0; node < num_numa_nodes; node++) {
+            struct bitmask* test_cpus = numa_allocate_cpumask();
+            if (numa_node_to_cpus(node, test_cpus) == 0) {
+                for (int cpu = 0; cpu < GGML_MAX_N_THREADS; cpu++) {
+                    if (numa_bitmask_isbitset(test_cpus, cpu) && cpu > max_cpu_found) {
+                        max_cpu_found = cpu;
+                    }
+                }
+            }
+            numa_free_cpumask(test_cpus);
+        }
+        cpu_scan_limit = max_cpu_found + 1;
+#endif
+        
+        GGML_LOG_INFO("   CPU scanning range: 0 to %d (total CPUs: %d, max CPU number: %d)\n", 
+                     cpu_scan_limit - 1, total_cpus, max_cpu_found);
         int threads_per_node = tpp->n_threads / num_numa_nodes;
         
         GGML_LOG_INFO("Distributing %d threads across %d NUMA nodes (%d per node)\n", 
@@ -916,7 +942,7 @@ static void create_optimal_cpu_masks(struct ggml_threadpool_params *tpp, int num
                 int node_cpu_count = 0;
                 
                 // Collect all CPUs for this node
-                for (int cpu = 0; cpu < GGML_MAX_N_THREADS && cpu < total_cpus; cpu++) {
+                for (int cpu = 0; cpu < cpu_scan_limit; cpu++) {
                     if (numa_bitmask_isbitset(node_cpus, cpu)) {
                         node_cpu_list[node_cpu_count++] = cpu;
                     }
@@ -1206,9 +1232,9 @@ struct ggml_numa_coordinator_manager * ggml_numa_coordinator_manager_new_with_pa
             struct bitmask* node_cpus = numa_allocate_cpumask();
             if (numa_node_to_cpus(i, node_cpus) == 0) {
                 // Debug: Show optimized mask before filtering
-                char opt_mask_str[512] = {0};
+                char opt_mask_str[1024] = {0};  // Increased size for more CPUs
                 int opt_pos = 0;
-                for (int cpu = 0; cpu < GGML_MAX_N_THREADS && opt_pos < 500; cpu++) {
+                for (int cpu = 0; cpu < GGML_MAX_N_THREADS && opt_pos < 1000; cpu++) {
                     if (optimized_tpp.cpumask[cpu]) {
                         opt_pos += snprintf(opt_mask_str + opt_pos, sizeof(opt_mask_str) - opt_pos, 
                                            "%s%d", opt_pos > 0 ? "," : "", cpu);
@@ -1216,10 +1242,10 @@ struct ggml_numa_coordinator_manager * ggml_numa_coordinator_manager_new_with_pa
                 }
                 GGML_LOG_INFO("   Optimized mask before filtering: [%s]\n", opt_mask_str);
                 
-                // Debug: Show what CPUs belong to this NUMA node
-                char node_mask_str[512] = {0};
+                // Debug: Show what CPUs belong to this NUMA node  
+                char node_mask_str[1024] = {0};  // Increased size for more CPUs
                 int node_pos = 0;
-                for (int cpu = 0; cpu < GGML_MAX_N_THREADS && node_pos < 500; cpu++) {
+                for (int cpu = 0; cpu < GGML_MAX_N_THREADS && node_pos < 1000; cpu++) {
                     if (numa_bitmask_isbitset(node_cpus, cpu)) {
                         node_pos += snprintf(node_mask_str + node_pos, sizeof(node_mask_str) - node_pos, 
                                             "%s%d", node_pos > 0 ? "," : "", cpu);
@@ -1241,9 +1267,9 @@ struct ggml_numa_coordinator_manager * ggml_numa_coordinator_manager_new_with_pa
                 
                 if (!has_numa_cpus) {
                     // Debug: Show what filtering failed to find
-                    char filtered_mask_str[512] = {0};
+                    char filtered_mask_str[1024] = {0};  // Increased size for more CPUs
                     int filtered_pos = 0;
-                    for (int cpu = 0; cpu < GGML_MAX_N_THREADS && filtered_pos < 500; cpu++) {
+                    for (int cpu = 0; cpu < GGML_MAX_N_THREADS && filtered_pos < 1000; cpu++) {
                         if (numa_tpp.cpumask[cpu]) {
                             filtered_pos += snprintf(filtered_mask_str + filtered_pos, sizeof(filtered_mask_str) - filtered_pos, 
                                                     "%s%d", filtered_pos > 0 ? "," : "", cpu);
@@ -1255,10 +1281,10 @@ struct ggml_numa_coordinator_manager * ggml_numa_coordinator_manager_new_with_pa
                     memcpy(numa_tpp.cpumask, optimized_tpp.cpumask, sizeof(numa_tpp.cpumask));
                 } else {
                     // Debug: Show successful filtering result
-                    char filtered_mask_str[512] = {0};
+                    char filtered_mask_str[1024] = {0};  // Increased size for more CPUs
                     int filtered_pos = 0;
                     int filtered_count = 0;
-                    for (int cpu = 0; cpu < GGML_MAX_N_THREADS && filtered_pos < 500; cpu++) {
+                    for (int cpu = 0; cpu < GGML_MAX_N_THREADS && filtered_pos < 1000; cpu++) {
                         if (numa_tpp.cpumask[cpu]) {
                             filtered_pos += snprintf(filtered_mask_str + filtered_pos, sizeof(filtered_mask_str) - filtered_pos, 
                                                     "%s%d", filtered_pos > 0 ? "," : "", cpu);
