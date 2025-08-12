@@ -2472,6 +2472,7 @@ extern "C" {
         
         // Multi-socket testing support
         bool                force_multi_socket;          // force multi-socket mode for testing
+        int                 max_numa_nodes;              // maximum NUMA nodes to use (0 = auto-detect all available)
     };
 
     struct ggml_threadpool;     // forward declaration, see ggml.c

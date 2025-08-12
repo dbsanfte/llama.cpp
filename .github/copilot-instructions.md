@@ -25,7 +25,7 @@ This is a fork of llama.cpp with **NUMA-aware improvements** for better CPU thre
 
 ```bash
 # Debug build - configure (pick up new tests)
-cmake -B build -DCMAKE_BUILD_TYPE=Debug -DCMAKE_EXPORT_COMPILE_COMMANDS=ON -DGGML_NUMA_MIRROR=ON -DGGML_OPENMP=ON
+cmake -B build -DCMAKE_BUILD_TYPE=Debug -DCMAKE_EXPORT_COMPILE_COMMANDS=ON -DGGML_NUMA_MIRROR=ON -DGGML_OPENMP=OFF
 
 # Debug build - build
 cmake --build build --parallel

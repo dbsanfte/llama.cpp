@@ -1093,9 +1093,21 @@ struct ggml_numa_coordinator_manager * ggml_numa_coordinator_manager_new_with_pa
     }
 #endif
     
+    // Apply max_numa_nodes limit if specified
+    if (tpp->max_numa_nodes > 0 && num_numa_nodes > tpp->max_numa_nodes) {
+        GGML_LOG_INFO("Limiting NUMA nodes from %d to %d (max_numa_nodes constraint)\n", num_numa_nodes, tpp->max_numa_nodes);
+        num_numa_nodes = tpp->max_numa_nodes;
+    }
+    
     if (tpp->force_multi_socket && !numa_is_available) {
         num_numa_nodes = 2; // Simulate 2 NUMA nodes for testing
         GGML_LOG_INFO("Forcing multi-socket mode with %d simulated NUMA nodes\n", num_numa_nodes);
+    }
+    
+    // Apply max_numa_nodes constraint even for force_multi_socket mode
+    if (tpp->max_numa_nodes > 0 && num_numa_nodes > tpp->max_numa_nodes) {
+        GGML_LOG_INFO("Limiting NUMA nodes from %d to %d (max_numa_nodes constraint)\n", num_numa_nodes, tpp->max_numa_nodes);
+        num_numa_nodes = tpp->max_numa_nodes;
     }
     
     // === COMPREHENSIVE COORDINATOR SETUP LOGGING ===

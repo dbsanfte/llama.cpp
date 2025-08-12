@@ -6960,6 +6960,7 @@ void ggml_threadpool_params_init(struct ggml_threadpool_params * p, int n_thread
     p->allow_numa_override   = true;  // Allow NUMA to override strict_cpu for locality
     p->warn_on_numa_override = true;  // Warn users when we override their settings
     p->force_multi_socket    = false; // CRITICAL FIX: Initialize to false to prevent random coordinator activation
+    p->max_numa_nodes        = 0;     // Auto-detect all available NUMA nodes
     
     memset(p->cpumask, 0, GGML_MAX_N_THREADS); // all-zero means use the default affinity (usually inherited)
 }
@@ -6978,6 +6979,8 @@ bool ggml_threadpool_params_match(const struct ggml_threadpool_params * p0, cons
     if (p0->numa_aware            != p1->numa_aware           ) return false;
     if (p0->allow_numa_override   != p1->allow_numa_override  ) return false;
     if (p0->warn_on_numa_override != p1->warn_on_numa_override) return false;
+    if (p0->force_multi_socket    != p1->force_multi_socket   ) return false;
+    if (p0->max_numa_nodes        != p1->max_numa_nodes       ) return false;
     return memcmp(p0->cpumask, p1->cpumask, GGML_MAX_N_THREADS) == 0;
 }
 

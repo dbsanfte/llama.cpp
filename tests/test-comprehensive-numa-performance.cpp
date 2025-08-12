@@ -2121,10 +2121,12 @@ private:
             if (use_real_numa && can_use_real_numa) {
                 // Use real NUMA - let coordinator handle it naturally
                 tpp.force_multi_socket = true;
+                tpp.max_numa_nodes = numa_nodes;  // Specify the exact number of NUMA nodes desired
                 memset(tpp.cpumask, false, sizeof(tpp.cpumask)); // Auto-optimization
             } else {
                 // Virtual NUMA simulation with constant thread count approach
                 tpp.force_multi_socket = true;
+                tpp.max_numa_nodes = numa_nodes;  // Specify virtual NUMA node count
                 
                 // Use constant thread allocation for ALL virtual NUMA configurations
                 create_virtual_numa_with_constant_threads(tpp.cpumask, numa_nodes);
