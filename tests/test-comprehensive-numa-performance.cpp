@@ -1137,6 +1137,7 @@ public:
             
             // LIGHTWEIGHT WARMUP - Just a small operation to initialize coordinator state
             printf("   🔥 Warmup coordinator...\n");
+            printf("   DEBUG: Creating warmup graph...\n");
             
             // Create a minimal warmup operation (single small matrix)
             struct ggml_cgraph * warmup_graph = ggml_new_graph(ctx);
@@ -1144,17 +1145,22 @@ public:
             struct ggml_tensor * warmup_b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 64, 64);  
             struct ggml_tensor * warmup_result = ggml_mul_mat(ctx, warmup_a, warmup_b);
             
+            printf("   DEBUG: Filling tensors...\n");
             fill_tensor_random(warmup_a);
             fill_tensor_random(warmup_b);
             ggml_build_forward_expand(warmup_graph, warmup_result);
             
+            printf("   DEBUG: Calling compute_graph...\n");
             int warmup_result_code = ggml_numa_coordinator_manager_compute_graph(mgr, warmup_graph);
+            printf("   DEBUG: compute_graph returned %d\n", warmup_result_code);
             if (warmup_result_code != 0) {
                 ggml_numa_coordinator_manager_free(mgr);
                 ggml_free(ctx);
                 return result;
             }
+            printf("   DEBUG: Calling wait_for_completion...\n");
             ggml_numa_coordinator_manager_wait_for_completion(mgr);
+            printf("   DEBUG: wait_for_completion returned\n");
             
             // Execute workload - use full batch size when possible for proper scaling analysis
             double total_execution_time = 0.0;
