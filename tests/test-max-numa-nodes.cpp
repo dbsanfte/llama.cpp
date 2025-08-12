@@ -39,12 +39,21 @@ static void test_assert(bool condition, const char* test_name, const char* messa
 }
 
 // Capture GGML log output to check for specific messages
-static char last_log_message[1024] = {0};
+static char captured_logs[8192] = {0};  // Larger buffer to capture multiple messages
+static int log_pos = 0;
+
 static void log_capture_callback(ggml_log_level level, const char* text, void* user_data) {
     (void)level;
     (void)user_data;
-    strncpy(last_log_message, text, sizeof(last_log_message) - 1);
-    last_log_message[sizeof(last_log_message) - 1] = '\0';
+    
+    // Append to captured logs buffer
+    int remaining = sizeof(captured_logs) - log_pos - 1;
+    if (remaining > 0) {
+        int len = snprintf(captured_logs + log_pos, remaining, "%s", text);
+        if (len > 0 && len < remaining) {
+            log_pos += len;
+        }
+    }
     
     if (g_config.verbose) {
         printf("    LOG: %s", text);
@@ -122,6 +131,9 @@ static void test_numa_node_limiting_real() {
     }
     
     // Set up log capture to verify limiting messages
+    memset(captured_logs, 0, sizeof(captured_logs));
+    log_pos = 0;
+    log_pos = 0;
     ggml_log_set(log_capture_callback, NULL);
     
     // Test limiting to 1 node when 2+ are available
@@ -131,14 +143,16 @@ static void test_numa_node_limiting_real() {
     tpp1.max_numa_nodes = 1;
     tpp1.numa_aware = true;
     
-    memset(last_log_message, 0, sizeof(last_log_message));
+    memset(captured_logs, 0, sizeof(captured_logs));
+    log_pos = 0;
+    log_pos = 0;
     struct ggml_numa_coordinator_manager* mgr1 = ggml_numa_coordinator_manager_new_with_params(&tpp1);
     
     test_assert(mgr1 != NULL, "limit_to_1_creation", 
                 "Coordinator should be created with max_numa_nodes=1");
     
-    bool found_limiting_msg = strstr(last_log_message, "Limiting NUMA nodes") != NULL ||
-                             strstr(last_log_message, "max_numa_nodes constraint") != NULL;
+    bool found_limiting_msg = strstr(captured_logs, "Limiting NUMA nodes") != NULL ||
+                             strstr(captured_logs, "max_numa_nodes constraint") != NULL;
     test_assert(found_limiting_msg, "limit_to_1_logging",
                 "Should log NUMA node limiting message");
     
@@ -151,13 +165,15 @@ static void test_numa_node_limiting_real() {
     tpp2.max_numa_nodes = real_numa_nodes + 1; // More than available
     tpp2.numa_aware = true;
     
-    memset(last_log_message, 0, sizeof(last_log_message));
+    memset(captured_logs, 0, sizeof(captured_logs));
+    log_pos = 0;
+    log_pos = 0;
     struct ggml_numa_coordinator_manager* mgr2 = ggml_numa_coordinator_manager_new_with_params(&tpp2);
     
     test_assert(mgr2 != NULL, "no_limit_creation",
                 "Coordinator should be created when max_numa_nodes >= available");
                 
-    bool no_limiting_msg = strstr(last_log_message, "Limiting NUMA nodes") == NULL;
+    bool no_limiting_msg = strstr(captured_logs, "Limiting NUMA nodes") == NULL;
     test_assert(no_limiting_msg, "no_limit_logging",
                 "Should NOT log limiting message when no limiting occurs");
     
@@ -186,13 +202,14 @@ static void test_numa_node_limiting_virtual() {
     tpp1.force_multi_socket = true;
     tpp1.numa_aware = true;
     
-    memset(last_log_message, 0, sizeof(last_log_message));
+    memset(captured_logs, 0, sizeof(captured_logs));
+    log_pos = 0;
     struct ggml_numa_coordinator_manager* mgr1 = ggml_numa_coordinator_manager_new_with_params(&tpp1);
     
     test_assert(mgr1 != NULL, "virtual_limit_creation",
                 "Coordinator should be created in force_multi_socket mode with limiting");
     
-    bool found_limiting_msg = strstr(last_log_message, "Limiting NUMA nodes from 2 to 1") != NULL;
+    bool found_limiting_msg = strstr(captured_logs, "Limiting NUMA nodes from 2 to 1") != NULL;
     test_assert(found_limiting_msg, "virtual_limit_logging",
                 "Should log limiting from 2 to 1 nodes in force_multi_socket mode");
     
@@ -206,13 +223,14 @@ static void test_numa_node_limiting_virtual() {
     tpp2.force_multi_socket = true;
     tpp2.numa_aware = true;
     
-    memset(last_log_message, 0, sizeof(last_log_message));
+    memset(captured_logs, 0, sizeof(captured_logs));
+    log_pos = 0;
     struct ggml_numa_coordinator_manager* mgr2 = ggml_numa_coordinator_manager_new_with_params(&tpp2);
     
     test_assert(mgr2 != NULL, "virtual_no_limit_creation",
                 "Coordinator should be created without limiting when max >= force_multi_socket default");
     
-    bool no_limiting_msg = strstr(last_log_message, "Limiting NUMA nodes") == NULL;
+    bool no_limiting_msg = strstr(captured_logs, "Limiting NUMA nodes") == NULL;
     test_assert(no_limiting_msg, "virtual_no_limit_logging",
                 "Should NOT log limiting when max_numa_nodes >= available in force_multi_socket");
     

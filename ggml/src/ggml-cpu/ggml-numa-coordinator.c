@@ -877,7 +877,7 @@ static void ggml_register_program_exit_cleanup(void) {
 // Helper function to create hyperthreading-optimized CPU masks
 // This assigns CPUs to avoid conflicts on the same physical core
 static void create_optimal_cpu_masks(struct ggml_threadpool_params *tpp, int num_numa_nodes) {
-    if (!tpp || num_numa_nodes < 2) return;
+    if (!tpp || num_numa_nodes < 1) return;  // Fixed: Allow single node optimization
     
     // Check if we have a custom CPU mask set
     bool has_custom_mask = false;
@@ -921,8 +921,6 @@ static void create_optimal_cpu_masks(struct ggml_threadpool_params *tpp, int num
         int max_cpu_num = total_cpus - 1; // numa_num_configured_cpus() returns count, not max number
         
         // For systems with gaps in CPU numbering, we need to scan higher
-        // Your system: 112 CPUs numbered 0-27,56-83,28-55,84-111  
-        // So max CPU number is 111, but total_cpus is 112
         int cpu_scan_limit = GGML_MAX_N_THREADS;
         
 #ifdef __linux__
@@ -1093,21 +1091,9 @@ struct ggml_numa_coordinator_manager * ggml_numa_coordinator_manager_new_with_pa
     }
 #endif
     
-    // Apply max_numa_nodes limit if specified
-    if (tpp->max_numa_nodes > 0 && num_numa_nodes > tpp->max_numa_nodes) {
-        GGML_LOG_INFO("Limiting NUMA nodes from %d to %d (max_numa_nodes constraint)\n", num_numa_nodes, tpp->max_numa_nodes);
-        num_numa_nodes = tpp->max_numa_nodes;
-    }
-    
     if (tpp->force_multi_socket && !numa_is_available) {
         num_numa_nodes = 2; // Simulate 2 NUMA nodes for testing
         GGML_LOG_INFO("Forcing multi-socket mode with %d simulated NUMA nodes\n", num_numa_nodes);
-    }
-    
-    // Apply max_numa_nodes constraint even for force_multi_socket mode
-    if (tpp->max_numa_nodes > 0 && num_numa_nodes > tpp->max_numa_nodes) {
-        GGML_LOG_INFO("Limiting NUMA nodes from %d to %d (max_numa_nodes constraint)\n", num_numa_nodes, tpp->max_numa_nodes);
-        num_numa_nodes = tpp->max_numa_nodes;
     }
     
     // === COMPREHENSIVE COORDINATOR SETUP LOGGING ===
@@ -1189,15 +1175,11 @@ struct ggml_numa_coordinator_manager * ggml_numa_coordinator_manager_new_with_pa
     // Initialize coordinator array memory
     memset(mgr->coordinators, 0, sizeof(struct ggml_coordinator_thread) * num_numa_nodes);
     
-    int threads_per_numa = tpp->n_threads / num_numa_nodes;
-    if (threads_per_numa < 1) threads_per_numa = 1;
-    
-    GGML_LOG_INFO("Creating NUMA coordinator with %d threads distributed across %d NUMA nodes (%d threads per node)\n", 
-                  tpp->n_threads, num_numa_nodes, threads_per_numa);
+    // NOTE: We'll calculate threads_per_numa after optimized CPU mask creation
     
     // Step 3.5: Create optimal CPU masks to avoid hyperthreading conflicts
     struct ggml_threadpool_params optimized_tpp = *tpp;  // Copy original parameters
-    if (num_numa_nodes > 1) {
+    if (num_numa_nodes >= 1) {  // Fixed: Always create optimal masks, even for single node
         GGML_LOG_INFO("================================================================================\n");
         GGML_LOG_INFO("                     Creating Optimal CPU Masks\n");
         GGML_LOG_INFO("================================================================================\n");
@@ -1220,6 +1202,13 @@ struct ggml_numa_coordinator_manager * ggml_numa_coordinator_manager_new_with_pa
         
         GGML_LOG_INFO("================================================================================\n");
     }
+    
+    // Now calculate threads per NUMA node using the optimized thread count
+    int threads_per_numa = optimized_tpp.n_threads / num_numa_nodes;
+    if (threads_per_numa < 1) threads_per_numa = 1;
+    
+    GGML_LOG_INFO("Creating NUMA coordinator with %d threads distributed across %d NUMA nodes (%d threads per node)\n", 
+                  optimized_tpp.n_threads, num_numa_nodes, threads_per_numa);
     
     for (int i = 0; i < num_numa_nodes; i++) {
         GGML_LOG_INFO("================================================================================\n");
@@ -1457,8 +1446,16 @@ struct ggml_numa_coordinator_manager * ggml_numa_coordinator_manager_new_with_pa
     GGML_LOG_INFO("                    NUMA Coordinator Initialization Complete\n");
     GGML_LOG_INFO("--------------------------------------------------------------------------------\n");
     GGML_LOG_INFO("    Status: %d NUMA coordinators created and configured\n", num_numa_nodes);
+    
+    // Calculate actual total threads distributed by summing from coordinators
+    int total_distributed_threads = 0;
+    for (int i = 0; i < num_numa_nodes; i++) {
+        total_distributed_threads += mgr->coordinators[i].n_threads;
+    }
+    int avg_threads_per_node = total_distributed_threads / num_numa_nodes;
+    
     GGML_LOG_INFO("    Total threads distributed: %d (avg %d per node)\n", 
-                  tpp->n_threads, tpp->n_threads / num_numa_nodes);
+                  total_distributed_threads, avg_threads_per_node);
     
     // Get current strategy name for final summary
     const char* final_strategy_name = "UNKNOWN";
@@ -1486,7 +1483,7 @@ struct ggml_numa_coordinator_manager * ggml_numa_coordinator_manager_new_with_pa
                       (void*)coord,
                       thread_status,
                       numa_is_available ? "HARDWARE" : "VIRTUAL",
-                      threads_per_numa);
+                      coord->n_threads);  // Use actual thread count from coordinator
     }
     GGML_LOG_INFO("================================================================================\n");
     
