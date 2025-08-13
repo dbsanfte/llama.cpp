@@ -152,18 +152,16 @@ static void* original_ggml_user_data = nullptr;
 // Custom GGML log callback that suppresses DEBUG messages but allows INFO
 static void suppress_debug_callback(ggml_log_level level, const char* text, void* user_data) {
     (void)user_data; // Suppress unused parameter warning
-    fputs(text, stderr);
-    fflush(stderr);
-
+    // fputs(text, stderr);
+    // fflush(stderr);
     // DS: just log everything for now
-    /*
+ 
         // Allow ERROR, WARN, and INFO messages through during suppression
         if (level == GGML_LOG_LEVEL_ERROR || level == GGML_LOG_LEVEL_WARN || level == GGML_LOG_LEVEL_INFO) {
             fputs(text, stderr);
             fflush(stderr);
         }
         // Only suppress DEBUG and lower-level messages
-    */
 }
 
 static void suppress_coordinator_logging() {
