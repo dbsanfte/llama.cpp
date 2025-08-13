@@ -40,6 +40,7 @@
 
 #include "ggml.h"
 #include "ggml-cpu.h"
+#include "ggml-backend.h"
 #include "../ggml/src/ggml-cpu/ggml-numa-coordinator.h"
 #include "common.h"
 
@@ -62,7 +63,7 @@ struct RealNUMATestConfig {
     
     std::vector<MatrixTest> matrix_tests;
     std::vector<int> batch_sizes = {1, 4, 8, 16, 32};
-    int iterations = 5;
+    int iterations = 10;  // Increased for better accuracy
     
     RealNUMATestConfig() {
         // Default test configurations focusing on different compute/memory profiles
@@ -82,10 +83,21 @@ struct RealNUMATestConfig {
     
     void set_quick_mode() {
         quick_mode = true;
-        iterations = 2;
+        iterations = 3;  // Reduced but still sufficient for quick testing
         matrix_tests = {
-            {512, 512, 512, "Quick Square Matrix", false},
-            {256, 256, 256, "Quick Batch Test", true}
+            {1024, 1024, 1024, "Quick Square Matrix", false},
+            {512, 512, 512, "Quick Batch Test", true}
+        };
+        batch_sizes = {1, 4, 8};
+    }
+
+    void set_medium_mode() {
+        quick_mode = false;
+        iterations = 5;  // Balanced for accuracy vs speed
+        matrix_tests = {
+            {1024, 1024, 1024, "Large Square (1024x1024)", false},
+            {2048, 2048, 2048, "XL Square (2048x2048)", false},
+            {1024, 4096, 2048, "Wide Matrix (1024x4096)", false}
         };
         batch_sizes = {1, 4, 8};
     }
@@ -208,9 +220,9 @@ void SummaryCollector::display_final_summary() {
         return;
     }
     
-    std::cout << "\n" << std::string(100, '=') << std::endl;
+    std::cout << "\n" << std::string(115, '=') << std::endl;
     std::cout << "🏆 COMPREHENSIVE NUMA PERFORMANCE SUMMARY" << std::endl;
-    std::cout << std::string(100, '=') << std::endl;
+    std::cout << std::string(115, '=') << std::endl;
     
     // Group results by test name
     std::map<std::string, std::vector<TestResult>> grouped_results;
@@ -218,30 +230,40 @@ void SummaryCollector::display_final_summary() {
         grouped_results[result.test_name].push_back(result);
     }
     
-    // Display summary table
+    // Display summary table with improved formatting
     std::cout << std::left;
-    std::cout << std::setw(35) << "Test Name" 
-              << std::setw(20) << "Matrix Config"
+    std::cout << std::setw(28) << "Test Name" 
+              << std::setw(22) << "Matrix Config"
               << std::setw(6) << "NUMA"
-              << std::setw(12) << "Time (ms)"
-              << std::setw(10) << "GFLOPS"
+              << std::setw(11) << "Time (ms)"
+              << std::setw(9) << "GFLOPS"
               << std::setw(12) << "Memory BW"
               << std::setw(10) << "Speedup" << std::endl;
-    std::cout << std::string(100, '-') << std::endl;
+    std::cout << std::string(115, '-') << std::endl;
     
     for (const auto& [test_name, results] : grouped_results) {
         bool first_in_group = true;
         for (const auto& result : results) {
-            std::cout << std::setw(35) << (first_in_group ? test_name : "")
-                      << std::setw(20) << (first_in_group ? result.matrix_config : "")
+            // Improved memory bandwidth display (handle small values better)
+            std::string mem_bw_str;
+            if (result.memory_bw_gb_s >= 1.0) {
+                mem_bw_str = std::to_string(static_cast<int>(result.memory_bw_gb_s * 10) / 10.0) + " GB/s";
+            } else if (result.memory_bw_gb_s >= 0.1) {
+                mem_bw_str = std::to_string(static_cast<int>(result.memory_bw_gb_s * 100) / 100.0) + " GB/s";
+            } else {
+                mem_bw_str = std::to_string(static_cast<int>(result.memory_bw_gb_s * 1000) / 10.0) + " MB/s";
+            }
+            
+            std::cout << std::setw(28) << (first_in_group ? test_name : "")
+                      << std::setw(22) << (first_in_group ? result.matrix_config : "")
                       << std::setw(6) << result.numa_nodes
-                      << std::setw(12) << std::fixed << std::setprecision(1) << result.time_ms
-                      << std::setw(10) << std::fixed << std::setprecision(1) << result.gflops
-                      << std::setw(12) << std::fixed << std::setprecision(1) << result.memory_bw_gb_s << " GB/s"
+                      << std::setw(11) << std::fixed << std::setprecision(1) << result.time_ms
+                      << std::setw(9) << std::fixed << std::setprecision(1) << result.gflops
+                      << std::setw(12) << mem_bw_str
                       << std::setw(10) << std::fixed << std::setprecision(2) << result.speedup << "x" << std::endl;
             first_in_group = false;
         }
-        std::cout << std::string(100, '-') << std::endl;
+        std::cout << std::string(115, '-') << std::endl;
     }
     
     // Performance analysis
@@ -294,7 +316,7 @@ void SummaryCollector::display_final_summary() {
     std::cout << "   Maximum speedup achieved: " << std::fixed << std::setprecision(2) << max_speedup << "x" << std::endl;
     std::cout << "   Best performing configuration: " << best_numa_nodes << " NUMA nodes" << std::endl;
     
-    std::cout << std::string(100, '=') << std::endl;
+    std::cout << std::string(115, '=') << std::endl;
 }
 
 // Matrix multiplication benchmark runner
@@ -323,17 +345,14 @@ public:
         result.numa_nodes_used = numa_nodes;
         result.config_description = std::to_string(numa_nodes) + " NUMA nodes";
         
-        // Initialize GGML context
+        // CRITICAL FIX: Use no_alloc = true to enable NUMA-aware tensor allocation
+        // The old approach allocated all tensor data from a single context buffer on one NUMA node!
         size_t ctx_size = ggml_tensor_overhead() * (3 * batch_size) + ggml_graph_overhead();
-        ctx_size += (size_t)m * k * sizeof(float) * batch_size;  // Matrix A
-        ctx_size += (size_t)k * n * sizeof(float) * batch_size;  // Matrix B  
-        ctx_size += (size_t)m * n * sizeof(float) * batch_size;  // Matrix C
-        ctx_size = ((ctx_size + 63) / 64) * 64; // Align to 64 bytes
         
         struct ggml_init_params params = {
             /*.mem_size   =*/ ctx_size,
             /*.mem_buffer =*/ nullptr,
-            /*.no_alloc   =*/ false,
+            /*.no_alloc   =*/ true,  // FIXED: Enable NUMA-aware allocation
         };
         
         std::vector<double> times;
@@ -346,7 +365,7 @@ public:
                 return result;
             }
             
-            // Create matrices
+            // Create matrices - tensors will have no data allocated yet
             std::vector<ggml_tensor*> tensors_a, tensors_b, tensors_c;
             
             for (int batch_idx = 0; batch_idx < batch_size; batch_idx++) {
@@ -361,20 +380,45 @@ public:
                 tensors_c.push_back(c);
             }
             
+            // CRITICAL FIX: Use NUMA-aware backend buffer allocation
+            // This ensures tensor data is distributed across NUMA nodes properly
+            ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors(ctx, ggml_backend_cpu_init());
+            if (!buffer) {
+                std::cerr << "❌ Failed to allocate NUMA-aware tensor buffer" << std::endl;
+                ggml_free(ctx);
+                return result;
+            }
+            
+            if (config.debug_mode) {
+                std::cout << "✅ NUMA-aware tensor buffer allocated successfully" << std::endl;
+            }
+            
+            
             // Initialize matrices with random data
             std::random_device rd;
             std::mt19937 gen(rd());
             std::normal_distribution<float> dist(0.0f, 1.0f);
             
             for (int batch_idx = 0; batch_idx < batch_size; batch_idx++) {
-                float* data_a = (float*)ggml_get_data(tensors_a[batch_idx]);
-                float* data_b = (float*)ggml_get_data(tensors_b[batch_idx]);
-                
-                for (int i = 0; i < ggml_nelements(tensors_a[batch_idx]); i++) {
+                // Allocate and initialize tensor A data
+                size_t size_a = ggml_nbytes(tensors_a[batch_idx]);
+                std::vector<float> data_a(ggml_nelements(tensors_a[batch_idx]));
+                for (size_t i = 0; i < data_a.size(); i++) {
                     data_a[i] = dist(gen);
                 }
-                for (int i = 0; i < ggml_nelements(tensors_b[batch_idx]); i++) {
+                ggml_backend_tensor_set(tensors_a[batch_idx], data_a.data(), 0, size_a);
+                
+                // Allocate and initialize tensor B data
+                size_t size_b = ggml_nbytes(tensors_b[batch_idx]);
+                std::vector<float> data_b(ggml_nelements(tensors_b[batch_idx]));
+                for (size_t i = 0; i < data_b.size(); i++) {
                     data_b[i] = dist(gen);
+                }
+                ggml_backend_tensor_set(tensors_b[batch_idx], data_b.data(), 0, size_b);
+                
+                if (config.debug_mode) {
+                    std::cout << "   Batch " << batch_idx << ": A=" << ggml_nelements(tensors_a[batch_idx])
+                              << " elements, B=" << ggml_nelements(tensors_b[batch_idx]) << " elements" << std::endl;
                 }
             }
             
@@ -410,6 +454,7 @@ public:
                 ggml_numa_coordinator_manager_new_with_params(&tpp);
             if (!mgr) {
                 std::cerr << "❌ Failed to create NUMA coordinator manager" << std::endl;
+                ggml_backend_buffer_free(buffer);
                 ggml_free(ctx);
                 return result;
             }
@@ -423,6 +468,7 @@ public:
             if (compute_result != 0) {
                 std::cerr << "❌ NUMA computation failed with code " << compute_result << std::endl;
                 ggml_numa_coordinator_manager_free(mgr);
+                ggml_backend_buffer_free(buffer);
                 ggml_free(ctx);
                 return result;
             }
@@ -435,6 +481,7 @@ public:
             
             // Cleanup
             ggml_numa_coordinator_manager_free(mgr);
+            ggml_backend_buffer_free(buffer);  // Free NUMA-aware buffer
             
             if (config.debug_mode) {
                 std::cout << "   Iteration " << iter + 1 << ": " << std::fixed << std::setprecision(2) 
@@ -492,17 +539,20 @@ public:
         
         if (config.quick_mode) {
             matrix_tests = {
-                {512, 512, 512, "Medium Square (512x512)"}
+                {1024, 1024, 1024, "Quick Square (1024x1024)"}
             };
         } else {
             matrix_tests = {
                 {1024, 1024, 1024, "Large Square (1024x1024)"},
-                {2048, 512, 1024, "Wide Matrix (2048x512)"},
-                {512, 2048, 1024, "Tall Matrix (512x2048)"}
+                {2048, 2048, 2048, "XL Square (2048x2048)"},
+                {4096, 1024, 2048, "Deep Matrix (4096x1024)"},
+                {1024, 4096, 2048, "Wide Matrix (1024x4096)"},
+                {2048, 512, 1024, "Wide Rect (2048x512)"},
+                {512, 2048, 1024, "Tall Rect (512x2048)"}
             };
         }
         
-        // Run matrix tests
+        // Run matrix tests with single operations first
         for (const auto& matrix_test : matrix_tests) {
             std::cout << "\n📊 Testing " << matrix_test.description << "..." << std::endl;
             
@@ -517,19 +567,30 @@ public:
                 store_results_for_summary(results, matrix_test.description, 
                     std::to_string(matrix_test.m) + "x" + std::to_string(matrix_test.n) + "x" + std::to_string(matrix_test.k));
             }
+        }
+        
+        // Run compute-intensive batch tests only for selected matrices
+        if (!config.quick_mode && numa_configs.size() > 1) {
+            std::cout << "\n🔥 Running compute-intensive batch tests..." << std::endl;
             
-            // Batch processing tests  
-            if (!config.quick_mode && numa_configs.size() > 1) {
-                for (int batch_size : {4, 8}) {
-                    std::cout << "   Testing batch size " << batch_size << "..." << std::endl;
+            // Only test batch processing on matrices that showed good single scaling
+            std::vector<MatrixTest> batch_test_matrices = {
+                {1024, 1024, 1024, "Large Square (1024x1024)"},
+                {2048, 2048, 2048, "XL Square (2048x2048)"},
+                {1024, 4096, 2048, "Wide Matrix (1024x4096)"}
+            };
+            
+            for (const auto& batch_matrix : batch_test_matrices) {
+                for (int batch_size : {4, 8, 16}) {
+                    std::cout << "\n   Testing " << batch_matrix.description << " with batch size " << batch_size << "..." << std::endl;
                     std::map<int, BenchmarkResult> batch_results;
                     for (const auto& [max_nodes, numa_nodes] : numa_configs) {
-                        batch_results[numa_nodes] = run_matrix_multiply(matrix_test.m, matrix_test.n, matrix_test.k, numa_nodes, batch_size);
+                        batch_results[numa_nodes] = run_matrix_multiply(batch_matrix.m, batch_matrix.n, batch_matrix.k, numa_nodes, batch_size);
                     }
                     
                     // Store batch results in global collector
-                    store_results_for_summary(batch_results, matrix_test.description + " (batch=" + std::to_string(batch_size) + ")",
-                        std::to_string(matrix_test.m) + "x" + std::to_string(matrix_test.n) + "x" + std::to_string(matrix_test.k) + " batch=" + std::to_string(batch_size));
+                    store_results_for_summary(batch_results, batch_matrix.description + " (batch=" + std::to_string(batch_size) + ")",
+                        std::to_string(batch_matrix.m) + "x" + std::to_string(batch_matrix.n) + "x" + std::to_string(batch_matrix.k) + " batch=" + std::to_string(batch_size));
                 }
             }
         }
@@ -629,6 +690,9 @@ int run_real_numa_performance_test(int argc, char** argv) {
         } else if (strcmp(argv[i], "--debug") == 0) {
             config.debug_mode = true;
             std::cout << "🔍 Debug mode enabled" << std::endl;
+        } else if (strcmp(argv[i], "--medium") == 0) {
+            config.set_medium_mode();
+            std::cout << "⚡ Medium mode enabled (faster than full but more comprehensive than quick)" << std::endl;
         } else if (strcmp(argv[i], "--force-virtual") == 0) {
             force_virtual_numa = true;
             std::cout << "⚠️  Force virtual NUMA mode enabled" << std::endl;
@@ -636,10 +700,13 @@ int run_real_numa_performance_test(int argc, char** argv) {
             std::cout << "Real NUMA Hardware Performance Test\n"
                       << "Usage: " << argv[0] << " [OPTIONS]\n"
                       << "Options:\n"
-                      << "  --quick           Run quick test with smaller matrices\n"
+                      << "  --quick           Run quick test with smaller matrices (fastest)\n"
+                      << "  --medium          Run medium test with selected large matrices (balanced)\n"
                       << "  --debug           Enable debug output\n"
                       << "  --force-virtual   Force test with virtual NUMA (for demo purposes)\n"
-                      << "  --help            Show this help message\n";
+                      << "  --help            Show this help message\n"
+                      << "\n"
+                      << "Default: Full comprehensive test with all matrix sizes and batch processing\n";
             return 0;
         }
     }
@@ -657,9 +724,15 @@ int run_real_numa_performance_test(int argc, char** argv) {
         std::cout << "• Test with force_multi_socket mode using test-comprehensive-numa-performance" << std::endl;
         std::cout << "• Use --force-virtual flag to run virtual NUMA demo" << std::endl;
         std::cout << "\n🔍 Current system NUMA status:" << std::endl;
+#ifdef GGML_NUMA_MIRROR
         std::cout << "• NUMA library available: " << (numa_available() >= 0 ? "YES" : "NO") << std::endl;
         std::cout << "• Hardware NUMA nodes: " << numa_num_configured_nodes() << std::endl;
         std::cout << "• Total CPUs: " << numa_num_configured_cpus() << std::endl;
+#else
+        std::cout << "• NUMA library available: NO (GGML_NUMA_MIRROR not enabled)" << std::endl;
+        std::cout << "• Hardware NUMA nodes: N/A" << std::endl;
+        std::cout << "• Total CPUs: " << std::thread::hardware_concurrency() << std::endl;
+#endif
         
         // Show a sample of what the test would do
         std::cout << "\n📝 This test would benchmark:" << std::endl;

@@ -93,6 +93,12 @@ RUN if [ "$INSTALL_PYTHON_DEPS" = "true" ]; then \
 # Set up ccache for faster compilation
 ENV PATH="/usr/lib/ccache:${PATH}"
 ENV CCACHE_DIR="/tmp/ccache"
+ENV CMAKE_C_COMPILER="/usr/lib/ccache/gcc"
+ENV CMAKE_CXX_COMPILER="/usr/lib/ccache/g++"
+ENV CMAKE_C_COMPILER_LAUNCHER="ccache"
+ENV CMAKE_CXX_COMPILER_LAUNCHER="ccache"
+ENV CC="/usr/lib/ccache/gcc"
+ENV CXX="/usr/lib/ccache/g++"
 RUN mkdir -p /tmp/ccache
 
 # Create a non-root user

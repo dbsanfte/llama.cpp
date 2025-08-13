@@ -122,7 +122,7 @@ Important: ALWAYS use the CMake test apparatus for testing.
     target_link_libraries(${LLAMA_TEST_NAME} PRIVATE ggml ggml-cpu common) # includes may differ
     ```
 3. Configure CMake again so it picks up your test:
-   `cmake -B build -DCMAKE_BUILD_TYPE=Debug -DCMAKE_EXPORT_COMPILE_COMMANDS=ON -DGGML_NUMA_MIRROR=ON`
+   `cmake -B build -DCMAKE_BUILD_TYPE=Debug -DCMAKE_EXPORT_COMPILE_COMMANDS=ON -DGGML_NUMA_MIRROR=ON -DGGML_OPENMP=OFF`
 4. Build with CMake:
    `cmake --build build --target test-my-feature`
 5. Run the test:
