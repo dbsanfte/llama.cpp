@@ -11,6 +11,7 @@
  */
 
 #include "ggml-numa-coordinator.h"
+#include "ggml-numa-operation-dispatch.h"  // New intelligent dispatcher
 #include "ggml-impl.h"
 #include "ggml-cpu.h"
 #include "ggml-cpu-impl.h"  // For ggml_compute_params structure
@@ -178,6 +179,10 @@ struct ggml_coordinator_thread {
     atomic_bool thread_created;                     // Whether thread was actually created
     struct ggml_numa_coordinator_manager * manager; // Reference to parent manager for callbacks
     
+    // Persistent work buffer for compute operations (NUMA-local)
+    void * work_buffer;                             // NUMA-local work buffer
+    size_t work_buffer_size;                        // Current work buffer size
+    
     // Performance tracking
     int64_t total_work_items;          // Total work items processed
     int64_t total_processing_time_us;  // Total processing time
@@ -329,245 +334,66 @@ static void ggml_register_program_exit_cleanup(void);
 
 // Operation-specific NUMA parallelization using proper GGML compute functions
 // Execute complete operations on NUMA nodes using GGML's optimized functions
+
+// Work buffer management functions
+static bool ggml_numa_ensure_work_buffer(struct ggml_coordinator_thread * coordinator, size_t required_size);
+
 static enum ggml_status ggml_numa_node_execute_operation(
     struct ggml_coordinator_thread * coordinator,
     struct ggml_tensor * operation
 ) {
     if (!coordinator || !operation) return GGML_STATUS_FAILED;
     
-    GGML_LOG_DEBUG("NUMA%d: executing complete operation %s\n", 
+    GGML_LOG_DEBUG("NUMA%d: executing operation %s\n", 
                    coordinator->numa_node, ggml_op_name(operation->op));
     
-    // Set up compute parameters for this NUMA node
+    // Simple direct execution - no strategy decisions, just execute the operation
+    // The dispatcher has already made all strategic decisions
+    
+    // Use the coordinator's fallback execution with proper work buffer support
     struct ggml_compute_params params = {
         .ith = 0,
-        .nth = coordinator->n_threads,  
+        .nth = coordinator->n_threads,
         .wsize = 0,
         .wdata = NULL,
-        .threadpool = coordinator->numa_pool  
+        .threadpool = coordinator->numa_pool
     };
     
-    // PROPER FIX: Execute MUL_MAT operations with full multi-threaded parallelization
-    // Instead of single-threaded workaround, use the NUMA threadpool's parallel execution
-    if (operation->op == GGML_OP_MUL_MAT) {
-        GGML_LOG_DEBUG("NUMA%d: MUL_MAT operation - using full threadpool parallelization\n", 
-                       coordinator->numa_node);
-        
-        // Use ggml_graph_compute with a single-node graph for this operation
-        // This leverages GGML's existing parallel execution infrastructure
-        struct ggml_context * temp_ctx = ggml_init((struct ggml_init_params) {
-            .mem_size = 1024 * 1024, // 1MB should be sufficient for graph metadata
-            .mem_buffer = NULL,
-            .no_alloc = true, // Don't allocate tensor data, just metadata
-        });
-        
-        if (!temp_ctx) {
-            GGML_LOG_ERROR("NUMA%d: Failed to create temporary context for MUL_MAT\n", coordinator->numa_node);
+    // Estimate work buffer size for operations that need it
+    size_t required_work_size = 0;
+    switch (operation->op) {
+        case GGML_OP_SOFT_MAX:
+        case GGML_OP_NORM:
+        case GGML_OP_RMS_NORM:
+            required_work_size = ggml_nelements(operation) * sizeof(float);
+            break;
+        case GGML_OP_MUL_MAT:
+            required_work_size = operation->ne[0] * operation->src[1]->ne[1] * sizeof(float);
+            break;
+        default:
+            required_work_size = 0;
+            break;
+    }
+    
+    // Ensure work buffer if needed
+    if (required_work_size > 0) {
+        if (!ggml_numa_ensure_work_buffer(coordinator, required_work_size)) {
+            GGML_LOG_ERROR("NUMA%d: Failed to ensure work buffer (%zu bytes) for %s\n", 
+                          coordinator->numa_node, required_work_size, ggml_op_name(operation->op));
             return GGML_STATUS_FAILED;
         }
         
-        // Create a computation graph containing just this operation
-        struct ggml_cgraph * temp_graph = ggml_new_graph(temp_ctx);
-        ggml_build_forward_expand(temp_graph, operation);
-        
-        // Create a computation plan using the coordinator's NUMA threadpool
-        struct ggml_cplan cplan = ggml_graph_plan(temp_graph, coordinator->n_threads, coordinator->numa_pool);
-        
-        // Execute the graph using the computation plan
-        enum ggml_status status = ggml_graph_compute(temp_graph, &cplan);
-        
-        // Clean up temporary context
-        ggml_free(temp_ctx);
-        
-        if (status == GGML_STATUS_SUCCESS) {
-            GGML_LOG_DEBUG("NUMA%d: MUL_MAT operation completed with full parallelization\n", coordinator->numa_node);
-        } else {
-            GGML_LOG_ERROR("NUMA%d: MUL_MAT operation failed with status %d\n", coordinator->numa_node, status);
-        }
-        
-        return status;
+        params.wsize = required_work_size;
+        params.wdata = coordinator->work_buffer;
     }
     
-    // Use GGML's optimized compute functions directly - no chunking
-    enum ggml_status status = GGML_STATUS_SUCCESS;
-    
-    switch (operation->op) {
-        // Basic arithmetic operations (high frequency, good NUMA candidates)
-        case GGML_OP_ADD:
-            ggml_compute_forward_add(&params, operation);
-            break;
-        case GGML_OP_ADD1:
-            ggml_compute_forward_add1(&params, operation);
-            break;
-        case GGML_OP_SUB:
-            ggml_compute_forward_sub(&params, operation);
-            break;
-        case GGML_OP_MUL:
-            ggml_compute_forward_mul(&params, operation);
-            break;
-        case GGML_OP_DIV:
-            ggml_compute_forward_div(&params, operation);
-            break;
-            
-        // Matrix operations (highest impact for NUMA coordination)
-        case GGML_OP_MUL_MAT:
-            ggml_compute_forward_mul_mat(&params, operation);
-            break;
-        case GGML_OP_OUT_PROD:
-            ggml_compute_forward_out_prod(&params, operation);
-            break;
-            
-        // Normalization operations (common in transformers, memory-intensive)
-        case GGML_OP_NORM:
-            ggml_compute_forward_norm(&params, operation);
-            break;
-        case GGML_OP_RMS_NORM:
-            ggml_compute_forward_rms_norm(&params, operation);
-            break;
-        case GGML_OP_RMS_NORM_BACK:
-            ggml_compute_forward_rms_norm_back(&params, operation);
-            break;
-        case GGML_OP_GROUP_NORM:
-            ggml_compute_forward_group_norm(&params, operation);
-            break;
-        case GGML_OP_L2_NORM:
-            ggml_compute_forward_l2_norm(&params, operation);
-            break;
-            
-        // Activation functions (frequent in neural networks)
-        case GGML_OP_UNARY:
-            ggml_compute_forward_unary(&params, operation);
-            break;
-        case GGML_OP_SILU_BACK:
-            ggml_compute_forward_silu_back(&params, operation);
-            break;
-        case GGML_OP_LEAKY_RELU:
-            ggml_compute_forward_leaky_relu(&params, operation);
-            break;
-            
-        // Attention and transformer-specific operations
-        case GGML_OP_SOFT_MAX:
-            ggml_compute_forward_soft_max(&params, operation);
-            break;
-        case GGML_OP_SOFT_MAX_BACK:
-            ggml_compute_forward_soft_max_ext_back(&params, operation);
-            break;
-        case GGML_OP_ROPE:
-            ggml_compute_forward_rope(&params, operation);
-            break;
-        case GGML_OP_ROPE_BACK:
-            ggml_compute_forward_rope_back(&params, operation);
-            break;
-            
-        // Tensor manipulation (moderate impact, but common)
-        case GGML_OP_CPY:
-            ggml_compute_forward_cpy(&params, operation);
-            break;
-        case GGML_OP_DUP:
-            ggml_compute_forward_dup(&params, operation);
-            break;
-        case GGML_OP_CONT:
-            ggml_compute_forward_cont(&params, operation);
-            break;
-        case GGML_OP_RESHAPE:
-            ggml_compute_forward_reshape(&params, operation);
-            break;
-        case GGML_OP_PERMUTE:
-            ggml_compute_forward_permute(&params, operation);
-            break;
-        case GGML_OP_TRANSPOSE:
-            ggml_compute_forward_transpose(&params, operation);
-            break;
-        case GGML_OP_VIEW:
-            ggml_compute_forward_view(&params, operation);
-            break;
-        case GGML_OP_SCALE:
-            ggml_compute_forward_scale(&params, operation);
-            break;
-        case GGML_OP_SET:
-            ggml_compute_forward_set(&params, operation);
-            break;
-            
-        // Row/tensor operations  
-        case GGML_OP_GET_ROWS:
-            ggml_compute_forward_get_rows(&params, operation);
-            break;
-        case GGML_OP_GET_ROWS_BACK:
-            ggml_compute_forward_get_rows_back(&params, operation);
-            break;
-        case GGML_OP_SET_ROWS:
-            ggml_compute_forward_set_rows(&params, operation);
-            break;
-            
-        // Aggregation operations
-        case GGML_OP_SUM:
-            ggml_compute_forward_sum(&params, operation);
-            break;
-        case GGML_OP_SUM_ROWS:
-            ggml_compute_forward_sum_rows(&params, operation);
-            break;
-        case GGML_OP_MEAN:
-            ggml_compute_forward_mean(&params, operation);
-            break;
-        case GGML_OP_ARGMAX:
-            ggml_compute_forward_argmax(&params, operation);
-            break;
-        case GGML_OP_COUNT_EQUAL:
-            ggml_compute_forward_count_equal(&params, operation);
-            break;
-            
-        // Convolution operations (high computational cost when present)
-        case GGML_OP_CONV_2D:
-            ggml_compute_forward_conv_2d(&params, operation);
-            break;
-        case GGML_OP_IM2COL:
-            ggml_compute_forward_im2col(&params, operation);
-            break;
-        case GGML_OP_IM2COL_BACK:
-            ggml_compute_forward_im2col_back_f32(&params, operation);
-            break;
-        case GGML_OP_CONV_TRANSPOSE_1D:
-            ggml_compute_forward_conv_transpose_1d(&params, operation);
-            break;
-        case GGML_OP_CONV_TRANSPOSE_2D:
-            ggml_compute_forward_conv_transpose_2d(&params, operation);
-            break;
-        case GGML_OP_POOL_1D:
-            ggml_compute_forward_pool_1d(&params, operation);
-            break;
-        case GGML_OP_POOL_2D:
-            ggml_compute_forward_pool_2d(&params, operation);
-            break;
-            
-        // Miscellaneous operations
-        case GGML_OP_REPEAT:
-            ggml_compute_forward_repeat(&params, operation);
-            break;
-        case GGML_OP_REPEAT_BACK:
-            ggml_compute_forward_repeat_back(&params, operation);
-            break;
-        case GGML_OP_CONCAT:
-            ggml_compute_forward_concat(&params, operation);
-            break;
-        case GGML_OP_CLAMP:
-            ggml_compute_forward_clamp(&params, operation);
-            break;
-            
-        default:
-            GGML_LOG_DEBUG("NUMA%d: Operation %s using public fallback execution\n", 
-                          coordinator->numa_node, ggml_op_name(operation->op));
-            // Use the public fallback function for operations not specifically handled
-            // This ensures operations are properly executed rather than silently skipped
-            status = ggml_numa_fallback_execute_operation(operation, &params);
-            if (status != GGML_STATUS_SUCCESS) {
-                GGML_LOG_WARN("NUMA%d: Fallback execution failed for operation %s\n",
-                             coordinator->numa_node, ggml_op_name(operation->op));
-            }
-            break;
-    }
+    // Execute the operation using coordinator's fallback function
+    enum ggml_status status = ggml_numa_fallback_execute_operation(operation, &params);
     
     if (status == GGML_STATUS_SUCCESS) {
         GGML_LOG_DEBUG("NUMA%d: Successfully executed operation %s\n", 
+                       coordinator->numa_node, ggml_op_name(operation->op));
+        GGML_LOG_DEBUG("Coordinator NUMA%d: Operation %s completed successfully\n", 
                        coordinator->numa_node, ggml_op_name(operation->op));
     } else {
         GGML_LOG_ERROR("NUMA%d: Failed to execute operation %s\n", 
@@ -575,6 +401,42 @@ static enum ggml_status ggml_numa_node_execute_operation(
     }
     
     return status;
+}
+
+// Work buffer management - ensure coordinator has sufficient NUMA-local work buffer
+static bool ggml_numa_ensure_work_buffer(struct ggml_coordinator_thread * coordinator, size_t required_size) {
+    if (!coordinator) return false;
+    
+    // If we already have a sufficient buffer, reuse it
+    if (coordinator->work_buffer && coordinator->work_buffer_size >= required_size) {
+        return true;
+    }
+    
+    // Free existing buffer if it's too small
+    if (coordinator->work_buffer) {
+        GGML_LOG_DEBUG("NUMA%d: Growing work buffer from %zu to %zu bytes\n", 
+                       coordinator->numa_node, coordinator->work_buffer_size, required_size);
+        numa_free(coordinator->work_buffer, coordinator->work_buffer_size);
+        coordinator->work_buffer = NULL;
+        coordinator->work_buffer_size = 0;
+    } else {
+        GGML_LOG_DEBUG("NUMA%d: Allocating initial work buffer of %zu bytes\n", 
+                       coordinator->numa_node, required_size);
+    }
+    
+    // Allocate new NUMA-local buffer
+    coordinator->work_buffer = numa_alloc_onnode(required_size, coordinator->numa_node);
+    if (!coordinator->work_buffer) {
+        GGML_LOG_ERROR("NUMA%d: Failed to allocate NUMA-local work buffer of size %zu\n", 
+                       coordinator->numa_node, required_size);
+        coordinator->work_buffer_size = 0;
+        return false;
+    }
+    
+    coordinator->work_buffer_size = required_size;
+    GGML_LOG_DEBUG("NUMA%d: Successfully allocated %zu bytes NUMA-local work buffer\n", 
+                   coordinator->numa_node, required_size);
+    return true;
 }
 
 // Initialize work queue
@@ -1424,6 +1286,9 @@ static struct ggml_numa_coordinator_manager * ggml_get_global_coordinator_manage
         g_global_coordinator_manager = ggml_numa_coordinator_manager_new(n_threads, force_multi_socket);
         
         if (g_global_coordinator_manager) {
+            // Initialize intelligent operation dispatcher
+            ggml_numa_dispatch_init();
+            
             // Register cleanup function to run at program exit
             ggml_register_program_exit_cleanup();
             GGML_LOG_INFO("Global coordinator manager created and registered for program exit cleanup\n");
@@ -1444,6 +1309,9 @@ static struct ggml_numa_coordinator_manager * ggml_get_global_coordinator_manage
         g_global_coordinator_manager = ggml_numa_coordinator_manager_new_with_params(tpp);
         
         if (g_global_coordinator_manager) {
+            // Initialize intelligent operation dispatcher
+            ggml_numa_dispatch_init();
+            
             // Register cleanup function to run at program exit
             ggml_register_program_exit_cleanup();
             GGML_LOG_INFO("Global coordinator manager created with parameters and registered for program exit cleanup\n");
@@ -2027,6 +1895,11 @@ struct ggml_numa_coordinator_manager * ggml_numa_coordinator_manager_new_with_pa
         // Step 7: Initialize work queue for this coordinator
         ggml_work_queue_init(&coord->work_queue);
         
+        // Step 8: Initialize persistent work buffer (NUMA-local)
+        coord->work_buffer = NULL;
+        coord->work_buffer_size = 0;
+        GGML_LOG_INFO("    NUMA node %d: initialized persistent work buffer system\n", i);
+        
         // Enhanced logging with complete CPU assignment details
         char final_cpu_summary[256] = {0};
         int summary_pos = 0;
@@ -2215,6 +2088,14 @@ void ggml_numa_coordinator_manager_free(struct ggml_numa_coordinator_manager * m
         ggml_cond_destroy(&coord->work_queue.work_completed);
         ggml_cond_destroy(&coord->work_queue.work_available);
         ggml_mutex_destroy(&coord->work_queue.queue_mutex);
+        
+        // Clean up persistent work buffer
+        if (coord->work_buffer) {
+            GGML_LOG_DEBUG("Freeing persistent work buffer for NUMA node %d (%zu bytes)\n", i, coord->work_buffer_size);
+            numa_free(coord->work_buffer, coord->work_buffer_size);
+            coord->work_buffer = NULL;
+            coord->work_buffer_size = 0;
+        }
         
         // Step 11: Coordinator workers return NUMA threadpools to cache for reuse
         if (coord->numa_pool) {
@@ -2977,149 +2858,6 @@ static enum ggml_status ggml_numa_execute_assigned_operations(
     }
 }
 
-//
-// GGML Integration Function - Main entry point from ggml-cpu.c
-//
-
-/**
- * Main GGML integration function - replaces standard graph computation with NUMA-aware version
- * This is the primary integration point that ggml-cpu.c calls instead of standard ggml_graph_compute
- * 
- * @param cgraph Computation graph to execute
- * @param n_threads Number of threads (used to determine if NUMA coordination is beneficial)
- * @return GGML_STATUS_SUCCESS on success, GGML_STATUS_FAILED on failure
- */
-enum ggml_status ggml_numa_graph_compute(struct ggml_cgraph * cgraph, int n_threads) {
-    if (!cgraph) {
-        GGML_LOG_ERROR("Invalid cgraph for NUMA graph computation\n");
-        return GGML_STATUS_FAILED;
-    }
-    
-    // Determine if NUMA coordination would be beneficial
-    if (!ggml_numa_should_coordinate(cgraph, n_threads)) {
-        GGML_LOG_DEBUG("NUMA coordination not beneficial - using standard computation\n");
-        // Fall back to standard GGML computation
-        struct ggml_cplan plan = ggml_graph_plan(cgraph, n_threads, NULL);
-        if (plan.work_size > 0) {
-            plan.work_data = malloc(plan.work_size);
-            if (!plan.work_data) {
-                return GGML_STATUS_FAILED;
-            }
-        }
-        
-        enum ggml_status status = ggml_graph_compute(cgraph, &plan);
-        
-        if (plan.work_data) {
-            free(plan.work_data);
-        }
-        
-        return status;
-    }
-    
-    GGML_LOG_INFO("Using NUMA-aware graph computation for %d operations with %d threads\n", 
-                  cgraph->n_nodes, n_threads);
-    
-    // Get or create the global NUMA coordinator manager
-    struct ggml_numa_coordinator_manager * mgr = ggml_numa_coordinator_manager_get_global(n_threads, false);
-    if (!mgr) {
-        GGML_LOG_ERROR("Failed to create NUMA coordinator manager\n");
-        return GGML_STATUS_FAILED;
-    }
-    
-    // Create graph scheduler
-    struct ggml_numa_graph_scheduler * scheduler = ggml_numa_create_graph_scheduler(cgraph, mgr->num_numa_nodes);
-    if (!scheduler) {
-        GGML_LOG_ERROR("Failed to create graph scheduler\n");
-        return GGML_STATUS_FAILED;
-    }
-    
-    // Assign operations to NUMA nodes
-    int assign_result = ggml_numa_assign_operations_to_nodes(scheduler);
-    if (assign_result != 0) {
-        GGML_LOG_ERROR("Failed to assign operations to NUMA nodes\n");
-        ggml_numa_free_graph_scheduler(scheduler);
-        return GGML_STATUS_FAILED;
-    }
-    
-    // Execute the assigned operations
-    enum ggml_status exec_result = ggml_numa_execute_assigned_operations(mgr, scheduler);
-    
-    // Clean up scheduler
-    ggml_numa_free_graph_scheduler(scheduler);
-    
-    if (exec_result == GGML_STATUS_SUCCESS) {
-        GGML_LOG_INFO("NUMA graph computation completed successfully\n");
-    } else {
-        GGML_LOG_ERROR("NUMA graph computation failed\n");
-    }
-    
-    return exec_result;
-}
-
-// Determine if NUMA coordination would be beneficial for a given graph
-static bool ggml_numa_should_coordinate(
-    struct ggml_cgraph * cgraph,
-    int n_threads
-) {
-    if (!cgraph) {
-        return false;
-    }
-    
-    // Check if NUMA is available at all
-#ifdef __linux__
-    if (numa_available() == -1) {
-        GGML_LOG_DEBUG("NUMA not available, skipping coordination\n");
-        return false;
-    }
-#else
-    GGML_LOG_DEBUG("NUMA coordination not supported on this platform\n");
-    return false;
-#endif
-    
-    // Minimum requirements for NUMA coordination
-    int min_operations_for_numa = 10;  // Need enough operations to distribute
-    int min_threads_for_numa = 4;      // Need enough threads to make coordination worthwhile
-    
-    if (cgraph->n_nodes < min_operations_for_numa) {
-        GGML_LOG_DEBUG("Too few operations (%d < %d) for NUMA coordination\n", 
-                      cgraph->n_nodes, min_operations_for_numa);
-        return false;
-    }
-    
-    if (n_threads < min_threads_for_numa) {
-        GGML_LOG_DEBUG("Too few threads (%d < %d) for NUMA coordination\n", 
-                      n_threads, min_threads_for_numa);
-        return false;
-    }
-    
-    // Check if we have multiple NUMA nodes
-    int num_numa_nodes = numa_max_node() + 1;
-    if (num_numa_nodes <= 1) {
-        GGML_LOG_DEBUG("Single NUMA node (%d), coordination not beneficial\n", num_numa_nodes);
-        return false;
-    }
-    
-    // Estimate if the computational load is large enough to justify NUMA coordination overhead
-    int64_t total_elements = 0;
-    for (int i = 0; i < cgraph->n_nodes; i++) {
-        if (cgraph->nodes[i]) {
-            total_elements += ggml_nelements(cgraph->nodes[i]);
-        }
-    }
-    
-    int64_t min_elements_for_numa = 100000; // Minimum computational load
-    if (total_elements < min_elements_for_numa) {
-        GGML_LOG_DEBUG("Computational load too small (%ld < %ld) for NUMA coordination\n", 
-                      total_elements, min_elements_for_numa);
-        return false;
-    }
-    
-    GGML_LOG_INFO("NUMA coordination beneficial: %d operations, %d threads, %d NUMA nodes, %ld total elements\n",
-                  cgraph->n_nodes, n_threads, num_numa_nodes, total_elements);
-    
-    return true;
-}
-
 // Public fallback execution function for operations not supported by NUMA coordinator
 enum ggml_status ggml_numa_fallback_execute_operation(struct ggml_tensor * operation, const struct ggml_compute_params * params) {
     if (!operation) {
@@ -3611,5 +3349,120 @@ int ggml_numa_coordinator_get_active_nodes(struct ggml_numa_coordinator_manager 
     }
     
     return count;
+}
+
+int ggml_numa_coordinator_manager_get_numa_nodes(struct ggml_numa_coordinator_manager * mgr) {
+    if (!mgr) {
+        return 1;  // Default to 1 if no manager available
+    }
+    return mgr->num_numa_nodes;
+}
+
+//
+// Coordinator Interface Implementation
+// These functions provide controlled access to coordinator resources for the dispatcher
+//
+
+struct ggml_threadpool * ggml_numa_coordinator_get_threadpool(struct ggml_numa_coordinator_manager * manager, int numa_node) {
+    if (!manager || numa_node < 0 || numa_node >= manager->num_numa_nodes) {
+        return NULL;
+    }
+    return manager->coordinators[numa_node].numa_pool;
+}
+
+int ggml_numa_coordinator_get_thread_count(struct ggml_numa_coordinator_manager * manager, int numa_node) {
+    if (!manager || numa_node < 0 || numa_node >= manager->num_numa_nodes) {
+        return -1;
+    }
+    return manager->coordinators[numa_node].n_threads;
+}
+
+bool ggml_numa_coordinator_ensure_work_buffer(struct ggml_numa_coordinator_manager * manager, int numa_node, size_t required_size) {
+    if (!manager || numa_node < 0 || numa_node >= manager->num_numa_nodes) {
+        return false;
+    }
+    return ggml_numa_ensure_work_buffer(&manager->coordinators[numa_node], required_size);
+}
+
+void * ggml_numa_coordinator_get_work_buffer(struct ggml_numa_coordinator_manager * manager, int numa_node) {
+    if (!manager || numa_node < 0 || numa_node >= manager->num_numa_nodes) {
+        return NULL;
+    }
+    return manager->coordinators[numa_node].work_buffer;
+}
+
+size_t ggml_numa_coordinator_get_work_buffer_size(struct ggml_numa_coordinator_manager * manager, int numa_node) {
+    if (!manager || numa_node < 0 || numa_node >= manager->num_numa_nodes) {
+        return 0;
+    }
+    return manager->coordinators[numa_node].work_buffer_size;
+}
+
+enum ggml_status ggml_numa_coordinator_execute_graph_operation(
+    struct ggml_numa_coordinator_manager * manager, 
+    struct ggml_tensor * operation, 
+    int numa_node) {
+    
+    if (!manager || !operation || numa_node < 0 || numa_node >= manager->num_numa_nodes) {
+        return GGML_STATUS_FAILED;
+    }
+    
+    struct ggml_coordinator_thread * coordinator = &manager->coordinators[numa_node];
+    
+    GGML_LOG_DEBUG("NUMA%d: Executing graph-based operation %s\n", 
+                   numa_node, ggml_op_name(operation->op));
+    
+    // Create temporary context for graph computation
+    struct ggml_context * temp_ctx = ggml_init((struct ggml_init_params) {
+        .mem_size = 1024 * 1024, // 1MB should be sufficient for graph metadata
+        .mem_buffer = NULL,
+        .no_alloc = true, // Don't allocate tensor data, just metadata
+    });
+    
+    if (!temp_ctx) {
+        GGML_LOG_ERROR("NUMA%d: Failed to create temporary context for operation %s\n", 
+                       numa_node, ggml_op_name(operation->op));
+        return GGML_STATUS_FAILED;
+    }
+    
+    // Create a computation graph containing just this operation
+    struct ggml_cgraph * temp_graph = ggml_new_graph(temp_ctx);
+    ggml_build_forward_expand(temp_graph, operation);
+    
+    // Create a computation plan using the coordinator's NUMA threadpool
+    struct ggml_cplan cplan = ggml_graph_plan(temp_graph, coordinator->n_threads, coordinator->numa_pool);
+    
+    enum ggml_status status = GGML_STATUS_SUCCESS;
+    
+    // Ensure adequate work buffer if needed
+    if (cplan.work_size > 0) {
+        if (!ggml_numa_ensure_work_buffer(coordinator, cplan.work_size)) {
+            GGML_LOG_ERROR("NUMA%d: Failed to ensure adequate work buffer of size %zu for operation %s\n", 
+                          numa_node, cplan.work_size, ggml_op_name(operation->op));
+            status = GGML_STATUS_FAILED;
+        } else {
+            cplan.work_data = coordinator->work_buffer;
+            GGML_LOG_DEBUG("NUMA%d: Using persistent work buffer (%zu bytes available, %zu needed) for %s\n", 
+                           numa_node, coordinator->work_buffer_size, cplan.work_size, ggml_op_name(operation->op));
+        }
+    }
+    
+    // Execute the graph using the computation plan
+    if (status == GGML_STATUS_SUCCESS) {
+        status = ggml_graph_compute(temp_graph, &cplan);
+        
+        if (status == GGML_STATUS_SUCCESS) {
+            GGML_LOG_DEBUG("NUMA%d: Graph-based operation %s completed successfully\n", 
+                           numa_node, ggml_op_name(operation->op));
+        } else {
+            GGML_LOG_ERROR("NUMA%d: Graph-based operation %s failed with status %d\n", 
+                           numa_node, ggml_op_name(operation->op), status);
+        }
+    }
+    
+    // Clean up temporary context
+    ggml_free(temp_ctx);
+    
+    return status;
 }
 

@@ -249,6 +249,68 @@ enum ggml_numa_memory_strategy ggml_numa_coordinator_manager_get_strategy(struct
  * @param mgr Manager instance
  * @return Number of NUMA nodes (1 if NUMA not available or mgr is NULL)
  */
+int ggml_numa_coordinator_manager_get_numa_nodes(struct ggml_numa_coordinator_manager * mgr);
+
+//
+// Coordinator Interface for Dispatcher
+// These functions provide controlled access to coordinator resources
+// without exposing internal implementation details
+//
+
+/**
+ * Get NUMA threadpool for a specific NUMA node
+ * @param manager Manager instance
+ * @param numa_node Target NUMA node (0-based)
+ * @return Threadpool pointer or NULL if invalid
+ */
+struct ggml_threadpool * ggml_numa_coordinator_get_threadpool(struct ggml_numa_coordinator_manager * manager, int numa_node);
+
+/**
+ * Get thread count for a specific NUMA node
+ * @param manager Manager instance  
+ * @param numa_node Target NUMA node (0-based)
+ * @return Thread count or -1 if invalid
+ */
+int ggml_numa_coordinator_get_thread_count(struct ggml_numa_coordinator_manager * manager, int numa_node);
+
+/**
+ * Ensure adequate work buffer for a coordinator
+ * @param manager Manager instance
+ * @param numa_node Target NUMA node (0-based)
+ * @param required_size Required buffer size in bytes
+ * @return true if buffer is adequate, false on failure
+ */
+bool ggml_numa_coordinator_ensure_work_buffer(struct ggml_numa_coordinator_manager * manager, int numa_node, size_t required_size);
+
+/**
+ * Get work buffer pointer for a coordinator
+ * @param manager Manager instance
+ * @param numa_node Target NUMA node (0-based)
+ * @return Work buffer pointer or NULL if invalid
+ */
+void * ggml_numa_coordinator_get_work_buffer(struct ggml_numa_coordinator_manager * manager, int numa_node);
+
+/**
+ * Get work buffer size for a coordinator
+ * @param manager Manager instance
+ * @param numa_node Target NUMA node (0-based) 
+ * @return Work buffer size or 0 if invalid
+ */
+size_t ggml_numa_coordinator_get_work_buffer_size(struct ggml_numa_coordinator_manager * manager, int numa_node);
+
+/**
+ * Execute operation using graph-based approach with full parallelization
+ * This handles complex operations like MUL_MAT that benefit from graph execution
+ * @param manager Manager instance
+ * @param operation Operation tensor
+ * @param numa_node Target NUMA node for execution
+ * @return GGML_STATUS_SUCCESS on success, GGML_STATUS_FAILED on failure
+ */
+enum ggml_status ggml_numa_coordinator_execute_graph_operation(
+    struct ggml_numa_coordinator_manager * manager, 
+    struct ggml_tensor * operation, 
+    int numa_node
+);
 int ggml_numa_coordinator_manager_get_num_nodes(struct ggml_numa_coordinator_manager * mgr);
 
 /**

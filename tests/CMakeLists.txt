@@ -327,3 +327,8 @@ llama_build_and_test(test-max-numa-nodes.cpp)
 target_link_libraries(${LLAMA_TEST_NAME} PRIVATE ggml ggml-cpu common numa)
 target_include_directories(${LLAMA_TEST_NAME} PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src)
 target_include_directories(${LLAMA_TEST_NAME} PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src/ggml-cpu)
+
+# test-numa-pread-fix
+set(LLAMA_TEST_NAME test-numa-pread-fix)
+llama_build_and_test(test-numa-pread-fix.cpp)
+target_link_libraries(${LLAMA_TEST_NAME} PRIVATE ggml ggml-cpu common)

@@ -25,6 +25,8 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
         ggml-cpu/ggml-cpu.c
         ggml-cpu/ggml-cpu.cpp
         ggml-cpu/ggml-numa-coordinator.c
+        ggml-cpu/ggml-numa-operation-dispatch.c
+        ggml-cpu/ggml-numa-operation-dispatch.h
         ggml-cpu/repack.cpp
         ggml-cpu/repack.h
         ggml-cpu/hbm.cpp

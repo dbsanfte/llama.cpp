@@ -9,6 +9,10 @@
 
 #include "ggml-cpu.h"
 
+#ifdef GGML_NUMA_MIRROR
+#include "ggml-numa-coordinator.h"
+#endif
+
 #include <cinttypes>
 #include <cstring>
 #include <limits>
@@ -361,9 +365,25 @@ llama_context::llama_context(
             LLAMA_LOG_INFO("%s: graph splits = %d (with bs=%d), %d (with bs=1)\n", __func__, n_splits_pp, n_tokens, n_splits_tg);
         }
     }
+
+#ifdef GGML_NUMA_MIRROR
+    // Initialize NUMA coordinator if NUMA mirroring is enabled
+    struct ggml_threadpool_params tpp = ggml_threadpool_params_default(cparams.n_threads);
+    numa_coordinator = ggml_numa_coordinator_manager_get_global_with_params(&tpp);
+    if (numa_coordinator) {
+        LLAMA_LOG_INFO("%s: initialized NUMA coordinator with %d threads\n", __func__, cparams.n_threads);
+    } else {
+        LLAMA_LOG_WARN("%s: failed to initialize NUMA coordinator, falling back to standard backend\n", __func__);
+    }
+#endif
 }
 
 llama_context::~llama_context() {
+#ifdef GGML_NUMA_MIRROR
+    // Note: We don't need to explicitly free the NUMA coordinator as it's a global singleton
+    // managed by ggml_numa_coordinator_manager. Setting to nullptr for clarity.
+    numa_coordinator = nullptr;
+#endif
     ggml_opt_free(opt_ctx);
 }
 
@@ -1420,6 +1440,29 @@ ggml_status llama_context::graph_compute(
     int n_threads        = batched ? cparams.n_threads_batch : cparams.n_threads;
     ggml_threadpool_t tp = batched ? threadpool_batch        : threadpool;
 
+#ifdef GGML_NUMA_MIRROR
+    // Try to use NUMA coordinator if available (initialized during construction)
+    if (numa_coordinator) {
+        LLAMA_LOG_DEBUG("%s: using NUMA coordinator for graph computation\n", __func__);
+        
+        // Use NUMA coordinator to compute the graph
+        int result = ggml_numa_coordinator_manager_compute_graph(numa_coordinator, gf);
+        if (result == 0) {
+            // Wait for completion
+            result = ggml_numa_coordinator_manager_wait_for_completion(numa_coordinator);
+            if (result == 0) {
+                LLAMA_LOG_DEBUG("%s: NUMA coordinator completed successfully\n", __func__);
+                return GGML_STATUS_SUCCESS;
+            } else {
+                LLAMA_LOG_WARN("%s: NUMA coordinator wait failed, falling back to backend scheduler\n", __func__);
+            }
+        } else {
+            LLAMA_LOG_WARN("%s: NUMA coordinator compute failed, falling back to backend scheduler\n", __func__);
+        }
+    }
+#endif
+
+    // Fallback to standard backend scheduler
     if (backend_cpu != nullptr) {
         auto * reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend_cpu));
         auto * set_threadpool_fn = (decltype(ggml_backend_cpu_set_threadpool) *) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cpu_set_threadpool");
