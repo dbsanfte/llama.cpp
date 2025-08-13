@@ -486,14 +486,18 @@ struct llama_mmap::impl {
             LLAMA_LOG_INFO("NUMA node %d: allocated %zu bytes at %p\n", node, total_size, node_mem);
             
             // Read model data from file directly into NUMA-local memory
-            if (pread(fd, node_mem, total_size, 0) != (ssize_t)total_size) {
-                LLAMA_LOG_ERROR("Failed to read model data for NUMA node %d\n", node);
+            // Use the llama_file API instead of direct pread to ensure proper file handling
+            try {
+                file->seek(0, SEEK_SET);
+                file->read_raw(node_mem, total_size);
+            } catch (const std::exception& e) {
+                LLAMA_LOG_ERROR("Failed to read model data for NUMA node %d: %s\n", node, e.what());
                 numa_free(node_mem, total_size);
                 // Clean up any previous allocations
                 for (const auto& mapping : numa_mappings) {
                     numa_free(mapping.addr, mapping.size);
                 }
-                throw std::runtime_error(format("pread failed: %s", strerror(errno)));
+                throw std::runtime_error(format("Failed to read model data for NUMA node %d: %s", node, e.what()));
             }
             
             LLAMA_LOG_INFO("NUMA node %d: loaded %zu bytes from file at %p\n", node, total_size, node_mem);
