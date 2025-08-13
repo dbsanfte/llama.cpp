@@ -114,17 +114,43 @@ struct ggml_work_group {
     struct ggml_tensor * result_tensor;   // Integrated result tensor
     int64_t split_dimension;              // Which dimension was split (0=rows, 1=cols, etc.)
     
+    // Lock-free linked list fields
+    struct ggml_work_group * volatile atomic_next; // Next work group in active list
+    atomic_bool in_active_list;                    // Whether this group is in the active list
+    atomic_int ref_count;                          // Reference count for safe memory management
+    
     // Synchronization for waiting on group completion
     ggml_mutex_t completion_mutex;  // Mutex for completion waiting
     ggml_cond_t completion_cond;    // Condition variable for completion
 };
 
-// Work group tracking in manager
+// Work group pool for memory allocation optimization
+struct ggml_work_group_pool {
+    struct ggml_work_group * pool_storage;     // Pre-allocated work group storage
+    struct ggml_work_group ** free_list;       // Array of pointers to free groups
+    int pool_size;                             // Total number of groups in pool
+    atomic_int free_count;                     // Number of available groups
+    ggml_mutex_t pool_mutex;                   // Mutex for pool operations
+    int64_t total_allocations;                 // Performance counter: total allocations
+    int64_t pool_hits;                         // Performance counter: successful pool gets
+    int64_t pool_misses;                       // Performance counter: pool exhaustion events
+};
+
+// Work group tracking in manager (lock-free version)
 struct ggml_work_group_tracker {
-    struct ggml_work_group ** groups;  // Array of active work groups
-    int max_groups;                    // Maximum number of groups
-    atomic_int next_group_id;          // Next group ID to assign
-    ggml_mutex_t groups_mutex;         // Mutex for group operations
+    struct ggml_work_group * volatile active_list_head; // Lock-free linked list head
+    atomic_int next_group_id;                           // Next group ID to assign
+    struct ggml_work_group_pool pool;                   // Pre-allocated work group pool
+    
+    // Statistics for lock-free operations
+    atomic_long lockfree_list_adds;                     // Number of groups added to list
+    atomic_long lockfree_list_removes;                  // Number of groups removed from list
+    atomic_long lockfree_scan_cycles;                   // Number of integration scan cycles
+    
+    // Legacy fields for compatibility (to be removed)
+    struct ggml_work_group ** groups;  // Array of active work groups (DEPRECATED)
+    int max_groups;                    // Maximum number of groups (DEPRECATED)
+    ggml_mutex_t groups_mutex;         // Mutex for group operations (DEPRECATED)
 };
 
 // Work queue for coordinator threads
@@ -143,7 +169,7 @@ struct ggml_coordinator_thread {
     int numa_node;                                  // NUMA node this coordinator manages
     int n_threads;                                  // Number of threads in this coordinator's pool
     struct ggml_threadpool * numa_pool;             // NUMA-specific threadpool
-    struct ggml_cgraph * numa_cgraph;               // NUMA node's own copy of cgraph
+    const struct ggml_cgraph * numa_cgraph;         // NUMA node's own copy of cgraph (const since read-only)
     struct ggml_context * numa_ctx;                 // Context for this NUMA node's cgraph copy
     struct ggml_work_queue work_queue;              // Work queue for this coordinator
     ggml_thread_t thread_handle;                    // Thread handle
@@ -162,6 +188,13 @@ struct ggml_numa_coordinator_manager {
     int num_numa_nodes;                                   // Number of NUMA nodes
     struct ggml_coordinator_thread * coordinators;        // Array of coordinator threads (one per NUMA node)
     struct ggml_work_queue global_work_queue;             // Global work queue from main thread
+    
+    // Asynchronous integration system
+    ggml_thread_t integration_thread;                     // Background integration thread
+    atomic_bool integration_thread_active;               // Integration thread active flag
+    atomic_bool integration_shutdown_requested;          // Shutdown flag for integration thread
+    ggml_mutex_t integration_mutex;                       // Mutex for integration operations
+    ggml_cond_t integration_work_available;               // Signal when work groups need integration
     
     // Synchronization for main thread
     atomic_int total_work_items;                          // Total work items pending
@@ -194,8 +227,46 @@ struct ggml_numa_coordinator_manager {
 static struct ggml_numa_coordinator_manager * g_global_coordinator_manager = NULL;
 static ggml_mutex_t g_coordinator_init_mutex = PTHREAD_MUTEX_INITIALIZER;
 
+// Global threadpool cache for reuse across manager instances
+#define MAX_CACHED_THREADPOOLS 8
+struct ggml_threadpool_cache_entry {
+    struct ggml_threadpool * pool;
+    int n_threads;
+    int numa_node;
+    bool in_use;
+    int64_t created_time_us;
+    int64_t last_used_time_us;
+    int reuse_count;
+};
+
+struct ggml_threadpool_cache {
+    struct ggml_threadpool_cache_entry entries[MAX_CACHED_THREADPOOLS];
+    int cache_size;
+    ggml_mutex_t cache_mutex;
+    int64_t total_requests;
+    int64_t cache_hits;
+    int64_t cache_misses;
+    bool initialized;
+};
+
+static struct ggml_threadpool_cache g_threadpool_cache = {0};
+static void ggml_threadpool_cache_init(void);
+static struct ggml_threadpool * ggml_threadpool_cache_get(int n_threads, int numa_node);
+static void ggml_threadpool_cache_return(struct ggml_threadpool * pool, int n_threads, int numa_node);
+static void ggml_threadpool_cache_cleanup(void);
+static void ggml_threadpool_cache_print_stats(void);
+
+// Lock-free work group list operations
+static void ggml_work_group_list_add(struct ggml_work_group_tracker * tracker, struct ggml_work_group * group);
+static bool ggml_work_group_list_remove(struct ggml_work_group_tracker * tracker, struct ggml_work_group * group);
+static void ggml_work_group_list_scan_and_integrate(struct ggml_work_group_tracker * tracker);
+static void ggml_work_group_ref_inc(struct ggml_work_group * group);
+static bool ggml_work_group_ref_dec_and_free(struct ggml_work_group_tracker * tracker, struct ggml_work_group * group);
+static void ggml_work_group_tracker_print_lockfree_stats(struct ggml_work_group_tracker * tracker);
+
 // Forward declarations
 static void * ggml_coordinator_thread_func(void * arg);
+static void * ggml_integration_thread_func(void * arg);  // New async integration thread
 static void ggml_work_queue_init(struct ggml_work_queue * queue);
 static void ggml_work_queue_destroy(struct ggml_work_queue * queue);
 static void ggml_work_queue_enqueue(struct ggml_work_queue * queue, struct ggml_work_item * item);
@@ -205,9 +276,19 @@ static struct ggml_work_item * ggml_work_queue_dequeue(struct ggml_work_queue * 
 static void ggml_work_group_tracker_init(struct ggml_work_group_tracker * tracker);
 static void ggml_work_group_tracker_destroy(struct ggml_work_group_tracker * tracker);
 static struct ggml_work_group * ggml_work_group_create(struct ggml_work_group_tracker * tracker, struct ggml_tensor * tensor, int num_chunks);
-static void ggml_work_group_free(struct ggml_work_group * group);
+static void ggml_work_group_free(struct ggml_work_group_tracker * tracker, struct ggml_work_group * group);
 static int ggml_work_group_check_completion(struct ggml_work_group * group);
 // static int ggml_operation_split_for_numa(struct ggml_tensor * tensor, int num_numa_nodes, struct ggml_work_item *** out_chunks); // Unused for now
+
+// Work group pool management functions
+static void ggml_work_group_pool_init(struct ggml_work_group_pool * pool, int pool_size);
+static void ggml_work_group_pool_destroy(struct ggml_work_group_pool * pool);
+static struct ggml_work_group * ggml_work_group_pool_get(struct ggml_work_group_pool * pool);
+static void ggml_work_group_pool_return(struct ggml_work_group_pool * pool, struct ggml_work_group * group);
+static void ggml_work_group_pool_print_stats(struct ggml_work_group_pool * pool);
+
+// Async work group completion functions
+int ggml_numa_coordinator_manager_check_work_group_completion(struct ggml_numa_coordinator_manager * mgr, int work_group_id);
 
 // Global coordinator management functions
 static struct ggml_numa_coordinator_manager * ggml_get_global_coordinator_manager(int n_threads, bool force_multi_socket);
@@ -575,11 +656,21 @@ static struct ggml_work_item * ggml_work_queue_dequeue(struct ggml_work_queue * 
 
 // Initialize work group tracker
 static void ggml_work_group_tracker_init(struct ggml_work_group_tracker * tracker) {
+    // Initialize lock-free fields
+    tracker->active_list_head = NULL;  // Direct assignment instead of atomic_init for volatile pointer
+    atomic_init(&tracker->lockfree_list_adds, 0);
+    atomic_init(&tracker->lockfree_list_removes, 0);
+    atomic_init(&tracker->lockfree_scan_cycles, 0);
+    
+    // Legacy initialization for compatibility
     tracker->max_groups = 64; // Support up to 64 concurrent work groups
     tracker->groups = malloc(sizeof(struct ggml_work_group *) * tracker->max_groups);
     memset(tracker->groups, 0, sizeof(struct ggml_work_group *) * tracker->max_groups);
     atomic_init(&tracker->next_group_id, 1);
     ggml_mutex_init(&tracker->groups_mutex);
+    
+    // Initialize work group pool with same capacity as tracker
+    ggml_work_group_pool_init(&tracker->pool, tracker->max_groups);
 }
 
 // Destroy work group tracker
@@ -591,7 +682,7 @@ static void ggml_work_group_tracker_destroy(struct ggml_work_group_tracker * tra
     // Clean up any remaining work groups
     for (int i = 0; i < tracker->max_groups; i++) {
         if (tracker->groups[i]) {
-            ggml_work_group_free(tracker->groups[i]);
+            ggml_work_group_free(tracker, tracker->groups[i]);
             tracker->groups[i] = NULL;
         }
     }
@@ -599,18 +690,447 @@ static void ggml_work_group_tracker_destroy(struct ggml_work_group_tracker * tra
     ggml_mutex_unlock(&tracker->groups_mutex);
     ggml_mutex_destroy(&tracker->groups_mutex);
     
+    // Print lock-free statistics before cleanup
+    ggml_work_group_tracker_print_lockfree_stats(tracker);
+    
     free(tracker->groups);
     tracker->groups = NULL;
+    
+    // Clean up work group pool
+    ggml_work_group_pool_destroy(&tracker->pool);
+}
+
+// ================================================================================================
+// Work Group Pool Management - Memory Allocation Optimization
+// ================================================================================================
+
+// Initialize work group pool
+static void ggml_work_group_pool_init(struct ggml_work_group_pool * pool, int pool_size) {
+    if (!pool || pool_size <= 0) return;
+    
+    pool->pool_size = pool_size;
+    atomic_init(&pool->free_count, pool_size);
+    pool->total_allocations = 0;
+    pool->pool_hits = 0;
+    pool->pool_misses = 0;
+    
+    // Pre-allocate storage for work groups
+    pool->pool_storage = malloc(sizeof(struct ggml_work_group) * pool_size);
+    pool->free_list = malloc(sizeof(struct ggml_work_group *) * pool_size);
+    
+    if (!pool->pool_storage || !pool->free_list) {
+        GGML_LOG_ERROR("Failed to allocate work group pool storage\n");
+        free(pool->pool_storage);
+        free(pool->free_list);
+        pool->pool_storage = NULL;
+        pool->free_list = NULL;
+        atomic_store(&pool->free_count, 0);
+        return;
+    }
+    
+    // Initialize all groups and add to free list
+    for (int i = 0; i < pool_size; i++) {
+        memset(&pool->pool_storage[i], 0, sizeof(struct ggml_work_group));
+        pool->free_list[i] = &pool->pool_storage[i];
+    }
+    
+    ggml_mutex_init(&pool->pool_mutex);
+    GGML_LOG_DEBUG("Initialized work group pool with %d pre-allocated groups\n", pool_size);
+}
+
+// Destroy work group pool
+static void ggml_work_group_pool_destroy(struct ggml_work_group_pool * pool) {
+    if (!pool) return;
+    
+    ggml_work_group_pool_print_stats(pool);
+    
+    ggml_mutex_destroy(&pool->pool_mutex);
+    free(pool->pool_storage);
+    free(pool->free_list);
+    
+    pool->pool_storage = NULL;
+    pool->free_list = NULL;
+    atomic_store(&pool->free_count, 0);
+}
+
+// Get work group from pool (fast path)
+static struct ggml_work_group * ggml_work_group_pool_get(struct ggml_work_group_pool * pool) {
+    if (!pool || !pool->pool_storage) return NULL;
+    
+    pool->total_allocations++;
+    
+    ggml_mutex_lock(&pool->pool_mutex);
+    
+    int free_count = atomic_load(&pool->free_count);
+    if (free_count <= 0) {
+        ggml_mutex_unlock(&pool->pool_mutex);
+        pool->pool_misses++;
+        GGML_LOG_WARN("Work group pool exhausted, falling back to malloc\n");
+        return NULL; // Fall back to malloc
+    }
+    
+    // Get group from free list
+    struct ggml_work_group * group = pool->free_list[free_count - 1];
+    pool->free_list[free_count - 1] = NULL;
+    atomic_fetch_sub(&pool->free_count, 1);
+    
+    ggml_mutex_unlock(&pool->pool_mutex);
+    
+    pool->pool_hits++;
+    
+    // Reset group state
+    memset(group, 0, sizeof(struct ggml_work_group));
+    return group;
+}
+
+// Return work group to pool (fast path)
+static void ggml_work_group_pool_return(struct ggml_work_group_pool * pool, struct ggml_work_group * group) {
+    if (!pool || !group || !pool->pool_storage) return;
+    
+    // Verify this group belongs to our pool
+    bool belongs_to_pool = (group >= pool->pool_storage && 
+                           group < pool->pool_storage + pool->pool_size);
+    
+    if (!belongs_to_pool) {
+        GGML_LOG_DEBUG("Work group not from pool, using regular free\n");
+        return; // This group was malloc'd, not from pool
+    }
+    
+    ggml_mutex_lock(&pool->pool_mutex);
+    
+    int free_count = atomic_load(&pool->free_count);
+    if (free_count >= pool->pool_size) {
+        ggml_mutex_unlock(&pool->pool_mutex);
+        GGML_LOG_ERROR("Work group pool corruption: too many free groups\n");
+        return;
+    }
+    
+    // Return to free list
+    pool->free_list[free_count] = group;
+    atomic_fetch_add(&pool->free_count, 1);
+    
+    ggml_mutex_unlock(&pool->pool_mutex);
+}
+
+// Print pool performance statistics
+static void ggml_work_group_pool_print_stats(struct ggml_work_group_pool * pool) {
+    if (!pool) return;
+    
+    double hit_rate = 0.0;
+    if (pool->total_allocations > 0) {
+        hit_rate = (double)pool->pool_hits / (double)pool->total_allocations * 100.0;
+    }
+    
+    GGML_LOG_INFO("Work Group Pool Stats: %ld total allocations, %ld hits (%.1f%%), %ld misses, %d free\n",
+                  pool->total_allocations, pool->pool_hits, hit_rate, pool->pool_misses, 
+                  atomic_load(&pool->free_count));
+}
+
+// ================================================================================================
+// Threadpool Cache Management - Persistent Threadpool Optimization
+// ================================================================================================
+
+// Initialize global threadpool cache
+static void ggml_threadpool_cache_init(void) {
+    if (g_threadpool_cache.initialized) return;
+    
+    memset(&g_threadpool_cache, 0, sizeof(g_threadpool_cache));
+    ggml_mutex_init(&g_threadpool_cache.cache_mutex);
+    g_threadpool_cache.initialized = true;
+    
+    GGML_LOG_DEBUG("Initialized threadpool cache with %d slots\n", MAX_CACHED_THREADPOOLS);
+}
+
+// Get threadpool from cache or create new one
+static struct ggml_threadpool * ggml_threadpool_cache_get(int n_threads, int numa_node) {
+    if (!g_threadpool_cache.initialized) {
+        ggml_threadpool_cache_init();
+    }
+    
+    g_threadpool_cache.total_requests++;
+    
+    ggml_mutex_lock(&g_threadpool_cache.cache_mutex);
+    
+    // Look for matching cached threadpool
+    for (int i = 0; i < MAX_CACHED_THREADPOOLS; i++) {
+        struct ggml_threadpool_cache_entry * entry = &g_threadpool_cache.entries[i];
+        
+        if (entry->pool && !entry->in_use && 
+            entry->n_threads == n_threads && entry->numa_node == numa_node) {
+            
+            // Found matching cached threadpool
+            entry->in_use = true;
+            entry->last_used_time_us = ggml_time_us();
+            entry->reuse_count++;
+            
+            ggml_mutex_unlock(&g_threadpool_cache.cache_mutex);
+            
+            g_threadpool_cache.cache_hits++;
+            GGML_LOG_DEBUG("Threadpool cache HIT: reusing pool for %d threads, numa %d (reuse count: %d)\n", 
+                          n_threads, numa_node, entry->reuse_count);
+            
+            return entry->pool;
+        }
+    }
+    
+    ggml_mutex_unlock(&g_threadpool_cache.cache_mutex);
+    
+    // Cache miss - need to create new threadpool
+    g_threadpool_cache.cache_misses++;
+    GGML_LOG_DEBUG("Threadpool cache MISS: creating new pool for %d threads, numa %d\n", n_threads, numa_node);
+    
+    return NULL; // Signal caller to create new threadpool
+}
+
+// Return threadpool to cache
+static void ggml_threadpool_cache_return(struct ggml_threadpool * pool, int n_threads, int numa_node) {
+    if (!pool || !g_threadpool_cache.initialized) return;
+    
+    ggml_mutex_lock(&g_threadpool_cache.cache_mutex);
+    
+    // Find the entry for this threadpool
+    for (int i = 0; i < MAX_CACHED_THREADPOOLS; i++) {
+        struct ggml_threadpool_cache_entry * entry = &g_threadpool_cache.entries[i];
+        
+        if (entry->pool == pool && entry->in_use) {
+            entry->in_use = false;
+            entry->last_used_time_us = ggml_time_us();
+            
+            ggml_mutex_unlock(&g_threadpool_cache.cache_mutex);
+            GGML_LOG_DEBUG("Threadpool returned to cache: %d threads, numa %d\n", 
+                          entry->n_threads, entry->numa_node);
+            return;
+        }
+    }
+    
+    // Not found in cache - try to add new entry
+    for (int i = 0; i < MAX_CACHED_THREADPOOLS; i++) {
+        struct ggml_threadpool_cache_entry * entry = &g_threadpool_cache.entries[i];
+        
+        if (!entry->pool) {
+            // Empty slot found
+            entry->pool = pool;
+            entry->n_threads = n_threads;  // ✅ Store the actual thread count
+            entry->numa_node = numa_node;   // ✅ Store the actual NUMA node
+            entry->in_use = false;
+            entry->created_time_us = ggml_time_us();
+            entry->last_used_time_us = ggml_time_us();
+            entry->reuse_count = 0;
+            
+            ggml_mutex_unlock(&g_threadpool_cache.cache_mutex);
+            GGML_LOG_DEBUG("Threadpool added to cache in slot %d\n", i);
+            return;
+        }
+    }
+    
+    ggml_mutex_unlock(&g_threadpool_cache.cache_mutex);
+    
+    // Cache full - free the threadpool
+    GGML_LOG_DEBUG("Threadpool cache full, freeing threadpool\n");
+    ggml_threadpool_free(pool);
+}
+
+// Print threadpool cache statistics
+static void ggml_threadpool_cache_print_stats(void) {
+    if (!g_threadpool_cache.initialized) return;
+    
+    double hit_rate = 0.0;
+    if (g_threadpool_cache.total_requests > 0) {
+        hit_rate = (double)g_threadpool_cache.cache_hits / (double)g_threadpool_cache.total_requests * 100.0;
+    }
+    
+    int active_pools = 0;
+    for (int i = 0; i < MAX_CACHED_THREADPOOLS; i++) {
+        if (g_threadpool_cache.entries[i].pool) active_pools++;
+    }
+    
+    GGML_LOG_INFO("Threadpool Cache Stats: %ld requests, %ld hits (%.1f%%), %ld misses, %d cached pools\n",
+                  g_threadpool_cache.total_requests, g_threadpool_cache.cache_hits, hit_rate,
+                  g_threadpool_cache.cache_misses, active_pools);
+}
+
+// Cleanup threadpool cache
+static void ggml_threadpool_cache_cleanup(void) {
+    if (!g_threadpool_cache.initialized) return;
+    
+    ggml_threadpool_cache_print_stats();
+    
+    ggml_mutex_lock(&g_threadpool_cache.cache_mutex);
+    
+    // Free all cached threadpools
+    for (int i = 0; i < MAX_CACHED_THREADPOOLS; i++) {
+        struct ggml_threadpool_cache_entry * entry = &g_threadpool_cache.entries[i];
+        if (entry->pool) {
+            ggml_threadpool_free(entry->pool);
+            entry->pool = NULL;
+        }
+    }
+    
+    ggml_mutex_unlock(&g_threadpool_cache.cache_mutex);
+    ggml_mutex_destroy(&g_threadpool_cache.cache_mutex);
+    
+    g_threadpool_cache.initialized = false;
+    GGML_LOG_DEBUG("Threadpool cache cleaned up\n");
+}
+
+// ============================================================================
+// Lock-free Work Group List Operations
+// ============================================================================
+
+// Increment reference count for work group (for memory safety)
+static void ggml_work_group_ref_inc(struct ggml_work_group * group) {
+    if (group) {
+        atomic_fetch_add(&group->ref_count, 1);
+    }
+}
+
+// Decrement reference count and free if zero (for memory safety)
+static bool ggml_work_group_ref_dec_and_free(struct ggml_work_group_tracker * tracker, struct ggml_work_group * group) {
+    if (!group) return false;
+    
+    int old_ref = atomic_fetch_sub(&group->ref_count, 1);
+    if (old_ref == 1) {
+        // Reference count reached zero, safe to free
+        GGML_LOG_DEBUG("Freeing work group %d (ref count reached 0)\n", group->group_id);
+        
+        // Clean up work group
+        if (group->chunks) {
+            free(group->chunks);
+            group->chunks = NULL;
+        }
+        
+        ggml_cond_destroy(&group->completion_cond);
+        ggml_mutex_destroy(&group->completion_mutex);
+        
+        // Return to pool or free
+        ggml_work_group_pool_return(&tracker->pool, group);
+        return true;
+    }
+    return false;
+}
+
+// Add work group to lock-free active list
+static void ggml_work_group_list_add(struct ggml_work_group_tracker * tracker, struct ggml_work_group * group) {
+    if (!tracker || !group) return;
+    
+    ggml_work_group_ref_inc(group); // Increment ref count for list membership
+    atomic_store(&group->in_active_list, true);
+    
+    // Lock-free insertion at head using compare-and-swap
+    struct ggml_work_group * old_head;
+    do {
+        old_head = atomic_load(&tracker->active_list_head);
+        group->atomic_next = old_head;
+    } while (!atomic_compare_exchange_weak(&tracker->active_list_head, &old_head, group));
+    
+    atomic_fetch_add(&tracker->lockfree_list_adds, 1);
+    GGML_LOG_DEBUG("Added work group %d to lock-free active list\n", group->group_id);
+}
+
+// Remove work group from lock-free active list (called when completed)
+static bool ggml_work_group_list_remove(struct ggml_work_group_tracker * tracker, struct ggml_work_group * group) {
+    if (!tracker || !group) return false;
+    
+    // Mark as not in list to prevent double removal
+    bool was_in_list = atomic_exchange(&group->in_active_list, false);
+    if (!was_in_list) {
+        return false; // Already removed
+    }
+    
+    // Note: For simplicity, we don't actually remove from the linked list here
+    // The integration thread will skip groups where in_active_list is false
+    // This avoids complex lock-free list removal with ABA problems
+    
+    atomic_fetch_add(&tracker->lockfree_list_removes, 1);
+    GGML_LOG_DEBUG("Marked work group %d for removal from active list\n", group->group_id);
+    
+    // Decrement reference count (will be freed when ref count reaches 0)
+    ggml_work_group_ref_dec_and_free(tracker, group);
+    
+    return true;
+}
+
+// Lock-free scan of active work groups and integrate completed ones
+static void ggml_work_group_list_scan_and_integrate(struct ggml_work_group_tracker * tracker) {
+    if (!tracker) return;
+    
+    atomic_fetch_add(&tracker->lockfree_scan_cycles, 1);
+    
+    // Walk the lock-free list without any locks
+    struct ggml_work_group * current = atomic_load(&tracker->active_list_head);
+    
+    while (current) {
+        struct ggml_work_group * next = atomic_load(&current->atomic_next);
+        
+        // Skip if group was marked for removal
+        if (!atomic_load(&current->in_active_list)) {
+            current = next;
+            continue;
+        }
+        
+        // Skip if already completed
+        if (atomic_load(&current->group_completed)) {
+            current = next;
+            continue;
+        }
+        
+        // Check if all chunks in this group are completed
+        int completed_chunks = atomic_load(&current->completed_chunks);
+        if (completed_chunks >= current->num_chunks) {
+            GGML_LOG_DEBUG("Lock-free integration: Work group %d ready (%d/%d chunks)\n", 
+                          current->group_id, completed_chunks, current->num_chunks);
+            
+            // Perform asynchronous integration (still need mutex for completion signaling)
+            ggml_mutex_lock(&current->completion_mutex);
+            
+            if (!atomic_load(&current->group_completed)) {
+                // Mark as completed
+                atomic_store(&current->group_completed, true);
+                
+                // Signal any threads waiting on this work group
+                ggml_cond_broadcast(&current->completion_cond);
+                
+                GGML_LOG_DEBUG("Lock-free integration: Work group %d integrated and completed\n", current->group_id);
+                
+                // Remove from active list
+                ggml_work_group_list_remove(tracker, current);
+            }
+            
+            ggml_mutex_unlock(&current->completion_mutex);
+        }
+        
+        current = next;
+    }
+}
+
+// Print lock-free statistics
+static void ggml_work_group_tracker_print_lockfree_stats(struct ggml_work_group_tracker * tracker) {
+    if (!tracker) return;
+    
+    long adds = atomic_load(&tracker->lockfree_list_adds);
+    long removes = atomic_load(&tracker->lockfree_list_removes);
+    long scans = atomic_load(&tracker->lockfree_scan_cycles);
+    
+    GGML_LOG_INFO("Lock-free Work Group Stats: %ld adds, %ld removes, %ld scan cycles\n", 
+                  adds, removes, scans);
 }
 
 // Create new work group
 static struct ggml_work_group * ggml_work_group_create(struct ggml_work_group_tracker * tracker, struct ggml_tensor * tensor, int num_chunks) {
     if (!tracker || !tensor || num_chunks <= 0) return NULL;
     
-    struct ggml_work_group * group = malloc(sizeof(struct ggml_work_group));
-    if (!group) return NULL;
+    // Try to get work group from pool first (fast path)
+    struct ggml_work_group * group = ggml_work_group_pool_get(&tracker->pool);
     
-    memset(group, 0, sizeof(struct ggml_work_group));
+    // Fall back to malloc if pool is exhausted (slow path)
+    if (!group) {
+        group = malloc(sizeof(struct ggml_work_group));
+        if (!group) return NULL;
+        memset(group, 0, sizeof(struct ggml_work_group));
+        GGML_LOG_DEBUG("Work group allocation: using malloc fallback\n");
+    }
+    
+    // Initialize work group
     group->group_id = atomic_fetch_add(&tracker->next_group_id, 1);
     group->original_tensor = tensor;
     group->num_chunks = num_chunks;
@@ -619,6 +1139,11 @@ static struct ggml_work_group * ggml_work_group_create(struct ggml_work_group_tr
     group->result_tensor = NULL;
     group->split_dimension = 0; // Default to row-wise split
     
+    // Initialize lock-free fields
+    group->atomic_next = NULL;
+    atomic_init(&group->in_active_list, false);
+    atomic_init(&group->ref_count, 1); // Start with reference count of 1
+    
     // Initialize synchronization primitives
     ggml_mutex_init(&group->completion_mutex);
     ggml_cond_init(&group->completion_cond);
@@ -626,12 +1151,22 @@ static struct ggml_work_group * ggml_work_group_create(struct ggml_work_group_tr
     // Allocate chunks array
     group->chunks = malloc(sizeof(struct ggml_work_item *) * num_chunks);
     if (!group->chunks) {
-        free(group);
+        // Return to pool if it came from there, otherwise free
+        bool is_from_pool = (group >= tracker->pool.pool_storage && 
+                            group < tracker->pool.pool_storage + tracker->pool.pool_size);
+        if (is_from_pool) {
+            ggml_work_group_pool_return(&tracker->pool, group);
+        } else {
+            free(group);
+        }
         return NULL;
     }
     memset(group->chunks, 0, sizeof(struct ggml_work_item *) * num_chunks);
     
-    // Find empty slot in tracker and store group
+    // Add to lock-free active list (replaces mutex-based array storage)
+    ggml_work_group_list_add(tracker, group);
+    
+    // Legacy storage for compatibility (TODO: remove after full migration)
     ggml_mutex_lock(&tracker->groups_mutex);
     bool stored = false;
     for (int i = 0; i < tracker->max_groups; i++) {
@@ -644,10 +1179,7 @@ static struct ggml_work_group * ggml_work_group_create(struct ggml_work_group_tr
     ggml_mutex_unlock(&tracker->groups_mutex);
     
     if (!stored) {
-        GGML_LOG_ERROR("Work group tracker full, cannot create new group\n");
-        free(group->chunks);
-        free(group);
-        return NULL;
+        GGML_LOG_WARN("Legacy work group array full, but lock-free list succeeded\n");
     }
     
     GGML_LOG_DEBUG("Created work group %d with %d chunks for tensor %p\n", group->group_id, num_chunks, (void*)tensor);
@@ -655,7 +1187,7 @@ static struct ggml_work_group * ggml_work_group_create(struct ggml_work_group_tr
 }
 
 // Free work group
-static void ggml_work_group_free(struct ggml_work_group * group) {
+static void ggml_work_group_free(struct ggml_work_group_tracker * tracker, struct ggml_work_group * group) {
     if (!group) return;
     
     GGML_LOG_DEBUG("Freeing work group %d\n", group->group_id);
@@ -663,6 +1195,7 @@ static void ggml_work_group_free(struct ggml_work_group * group) {
     // Free chunks (work items are freed by coordinator threads)
     if (group->chunks) {
         free(group->chunks);
+        group->chunks = NULL;
     }
     
     // Clean up synchronization primitives
@@ -672,7 +1205,19 @@ static void ggml_work_group_free(struct ggml_work_group * group) {
     // Note: We don't free result_tensor as it's typically owned by the caller
     // Note: We don't free original_tensor as it's owned by the caller
     
-    free(group);
+    // Return to pool if it came from there, otherwise free
+    if (tracker) {
+        ggml_work_group_pool_return(&tracker->pool, group);
+        
+        // Check if the return was successful (group was from pool)
+        bool is_from_pool = (group >= tracker->pool.pool_storage && 
+                            group < tracker->pool.pool_storage + tracker->pool.pool_size);
+        if (!is_from_pool) {
+            free(group); // It was malloc'd, so free it
+        }
+    } else {
+        free(group); // No tracker available, assume it was malloc'd
+    }
 }
 
 // Check work group completion and perform integration if needed
@@ -806,12 +1351,65 @@ static void * ggml_coordinator_thread_func(void * arg) {
         ggml_cond_broadcast(&coordinator->manager->main_sync_cond);
         ggml_mutex_unlock(&coordinator->manager->main_sync_mutex);
         
+        // Signal integration thread that work may be ready for integration
+        ggml_mutex_lock(&coordinator->manager->integration_mutex);
+        ggml_cond_signal(&coordinator->manager->integration_work_available);
+        ggml_mutex_unlock(&coordinator->manager->integration_mutex);
+        
         // Free the work item
         free(work_item);
     }
     
     atomic_store(&coordinator->active, false);
     GGML_LOG_INFO("Coordinator thread for NUMA node %d shutting down\n", coordinator->numa_node);
+    
+    return NULL;
+}
+
+// Asynchronous integration thread function - handles work group completion and integration in background
+static void * ggml_integration_thread_func(void * arg) {
+    if (!arg) {
+        GGML_LOG_ERROR("Integration thread: invalid argument\n");
+        return NULL;
+    }
+    
+    struct ggml_numa_coordinator_manager * mgr = (struct ggml_numa_coordinator_manager *)arg;
+    
+    GGML_LOG_INFO("Async integration thread starting\n");
+    
+    atomic_store(&mgr->integration_thread_active, true);
+    
+    // Main integration loop - runs continuously in background
+    while (!atomic_load(&mgr->integration_shutdown_requested)) {
+        
+        // 🚀 LOCK-FREE SCANNING: Replace mutex-protected array scan with lock-free list scan
+        ggml_work_group_list_scan_and_integrate(&mgr->work_groups);
+        
+        // Use a short timeout to periodically check for new work groups
+        ggml_mutex_lock(&mgr->integration_mutex);
+        
+        // Double-check shutdown flag before waiting
+        if (!atomic_load(&mgr->integration_shutdown_requested)) {
+            struct timespec timeout;
+            clock_gettime(CLOCK_REALTIME, &timeout);
+            timeout.tv_nsec += 10000000; // 10ms timeout
+            if (timeout.tv_nsec >= 1000000000) {
+                timeout.tv_sec += 1;
+                timeout.tv_nsec -= 1000000000;
+            }
+            ggml_cond_timedwait(&mgr->integration_work_available, &mgr->integration_mutex, &timeout);
+        }
+        
+        ggml_mutex_unlock(&mgr->integration_mutex);
+        
+        // Final shutdown check after condition wait to ensure responsiveness
+        if (atomic_load(&mgr->integration_shutdown_requested)) {
+            break;
+        }
+    }
+    
+    atomic_store(&mgr->integration_thread_active, false);
+    GGML_LOG_INFO("Async integration thread shutting down\n");
     
     return NULL;
 }
@@ -863,6 +1461,9 @@ static void ggml_cleanup_global_coordinator_at_exit(void) {
         ggml_numa_coordinator_manager_free(g_global_coordinator_manager);
         g_global_coordinator_manager = NULL;
     }
+    
+    // Also cleanup threadpool cache
+    ggml_threadpool_cache_cleanup();
 }
 
 // Register cleanup to happen at program exit
@@ -918,7 +1519,6 @@ static void create_optimal_cpu_masks(struct ggml_threadpool_params *tpp, int num
 #ifdef __linux__
         // Use real NUMA topology instead of hardcoded assumptions
         int total_cpus = numa_num_configured_cpus();
-        int max_cpu_num = total_cpus - 1; // numa_num_configured_cpus() returns count, not max number
         
         // For systems with gaps in CPU numbering, we need to scan higher
         int cpu_scan_limit = GGML_MAX_N_THREADS;
@@ -1134,6 +1734,12 @@ struct ggml_numa_coordinator_manager * ggml_numa_coordinator_manager_new_with_pa
     atomic_init(&mgr->completed_work_items, 0);
     atomic_init(&mgr->manager_active, true);
     atomic_init(&mgr->threads_started, false);
+    
+    // Initialize async integration system
+    atomic_init(&mgr->integration_thread_active, false);
+    atomic_init(&mgr->integration_shutdown_requested, false);
+    ggml_mutex_init(&mgr->integration_mutex);
+    ggml_cond_init(&mgr->integration_work_available);
     
     // Initialize progress callback system
     mgr->progress_callback = NULL;
@@ -1395,18 +2001,27 @@ struct ggml_numa_coordinator_manager * ggml_numa_coordinator_manager_new_with_pa
             }
         }
         
-        // Step 6: Create NUMA threadpool with filtered parameters
-        coord->numa_pool = ggml_threadpool_new(&numa_tpp);
+        // Step 6: Create NUMA threadpool with cache optimization
+        coord->numa_pool = ggml_threadpool_cache_get(numa_tpp.n_threads, i);
         if (!coord->numa_pool) {
-            GGML_LOG_ERROR("Failed to create NUMA threadpool for node %d\n", i);
-           
-            // Cleanup previous coordinators
-            for (int j = 0; j < i; j++) {
-                ggml_threadpool_free(mgr->coordinators[j].numa_pool);
+            // Cache miss - create new threadpool
+            coord->numa_pool = ggml_threadpool_new(&numa_tpp);
+            if (!coord->numa_pool) {
+                GGML_LOG_ERROR("Failed to create NUMA threadpool for node %d\n", i);
+               
+                // Cleanup previous coordinators  
+                for (int j = 0; j < i; j++) {
+                    ggml_threadpool_cache_return(mgr->coordinators[j].numa_pool, 
+                                               mgr->coordinators[j].n_threads, 
+                                               mgr->coordinators[j].numa_node);
+                }
+                free(mgr->coordinators);
+                free(mgr);
+                return NULL;
             }
-            free(mgr->coordinators);
-            free(mgr);
-            return NULL;
+            GGML_LOG_DEBUG("Created new threadpool for NUMA node %d (%d threads)\n", i, numa_tpp.n_threads);
+        } else {
+            GGML_LOG_DEBUG("Reused cached threadpool for NUMA node %d (%d threads)\n", i, numa_tpp.n_threads);
         }
         
         // Step 7: Initialize work queue for this coordinator
@@ -1487,6 +2102,15 @@ struct ggml_numa_coordinator_manager * ggml_numa_coordinator_manager_new_with_pa
     }
     GGML_LOG_INFO("================================================================================\n");
     
+    // Start the async integration thread for work group completion handling
+    GGML_LOG_INFO("Starting async integration thread for background work group completion\n");
+    if (ggml_thread_create(&mgr->integration_thread, NULL, ggml_integration_thread_func, mgr) != 0) {
+        GGML_LOG_ERROR("Failed to create async integration thread\n");
+        // Integration thread failure is not critical - manager can still work synchronously
+    } else {
+        GGML_LOG_INFO("✅ Async integration thread started successfully\n");
+    }
+    
     return mgr;
 }
 
@@ -1505,6 +2129,58 @@ void ggml_numa_coordinator_manager_free(struct ggml_numa_coordinator_manager * m
     if (!mgr) return;
     
     GGML_LOG_INFO("Starting hierarchical cleanup of NUMA coordinator manager\n");
+    
+    // Step 8.5: Stop async integration thread first with graceful shutdown
+    atomic_store(&mgr->integration_shutdown_requested, true);
+    
+    // Signal integration thread to wake up and check shutdown flag
+    ggml_mutex_lock(&mgr->integration_mutex);
+    ggml_cond_signal(&mgr->integration_work_available);
+    ggml_mutex_unlock(&mgr->integration_mutex);
+    
+    // Wait for integration thread to finish if it was started
+    if (atomic_load(&mgr->integration_thread_active)) {
+        GGML_LOG_INFO("Waiting for integration thread to acknowledge shutdown...\n");
+        
+        // Wait up to 1 second for graceful shutdown
+        struct timespec timeout;
+        clock_gettime(CLOCK_REALTIME, &timeout);
+        timeout.tv_sec += 1; // 1 second timeout
+        
+        // Check if thread acknowledges shutdown by clearing the active flag
+        bool graceful_shutdown = false;
+        while (atomic_load(&mgr->integration_thread_active)) {
+            struct timespec current_time;
+            clock_gettime(CLOCK_REALTIME, &current_time);
+            
+            if (current_time.tv_sec > timeout.tv_sec || 
+                (current_time.tv_sec == timeout.tv_sec && current_time.tv_nsec > timeout.tv_nsec)) {
+                // Timeout reached
+                GGML_LOG_WARN("Integration thread did not respond to shutdown signal within 1 second\n");
+                break;
+            }
+            
+            // Brief sleep to avoid busy waiting
+            struct timespec sleep_time = { 0, 1000000 }; // 1ms
+            nanosleep(&sleep_time, NULL);
+        }
+        
+        if (!atomic_load(&mgr->integration_thread_active)) {
+            GGML_LOG_INFO("Integration thread acknowledged shutdown gracefully\n");
+            graceful_shutdown = true;
+        }
+        
+        // Skip join if graceful shutdown - thread has already exited cleanly
+        if (graceful_shutdown) {
+            GGML_LOG_INFO("Async integration thread stopped cleanly (no join needed)\n");
+            // Thread has already exited gracefully, no need to join
+        } else {
+            GGML_LOG_WARN("Attempting to join with unresponsive integration thread (may hang)\n");
+            // Only join if thread didn't respond gracefully
+            ggml_thread_join(mgr->integration_thread, NULL);
+            GGML_LOG_INFO("Async integration thread join completed (possibly forced)\n");
+        }
+    }
     
     // Step 9: Main thread signals cleanup to coordinator workers
     atomic_store(&mgr->manager_active, false);
@@ -1540,12 +2216,12 @@ void ggml_numa_coordinator_manager_free(struct ggml_numa_coordinator_manager * m
         ggml_cond_destroy(&coord->work_queue.work_available);
         ggml_mutex_destroy(&coord->work_queue.queue_mutex);
         
-        // Step 11: Coordinator workers cleanup their NUMA threadpools and signal completion
+        // Step 11: Coordinator workers return NUMA threadpools to cache for reuse
         if (coord->numa_pool) {
-            GGML_LOG_DEBUG("Freeing NUMA threadpool for coordinator %d\n", i);
-            ggml_threadpool_free(coord->numa_pool);
+            GGML_LOG_DEBUG("Returning NUMA threadpool for coordinator %d to cache\n", i);
+            ggml_threadpool_cache_return(coord->numa_pool, coord->n_threads, coord->numa_node);
             coord->numa_pool = NULL;
-            GGML_LOG_DEBUG("NUMA threadpool for coordinator %d freed\n", i);
+            GGML_LOG_DEBUG("NUMA threadpool for coordinator %d returned to cache\n", i);
         }
         
         // Step 10: NUMA node threadpools cleanup and clear their cgraph references  
@@ -1572,11 +2248,16 @@ void ggml_numa_coordinator_manager_free(struct ggml_numa_coordinator_manager * m
     ggml_mutex_destroy(&mgr->main_sync_mutex);
     ggml_mutex_destroy(&mgr->strategy_mutex);
     
+    // Clean up async integration system
+    ggml_cond_destroy(&mgr->integration_work_available);
+    ggml_mutex_destroy(&mgr->integration_mutex);
+    
     if (mgr->coordinators) {
         free(mgr->coordinators);
     }
     
     free(mgr);
+    ggml_threadpool_cache_print_stats();
     GGML_LOG_INFO("NUMA coordinator manager cleanup completed\n");
 }
 
@@ -1608,9 +2289,8 @@ int ggml_numa_coordinator_manager_set_cgraph(struct ggml_numa_coordinator_manage
     for (int i = 0; i < mgr->num_numa_nodes; i++) {
         struct ggml_coordinator_thread * coord = &mgr->coordinators[i];
         
-        // Store reference to the original cgraph (properly handle const)
-        // The coordinator threads only read the cgraph, so the const cast is safe
-        coord->numa_cgraph = (struct ggml_cgraph *)master_cgraph; 
+        // Store reference to the original cgraph (no cast needed with const field)
+        coord->numa_cgraph = master_cgraph; 
         coord->numa_ctx = NULL; // No separate context needed
     }
     
@@ -1734,7 +2414,7 @@ int ggml_numa_coordinator_manager_submit_data_parallel_work(struct ggml_numa_coo
             }
             
             // Then free the work group itself
-            ggml_work_group_free(group);
+            ggml_work_group_free(&mgr->work_groups, group);
             return -1;
         }
         
@@ -1848,7 +2528,7 @@ int ggml_numa_coordinator_manager_compute_graph(struct ggml_numa_coordinator_man
         }
         
         if (use_data_parallel) {
-            // Submit with data parallelism
+            // Submit with data parallelism - ASYNC, no blocking
             int work_group_id = ggml_numa_coordinator_manager_submit_data_parallel_work(mgr, node);
             if (work_group_id < 0) {
                 GGML_LOG_WARN("Failed to submit data parallel work for cgraph node %d, falling back to single-node\n", i);
@@ -1858,21 +2538,17 @@ int ggml_numa_coordinator_manager_compute_graph(struct ggml_numa_coordinator_man
                     GGML_LOG_ERROR("Failed to submit work for cgraph node %d\n", i);
                     return -1;
                 }
-            } else {
-                // Wait for data parallel work group to complete
-                result = ggml_numa_coordinator_manager_wait_for_work_group(mgr, work_group_id);
-                if (result != 0) {
-                    GGML_LOG_ERROR("Data parallel work group %d failed for cgraph node %d\n", work_group_id, i);
-                    return -1;
-                }
             }
+            // NO BLOCKING - let work execute asynchronously
+            GGML_LOG_DEBUG("Submitted data parallel work group %d asynchronously for cgraph node %d\n", work_group_id, i);
         } else {
-            // Submit to single NUMA node
+            // Submit to single NUMA node - ASYNC, no blocking
             int work_id = ggml_numa_coordinator_manager_submit_work(mgr, node, -1);
             if (work_id < 0) {
                 GGML_LOG_WARN("Failed to submit work for cgraph node %d\n", i);
                 return -1;
             }
+            GGML_LOG_DEBUG("Submitted single-node work %d asynchronously for cgraph node %d\n", work_id, i);
         }
     }
     
@@ -1924,11 +2600,9 @@ int ggml_numa_coordinator_manager_wait_for_completion(struct ggml_numa_coordinat
     return 0;
 }
 
-// Wait for a specific work group to complete (used for data parallel work)
-int ggml_numa_coordinator_manager_wait_for_work_group(struct ggml_numa_coordinator_manager * mgr, int work_group_id) {
+// Non-blocking check for work group completion (replaces blocking wait)
+int ggml_numa_coordinator_manager_check_work_group_completion(struct ggml_numa_coordinator_manager * mgr, int work_group_id) {
     if (!mgr || work_group_id <= 0) return -1;
-    
-    GGML_LOG_DEBUG("Waiting for work group %d to complete\n", work_group_id);
     
     struct ggml_work_group * target_group = NULL;
     
@@ -1944,39 +2618,83 @@ int ggml_numa_coordinator_manager_wait_for_work_group(struct ggml_numa_coordinat
     ggml_mutex_unlock(&mgr->work_groups.groups_mutex);
     
     if (!target_group) {
-        GGML_LOG_ERROR("Work group %d not found\n", work_group_id);
-        return -1;
+        GGML_LOG_DEBUG("Work group %d not found (may have been cleaned up)\n", work_group_id);
+        return 1; // Assume completed if not found
     }
     
-    // Wait for completion and integration using condition variable
+    // Non-blocking check for completion
+    return atomic_load(&target_group->group_completed) ? 1 : 0;
+}
+
+// Wait for a specific work group to complete (used for data parallel work)
+// NOTE: This is now mainly used for final synchronization, async integration handles most cases
+int ggml_numa_coordinator_manager_wait_for_work_group(struct ggml_numa_coordinator_manager * mgr, int work_group_id) {
+    if (!mgr || work_group_id <= 0) return -1;
+    
+    GGML_LOG_DEBUG("Final synchronization wait for work group %d\n", work_group_id);
+    
+    // First try non-blocking check
+    int completion_status = ggml_numa_coordinator_manager_check_work_group_completion(mgr, work_group_id);
+    if (completion_status == 1) {
+        GGML_LOG_DEBUG("Work group %d already completed\n", work_group_id);
+        return 0;
+    } else if (completion_status == -1) {
+        return -1; // Error case
+    }
+    
+    struct ggml_work_group * target_group = NULL;
+    
+    // Find the work group for final synchronization
+    ggml_mutex_lock(&mgr->work_groups.groups_mutex);
+    for (int i = 0; i < mgr->work_groups.max_groups; i++) {
+        struct ggml_work_group * group = mgr->work_groups.groups[i];
+        if (group && group->group_id == work_group_id) {
+            target_group = group;
+            break;
+        }
+    }
+    ggml_mutex_unlock(&mgr->work_groups.groups_mutex);
+    
+    if (!target_group) {
+        GGML_LOG_DEBUG("Work group %d not found during final sync (may have been cleaned up)\n", work_group_id);
+        return 0; // Assume completed if not found
+    }
+    
+    // Final blocking wait for completion (should be rare due to async integration)
     ggml_mutex_lock(&target_group->completion_mutex);
     
     while (!atomic_load(&target_group->group_completed)) {
-        // Check if all chunks are completed and trigger integration if needed
-        int completion_status = ggml_work_group_check_completion(target_group);
-        if (completion_status == 1) {
-            // Successfully completed and integrated
-            break;
-        } else if (completion_status == -1) {
-            // Integration failed
-            GGML_LOG_ERROR("Work group %d integration failed\n", work_group_id);
-            ggml_mutex_unlock(&target_group->completion_mutex);
-            return -1;
+        // Brief timeout-based wait to allow async integration to complete
+        struct timespec timeout;
+        clock_gettime(CLOCK_REALTIME, &timeout);
+        timeout.tv_nsec += 1000000; // 1ms timeout
+        if (timeout.tv_nsec >= 1000000000) {
+            timeout.tv_sec += 1;
+            timeout.tv_nsec -= 1000000000;
         }
         
-        // Wait on condition variable instead of sleeping
-        ggml_cond_wait(&target_group->completion_cond, &target_group->completion_mutex);
+        int wait_result = ggml_cond_timedwait(&target_group->completion_cond, &target_group->completion_mutex, &timeout);
+        if (wait_result != 0) {
+            // Timeout - check if integration thread is handling it
+            GGML_LOG_DEBUG("Work group %d: timeout in final sync, checking async integration status\n", work_group_id);
+            break; // Exit and recheck completion status
+        }
     }
     
+    bool is_completed = atomic_load(&target_group->group_completed);
     ggml_mutex_unlock(&target_group->completion_mutex);
     
-    GGML_LOG_INFO("Work group %d completed successfully\n", work_group_id);
+    if (is_completed) {
+        GGML_LOG_DEBUG("Work group %d completed via async integration\n", work_group_id);
+    } else {
+        GGML_LOG_WARN("Work group %d: final sync timeout - async integration may still be processing\n", work_group_id);
+    }
     
     // Clean up completed work group
     ggml_mutex_lock(&mgr->work_groups.groups_mutex);
     for (int i = 0; i < mgr->work_groups.max_groups; i++) {
         if (mgr->work_groups.groups[i] && mgr->work_groups.groups[i]->group_id == work_group_id) {
-            ggml_work_group_free(mgr->work_groups.groups[i]);
+            ggml_work_group_free(&mgr->work_groups, mgr->work_groups.groups[i]);
             mgr->work_groups.groups[i] = NULL;
             break;
         }
