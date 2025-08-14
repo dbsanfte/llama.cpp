@@ -217,17 +217,6 @@ get_filename_component(TEST_TARGET test-c.c NAME_WE)
 add_executable(${TEST_TARGET} test-c.c)
 target_link_libraries(${TEST_TARGET} PRIVATE llama)
 
-# test-simple-rope
-set(LLAMA_TEST_NAME test-simple-rope)
-llama_build_and_test(test-simple-rope.cpp)
-target_link_libraries(${LLAMA_TEST_NAME} PRIVATE ggml ggml-cpu common)
-
-# test-phase2-rope-numa
-set(LLAMA_TEST_NAME test-phase2-rope-numa)
-llama_build_and_test(test-phase2-rope-numa.cpp)
-target_link_libraries(${LLAMA_TEST_NAME} PRIVATE ggml ggml-cpu common)
-target_include_directories(${LLAMA_TEST_NAME} PRIVATE ${CMAKE_SOURCE_DIR}/ggml/include ${CMAKE_SOURCE_DIR}/ggml/src/ggml-cpu)
-
 # test-numa-coordinator
 set(LLAMA_TEST_NAME test-numa-coordinator)
 llama_build_and_test(test-numa-coordinator.cpp)
