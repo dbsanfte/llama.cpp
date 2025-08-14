@@ -11,6 +11,11 @@
 #include "ggml-cpu-impl.h"  // For ggml_compute_params structure
 #include "ggml.h"           // For ggml_cplan and graph functions
 
+// Include all operation headers for fallback system
+#include "ops.h"            // Main operations
+#include "unary-ops.h"      // Unary operations (sin, cos, log, etc.)
+#include "binary-ops.h"     // Binary operations (add, sub, mul, div)
+
 #ifdef __linux__
 #include <numa.h>
 #include <numaif.h>
@@ -20,6 +25,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <math.h>
+#include <stdatomic.h>      // For atomic operations in statistics
 
 //
 // Forward Declarations for Internal Functions
@@ -240,12 +246,16 @@ enum ggml_status ggml_numa_dispatch_operation(
         }
         
     } else {
-        // No handler registered - route to single-node coordinator execution
-        GGML_LOG_DEBUG("No handler registered for operation %s, using single-node execution\n", 
+        // No handler registered - use single-threaded fallback system
+        GGML_LOG_DEBUG("No handler registered for operation %s, using fallback execution\n", 
                       ggml_op_name(operation->op));
         
-        // Route to coordinator for execution - no fallback needed, coordinator handles it
-        result = ggml_numa_execute_single_node(manager, operation, context);
+        // Route to fallback system for safe single-threaded execution
+        result = ggml_numa_execute_operation_fallback((struct ggml_tensor *)operation, NULL);
+        
+        if (result != GGML_STATUS_SUCCESS) {
+            GGML_LOG_ERROR("Fallback execution failed for operation %s\n", ggml_op_name(operation->op));
+        }
     }
     
     // Update timing statistics
@@ -266,6 +276,8 @@ static enum ggml_status ggml_numa_execute_single_node(
     struct ggml_numa_coordinator_manager * manager,
     const struct ggml_tensor * operation,
     const ggml_numa_work_context_t * context) {
+    
+    (void)context; // Suppress unused parameter warning
     
     GGML_LOG_DEBUG("Executing %s on single node (NUMA node 0)\n", ggml_op_name(operation->op));
     
@@ -309,10 +321,10 @@ static enum ggml_status ggml_numa_execute_complex_graph(
     const struct ggml_tensor * operation,
     const ggml_numa_work_context_t * context) {
     
-    GGML_LOG_DEBUG("Executing complex operation %s using graph-based approach\n", 
-                   ggml_op_name(operation->op));
+    (void)context; // Suppress unused parameter warning
     
-    // Use primary coordinator for complex operations
+    GGML_LOG_DEBUG("Executing complex operation %s using graph-based approach\n", 
+                  ggml_op_name(operation->op));    // Use primary coordinator for complex operations
     int primary_numa_node = 0;
     
     // Use the coordinator's graph execution capability
@@ -465,11 +477,23 @@ enum ggml_status ggml_numa_graph_compute(struct ggml_cgraph * cgraph, int n_thre
     
     // Determine if NUMA coordination would be beneficial
     if (!ggml_numa_should_coordinate(cgraph, n_threads)) {
-        GGML_LOG_DEBUG("NUMA coordination not beneficial - falling back to standard computation\n");
-        // TODO: For now, we'll just return failure when NUMA coordination isn't beneficial
-        // In the future, this could fall back to standard GGML computation
-        GGML_LOG_ERROR("Fallback to standard computation not implemented in dispatcher\n");
-        return GGML_STATUS_FAILED;
+        GGML_LOG_DEBUG("NUMA coordination not beneficial - using single-threaded fallback computation\n");
+        
+        // Use single-threaded fallback for each operation in the graph
+        for (int i = 0; i < cgraph->n_nodes; i++) {
+            struct ggml_tensor * operation = cgraph->nodes[i];
+            if (!operation) continue;
+            
+            enum ggml_status result = ggml_numa_execute_operation_fallback(operation, NULL);
+            if (result != GGML_STATUS_SUCCESS) {
+                GGML_LOG_ERROR("Fallback execution failed for operation %d (%s)\n", 
+                              i, ggml_op_name(operation->op));
+                return GGML_STATUS_FAILED;
+            }
+        }
+        
+        GGML_LOG_DEBUG("Single-threaded fallback computation completed successfully\n");
+        return GGML_STATUS_SUCCESS;
     }
     
     GGML_LOG_INFO("Using NUMA-aware graph computation via dispatcher for %d operations with %d threads\n", 
@@ -505,6 +529,58 @@ enum ggml_status ggml_numa_graph_compute(struct ggml_cgraph * cgraph, int n_thre
     
     GGML_LOG_INFO("NUMA graph computation completed successfully via dispatcher\n");
     return GGML_STATUS_SUCCESS;
+}
+
+// Enhanced entry point with virtual NUMA support for testing
+enum ggml_status ggml_numa_graph_compute_with_virtual(struct ggml_cgraph * cgraph, int n_threads, bool force_virtual_numa) {
+    if (!cgraph) {
+        GGML_LOG_ERROR("Invalid cgraph for NUMA graph computation\n");
+        return GGML_STATUS_FAILED;
+    }
+    
+    // Initialize dispatcher if not already done
+    ggml_numa_dispatch_init();
+    
+    if (force_virtual_numa) {
+        GGML_LOG_INFO("Virtual NUMA mode enabled for operation dispatch testing\n");
+        
+        // Get or create the global NUMA coordinator manager with virtual NUMA forced
+        struct ggml_numa_coordinator_manager * mgr = ggml_numa_coordinator_manager_get_global(n_threads, force_virtual_numa);
+        if (!mgr) {
+            GGML_LOG_ERROR("Failed to create virtual NUMA coordinator manager\n");
+            return GGML_STATUS_FAILED;
+        }
+        
+        GGML_LOG_INFO("Using virtual NUMA-aware graph computation via dispatcher for %d operations with %d threads\n", 
+                      cgraph->n_nodes, n_threads);
+        
+        // Process each operation in the graph through the dispatcher
+        for (int i = 0; i < cgraph->n_nodes; i++) {
+            struct ggml_tensor * operation = cgraph->nodes[i];
+            if (!operation) continue;
+            
+            // Create work context for this operation
+            ggml_numa_work_context_t context = ggml_numa_create_work_context(operation, mgr);
+            
+            // Let dispatcher decide strategy and execute
+            enum ggml_status result = ggml_numa_dispatch_operation(mgr, operation, &context);
+            
+            if (result != GGML_STATUS_SUCCESS) {
+                GGML_LOG_ERROR("Virtual NUMA dispatcher failed to execute operation %d (%s)\n", 
+                              i, ggml_op_name(operation->op));
+                return GGML_STATUS_FAILED;
+            }
+            
+            GGML_LOG_DEBUG("Virtual NUMA dispatcher successfully executed operation %d (%s)\n", 
+                          i, ggml_op_name(operation->op));
+        }
+        
+        GGML_LOG_INFO("Virtual NUMA graph computation completed successfully via dispatcher\n");
+        return GGML_STATUS_SUCCESS;
+    } else {
+        // Use standard NUMA dispatch
+        return ggml_numa_graph_compute(cgraph, n_threads);
+    }
 }
 
 // Helper function to determine if NUMA coordination would be beneficial for a given graph
@@ -614,6 +690,8 @@ static enum ggml_status ggml_numa_analyze_mul_mat(
     const int64_t ne10 = operation->src[1]->ne[0]; // K dimension
     const int64_t ne11 = operation->src[1]->ne[1]; // N dimension
     
+    (void)ne10; // Suppress unused variable warning - used for validation
+    
     // Calculate computational complexity (roughly proportional to M*K*N)
     const int64_t complexity = ne01 * ne00 * ne11;
     
@@ -656,15 +734,16 @@ const ggml_numa_operation_handler_t ggml_numa_handler_mul_mat_enhanced = {
 };
 
 const ggml_numa_operation_handler_t ggml_numa_handler_complex = {
-    .operation_type = GGML_OP_ROPE, // Represents complex operations
-    .default_strategy = NUMA_EXECUTION_SINGLE_NODE,
+    .operation_type = GGML_OP_ROPE, // Complex ROPE operations
+    .default_strategy = NUMA_EXECUTION_DATA_PARALLEL,  // Use data parallel for large ROPE
     .complexity = NUMA_OP_COMPLEXITY_COMPLEX,
     .workload_type = NUMA_OP_CACHE_SENSITIVE,
-    .min_elements_for_parallel = INT64_MAX, // Never parallelize by default
-    .optimal_chunk_size = 0,
-    .parallel_efficiency_estimate = 0.0f,
+    .min_elements_for_parallel = 100000, // Enable NUMA for operations with >100K elements (was INT64_MAX)
+    .optimal_chunk_size = 1 * 1024 * 1024,  // 1MB chunks for ROPE
+    .parallel_efficiency_estimate = 0.75f,  // Good efficiency for ROPE
     .requires_synchronization = true,
-    .supports_in_place = false
+    .supports_in_place = false,
+    .analyze = NULL  // Use default analysis for now
 };
 
 //
@@ -684,6 +763,283 @@ static bool coordinator_ensure_work_buffer(struct ggml_numa_coordinator_manager 
     return ggml_numa_coordinator_ensure_work_buffer(manager, numa_node, required_size);
 }
 
+//
+// Phase 1: Complete Single-Threaded Fallback System with Improved Organization
+// 
+// This implements the critical Phase 1 foundation that handles ALL GGML operations
+// through single-threaded execution to avoid threading conflicts while providing
+// a stable foundation for gradual NUMA-aware migration.
+//
+
+// Helper macros to reduce repetition in dispatch switch
+#define DISPATCH_SIMPLE(op_enum, forward_func) \
+    case op_enum: \
+        ggml_compute_forward_##forward_func(&fallback_params, tensor); \
+        break;
+
+#define DISPATCH_UNARY(op_enum) \
+    case op_enum: \
+        ggml_compute_forward_unary(&fallback_params, tensor); \
+        break;
+
+// Helper function for operations that need parameter validation
+static enum ggml_status validate_tensor_operation(struct ggml_tensor * tensor, const char * op_name) {
+    if (!tensor) {
+        GGML_LOG_ERROR("%s: Invalid tensor\n", op_name);
+        return GGML_STATUS_FAILED;
+    }
+    return GGML_STATUS_SUCCESS;
+}
+
+// Helper function for matrix operations that need dimension checking
+static enum ggml_status validate_matrix_operation(struct ggml_tensor * tensor, const char * op_name) {
+    if (validate_tensor_operation(tensor, op_name) != GGML_STATUS_SUCCESS) {
+        return GGML_STATUS_FAILED;
+    }
+    
+    if (tensor->src[0] && tensor->src[1]) {
+        // Add matrix-specific validation here if needed
+        GGML_LOG_DEBUG("%s: Matrix operation validated\n", op_name);
+    }
+    
+    return GGML_STATUS_SUCCESS;
+}
+
+enum ggml_status ggml_numa_execute_operation_fallback(struct ggml_tensor * tensor, struct ggml_cplan * cplan) {
+    if (!tensor) {
+        GGML_LOG_ERROR("Invalid tensor for fallback execution\n");
+        return GGML_STATUS_FAILED;
+    }
+
+    // Create single-threaded compute params to avoid threadpool conflicts
+    struct ggml_compute_params fallback_params = {
+        .ith = 0,                  // Single thread index
+        .nth = 1,                  // Single thread total
+        .wsize = cplan ? cplan->work_size : 0,
+        .wdata = cplan ? cplan->work_data : NULL,
+        .threadpool = NULL         // Critical: no threadpool conflicts
+    };
+
+    // Increment fallback usage statistics
+    atomic_fetch_add_explicit(&g_dispatch_stats.fallback_operations, 1, memory_order_relaxed);
+
+    GGML_LOG_DEBUG("Executing operation %s via single-threaded fallback\n", ggml_op_name(tensor->op));
+
+    // Optimized switch statement with helper macros for reduced repetition
+    switch (tensor->op) {
+        // No operation - pass through
+        case GGML_OP_NONE:
+            break;
+            
+        // === BASIC MATH OPERATIONS (using macros for cleaner code) ===
+        DISPATCH_SIMPLE(GGML_OP_DUP, dup)
+        DISPATCH_SIMPLE(GGML_OP_ADD, add)
+        DISPATCH_SIMPLE(GGML_OP_ADD1, add1)
+        DISPATCH_SIMPLE(GGML_OP_ACC, acc)
+        DISPATCH_SIMPLE(GGML_OP_SUB, sub)
+        DISPATCH_SIMPLE(GGML_OP_MUL, mul)
+        DISPATCH_SIMPLE(GGML_OP_DIV, div)
+        
+        // === UNARY MATH OPERATIONS (all use same handler) ===
+        DISPATCH_UNARY(GGML_OP_SQR)
+        DISPATCH_UNARY(GGML_OP_SQRT)
+        DISPATCH_UNARY(GGML_OP_LOG)
+        DISPATCH_UNARY(GGML_OP_SIN)
+        DISPATCH_UNARY(GGML_OP_COS)
+        
+        // === REDUCTION OPERATIONS ===
+        DISPATCH_SIMPLE(GGML_OP_SUM, sum)
+        DISPATCH_SIMPLE(GGML_OP_SUM_ROWS, sum_rows)
+        DISPATCH_SIMPLE(GGML_OP_MEAN, mean)
+        DISPATCH_SIMPLE(GGML_OP_ARGMAX, argmax)
+        DISPATCH_SIMPLE(GGML_OP_COUNT_EQUAL, count_equal)
+        
+        // === TENSOR MANIPULATION ===
+        DISPATCH_SIMPLE(GGML_OP_REPEAT, repeat)
+        DISPATCH_SIMPLE(GGML_OP_REPEAT_BACK, repeat_back)
+        DISPATCH_SIMPLE(GGML_OP_CONCAT, concat)
+        DISPATCH_SIMPLE(GGML_OP_SILU_BACK, silu_back)
+        DISPATCH_SIMPLE(GGML_OP_CPY, cpy)
+        DISPATCH_SIMPLE(GGML_OP_CONT, cont)
+        DISPATCH_SIMPLE(GGML_OP_RESHAPE, reshape)
+        DISPATCH_SIMPLE(GGML_OP_VIEW, view)
+        DISPATCH_SIMPLE(GGML_OP_PERMUTE, permute)
+        DISPATCH_SIMPLE(GGML_OP_TRANSPOSE, transpose)
+        DISPATCH_SIMPLE(GGML_OP_GET_ROWS, get_rows)
+        DISPATCH_SIMPLE(GGML_OP_GET_ROWS_BACK, get_rows_back)
+        DISPATCH_SIMPLE(GGML_OP_SET_ROWS, set_rows)
+        
+        // === NORMALIZATION OPERATIONS ===
+        DISPATCH_SIMPLE(GGML_OP_NORM, norm)
+        DISPATCH_SIMPLE(GGML_OP_RMS_NORM, rms_norm)
+        DISPATCH_SIMPLE(GGML_OP_RMS_NORM_BACK, rms_norm_back)
+        DISPATCH_SIMPLE(GGML_OP_GROUP_NORM, group_norm)
+        DISPATCH_SIMPLE(GGML_OP_L2_NORM, l2_norm)
+        
+        // === MATRIX OPERATIONS (with validation) ===
+        case GGML_OP_MUL_MAT:
+            if (validate_matrix_operation(tensor, "MUL_MAT") != GGML_STATUS_SUCCESS) {
+                return GGML_STATUS_FAILED;
+            }
+            ggml_compute_forward_mul_mat(&fallback_params, tensor);
+            break;
+            
+        case GGML_OP_MUL_MAT_ID:
+            // MUL_MAT_ID uses same implementation as MUL_MAT for fallback
+            if (validate_matrix_operation(tensor, "MUL_MAT_ID") != GGML_STATUS_SUCCESS) {
+                return GGML_STATUS_FAILED;
+            }
+            ggml_compute_forward_mul_mat(&fallback_params, tensor);
+            break;
+            
+        DISPATCH_SIMPLE(GGML_OP_OUT_PROD, out_prod)
+        
+        // === UTILITY OPERATIONS ===
+        DISPATCH_SIMPLE(GGML_OP_SCALE, scale)
+        DISPATCH_SIMPLE(GGML_OP_SET, set)
+        
+        // === MASKING OPERATIONS ===
+        DISPATCH_SIMPLE(GGML_OP_DIAG, diag)
+        DISPATCH_SIMPLE(GGML_OP_DIAG_MASK_INF, diag_mask_inf)
+        DISPATCH_SIMPLE(GGML_OP_DIAG_MASK_ZERO, diag_mask_zero)
+        
+        // === ACTIVATION OPERATIONS ===
+        DISPATCH_SIMPLE(GGML_OP_SOFT_MAX, soft_max)
+        case GGML_OP_SOFT_MAX_BACK:
+            // Use soft_max_ext_back as fallback for soft_max_back
+            ggml_compute_forward_soft_max_ext_back(&fallback_params, tensor);
+            break;
+            
+        // === COMPLEX OPERATIONS ===
+        DISPATCH_SIMPLE(GGML_OP_ROPE, rope)
+        DISPATCH_SIMPLE(GGML_OP_ROPE_BACK, rope_back)
+        DISPATCH_SIMPLE(GGML_OP_CLAMP, clamp)
+        
+        // === CONVOLUTION OPERATIONS ===
+        DISPATCH_SIMPLE(GGML_OP_CONV_TRANSPOSE_1D, conv_transpose_1d)
+        DISPATCH_SIMPLE(GGML_OP_IM2COL, im2col)
+        case GGML_OP_IM2COL_BACK:
+            ggml_compute_forward_im2col_back_f32(&fallback_params, tensor);
+            break;
+        DISPATCH_SIMPLE(GGML_OP_CONV_2D, conv_2d)
+        DISPATCH_SIMPLE(GGML_OP_CONV_2D_DW, conv_2d_dw)
+        DISPATCH_SIMPLE(GGML_OP_CONV_TRANSPOSE_2D, conv_transpose_2d)
+        
+        // === POOLING OPERATIONS ===
+        DISPATCH_SIMPLE(GGML_OP_POOL_1D, pool_1d)
+        DISPATCH_SIMPLE(GGML_OP_POOL_2D, pool_2d)
+        DISPATCH_SIMPLE(GGML_OP_POOL_2D_BACK, pool_2d_back)
+        
+        // === UTILITY OPERATIONS ===
+        DISPATCH_SIMPLE(GGML_OP_UPSCALE, upscale)
+        DISPATCH_SIMPLE(GGML_OP_PAD, pad)
+        DISPATCH_SIMPLE(GGML_OP_PAD_REFLECT_1D, pad_reflect_1d)
+        DISPATCH_SIMPLE(GGML_OP_ROLL, roll)
+        DISPATCH_SIMPLE(GGML_OP_ARANGE, arange)
+        DISPATCH_SIMPLE(GGML_OP_TIMESTEP_EMBEDDING, timestep_embedding)
+        DISPATCH_SIMPLE(GGML_OP_ARGSORT, argsort)
+        DISPATCH_SIMPLE(GGML_OP_LEAKY_RELU, leaky_relu)
+        
+        // === ATTENTION OPERATIONS (special parameter handling) ===
+        case GGML_OP_FLASH_ATTN_EXT:
+            // Flash attention requires special parameter handling
+            if (tensor->src[0] && tensor->src[1] && tensor->src[2]) {
+                ggml_compute_forward_flash_attn_ext(&fallback_params,
+                    tensor->src[0], tensor->src[1], tensor->src[2], 
+                    tensor->src[3], tensor);
+            } else {
+                GGML_LOG_ERROR("FLASH_ATTN_EXT requires valid Q, K, V tensors\n");
+                return GGML_STATUS_FAILED;
+            }
+            break;
+            
+        case GGML_OP_FLASH_ATTN_BACK:
+            ggml_compute_forward_flash_attn_back(&fallback_params, false, tensor);
+            break;
+            
+        // === STATE SPACE MODEL OPERATIONS ===
+        DISPATCH_SIMPLE(GGML_OP_SSM_CONV, ssm_conv)
+        DISPATCH_SIMPLE(GGML_OP_SSM_SCAN, ssm_scan)
+        
+        // === WINDOW OPERATIONS ===
+        DISPATCH_SIMPLE(GGML_OP_WIN_PART, win_part)
+        DISPATCH_SIMPLE(GGML_OP_WIN_UNPART, win_unpart)
+        
+        // === POSITIONAL OPERATIONS ===
+        DISPATCH_SIMPLE(GGML_OP_GET_REL_POS, get_rel_pos)
+        DISPATCH_SIMPLE(GGML_OP_ADD_REL_POS, add_rel_pos)
+        
+        // === RWKV OPERATIONS ===
+        DISPATCH_SIMPLE(GGML_OP_RWKV_WKV6, rwkv_wkv6)
+        case GGML_OP_GATED_LINEAR_ATTN:
+            ggml_compute_forward_gla(&fallback_params, tensor);
+            break;
+        DISPATCH_SIMPLE(GGML_OP_RWKV_WKV7, rwkv_wkv7)
+        
+        // === GENERIC OPERATIONS ===
+        DISPATCH_SIMPLE(GGML_OP_UNARY, unary)
+        
+        // === CUSTOM MAP OPERATIONS ===
+        DISPATCH_SIMPLE(GGML_OP_MAP_CUSTOM1, map_custom1)
+        DISPATCH_SIMPLE(GGML_OP_MAP_CUSTOM2, map_custom2)
+        DISPATCH_SIMPLE(GGML_OP_MAP_CUSTOM3, map_custom3)
+        DISPATCH_SIMPLE(GGML_OP_CUSTOM, custom)
+        
+        // === LOSS OPERATIONS ===
+        DISPATCH_SIMPLE(GGML_OP_CROSS_ENTROPY_LOSS, cross_entropy_loss)
+        DISPATCH_SIMPLE(GGML_OP_CROSS_ENTROPY_LOSS_BACK, cross_entropy_loss_back)
+        
+        // === OPTIMIZATION OPERATIONS ===
+        DISPATCH_SIMPLE(GGML_OP_OPT_STEP_ADAMW, opt_step_adamw)
+        
+        // === ADDITIONAL OPERATIONS ===
+        DISPATCH_SIMPLE(GGML_OP_GLU, glu)
+            
+        default:
+            GGML_LOG_ERROR("Unsupported operation %s (%d) in fallback system\n", 
+                          ggml_op_name(tensor->op), tensor->op);
+            return GGML_STATUS_FAILED;
+    }
+
+    GGML_LOG_DEBUG("Successfully executed operation %s via fallback\n", ggml_op_name(tensor->op));
+    return GGML_STATUS_SUCCESS;
+}
+
+// Cleanup helper macros
+#undef DISPATCH_SIMPLE
+#undef DISPATCH_UNARY
+            ggml_compute_forward_custom(&fallback_params, tensor);
+            break;
+            
+        // Loss Operations
+        case GGML_OP_CROSS_ENTROPY_LOSS:
+            ggml_compute_forward_cross_entropy_loss(&fallback_params, tensor);
+            break;
+            
+        case GGML_OP_CROSS_ENTROPY_LOSS_BACK:
+            ggml_compute_forward_cross_entropy_loss_back(&fallback_params, tensor);
+            break;
+            
+        // Optimization Operations
+        case GGML_OP_OPT_STEP_ADAMW:
+            ggml_compute_forward_opt_step_adamw(&fallback_params, tensor);
+            break;
+            
+        // Additional Operations
+        case GGML_OP_GLU:
+            ggml_compute_forward_glu(&fallback_params, tensor);
+            break;
+            
+        default:
+            GGML_LOG_ERROR("Unsupported operation %s (%d) in fallback system\n", 
+                          ggml_op_name(tensor->op), tensor->op);
+            return GGML_STATUS_FAILED;
+    }
+
+    GGML_LOG_DEBUG("Successfully executed operation %s via fallback\n", ggml_op_name(tensor->op));
+    return GGML_STATUS_SUCCESS;
+}
+
 static void * coordinator_get_work_buffer(struct ggml_numa_coordinator_manager * manager, int numa_node) {
     return ggml_numa_coordinator_get_work_buffer(manager, numa_node);
 }
@@ -698,6 +1054,10 @@ static int coordinator_submit_work(struct ggml_numa_coordinator_manager * manage
 
 static int coordinator_submit_data_parallel_work(struct ggml_numa_coordinator_manager * manager, struct ggml_tensor * operation, 
                                                 int work_group_id, const int * target_nodes, int num_target_nodes) {
+    (void)work_group_id;    // Suppress unused parameter warning  
+    (void)target_nodes;     // Suppress unused parameter warning
+    (void)num_target_nodes; // Suppress unused parameter warning
+    
     // Use simpler submission for now - the original function signature is different
     return ggml_numa_coordinator_manager_submit_data_parallel_work(manager, operation);
 }

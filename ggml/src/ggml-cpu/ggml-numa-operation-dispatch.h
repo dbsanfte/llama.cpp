@@ -34,6 +34,12 @@ struct ggml_cgraph;
 // Main entry point - replaces ggml_graph_compute for NUMA-aware computation
 enum ggml_status ggml_numa_graph_compute(struct ggml_cgraph * cgraph, int n_threads);
 
+// Enhanced entry point with virtual NUMA support for testing
+enum ggml_status ggml_numa_graph_compute_with_virtual(struct ggml_cgraph * cgraph, int n_threads, bool force_virtual_numa);
+
+// Phase 1: Single-threaded fallback system for complete operation coverage
+enum ggml_status ggml_numa_execute_operation_fallback(struct ggml_tensor * tensor, struct ggml_cplan * cplan);
+
 //
 // Coordinator Interface for Dispatcher
 //
@@ -254,6 +260,7 @@ typedef struct {
     // Operation statistics
     int64_t total_operations;
     int64_t parallelized_operations;
+    int64_t fallback_operations;        // Phase 1: Operations executed via single-threaded fallback
     
     // Timing statistics
     int64_t total_execution_time_us;

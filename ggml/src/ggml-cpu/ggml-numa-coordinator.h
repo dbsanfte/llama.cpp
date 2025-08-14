@@ -216,7 +216,7 @@ struct ggml_numa_perf_stats ggml_numa_coordinator_manager_get_stats(struct ggml_
 enum ggml_status ggml_numa_fallback_execute_operation(struct ggml_tensor * operation, const struct ggml_compute_params * params);
 
 /**
- * Main GGML integration function - NUMA-aware graph computation
+ * Main NUMA-aware graph computation function
  * This is the primary integration point that replaces standard ggml_graph_compute
  * when NUMA coordination is beneficial
  * 
@@ -225,6 +225,16 @@ enum ggml_status ggml_numa_fallback_execute_operation(struct ggml_tensor * opera
  * @return GGML_STATUS_SUCCESS on success, GGML_STATUS_FAILED on failure
  */
 enum ggml_status ggml_numa_graph_compute(struct ggml_cgraph * cgraph, int n_threads);
+
+/**
+ * NUMA-aware graph computation with virtual NUMA support for testing
+ * 
+ * @param cgraph Computation graph to execute
+ * @param n_threads Number of threads for computation
+ * @param force_virtual_numa Force virtual NUMA mode even without hardware NUMA
+ * @return GGML_STATUS_SUCCESS on success, GGML_STATUS_FAILED on failure
+ */
+enum ggml_status ggml_numa_graph_compute_with_virtual(struct ggml_cgraph * cgraph, int n_threads, bool force_virtual_numa);
 
 /**
  * Set memory management strategy for the coordinator

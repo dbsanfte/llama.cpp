@@ -6,10 +6,17 @@ This document provides instructions for AI assistants (GitHub Copilot, Claude, e
 
 This is a fork of llama.cpp with **NUMA-aware improvements** for better CPU threading and memory allocation. The project includes:
 
-- **Fixed NUMA thread assignment** - Proper CPU topology detection instead of naive modulo arithmetic
-- **Configurable hyperthreading** - Default enabled, user can disable with `--cpu-no-hyperthreading`
-- **Intel hybrid CPU support** - Detects P-cores vs E-cores
+- **NUMA-aware Coordinator and Node/Thread assignment** - `ggml/src/ggml-cpu/ggml-numa-coordinator.c`
+- **Work-in-Progress dispatcher to the Coordinator** - `ggml/src/ggml-cpu/ggml-numa-operation-dispatch.c`
 - **Development container** - Ubuntu 24.04 with all dependencies for consistent building
+
+### Goal
+
+Our goal is to implement a NUMA-aware scheduling and execution model for the llama.cpp project, improving performance on multi-socket systems. Our main consumer will be `src/llama-context.cpp` via `ggml/src/ggml-cpu/ggml-cpu.c`.
+
+We must implement the complete 193-item set of arithmetic operations in `ggml/src/ggml-cpu/ops.h` in our dispatcher.
+
+The plan for this can be found in: `.devcontainer/changelog/2025-08-14-operation-analysis-big-bang-strategy.md`
 
 ## 🏗️ Build Environment Setup
 
@@ -30,12 +37,8 @@ cmake -B build -DCMAKE_BUILD_TYPE=Debug -DCMAKE_EXPORT_COMPILE_COMMANDS=ON -DGGM
 # Debug build - build
 cmake --build build --parallel
 
-# Run a test (if your test is e.g. tests/test-my-feature.cpp)
-./build/bin/test-my-feature
-
 # ^^ Note: Never limit the threads count of `--parallel`, just let cmake autodetect the number of cores and choose the max threadcount itself.
 ```
-
 
 ### Quick sanity check against a real model:
 ```bash
@@ -47,11 +50,11 @@ wget -c -O ./.devcontainer/qwen2.5-0.5b-instruct-q8_0.gguf https://huggingface.c
 ## 🧠 Key Areas of Focus
 
 ### 1. NUMA Memory Management
-**Files**: `ggml/src/ggml-cpu.c`, `src/llama-mmap.cpp`, `ggml/src/ggml-numa-coordinator.c`, `ggml/src/ggml-cpu-numa-buffer.cpp`
+**Files**: `ggml/src/ggml-cpu/ggml-cpu.c`, `src/llama-mmap.cpp`, `ggml/src/ggml-numa-coordinator.c`, `ggml/src/ggml-cpu-numa-buffer.cpp`
 
 - **NUMA mirroring**: `tensor_data()` and `tensor_set_data()` in `ggml/src/ggml.h` to handle numa-aware tensor data access and mirror across nodes, and numa-aware cache mirroring in `ggml-cpu-numa-buffer.cpp`
-- **Thread-to-NUMA mapping**: In the numa coordinator, each worker threadpool gets assigned to its own numa node
-- **Memory allocation**: `numa_alloc_onnode()` for local allocation
+- **Thread-to-NUMA mapping**: In the numa coordinator, each worker threadpool gets assigned to its own numa node.
+- **Memory allocation**: NEVER use `malloc()` to allocate memory/buffers. ALWAYS use `numa_alloc_onnode()` for local allocation on the current numa node.
 
 ### 2. CPU Topology Detection
 **Files**: `common/common.cpp`, `common/common.h`, `ggml/src/ggml-numa-coordinator.c`
@@ -79,16 +82,17 @@ New command-line arguments for `llama-server` should be added to the file above.
 
 ### Common Edit Patterns
 
-#### Adding New Command-line Params to llama-server
-1. Update structs in `common/common.h`
-2. Add argument parsing in `common/arg.cpp`
-3. Update logic in `common/common.cpp`
-4. Test with `--your-param` flag
-
 #### Modifying NUMA Logic
-1. Check `ggml-cpu.c`, `ggml-numa-coordinator.c` for thread computation changes
+1. Check `ggml-cpu.c`, `ggml-numa-coordinator.c` for thread computation changes and numa node logic
 2. Update `llama-mmap.cpp`, `ggml-cpu-numa-buffer.cpp` for memory allocation
-3. Test on multi-NUMA system ideally, or in dev container as tests will mimic "virtual numas" by splitting up physical cores into numa-like compute groups
+3. Write functional tests in `tests/test-numa-coordinator.cpp`
+4. Verify tests pass and no regressions
+
+#### Modifying Dispatcher/Operation Logic
+1. Check the operations list in `ggml/src/ggml-cpu/ops.h`
+2. Implement the operation in `ggml/src/ggml-cpu/ggml-numa-operation-dispatch.c`
+3. Write functional tests in `tests/test-numa-dispatcher.cpp`
+4. Verify tests pass and no regressions
 
 ### Debugging Approach
 
@@ -105,30 +109,38 @@ gdb --batch --ex run --ex bt --ex quit --args ./build/bin/${testFileName}
 
 ### Platform Compatibility
 - NUMA features are Linux-specific (`#if defined(__x86_64__) && defined(__linux__)`)
-- Provide fallbacks for other platforms
 
 ### Testing Guidelines
 CMake tests live in the `tests/` folder and are built into `build/bin/`. Build and run tests as above.
 
-Important: ALWAYS add tests to the `tests/` folder, never to the project root. 
-Important: ALWAYS use the CMake test apparatus for testing.
+**Important:** ALWAYS add tests to the `tests/` folder, never to the project root!
+**Important:** ALWAYS use the CMake build/test apparatus for compiling tests!
 
-1. Write tests for your new features and add the `test-feature-name.cpp` to `tests/`
-2. Add the test to the end of `/tests/CMakeLists.txt`:
+1. Write tests in one of the following two files:
+   - `tests/test-numa-dispatcher.cpp`
+   - `tests/test-numa-coordinator.cpp`
+
+2. Tests are already added to the CMake build system in `/tests/CMakeLists.txt`, but for reference, the schema looks like this, in case you need to update includes:
     ```c
-    # test-my-feature
-    set(LLAMA_TEST_NAME test-my-feature)
-    llama_build_and_test(test-my-feature.cpp)
+    # test-numa-dispatcher
+    set(LLAMA_TEST_NAME test-numa-dispatcher)
+    llama_build_and_test(test-numa-dispatcher.cpp)
     target_link_libraries(${LLAMA_TEST_NAME} PRIVATE ggml ggml-cpu common) # includes may differ
     ```
+
 3. Configure CMake again so it picks up your test:
    `cmake -B build -DCMAKE_BUILD_TYPE=Debug -DCMAKE_EXPORT_COMPILE_COMMANDS=ON -DGGML_NUMA_MIRROR=ON -DGGML_OPENMP=OFF`
-4. Build with CMake:
-   `cmake --build build --target test-my-feature`
-5. Run the test:
-   `./build/bin/test-my-feature`
 
-A feature isn't done until it has comprehensive, working tests!
+4. Build with CMake:
+   `cmake --build build --target test-numa-dispatcher`
+
+5. Run the tests:
+   `./build/bin/test-numa-coordinator`
+   `./build/bin/test-numa-dispatcher`
+
+6. Verify sane test output, no errors, no overflowing variables, no hanging/segfaults, etc.
+
+A feature isn't done until it has comprehensive, working tests in one of these files!
 
 ## 🐛 Common Issues and Solutions
 
@@ -147,6 +159,7 @@ cmake --build build --parallel --verbose
 ## 📚 Key Documentation Files
 
 - `.devcontainer/changelog/*.md` - Changelog and comprehensive technical documentation
+- `.devcontainer/changelog/2025-08-14-operation-analysis-big-bang-strategy.md` - Numa coordinator/dispatcher design guide and project plan
 - `.devcontainer/README.md` - Dev container usage guide
 - `docs/build.md` - Official build instructions
 

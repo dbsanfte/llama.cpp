@@ -217,118 +217,25 @@ get_filename_component(TEST_TARGET test-c.c NAME_WE)
 add_executable(${TEST_TARGET} test-c.c)
 target_link_libraries(${TEST_TARGET} PRIVATE llama)
 
-# NUMA coordinator functional tests
-set(LLAMA_TEST_NAME test-numa-coordinator-functional)
-llama_build_and_test(test-numa-coordinator-functional.cpp)
-target_link_libraries(${LLAMA_TEST_NAME} PRIVATE ggml ggml-cpu common)
-target_include_directories(${LLAMA_TEST_NAME} PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src)
-target_include_directories(${LLAMA_TEST_NAME} PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src/ggml-cpu)
-
-# test-numa-hotspot-analysis
-set(LLAMA_TEST_NAME test-numa-hotspot-analysis)
-llama_build_and_test(test-numa-hotspot-analysis.cpp)
+# test-simple-rope
+set(LLAMA_TEST_NAME test-simple-rope)
+llama_build_and_test(test-simple-rope.cpp)
 target_link_libraries(${LLAMA_TEST_NAME} PRIVATE ggml ggml-cpu common)
 
-# test-cpu-mask-integration
-set(LLAMA_TEST_NAME test-cpu-mask-integration)
-llama_build_and_test(test-cpu-mask-integration.cpp)
+# test-phase2-rope-numa
+set(LLAMA_TEST_NAME test-phase2-rope-numa)
+llama_build_and_test(test-phase2-rope-numa.cpp)
 target_link_libraries(${LLAMA_TEST_NAME} PRIVATE ggml ggml-cpu common)
+target_include_directories(${LLAMA_TEST_NAME} PRIVATE ${CMAKE_SOURCE_DIR}/ggml/include ${CMAKE_SOURCE_DIR}/ggml/src/ggml-cpu)
 
-# test-comprehensive-numa-performance  
-set(LLAMA_TEST_NAME test-comprehensive-numa-performance)
-llama_build_and_test(test-comprehensive-numa-performance.cpp)
+# test-numa-coordinator
+set(LLAMA_TEST_NAME test-numa-coordinator)
+llama_build_and_test(test-numa-coordinator.cpp)
 target_link_libraries(${LLAMA_TEST_NAME} PRIVATE ggml ggml-cpu common)
-target_include_directories(${LLAMA_TEST_NAME} PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src)
-target_include_directories(${LLAMA_TEST_NAME} PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src/ggml-cpu)
+target_include_directories(${LLAMA_TEST_NAME} PRIVATE ${CMAKE_SOURCE_DIR}/ggml/include ${CMAKE_SOURCE_DIR}/ggml/src/ggml-cpu)
 
-# test-real-numa-performance  
-llama_build_and_test(test-real-numa-performance.cpp)
-target_link_libraries(test-real-numa-performance PRIVATE ggml ggml-cpu common)
-target_include_directories(test-real-numa-performance PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src)
-target_include_directories(test-real-numa-performance PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src/ggml-cpu)
-
-# test-chunking-ab-comparison
-set(LLAMA_TEST_NAME test-chunking-ab-comparison)
-llama_build_and_test(test-chunking-ab-comparison.cpp)
+# test-numa-dispatcher
+set(LLAMA_TEST_NAME test-numa-dispatcher)
+llama_build_and_test(test-numa-dispatcher.cpp)
 target_link_libraries(${LLAMA_TEST_NAME} PRIVATE ggml ggml-cpu common)
-target_include_directories(${LLAMA_TEST_NAME} PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src)
-target_include_directories(${LLAMA_TEST_NAME} PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src/ggml-cpu)
-
-# test-numa-strategy-selection
-set(LLAMA_TEST_NAME test-numa-strategy-selection)
-llama_build_and_test(test-numa-strategy-selection.cpp)
-target_link_libraries(${LLAMA_TEST_NAME} PRIVATE ggml ggml-cpu common)
-target_include_directories(${LLAMA_TEST_NAME} PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src)
-target_include_directories(${LLAMA_TEST_NAME} PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src/ggml-cpu)
-
-# test-cache-optimization
-set(LLAMA_TEST_NAME test-cache-optimization)
-llama_build_and_test(test-cache-optimization.cpp)
-target_link_libraries(${LLAMA_TEST_NAME} PRIVATE ggml ggml-cpu common)
-target_include_directories(${LLAMA_TEST_NAME} PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src)
-target_include_directories(${LLAMA_TEST_NAME} PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src/ggml-cpu)
-
-# test-numa-coordinator-integration
-set(LLAMA_TEST_NAME test-numa-coordinator-integration)
-llama_build_and_test(test-numa-coordinator-integration.cpp)
-target_link_libraries(${LLAMA_TEST_NAME} PRIVATE ggml ggml-cpu common)
-target_include_directories(${LLAMA_TEST_NAME} PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src)
-target_include_directories(${LLAMA_TEST_NAME} PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src/ggml-cpu)
-
-# test-kv-cache-numa-analysis
-set(LLAMA_TEST_NAME test-kv-cache-numa-analysis)
-add_executable(${LLAMA_TEST_NAME} test-kv-cache-numa-analysis.cpp)
-target_link_libraries(${LLAMA_TEST_NAME} PRIVATE numa)
-
-# test-repack-numa-enhanced
-set(LLAMA_TEST_NAME test-repack-numa-enhanced)
-llama_build_and_test(test-repack-numa-enhanced.cpp)
-target_link_libraries(${LLAMA_TEST_NAME} PRIVATE ggml ggml-cpu common)
-target_include_directories(${LLAMA_TEST_NAME} PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src)
-if (GGML_CPU_REPACK)
-    target_compile_definitions(${LLAMA_TEST_NAME} PRIVATE GGML_USE_CPU_REPACK)
-endif()
-
-# test-cpu-numa-enhancement
-set(LLAMA_TEST_NAME test-cpu-numa-enhancement)
-llama_build_and_test(test-cpu-numa-enhancement.cpp)
-target_link_libraries(${LLAMA_TEST_NAME} PRIVATE ggml ggml-cpu common numa)
-
-# test-dual-numa-buffer-allocation
-set(LLAMA_TEST_NAME test-dual-numa-buffer-allocation)
-llama_build_and_test(test-dual-numa-buffer-allocation.cpp)
-target_link_libraries(${LLAMA_TEST_NAME} PRIVATE ggml ggml-cpu common numa)
-
-# test-cpu-numa-enhancement-simple
-set(LLAMA_TEST_NAME test-cpu-numa-enhancement-simple)
-llama_build_and_test(test-cpu-numa-enhancement-simple.cpp)
-target_link_libraries(${LLAMA_TEST_NAME} PRIVATE ggml ggml-cpu common numa)
-
-# test-cpu-buffer-direct
-set(LLAMA_TEST_NAME test-cpu-buffer-direct)
-llama_build_and_test(test-cpu-buffer-direct.cpp)
-target_link_libraries(${LLAMA_TEST_NAME} PRIVATE ggml ggml-cpu common numa)
-
-# test-numa-coordinator-repack-integration  
-set(LLAMA_TEST_NAME test-numa-coordinator-repack-integration)
-llama_build_and_test(test-numa-coordinator-repack-integration.cpp)
-target_link_libraries(${LLAMA_TEST_NAME} PRIVATE ggml ggml-cpu common numa)
-target_include_directories(${LLAMA_TEST_NAME} PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src)
-target_include_directories(${LLAMA_TEST_NAME} PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src/ggml-cpu)
-
-# test-gpu-numa-binding
-set(LLAMA_TEST_NAME test-gpu-numa-binding)
-llama_build_and_test(test-gpu-numa-binding.cpp)
-target_link_libraries(${LLAMA_TEST_NAME} PRIVATE ggml ggml-cpu common numa)
-
-# test-max-numa-nodes
-set(LLAMA_TEST_NAME test-max-numa-nodes)
-llama_build_and_test(test-max-numa-nodes.cpp)
-target_link_libraries(${LLAMA_TEST_NAME} PRIVATE ggml ggml-cpu common numa)
-target_include_directories(${LLAMA_TEST_NAME} PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src)
-target_include_directories(${LLAMA_TEST_NAME} PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src/ggml-cpu)
-
-# test-numa-pread-fix
-set(LLAMA_TEST_NAME test-numa-pread-fix)
-llama_build_and_test(test-numa-pread-fix.cpp)
-target_link_libraries(${LLAMA_TEST_NAME} PRIVATE ggml ggml-cpu common)
+target_include_directories(${LLAMA_TEST_NAME} PRIVATE ${CMAKE_SOURCE_DIR}/ggml/include ${CMAKE_SOURCE_DIR}/ggml/src/ggml-cpu)

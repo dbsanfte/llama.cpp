@@ -2869,24 +2869,56 @@ enum ggml_status ggml_numa_fallback_execute_operation(struct ggml_tensor * opera
     
     // Create default single-threaded compute parameters if none provided
     struct ggml_compute_params fallback_params;
+    void * temp_work_buffer = NULL;
+    size_t temp_work_size = 0;
+    
     if (params && operation->op != GGML_OP_MUL_MAT) {
         // Use provided params for non-MUL_MAT operations
         fallback_params = *params;
     } else {
-        // For MUL_MAT operations, we need a minimal threadpool even in single-threaded mode
-        // because MUL_MAT code expects valid threadpool for barriers and chunk management
-        if (operation->op == GGML_OP_MUL_MAT && params && params->threadpool) {
-            // Create single-threaded parameters but keep the threadpool
-            // We'll temporarily set it to single-threaded mode
+        // Special handling for MUL_MAT operations which require work buffers
+        if (operation->op == GGML_OP_MUL_MAT) {
+            // Calculate required work buffer size for MUL_MAT
+            // Based on ggml-cpu.c:1389 assertion: params->wsize >= ne13*nbw3
+            struct ggml_tensor * src1 = operation->src[1];
+            if (src1) {
+                const int64_t ne10 = src1->ne[0];
+                const int64_t ne11 = src1->ne[1]; 
+                const int64_t ne12 = src1->ne[2];
+                const int64_t ne13 = src1->ne[3];
+                
+                // Calculate work buffer size based on type conversion requirements
+                const size_t nbw0 = ggml_type_size(GGML_TYPE_Q8_0);  // vec_dot_type
+                const size_t nbw1 = ((ne10 + 31) / 32) * nbw0;       // row size with alignment
+                const size_t nbw2 = nbw1 * ne11;
+                const size_t nbw3 = nbw2 * ne12;
+                temp_work_size = ne13 * nbw3;
+                
+                // Allocate temporary work buffer (minimum 64KB to be safe)
+                temp_work_size = temp_work_size < 65536 ? 65536 : temp_work_size;
+                
+                // Get current CPU and its NUMA node for NUMA-aware allocation
+                int current_cpu = sched_getcpu();
+                int numa_node = (current_cpu >= 0) ? numa_node_of_cpu(current_cpu) : 0;
+                temp_work_buffer = numa_alloc_onnode(temp_work_size, numa_node);
+                
+                if (!temp_work_buffer) {
+                    GGML_LOG_ERROR("Failed to allocate NUMA work buffer for MUL_MAT: %zu bytes on node %d\n", temp_work_size, numa_node);
+                    return GGML_STATUS_FAILED;
+                }
+                
+                GGML_LOG_DEBUG("Allocated temporary work buffer for MUL_MAT: %zu bytes on NUMA node %d\n", temp_work_size, numa_node);
+            }
+            
             fallback_params = (struct ggml_compute_params) {
                 .ith = 0,
                 .nth = 1,
-                .wsize = 0,
-                .wdata = NULL,
-                .threadpool = params->threadpool
+                .wsize = temp_work_size,
+                .wdata = temp_work_buffer,
+                .threadpool = params ? params->threadpool : NULL
             };
         } else {
-            // Default fallback for other operations or when no threadpool available
+            // Default fallback for other operations
             fallback_params = (struct ggml_compute_params) {
                 .ith = 0,
                 .nth = 1,
@@ -2897,60 +2929,64 @@ enum ggml_status ggml_numa_fallback_execute_operation(struct ggml_tensor * opera
         }
     }
     
-    // Execute the operation using GGML's standard compute functions
-    // This provides a basic fallback for operations not handled by NUMA coordinator
-    switch (operation->op) {
-        // Add basic operations that have public compute functions
-        case GGML_OP_ADD:
-            ggml_compute_forward_add(&fallback_params, operation);
-            break;
-        case GGML_OP_MUL:
-            ggml_compute_forward_mul(&fallback_params, operation);
-            break;
-        case GGML_OP_DUP:
-            ggml_compute_forward_dup(&fallback_params, operation);
-            break;
-        case GGML_OP_CPY:
-            ggml_compute_forward_cpy(&fallback_params, operation);
-            break;
-        case GGML_OP_CONT:
-            ggml_compute_forward_cont(&fallback_params, operation);
-            break;
-        case GGML_OP_RESHAPE:
-            ggml_compute_forward_reshape(&fallback_params, operation);
-            break;
-        case GGML_OP_VIEW:
-            ggml_compute_forward_view(&fallback_params, operation);
-            break;
-        case GGML_OP_PERMUTE:
-            ggml_compute_forward_permute(&fallback_params, operation);
-            break;
-        case GGML_OP_TRANSPOSE:
-            ggml_compute_forward_transpose(&fallback_params, operation);
-            break;
-        case GGML_OP_NORM:
-            ggml_compute_forward_norm(&fallback_params, operation);
-            break;
-        case GGML_OP_RMS_NORM:
-            ggml_compute_forward_rms_norm(&fallback_params, operation);
-            break;
-        case GGML_OP_SUM:
-            ggml_compute_forward_sum(&fallback_params, operation);
-            break;
-        case GGML_OP_MEAN:
-            ggml_compute_forward_mean(&fallback_params, operation);
-            break;
-        case GGML_OP_SOFT_MAX:
-            ggml_compute_forward_soft_max(&fallback_params, operation);
-            break;
-        case GGML_OP_MUL_MAT:
-            ggml_compute_forward_mul_mat(&fallback_params, operation);
-            break;
-            
-        default:
-            GGML_LOG_ERROR("Operation %s not available for fallback execution - no public compute function\n", 
-                          ggml_op_name(operation->op));
-            return GGML_STATUS_FAILED;
+    // COORDINATOR SHOULD NOT KNOW ABOUT SPECIFIC OPERATIONS!
+    // The coordinator is a generic execution engine - all operation-specific
+    // logic belongs in the dispatcher. The coordinator just executes whatever
+    // the dispatcher tells it to execute.
+    
+    // For now, we use GGML's graph-based execution as our generic execution method
+    // The dispatcher should have already prepared the operation for execution
+    
+    GGML_LOG_DEBUG("NUMA%d: Generic fallback execution for operation %s\n", 
+                   coordinator ? coordinator->numa_node : -1, ggml_op_name(operation->op));
+    
+    // Create a simple computation graph containing just this operation
+    struct ggml_context * temp_ctx = ggml_init((struct ggml_init_params) {
+        .mem_size = 1024 * 1024, // 1MB for metadata
+        .mem_buffer = NULL,
+        .no_alloc = true, // Don't allocate tensor data
+    });
+    
+    if (!temp_ctx) {
+        GGML_LOG_ERROR("Failed to create temporary context for operation %s\n", 
+                       ggml_op_name(operation->op));
+        if (temp_work_buffer) {
+            numa_free(temp_work_buffer, temp_work_size);
+        }
+        return GGML_STATUS_FAILED;
+    }
+    
+    // Create computation graph and plan
+    struct ggml_cgraph * temp_graph = ggml_new_graph(temp_ctx);
+    ggml_build_forward_expand(temp_graph, operation);
+    
+    // Use the provided threadpool or default parameters
+    struct ggml_threadpool * pool = (params && params->threadpool) ? params->threadpool : NULL;
+    int n_threads = (params && params->nth > 0) ? params->nth : 1;
+    
+    struct ggml_cplan cplan = ggml_graph_plan(temp_graph, n_threads, pool);
+    
+    // Use provided work buffer or temporary work buffer
+    if (params && params->wdata && params->wsize >= cplan.work_size) {
+        cplan.work_data = params->wdata;
+    } else if (temp_work_buffer && temp_work_size >= cplan.work_size) {
+        cplan.work_data = temp_work_buffer;
+    } else if (cplan.work_size > 0) {
+        GGML_LOG_WARN("Insufficient work buffer for operation %s: need %zu bytes, have %zu\n", 
+                      ggml_op_name(operation->op), cplan.work_size, 
+                      temp_work_buffer ? temp_work_size : 0);
+    }
+    
+    // Execute the graph
+    enum ggml_status status = ggml_graph_compute(temp_graph, &cplan);
+    
+    // Cleanup
+    ggml_free(temp_ctx);
+    
+    // Clean up temporary work buffer if allocated
+    if (temp_work_buffer) {
+        numa_free(temp_work_buffer, temp_work_size);
+        GGML_LOG_DEBUG("Freed temporary work buffer for operation %s\n", ggml_op_name(operation->op));
     }
     
     GGML_LOG_DEBUG("Fallback execution completed for operation %s\n", ggml_op_name(operation->op));
