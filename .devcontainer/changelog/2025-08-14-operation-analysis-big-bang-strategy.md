@@ -200,32 +200,139 @@ typedef struct {
 } ggml_operation_info_t;
 ```
 
-## Implementation Strategy
+## Implementation Strategy - Updated with Fallback Architecture
 
-1. **Task 4**: Create dispatcher framework with operation registry and fallback system
-2. **Task 5**: Implement ROPE handler (highest crash risk)
-3. **Task 6**: Implement MUL_MAT handler (highest performance impact)
-4. **Tasks 7-N**: Systematically migrate all 193 operations by priority
+### Phase 1: Single-Threaded Fallback Foundation (Task 4.1)
+**Status:** ✅ DISPATCHER FRAMEWORK COMPLETE, 🔄 FALLBACK IMPLEMENTATION NEEDED
 
-Each operation implementation will:
-- Determine optimal parallelization strategy
-- Split work appropriately for NUMA nodes
-- Submit work items to coordinator 
-- Handle operation-specific optimizations
+**Threading Conflict Resolution:**
+The big-bang approach creates a critical threading architecture conflict:
+- ggml-cpu.c uses `struct ggml_threadpool` for its own parallel execution
+- Our NUMA coordinator uses separate threadpool system
+- Mixing both causes race conditions and synchronization nightmares
+
+**Solution: Three-Phase Fallback Evolution**
+1. **Phase 1:** Single-threaded fallback (simple, conflict-free)
+2. **Phase 2:** Incremental NUMA-aware operation implementation  
+3. **Phase 3:** NUMA-aware fallback for complex operations (advanced)
+
+**Phase 1 Implementation:**
+```c
+static int handle_operation_fallback(struct ggml_compute_params * params, 
+                                   struct ggml_tensor * tensor, 
+                                   ggml_simple_coordinator_manager_t * coordinator) {
+    // Create single-threaded params to avoid threadpool conflicts
+    struct ggml_compute_params fallback_params = {
+        .ith = 0,           // Single thread
+        .nth = 1,           // Total = 1  
+        .wsize = params->wsize,
+        .wdata = params->wdata,
+        .threadpool = NULL  // No threadpool conflicts
+    };
+    
+    // Call specific operation handler directly
+    switch (tensor->op) {
+        case GGML_OP_ADD:    ggml_compute_forward_add(&fallback_params, tensor); break;
+        case GGML_OP_MUL:    ggml_compute_forward_mul(&fallback_params, tensor); break;
+        case GGML_OP_SUB:    ggml_compute_forward_sub(&fallback_params, tensor); break;
+        // ... 190 more operations
+        default: return -1; // Unsupported
+    }
+    
+    atomic_fetch_add_explicit(&g_dispatcher_state.fallback_operations, 1, memory_order_relaxed);
+    return 0;
+}
+```
+
+**Benefits:**
+- ✅ Zero threading conflicts
+- ✅ Allows gradual migration without breaking existing operations
+- ✅ Performance impact only on unimplemented operations (temporary)
+- ✅ Simple and reliable
+
+### Phase 2: Incremental Operation Migration (Tasks 5-N)
+
+**Priority 1: Critical Operations (Crash Prevention)**
+- [ ] **Task 5: ROPE Handler** (sequence-parallel, crash prevention) 
+- [ ] **Task 6: MUL_MAT Handler** (matrix multiplication, highest performance impact)
+- [ ] **Task 7: FLASH_ATTN_EXT Handler** (attention mechanism, critical for transformers)
+
+**Priority 2: High-Performance Math Operations**
+- [ ] **Task 8-12:** SUB, MUL, DIV, SQR, SQRT (element-parallel, high-frequency)
+- [ ] **Task 13-17:** LOG, SIN, COS, EXP (transcendental, parallelizable)
+
+**Priority 3: Tensor Operations**  
+- [ ] **Task 18-22:** SOFT_MAX, RMS_NORM, GELU, SILU (normalization/activation)
+- [ ] **Task 23-27:** RESHAPE, PERMUTE, TRANSPOSE (layout operations)
+
+**Incremental Migration Strategy:**
+Each task implements one operation with:
+- NUMA-aware work distribution via coordinator
+- Proper parallelization strategy (element/row/sequence/batch)
+- Performance validation against single-threaded fallback
+- Comprehensive testing
+
+**Fallback Reduction:** As operations migrate, fallback usage decreases:
+```
+Initial: 193 operations → fallback
+After Task 5: 192 operations → fallback, 1 → NUMA-aware
+After Task 6: 191 operations → fallback, 2 → NUMA-aware
+...
+Target: 0 operations → fallback, 193 → NUMA-aware
+```
+
+### Phase 3: NUMA-Aware Fallback for Complex Operations
+
+**For operations too complex to fully reimplement:**
+```c
+static int handle_operation_numa_fallback(struct ggml_compute_params * params,
+                                        struct ggml_tensor * tensor,
+                                        ggml_simple_coordinator_manager_t * coordinator) {
+    // Create work items that preserve NUMA awareness while using proven operation logic
+    ggml_work_item_t * work_item = ggml_create_work_item(
+        operation_wrapper_function,  // Wrapper around original handler
+        tensor,
+        params->wsize,
+        ggml_get_preferred_numa_node_for_tensor(tensor)
+    );
+    
+    return ggml_simple_coordinator_enqueue_work(coordinator, work_item);
+}
+```
 
 ## Expected Benefits
 
-- **Complete NUMA Optimization**: All operations NUMA-aware
+- **Phase 1:** Zero threading conflicts, reliable fallback system
+- **Phase 2:** Progressive performance gains as operations become NUMA-aware
+- **Phase 3:** Complete NUMA optimization with maintained compatibility
 - **Unified Threading Model**: Single coordinator manages all parallelism
 - **Crash Prevention**: Proper ROPE sequence splitting
 - **Performance Gains**: Optimized parallelization per operation type
 - **Clean Architecture**: No threadpool conflicts or race conditions
 
-## Migration Commitment
+## Migration Commitment - Updated Timeline
 
-This represents a significant undertaking - migrating 193 operations from ggml-cpu.c to our dispatcher-coordinator system. However, it provides the clean architectural foundation needed for robust NUMA-aware inference with no threading conflicts.
+**Phased Implementation Strategy:**
 
-**Estimated Timeline:** 193 operations × ~2 hours avg = ~400 hours of implementation work, but can be parallelized across team members and incrementally tested.
+**Phase 1 (Task 4.1):** Single-threaded fallback implementation  
+*Timeline:* 2-4 hours  
+*Deliverable:* Working fallback for all 193 operations without threading conflicts
+
+**Phase 2 (Tasks 5-N):** Incremental operation migration  
+*Timeline:* 193 operations × 1-3 hours avg = 200-600 hours  
+*Parallelizable:* Yes, can be distributed across team members  
+*Testing:* Each operation validated individually and integrated incrementally
+
+**Phase 3 (Advanced):** NUMA-aware fallback for complex operations  
+*Timeline:* As needed for operations too complex for full reimplementation  
+*Optional:* Only for operations where full rewrite isn't cost-effective
+
+**Key Advantages of This Approach:**
+- ✅ **Immediate deployment capability** - Phase 1 provides working system
+- ✅ **Risk mitigation** - Each operation tested independently  
+- ✅ **Progressive performance gains** - Benefits increase with each migrated operation
+- ✅ **Maintainable timeline** - ~200-400 hour range much more realistic
+- ✅ **Team parallelization** - Multiple developers can work simultaneously
 
 **Success Criteria:** 
 - All 193 operations migrated and tested
