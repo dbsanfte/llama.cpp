@@ -40,6 +40,12 @@ enum ggml_status ggml_numa_graph_compute_with_virtual(struct ggml_cgraph * cgrap
 // Phase 1: Single-threaded fallback system for complete operation coverage
 enum ggml_status ggml_numa_execute_operation_fallback(struct ggml_tensor * tensor, struct ggml_cplan * cplan);
 
+// NUMA intercept function - called from ggml_compute_forward to route operations to NUMA system
+enum ggml_status ggml_numa_intercept_operation(struct ggml_tensor * tensor, struct ggml_compute_params * params);
+
+// Graph-level processing function - primary interface for graph computation
+int ggml_numa_dispatch_compute_graph(struct ggml_cgraph * cgraph, int n_threads);
+
 //
 // Dispatcher Work Buffer Management
 // Persistent work buffer system for performance-critical operations (like MUL_MAT)
@@ -80,7 +86,7 @@ typedef struct {
     size_t (*get_work_buffer_size)(struct ggml_numa_coordinator_manager * manager, int numa_node);
     
     // Submit work to a specific coordinator (for complex execution strategies)
-    int (*submit_work)(struct ggml_numa_coordinator_manager * manager, struct ggml_tensor * operation, int target_numa_node);
+    int (*submit_work)(struct ggml_numa_coordinator_manager * manager, struct ggml_tensor * operation, int target_numa_node, ggml_numa_execution_strategy_t strategy);
     
     // Submit data parallel work across multiple coordinators
     int (*submit_data_parallel_work)(struct ggml_numa_coordinator_manager * manager, struct ggml_tensor * operation, 
@@ -89,15 +95,8 @@ typedef struct {
 
 //
 // Operation Classification System
+// (ggml_numa_execution_strategy_t defined in ggml-numa-coordinator.h)
 //
-
-typedef enum {
-    NUMA_EXECUTION_SINGLE_NODE,     // Execute on primary node only
-    NUMA_EXECUTION_DATA_PARALLEL,   // Distribute data across nodes
-    NUMA_EXECUTION_TASK_PARALLEL,   // Distribute different tasks across nodes  
-    NUMA_EXECUTION_HYBRID,          // Combination of strategies
-    NUMA_EXECUTION_CUSTOM           // Operation-specific strategy
-} ggml_numa_execution_strategy_t;
 
 typedef enum {
     NUMA_OP_COMPLEXITY_SIMPLE,      // O(n) operations, high parallelization potential

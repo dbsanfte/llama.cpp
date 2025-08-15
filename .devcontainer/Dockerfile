@@ -39,6 +39,7 @@ RUN apt-get update && \
         ninja-build \
         gdb \
         valgrind \
+        strace \
         sudo \
         gh && \
     update-ca-certificates && \

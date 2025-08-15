@@ -11,6 +11,7 @@
 
 #ifdef GGML_NUMA_MIRROR
 #include "ggml-numa-coordinator.h"
+#include "ggml-numa-operation-dispatch.h"
 #endif
 
 #include <cinttypes>
@@ -1441,23 +1442,17 @@ ggml_status llama_context::graph_compute(
     ggml_threadpool_t tp = batched ? threadpool_batch        : threadpool;
 
 #ifdef GGML_NUMA_MIRROR
-    // Try to use NUMA coordinator if available (initialized during construction)
+    // Try to use NUMA dispatcher if available (replaces direct coordinator access)
     if (numa_coordinator) {
-        LLAMA_LOG_DEBUG("%s: using NUMA coordinator for graph computation\n", __func__);
+        LLAMA_LOG_DEBUG("%s: using NUMA dispatcher for graph computation\n", __func__);
         
-        // Use NUMA coordinator to compute the graph
-        int result = ggml_numa_coordinator_manager_compute_graph(numa_coordinator, gf);
+        // Route through dispatcher instead of coordinator directly
+        int result = ggml_numa_dispatch_compute_graph(gf, n_threads);
         if (result == 0) {
-            // Wait for completion
-            result = ggml_numa_coordinator_manager_wait_for_completion(numa_coordinator);
-            if (result == 0) {
-                LLAMA_LOG_DEBUG("%s: NUMA coordinator completed successfully\n", __func__);
-                return GGML_STATUS_SUCCESS;
-            } else {
-                LLAMA_LOG_WARN("%s: NUMA coordinator wait failed, falling back to backend scheduler\n", __func__);
-            }
+            LLAMA_LOG_DEBUG("%s: NUMA dispatcher completed successfully\n", __func__);
+            return GGML_STATUS_SUCCESS;
         } else {
-            LLAMA_LOG_WARN("%s: NUMA coordinator compute failed, falling back to backend scheduler\n", __func__);
+            LLAMA_LOG_WARN("%s: NUMA dispatcher failed, falling back to backend scheduler\n", __func__);
         }
     }
 #endif

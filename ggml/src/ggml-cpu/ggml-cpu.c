@@ -17,6 +17,7 @@
 
 #ifdef GGML_NUMA_MIRROR
 #include "ggml-numa-coordinator.h"
+#include "ggml-numa-operation-dispatch.h"
 #ifdef __linux__
 #include <numa.h>
 #include <sched.h>
@@ -697,14 +698,13 @@ int ggml_numa_node_count(void) {
 
 #ifdef GGML_NUMA_MIRROR
 bool ggml_numa_should_mirror(void) {
-    // Only enable mirroring if:
+    // Enable mirroring/dispatcher if:
     // 1. NUMA is initialized and enabled
-    // 2. Strategy is specifically MIRROR
-    // 3. We have multiple NUMA nodes
+    // 2. Strategy is specifically MIRROR (even on single-node systems for testing/virtual NUMA)
     return g_numa_state.initialized && 
            g_numa_state.numa_enabled &&
-           g_numa_state.strategy == GGML_NUMA_STRATEGY_MIRROR &&
-           g_numa_state.numa_nodes > 1;
+           g_numa_state.strategy == GGML_NUMA_STRATEGY_MIRROR;
+    // Note: Removed numa_nodes > 1 check to allow single-node dispatcher usage
 }
 #endif
 
@@ -1877,6 +1877,22 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
     if (ggml_cpu_extra_compute_forward(params, tensor)) {
         return;
     }
+
+#ifdef GGML_NUMA_MIRROR
+    // NUMA dispatch intercept - route operations to NUMA coordinator when NUMA mirroring is enabled
+    if (ggml_numa_should_mirror() && params->ith == 0) {
+        extern enum ggml_status ggml_numa_intercept_operation(struct ggml_tensor * tensor, struct ggml_compute_params * params);
+        enum ggml_status numa_result = ggml_numa_intercept_operation(tensor, params);
+        
+        if (numa_result == GGML_STATUS_SUCCESS) {
+            // Operation was successfully handled by NUMA system
+            return;
+        }
+        
+        // If NUMA dispatch failed, continue with standard execution
+        GGML_LOG_DEBUG("NUMA dispatch failed for %s, using standard execution\n", ggml_op_name(tensor->op));
+    }
+#endif
 
     switch (tensor->op) {
         case GGML_OP_DUP:
@@ -3248,6 +3264,14 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
     GGML_ASSERT(cplan);
     GGML_ASSERT(cplan->n_threads > 0);
     GGML_ASSERT(cplan->work_size == 0 || cplan->work_data != NULL);
+
+#ifdef GGML_NUMA_MIRROR
+    // NUMA intercept: Check if NUMA system should handle this graph computation
+    if (g_numa_state.numa_enabled && g_numa_state.coordinator) {
+        GGML_LOG_INFO("Processing computation graph with %d nodes through NUMA dispatcher\n", cgraph->n_nodes);
+        return ggml_numa_graph_compute(cgraph, cplan->n_threads);
+    }
+#endif
 
     int n_threads                               = cplan->n_threads;
     struct ggml_threadpool * threadpool = cplan->threadpool;

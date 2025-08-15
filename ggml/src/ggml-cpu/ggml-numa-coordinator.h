@@ -11,6 +11,15 @@
 // Note: Minimal includes to avoid path issues from tests
 // Full implementation includes are in the .c file
 
+// Execution Strategy - moved here to avoid circular dependencies
+typedef enum {
+    NUMA_EXECUTION_SINGLE_NODE,     // Execute on primary node only
+    NUMA_EXECUTION_DATA_PARALLEL,   // Distribute data across nodes
+    NUMA_EXECUTION_TASK_PARALLEL,   // Distribute different tasks across nodes  
+    NUMA_EXECUTION_HYBRID,          // Combination of strategies
+    NUMA_EXECUTION_CUSTOM           // Operation-specific strategy
+} ggml_numa_execution_strategy_t;
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -123,9 +132,19 @@ int ggml_numa_coordinator_manager_start(struct ggml_numa_coordinator_manager * m
  * @param numa_node_hint Preferred NUMA node (-1 for automatic)
  * @return Work ID on success, -1 on failure
  */
+/**
+ * Submit tensor for processing by a specific NUMA node
+ * 
+ * @param mgr Manager instance
+ * @param tensor Tensor to process
+ * @param numa_node_hint Preferred NUMA node (-1 for automatic)
+ * @param execution_strategy How the coordinator should execute this operation
+ * @return Work ID on success, -1 on failure
+ */
 int ggml_numa_coordinator_manager_submit_work(struct ggml_numa_coordinator_manager * mgr,
                                               struct ggml_tensor * tensor,
-                                              int numa_node_hint);
+                                              int numa_node_hint,
+                                              ggml_numa_execution_strategy_t execution_strategy);
 
 /**
  * Submit tensor with data parallelism across multiple NUMA nodes

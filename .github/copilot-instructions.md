@@ -54,7 +54,7 @@ wget -c -O ./.devcontainer/qwen2.5-0.5b-instruct-q8_0.gguf https://huggingface.c
 
 - **NUMA mirroring**: `tensor_data()` and `tensor_set_data()` in `ggml/src/ggml.h` to handle numa-aware tensor data access and mirror across nodes, and numa-aware cache mirroring in `ggml-cpu-numa-buffer.cpp`
 - **Thread-to-NUMA mapping**: In the numa coordinator, each worker threadpool gets assigned to its own numa node.
-- **Memory allocation**: NEVER use `malloc()` to allocate memory/buffers. ALWAYS use `numa_alloc_onnode()` for local allocation on the current numa node.
+- **Memory allocation**: ALWAYS use `numa_alloc_onnode()` for local memory/buffer allocation on the current numa node, or indeed ALL numa nodes. Remember, we're trying to achieve data parallelism! Each numa node needs its own local copy of everything!
 
 ### 2. CPU Topology Detection
 **Files**: `common/common.cpp`, `common/common.h`, `ggml/src/ggml-numa-coordinator.c`

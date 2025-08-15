@@ -3,7 +3,6 @@
 #include "ggml-backend.h"
 #include "ggml-numa-operation-dispatch.h"
 #include "ggml-numa-coordinator.h"
-#include "ggml-numa-rope-handler.h"
 #include <vector>
 #include <stdio.h>
 #include <stdlib.h>
@@ -836,141 +835,6 @@ public:
                        reuse_test_passed ? "Work buffer reuse and growth patterns validated" : failure_reason);
     }
     
-    // Test: NUMA ROPE Dispatch Integration
-    void test_numa_rope_dispatch_integration() {
-        printf("--- Test: NUMA ROPE Dispatch Integration ---\n");
-        printf("Testing NUMA-aware ROPE operation dispatch integration...\n");
-        
-        bool rope_integration_passed = true;
-        const char* failure_reason = "Unknown error";
-        
-        // Create test context for ROPE operation
-        struct ggml_init_params rope_params;
-        rope_params.mem_size = 8 * 1024 * 1024;  // 8MB for ROPE test
-        rope_params.mem_buffer = nullptr;
-        rope_params.no_alloc = false;
-        struct ggml_context* rope_ctx = ggml_init(rope_params);
-        
-        if (!rope_ctx) {
-            failure_reason = "Failed to create ROPE test context";
-            rope_integration_passed = false;
-        } else {
-            printf("  Creating ROPE operation for NUMA dispatch testing...\n");
-            
-            // Create ROPE tensors (typical transformer dimensions)
-            // Input: [embedding_dim=128, num_heads=8, seq_len=16, batch=2]  
-            struct ggml_tensor* rope_input = ggml_new_tensor_4d(rope_ctx, GGML_TYPE_F32, 128, 8, 16, 2);
-            struct ggml_tensor* rope_pos = ggml_new_tensor_1d(rope_ctx, GGML_TYPE_I32, 16);
-            
-            if (!rope_input || !rope_pos) {
-                failure_reason = "Failed to create ROPE input tensors";
-                rope_integration_passed = false;
-            } else {
-                printf("  ✅ ROPE tensors created: input[128,8,16,2] F32, pos[16] I32\n");
-                
-                // Initialize position data
-                int32_t* pos_data = (int32_t*)ggml_get_data(rope_pos);
-                for (int i = 0; i < 16; i++) {
-                    pos_data[i] = i;  // Sequential positions 0,1,2,...,15
-                }
-                
-                // Initialize input data with simple pattern
-                float* input_data = (float*)ggml_get_data(rope_input);
-                for (size_t i = 0; i < ggml_nelements(rope_input); i++) {
-                    input_data[i] = 0.1f * (float)(i % 10);  // Pattern: 0.0, 0.1, 0.2, ..., 0.9, 0.0, ...
-                }
-                
-                printf("  ✅ ROPE test data initialized\n");
-                
-                // Create ROPE operation with standard parameters
-                struct ggml_tensor* rope_result = ggml_rope_ext(
-                    rope_ctx, rope_input, rope_pos, NULL,
-                    128,    // n_dims (ROPE dimensions)
-                    0,      // mode (standard ROPE)
-                    0,      // n_ctx (unused)
-                    10000.0f,  // freq_base
-                    1.0f,   // freq_scale
-                    0.0f,   // ext_factor 
-                    1.0f,   // attn_factor
-                    1.0f,   // beta_fast
-                    1.0f    // beta_slow
-                );
-                
-                if (!rope_result) {
-                    failure_reason = "Failed to create ROPE operation";
-                    rope_integration_passed = false;
-                } else if (rope_result->op != GGML_OP_ROPE) {
-                    failure_reason = "ROPE operation has incorrect type";
-                    rope_integration_passed = false;
-                } else {
-                    printf("  ✅ ROPE operation created successfully\n");
-                    
-                    // Test ROPE operation through dispatcher infrastructure (not execution)
-                    printf("  Testing ROPE operation integration with dispatcher infrastructure...\n");
-                    
-                    // Instead of executing, just verify the dispatcher can handle ROPE operations
-                    // This tests the integration without risking segfaults from incomplete execution
-                    
-                    // Verify ROPE operation properties for dispatcher routing
-                    if (rope_result->op == GGML_OP_ROPE &&
-                        rope_result->src[0] == rope_input &&
-                        rope_result->src[1] == rope_pos) {
-                        printf("  ✅ ROPE operation correctly structured for dispatcher\n");
-                    } else {
-                        printf("  ⚠️  ROPE operation structure issue for dispatcher\n");
-                    }
-                    
-                    // Test that ROPE parameters are accessible
-                    if (rope_result->op_params) {
-                        int n_dims = ((int32_t *)rope_result->op_params)[1];
-                        int mode = ((int32_t *)rope_result->op_params)[2];
-                        printf("  ✅ ROPE parameters accessible: n_dims=%d, mode=%d\n", n_dims, mode);
-                    } else {
-                        printf("  ⚠️  ROPE operation parameters not set\n");
-                    }
-                    
-                    // Test ROPE handler registration
-                    printf("  Testing ROPE handler registration in dispatcher...\n");
-                    extern const ggml_numa_operation_handler_t* ggml_numa_dispatch_get_handler(enum ggml_op op);
-                    const ggml_numa_operation_handler_t* rope_handler = ggml_numa_dispatch_get_handler(GGML_OP_ROPE);
-                    
-                    if (rope_handler) {
-                        printf("  ✅ ROPE handler registered in dispatcher system\n");
-                        
-                        if (rope_handler->operation_type == GGML_OP_ROPE) {
-                            printf("  ✅ ROPE handler has correct operation type\n");
-                        } else {
-                            printf("  ⚠️  ROPE handler operation type mismatch\n");
-                        }
-                        
-                        if (rope_handler->default_strategy == NUMA_EXECUTION_DATA_PARALLEL) {
-                            printf("  ✅ ROPE handler configured for data-parallel execution\n");
-                        } else {
-                            printf("  ⚠️  ROPE handler has unexpected execution strategy\n");
-                        }
-                        
-                    } else {
-                        printf("  ⚠️  ROPE handler not found in dispatcher system\n");
-                    }
-                    
-                    printf("  Testing NUMA-aware ROPE stub function...\n");
-                    
-                    // Call the ROPE stub function (should not crash)
-                    ggml_numa_dispatch_rope(nullptr, rope_input, rope_pos, nullptr, rope_result);
-                    printf("  ✅ NUMA ROPE dispatch function callable (stub implementation)\n");
-                }
-            }
-            
-            ggml_free(rope_ctx);
-        }
-        
-        printf("✅ NUMA ROPE dispatch integration: %s\n", 
-               rope_integration_passed ? "VERIFIED" : "FAILED");
-        
-        add_test_result("numa_rope_dispatch_integration", rope_integration_passed,
-                       rope_integration_passed ? "NUMA-aware ROPE dispatch integration verified" : failure_reason);
-    }
-    
     // Test: MUL_MAT Mathematical Correctness
     void test_mul_mat_mathematical_correctness() {
         printf("--- Test: MUL_MAT Mathematical Correctness ---\n");
@@ -1101,6 +965,129 @@ public:
         
         add_test_result("mul_mat_mathematical_correctness", correctness_test_passed,
                        correctness_test_passed ? "MUL_MAT produces correct results across all matrix sizes" : failure_reason);
+    }
+    
+    // Test: MUL_MAT Parallel Chunking
+    void test_mul_mat_parallel_chunking() {
+        printf("--- Test: MUL_MAT Parallel Chunking ---\n");
+        printf("Testing NUMA-aware parallel chunking for large matrices...\n");
+        
+        bool chunking_test_passed = true;
+        const char* failure_reason = nullptr;
+        
+        // Test with large matrix that should trigger parallel chunking
+        struct ggml_init_params params;
+        params.mem_size = 128 * 1024 * 1024;  // 128MB for large matrices
+        params.mem_buffer = nullptr;
+        params.no_alloc = false;
+        
+        struct ggml_context* test_ctx = ggml_init(params);
+        if (!test_ctx) {
+            add_test_result("mul_mat_parallel_chunking", false, "Failed to create test context");
+            return;
+        }
+        
+        // Create large matrix that should trigger chunking (complexity > 10M)
+        // 128x128 * 128x64 = 1,048,576 elements, complexity = 128*128*64 = 1,048,576 ops
+        // We need bigger matrices to exceed 10M threshold
+        const int large_size = 256;  // 256x256 * 256x128 = 4.2M ops, still not enough
+        const int xl_size = 400;     // 400x400 * 400x200 = 32M ops - should trigger chunking
+        
+        printf("  Testing XL matrices (%dx%d * %dx%d = %d ops)...\n", 
+               xl_size, xl_size, xl_size, xl_size/2, xl_size * xl_size * (xl_size/2));
+        
+        struct ggml_tensor* a = ggml_new_tensor_2d(test_ctx, GGML_TYPE_F32, xl_size, xl_size);
+        struct ggml_tensor* b = ggml_new_tensor_2d(test_ctx, GGML_TYPE_F32, xl_size, xl_size/2);
+        
+        if (!a || !b) {
+            printf("  ❌ Failed to create XL test tensors\n");
+            ggml_free(test_ctx);
+            add_test_result("mul_mat_parallel_chunking", false, "Failed to create large test tensors");
+            return;
+        }
+        
+        // Initialize with known values
+        float* a_data = (float*)ggml_get_data(a);
+        float* b_data = (float*)ggml_get_data(b);
+        
+        for (int i = 0; i < ggml_nelements(a); i++) {
+            a_data[i] = 0.01f;  // Smaller values for large matrices
+        }
+        for (int i = 0; i < ggml_nelements(b); i++) {
+            b_data[i] = 0.02f;
+        }
+        
+        // Create MUL_MAT operation
+        struct ggml_tensor* result = ggml_mul_mat(test_ctx, a, b);
+        if (!result) {
+            printf("  ❌ Failed to create XL MUL_MAT operation\n");
+            ggml_free(test_ctx);
+            add_test_result("mul_mat_parallel_chunking", false, "Failed to create MUL_MAT operation");
+            return;
+        }
+        
+        printf("  ✅ XL MUL_MAT operation created: %dx%d * %dx%d -> %dx%d\n",
+               xl_size, xl_size, xl_size/2, xl_size, xl_size, xl_size/2);
+        
+        // Execute via dispatcher to test chunking logic
+        struct ggml_numa_coordinator_manager * manager = ggml_numa_coordinator_manager_get_global(-1, false);
+        if (!manager) {
+            printf("  ❌ Failed to get coordinator manager\n");
+            ggml_free(test_ctx);
+            add_test_result("mul_mat_parallel_chunking", false, "Failed to get coordinator manager");
+            return;
+        }
+        
+        printf("  🚀 Testing chunked dispatcher execution on XL matrix...\n");
+        
+        ggml_numa_work_context_t context = ggml_numa_create_work_context(result, manager);
+        enum ggml_status dispatch_result = ggml_numa_dispatch_operation(manager, result, &context);
+        
+        if (dispatch_result != GGML_STATUS_SUCCESS) {
+            printf("  ❌ XL matrix dispatcher execution failed (status=%d)\n", dispatch_result);
+            ggml_free(test_ctx);
+            add_test_result("mul_mat_parallel_chunking", false, "XL matrix dispatcher execution failed");
+            return;
+        }
+        
+        printf("  ✅ XL matrix dispatcher execution: SUCCESS\n");
+        
+        // Verify mathematical correctness for chunked execution
+        float* result_data = (float*)ggml_get_data(result);
+        float expected_value = 0.01f * 0.02f * xl_size; // Sum of products
+        bool math_correct = true;
+        int incorrect_count = 0;
+        
+        for (int i = 0; i < ggml_nelements(result) && incorrect_count < 5; i++) {
+            float actual = result_data[i];
+            float diff = fabs(actual - expected_value);
+            if (diff > 1e-4f) { // Slightly larger tolerance for large matrices
+                if (incorrect_count == 0) {
+                    printf("  ❌ Mathematical errors in chunked execution:\n");
+                }
+                printf("    Element[%d]: expected=%.6f, actual=%.6f, diff=%.6f\n", 
+                       i, expected_value, actual, diff);
+                incorrect_count++;
+                math_correct = false;
+            }
+        }
+        
+        if (math_correct) {
+            printf("  ✅ Chunked execution mathematical correctness: VERIFIED\n");
+            printf("  📊 Expected: %.6f, Actual sample: %.6f\n", expected_value, result_data[0]);
+        } else {
+            printf("  ❌ Chunked execution mathematical correctness: FAILED\n");
+            chunking_test_passed = false;
+            failure_reason = "Mathematical results incorrect in chunked execution";
+        }
+        
+        ggml_free(test_ctx);
+        
+        printf("🔀 MUL_MAT parallel chunking: %s\n", 
+               chunking_test_passed ? "CHUNKING VALIDATED" : "CHUNKING FAILED");
+        
+        add_test_result("mul_mat_parallel_chunking", chunking_test_passed,
+                       chunking_test_passed ? "NUMA-aware parallel chunking verified for large matrices" : failure_reason);
     }
     
     // Test: MUL_MAT Dispatcher Execution 
@@ -1355,10 +1342,10 @@ public:
         test_numa_node_detection_and_fallback();
         printf("\n");
         
-        test_numa_rope_dispatch_integration();
+        test_mul_mat_mathematical_correctness();
         printf("\n");
         
-        test_mul_mat_mathematical_correctness();
+        test_mul_mat_parallel_chunking();
         printf("\n");
         
         test_mul_mat_dispatcher_execution();
