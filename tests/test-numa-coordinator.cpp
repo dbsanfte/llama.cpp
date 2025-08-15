@@ -37,11 +37,10 @@ public:
         }
 
         // Create context with larger memory for comprehensive tests
-        struct ggml_init_params params = {
-            .mem_size = 64 * 1024 * 1024,  // 64MB for comprehensive testing
-            .mem_buffer = NULL,
-            .no_alloc = true,
-        };
+        struct ggml_init_params params;
+        params.mem_size = 64 * 1024 * 1024;  // 64MB for comprehensive testing
+        params.mem_buffer = NULL;
+        params.no_alloc = true;
         
         ctx = ggml_init(params);
         if (!ctx) {
@@ -120,17 +119,37 @@ public:
     void test_standard_numa_behavior() {
         printf("--- Test: Standard NUMA Behavior ---\n");
         
-        // Create simple test operation
-        struct ggml_tensor * a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 32, 32);
-        struct ggml_tensor * b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 32, 32);
+        // Create execution context with actual memory allocation
+        struct ggml_init_params exec_params;
+        exec_params.mem_size = 8 * 1024 * 1024;  // 8MB for execution
+        exec_params.mem_buffer = NULL;
+        exec_params.no_alloc = false;  // Allow actual memory allocation
+        struct ggml_context* exec_ctx = ggml_init(exec_params);
+        if (!exec_ctx) {
+            add_test_result("standard_numa_behavior", false, "Failed to create execution context");
+            return;
+        }
+        
+        // Create simple test operation with actual data
+        struct ggml_tensor * a = ggml_new_tensor_2d(exec_ctx, GGML_TYPE_F32, 32, 32);
+        struct ggml_tensor * b = ggml_new_tensor_2d(exec_ctx, GGML_TYPE_F32, 32, 32);
         
         if (!a || !b) {
+            ggml_free(exec_ctx);
             add_test_result("standard_numa_behavior", false, "Failed to create test tensors");
             return;
         }
         
-        struct ggml_tensor * result = ggml_add(ctx, a, b);
-        struct ggml_cgraph * gf = ggml_new_graph(ctx);
+        // Initialize tensor data
+        float* a_data = (float*)ggml_get_data(a);
+        float* b_data = (float*)ggml_get_data(b);
+        for (int i = 0; i < 32*32; i++) {
+            a_data[i] = 1.0f;
+            b_data[i] = 2.0f;
+        }
+        
+        struct ggml_tensor * result = ggml_add(exec_ctx, a, b);
+        struct ggml_cgraph * gf = ggml_new_graph(exec_ctx);
         ggml_build_forward_expand(gf, result);
         
         printf("Testing standard NUMA (should handle gracefully without hardware NUMA)...\n");
@@ -146,6 +165,9 @@ public:
             add_test_result("standard_numa_behavior", false, "Unexpected NUMA result");
             printf("⚠️  Unexpected NUMA result\n");
         }
+        
+        // Clean up execution context
+        ggml_free(exec_ctx);
     }
     
     // Test: Coordinator thread management
@@ -160,16 +182,35 @@ public:
             int threads = thread_counts[i];
             printf("Testing with %d threads...\n", threads);
             
-            // Create simple operation
-            struct ggml_tensor * input = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1000);
-            if (!input) {
-                printf("⚠️  Failed to create tensor for %d threads\n", threads);
+            // Create execution context with actual memory allocation for safe testing
+            struct ggml_init_params thread_test_params;
+            thread_test_params.mem_size = 2 * 1024 * 1024;  // 2MB for thread test
+            thread_test_params.mem_buffer = NULL;
+            thread_test_params.no_alloc = false;  // Allow actual memory allocation
+            struct ggml_context* thread_ctx = ggml_init(thread_test_params);
+            if (!thread_ctx) {
+                printf("⚠️  Failed to create context for %d threads\n", threads);
                 all_passed = false;
                 continue;
             }
             
-            struct ggml_tensor * result = ggml_cont(ctx, input);
-            struct ggml_cgraph * gf = ggml_new_graph(ctx);
+            // Create simple operation with data
+            struct ggml_tensor * input = ggml_new_tensor_1d(thread_ctx, GGML_TYPE_F32, 100);
+            if (!input) {
+                printf("⚠️  Failed to create tensor for %d threads\n", threads);
+                ggml_free(thread_ctx);
+                all_passed = false;
+                continue;
+            }
+            
+            // Initialize data to avoid uninitialized memory access
+            float* input_data = (float*)ggml_get_data(input);
+            for (int j = 0; j < 100; j++) {
+                input_data[j] = (float)j * 0.1f;
+            }
+            
+            struct ggml_tensor * result = ggml_cont(thread_ctx, input);
+            struct ggml_cgraph * gf = ggml_new_graph(thread_ctx);
             ggml_build_forward_expand(gf, result);
             
             enum ggml_status status = ggml_numa_graph_compute_with_virtual(gf, threads, true);
@@ -180,6 +221,8 @@ public:
             } else {
                 printf("✅ Thread count %d handled properly\n", threads);
             }
+            
+            ggml_free(thread_ctx);
         }
         
         add_test_result("coordinator_thread_management", all_passed, 
@@ -245,23 +288,45 @@ public:
         
         // Test with zero threads
         printf("Testing zero threads (should handle gracefully)...\n");
-        struct ggml_tensor * input = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 100);
-        if (input) {
-            struct ggml_tensor * result = ggml_cont(ctx, input);
-            struct ggml_cgraph * gf = ggml_new_graph(ctx);
-            ggml_build_forward_expand(gf, result);
-            
-            enum ggml_status status = ggml_numa_graph_compute_with_virtual(gf, 0, true);
-            // Should handle gracefully, any non-crash result is acceptable
-            printf("✅ Zero threads handled without crash\n");
+        
+        // Create execution context for safe testing
+        struct ggml_init_params error_params;
+        error_params.mem_size = 1024 * 1024;  // 1MB for error test
+        error_params.mem_buffer = NULL;
+        error_params.no_alloc = false;  // Allow actual memory allocation
+        struct ggml_context* error_ctx = ggml_init(error_params);
+        
+        if (error_ctx) {
+            struct ggml_tensor * input = ggml_new_tensor_1d(error_ctx, GGML_TYPE_F32, 100);
+            if (input) {
+                // Initialize data
+                float* input_data = (float*)ggml_get_data(input);
+                for (int i = 0; i < 100; i++) {
+                    input_data[i] = (float)i * 0.01f;
+                }
+                
+                struct ggml_tensor * result = ggml_cont(error_ctx, input);
+                struct ggml_cgraph * gf = ggml_new_graph(error_ctx);
+                ggml_build_forward_expand(gf, result);
+                
+                enum ggml_status status = ggml_numa_graph_compute_with_virtual(gf, 0, true);
+                (void)status; // Suppress unused variable warning
+                // Should handle gracefully, any non-crash result is acceptable
+                printf("✅ Zero threads handled without crash\n");
+            } else {
+                printf("⚠️  Failed to create test tensor for zero threads test\n");
+                all_passed = false;
+            }
+            ggml_free(error_ctx);
         } else {
-            printf("⚠️  Failed to create test tensor for zero threads test\n");
+            printf("⚠️  Failed to create execution context for zero threads test\n");
             all_passed = false;
         }
         
         // Test with NULL graph (should handle gracefully)
         printf("Testing NULL graph (should handle gracefully)...\n");
         enum ggml_status null_status = ggml_numa_graph_compute_with_virtual(NULL, 4, true);
+        (void)null_status; // Suppress unused variable warning
         // Should handle gracefully, any non-crash result is acceptable
         printf("✅ NULL graph handled without crash\n");
         

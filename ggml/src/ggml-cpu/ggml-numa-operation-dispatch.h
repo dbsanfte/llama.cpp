@@ -41,6 +41,23 @@ enum ggml_status ggml_numa_graph_compute_with_virtual(struct ggml_cgraph * cgrap
 enum ggml_status ggml_numa_execute_operation_fallback(struct ggml_tensor * tensor, struct ggml_cplan * cplan);
 
 //
+// Dispatcher Work Buffer Management
+// Persistent work buffer system for performance-critical operations (like MUL_MAT)
+//
+
+// Initialize dispatcher work buffer system
+void ggml_numa_dispatch_work_buffers_init(void);
+
+// Ensure work buffer of required size for a NUMA node (auto-growing)
+bool ggml_numa_dispatch_ensure_work_buffer(int numa_node, size_t required_size);
+
+// Get work buffer for a NUMA node (returns buffer and optionally its size)
+void* ggml_numa_dispatch_get_work_buffer(int numa_node, size_t* buffer_size);
+
+// Cleanup all dispatcher work buffers (called at program exit)
+void ggml_numa_dispatch_cleanup_work_buffers(void);
+
+//
 // Coordinator Interface for Dispatcher
 //
 // This interface provides controlled access to coordinator resources

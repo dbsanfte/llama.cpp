@@ -27,6 +27,9 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
         ggml-cpu/ggml-numa-coordinator.c
         ggml-cpu/ggml-numa-operation-dispatch.c
         ggml-cpu/ggml-numa-operation-dispatch.h
+        ggml-cpu/ggml-numa-rope-handler.c
+        ggml-cpu/ggml-numa-fallback.c
+        ggml-cpu/ggml-numa-rope-handler.h
         ggml-work-item.c
         ggml-cpu/repack.cpp
         ggml-cpu/repack.h

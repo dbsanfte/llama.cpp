@@ -206,16 +206,6 @@ struct ggml_numa_perf_stats {
 struct ggml_numa_perf_stats ggml_numa_coordinator_manager_get_stats(struct ggml_numa_coordinator_manager * mgr, int numa_node);
 
 /**
- * Execute a tensor operation using standard GGML fallback (single-threaded)
- * This function provides a public fallback for operations not supported by NUMA coordinator
- * 
- * @param operation The tensor operation to execute
- * @param params Compute parameters (optional, can be NULL for default single-threaded)
- * @return GGML_STATUS_SUCCESS on success, GGML_STATUS_FAILED on failure
- */
-enum ggml_status ggml_numa_fallback_execute_operation(struct ggml_tensor * operation, const struct ggml_compute_params * params);
-
-/**
  * Main NUMA-aware graph computation function
  * This is the primary integration point that replaces standard ggml_graph_compute
  * when NUMA coordination is beneficial

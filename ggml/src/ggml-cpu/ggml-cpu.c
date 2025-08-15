@@ -19,6 +19,7 @@
 #include "ggml-numa-coordinator.h"
 #ifdef __linux__
 #include <numa.h>
+#include <sched.h>
 #endif
 #endif
 
@@ -1226,7 +1227,7 @@ void ggml_set_f32_nd(const struct ggml_tensor * tensor, int i0, int i1, int i2, 
 
 // ggml_compute_forward_mul_mat
 
-static void ggml_compute_forward_mul_mat_one_chunk(
+void ggml_compute_forward_mul_mat_one_chunk_legacy(
     const struct ggml_compute_params * params,
     struct ggml_tensor * dst,
     const enum ggml_type type,
@@ -1310,6 +1311,99 @@ static void ggml_compute_forward_mul_mat_one_chunk(
 
                 for (int cn = 0; cn < num_rows_per_vec_dot; ++cn) {
                     memcpy(&dst_col[iir0 + cn * nb1 / nb0], tmp + (cn * 16), (MIN(iir0 + blck_0, ir0_end) - iir0) * sizeof(float));
+                }
+            }
+        }
+    }
+}
+
+// Clean alternative implementation for performance comparison
+void ggml_compute_forward_mul_mat_one_chunk(
+    const struct ggml_compute_params * params,
+    struct ggml_tensor * dst,
+    const enum ggml_type type,
+    const int64_t num_rows_per_vec_dot,
+    const int64_t ir0_start,
+    const int64_t ir0_end,
+    const int64_t ir1_start,
+    const int64_t ir1_end) {
+
+    const struct ggml_tensor * src0 = dst->src[0];
+    const struct ggml_tensor * src1 = dst->src[1];
+
+    GGML_TENSOR_BINARY_OP_LOCALS
+
+    // Early exit for empty work
+    if (ir0_start >= ir0_end || ir1_start >= ir1_end) {
+        return;
+    }
+
+    // Get optimized vector dot function for this type
+    ggml_vec_dot_t const vec_dot = type_traits_cpu[type].vec_dot;
+    enum ggml_type const vec_dot_type = type_traits_cpu[type].vec_dot_type;
+    
+    // Determine data source and row characteristics
+    const bool src1_cont = ggml_is_contiguous(src1);
+    const void * wdata = (src1->type == vec_dot_type) ? tensor_data(src1) : params->wdata;
+    const size_t row_size = ggml_row_size(vec_dot_type, ne10);
+    
+    // Broadcasting factors (how many times to repeat src0 dimensions)
+    const int64_t r2 = ne12 / ne02;  // Batch dimension 2 broadcast factor
+    const int64_t r3 = ne13 / ne03;  // Batch dimension 3 broadcast factor
+    
+    // Validate broadcasting requirements
+    assert(ne12 % ne02 == 0);
+    assert(ne13 % ne03 == 0);
+
+    // Cache-friendly block sizes
+    const int64_t block_size_rows = 16;
+    const int64_t block_size_cols = 16;
+    
+    // Memory stride for src1 columns
+    const size_t src1_col_stride = src1_cont || src1->type != vec_dot_type ? row_size : nb11;
+
+    // Process the chunk in cache-friendly blocks
+    for (int64_t block_col_start = ir1_start; block_col_start < ir1_end; block_col_start += block_size_cols) {
+        const int64_t block_col_end = MIN(block_col_start + block_size_cols, ir1_end);
+        
+        for (int64_t block_row_start = ir0_start; block_row_start < ir0_end; block_row_start += block_size_rows) {
+            const int64_t block_row_end = MIN(block_row_start + block_size_rows, ir0_end);
+            
+            // Process each column in the current block
+            for (int64_t col = block_col_start; col < block_col_end; col += num_rows_per_vec_dot) {
+                
+                // Calculate tensor indices for broadcasting
+                const int64_t i13 = col / (ne12 * ne1);      // Batch index 3
+                const int64_t i12 = (col - i13 * ne12 * ne1) / ne1;  // Batch index 2  
+                const int64_t i11 = col - i13 * ne12 * ne1 - i12 * ne1;  // Column index
+                
+                // Apply broadcasting to get src0 indices
+                const int64_t i03 = i13 / r3;  // Broadcasted batch index 3
+                const int64_t i02 = i12 / r2;  // Broadcasted batch index 2
+                
+                // Get pointers to the current data slices
+                const char * src0_base = (const char*)tensor_data(src0) + (i02 * nb02 + i03 * nb03);
+                
+                const char * src1_col = (const char*)wdata +
+                    (src1_cont || src1->type != vec_dot_type
+                        ? (i11 + i12 * ne11 + i13 * ne12 * ne11) * row_size
+                        : (i11 * nb11 + i12 * nb12 + i13 * nb13));
+                        
+                float * dst_base = (float*)((char*)tensor_data(dst) + (i11 * nb1 + i12 * nb2 + i13 * nb3));
+                
+                // Process rows in this block for current column
+                for (int64_t row = block_row_start; row < block_row_end; row += num_rows_per_vec_dot) {
+                    const char * src0_row = src0_base + row * nb01;
+                    float * dst_ptr = dst_base + row;  // Fixed: direct indexing, not stride multiplication
+                    
+                    // Perform the core mathematical operation: dot product
+                    vec_dot(ne00, dst_ptr, 
+                           (num_rows_per_vec_dot > 1 ? 16 : 0), 
+                           src0_row, 
+                           (num_rows_per_vec_dot > 1 ? nb01 : 0), 
+                           src1_col, 
+                           (num_rows_per_vec_dot > 1 ? src1_col_stride : 0), 
+                           num_rows_per_vec_dot);
                 }
             }
         }
@@ -3221,7 +3315,49 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
 enum ggml_status ggml_graph_compute_with_ctx(struct ggml_context * ctx, struct ggml_cgraph * cgraph, int n_threads) {
     struct ggml_cplan cplan = ggml_graph_plan(cgraph, n_threads, NULL);
 
+#ifdef GGML_NUMA_MIRROR
+    // NUMA-AWARE WORK BUFFER ALLOCATION
+    // Instead of using ggml_new_buffer() which allocates from context memory (not NUMA-aware),
+    // we'll use our persistent dispatcher work buffer system for optimal NUMA performance
+    
+    if (cplan.work_size > 0) {
+        // Get current CPU and NUMA node for NUMA-aware allocation
+        int current_cpu = sched_getcpu();
+        int numa_node = 0;  // Default to node 0 if detection fails
+        if (current_cpu >= 0) {
+            int detected_node = numa_node_of_cpu(current_cpu);
+            if (detected_node >= 0) {
+                numa_node = detected_node;
+            }
+        }
+        
+        // Try to use persistent dispatcher work buffer for NUMA optimization
+        extern bool ggml_numa_dispatch_ensure_work_buffer(int numa_node, size_t required_size);
+        extern void* ggml_numa_dispatch_get_work_buffer(int numa_node, size_t* buffer_size);
+        
+        if (ggml_numa_dispatch_ensure_work_buffer(numa_node, cplan.work_size)) {
+            size_t buffer_size = 0;
+            void* persistent_buffer = ggml_numa_dispatch_get_work_buffer(numa_node, &buffer_size);
+            
+            if (persistent_buffer && buffer_size >= cplan.work_size) {
+                cplan.work_data = (uint8_t *)persistent_buffer;
+                GGML_LOG_DEBUG("Using NUMA-aware persistent work buffer: %zu bytes on node %d (replaces ggml_new_buffer)\n", 
+                               buffer_size, numa_node);
+            } else {
+                // Fallback to original context allocation
+                cplan.work_data = (uint8_t *)ggml_new_buffer(ctx, cplan.work_size);
+                GGML_LOG_DEBUG("Fallback to context work buffer: %zu bytes (NUMA dispatcher unavailable)\n", cplan.work_size);
+            }
+        } else {
+            // Fallback to original context allocation
+            cplan.work_data = (uint8_t *)ggml_new_buffer(ctx, cplan.work_size);
+            GGML_LOG_DEBUG("Fallback to context work buffer: %zu bytes (NUMA allocation failed)\n", cplan.work_size);
+        }
+    }
+#else
+    // Non-NUMA build: use original context allocation
     cplan.work_data = (uint8_t *)ggml_new_buffer(ctx, cplan.work_size);
+#endif
 
     return ggml_graph_compute(cgraph, &cplan);
 }

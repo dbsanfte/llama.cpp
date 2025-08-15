@@ -12,6 +12,7 @@
 
 #include "ggml-numa-coordinator.h"
 #include "ggml-numa-operation-dispatch.h"  // New intelligent dispatcher
+#include "ggml-numa-fallback.h"            // Centralized fallback system
 #include "ggml-impl.h"
 #include "ggml-cpu.h"
 #include "ggml-cpu-impl.h"  // For ggml_compute_params structure
@@ -387,8 +388,16 @@ static enum ggml_status ggml_numa_node_execute_operation(
         params.wdata = coordinator->work_buffer;
     }
     
-    // Execute the operation using coordinator's fallback function
-    enum ggml_status status = ggml_numa_fallback_execute_operation(operation, &params);
+    // Execute the operation using the intelligent dispatcher system instead of direct fallback
+    // Get the coordinator manager from the coordinator
+    struct ggml_numa_coordinator_manager * manager = 
+        (struct ggml_numa_coordinator_manager *)((char*)coordinator - 
+            coordinator->numa_node * sizeof(struct ggml_coordinator_thread));
+    
+    // Create proper work context using the helper function
+    ggml_numa_work_context_t context = ggml_numa_create_work_context(operation, manager);
+    
+    enum ggml_status status = ggml_numa_dispatch_operation(manager, operation, &context);
     
     if (status == GGML_STATUS_SUCCESS) {
         GGML_LOG_DEBUG("NUMA%d: Successfully executed operation %s\n", 
@@ -1325,7 +1334,7 @@ static struct ggml_numa_coordinator_manager * ggml_get_global_coordinator_manage
 // Program exit cleanup function
 static void ggml_cleanup_global_coordinator_at_exit(void) {
     if (g_global_coordinator_manager) {
-        GGML_LOG_INFO("Program exit: cleaning up global coordinator manager\n");
+        // Avoid logging during exit cleanup to prevent segfaults
         ggml_numa_coordinator_manager_free(g_global_coordinator_manager);
         g_global_coordinator_manager = NULL;
     }
@@ -1372,7 +1381,11 @@ static void create_optimal_cpu_masks(struct ggml_threadpool_params *tpp, int num
 #ifdef __linux__
             target_threads = numa_num_configured_cpus();
 #else
-            target_threads = std::thread::hardware_concurrency();
+            // Fallback for non-Linux systems using POSIX sysconf
+            target_threads = (int)sysconf(_SC_NPROCESSORS_ONLN);
+            if (target_threads <= 0) {
+                target_threads = 4; // Safe fallback
+            }
 #endif
             GGML_LOG_INFO("   Auto-detected %d threads (was %d)\n", target_threads, tpp->n_threads);
             tpp->n_threads = target_threads; // Update the threadpool params
@@ -2074,7 +2087,11 @@ void ggml_numa_coordinator_manager_free(struct ggml_numa_coordinator_manager * m
         
         // Wait for coordinator thread to finish (only if thread was actually created)
         if (atomic_load(&coord->thread_created)) {
-            ggml_thread_join(coord->thread_handle, NULL);
+            // Avoid logging during cleanup to prevent issues
+            int join_result = ggml_thread_join(coord->thread_handle, NULL);
+            if (join_result != 0) {
+                // Don't log or fail the cleanup, just continue silently
+            }
         }
         
         // Clean up work queue AFTER thread has finished - no result buffers in graph-level approach
@@ -2856,141 +2873,6 @@ static enum ggml_status ggml_numa_execute_assigned_operations(
                        final_completed_count, scheduler->num_operations);
         return GGML_STATUS_FAILED;
     }
-}
-
-// Public fallback execution function for operations not supported by NUMA coordinator
-enum ggml_status ggml_numa_fallback_execute_operation(struct ggml_tensor * operation, const struct ggml_compute_params * params) {
-    if (!operation) {
-        GGML_LOG_ERROR("Invalid operation tensor for fallback execution\n");
-        return GGML_STATUS_FAILED;
-    }
-    
-    GGML_LOG_DEBUG("Fallback execution for operation %s\n", ggml_op_name(operation->op));
-    
-    // Create default single-threaded compute parameters if none provided
-    struct ggml_compute_params fallback_params;
-    void * temp_work_buffer = NULL;
-    size_t temp_work_size = 0;
-    
-    if (params && operation->op != GGML_OP_MUL_MAT) {
-        // Use provided params for non-MUL_MAT operations
-        fallback_params = *params;
-    } else {
-        // Special handling for MUL_MAT operations which require work buffers
-        if (operation->op == GGML_OP_MUL_MAT) {
-            // Calculate required work buffer size for MUL_MAT
-            // Based on ggml-cpu.c:1389 assertion: params->wsize >= ne13*nbw3
-            struct ggml_tensor * src1 = operation->src[1];
-            if (src1) {
-                const int64_t ne10 = src1->ne[0];
-                const int64_t ne11 = src1->ne[1]; 
-                const int64_t ne12 = src1->ne[2];
-                const int64_t ne13 = src1->ne[3];
-                
-                // Calculate work buffer size based on type conversion requirements
-                const size_t nbw0 = ggml_type_size(GGML_TYPE_Q8_0);  // vec_dot_type
-                const size_t nbw1 = ((ne10 + 31) / 32) * nbw0;       // row size with alignment
-                const size_t nbw2 = nbw1 * ne11;
-                const size_t nbw3 = nbw2 * ne12;
-                temp_work_size = ne13 * nbw3;
-                
-                // Allocate temporary work buffer (minimum 64KB to be safe)
-                temp_work_size = temp_work_size < 65536 ? 65536 : temp_work_size;
-                
-                // Get current CPU and its NUMA node for NUMA-aware allocation
-                int current_cpu = sched_getcpu();
-                int numa_node = (current_cpu >= 0) ? numa_node_of_cpu(current_cpu) : 0;
-                temp_work_buffer = numa_alloc_onnode(temp_work_size, numa_node);
-                
-                if (!temp_work_buffer) {
-                    GGML_LOG_ERROR("Failed to allocate NUMA work buffer for MUL_MAT: %zu bytes on node %d\n", temp_work_size, numa_node);
-                    return GGML_STATUS_FAILED;
-                }
-                
-                GGML_LOG_DEBUG("Allocated temporary work buffer for MUL_MAT: %zu bytes on NUMA node %d\n", temp_work_size, numa_node);
-            }
-            
-            fallback_params = (struct ggml_compute_params) {
-                .ith = 0,
-                .nth = 1,
-                .wsize = temp_work_size,
-                .wdata = temp_work_buffer,
-                .threadpool = params ? params->threadpool : NULL
-            };
-        } else {
-            // Default fallback for other operations
-            fallback_params = (struct ggml_compute_params) {
-                .ith = 0,
-                .nth = 1,
-                .wsize = 0,
-                .wdata = NULL,
-                .threadpool = NULL
-            };
-        }
-    }
-    
-    // COORDINATOR SHOULD NOT KNOW ABOUT SPECIFIC OPERATIONS!
-    // The coordinator is a generic execution engine - all operation-specific
-    // logic belongs in the dispatcher. The coordinator just executes whatever
-    // the dispatcher tells it to execute.
-    
-    // For now, we use GGML's graph-based execution as our generic execution method
-    // The dispatcher should have already prepared the operation for execution
-    
-    GGML_LOG_DEBUG("NUMA%d: Generic fallback execution for operation %s\n", 
-                   coordinator ? coordinator->numa_node : -1, ggml_op_name(operation->op));
-    
-    // Create a simple computation graph containing just this operation
-    struct ggml_context * temp_ctx = ggml_init((struct ggml_init_params) {
-        .mem_size = 1024 * 1024, // 1MB for metadata
-        .mem_buffer = NULL,
-        .no_alloc = true, // Don't allocate tensor data
-    });
-    
-    if (!temp_ctx) {
-        GGML_LOG_ERROR("Failed to create temporary context for operation %s\n", 
-                       ggml_op_name(operation->op));
-        if (temp_work_buffer) {
-            numa_free(temp_work_buffer, temp_work_size);
-        }
-        return GGML_STATUS_FAILED;
-    }
-    
-    // Create computation graph and plan
-    struct ggml_cgraph * temp_graph = ggml_new_graph(temp_ctx);
-    ggml_build_forward_expand(temp_graph, operation);
-    
-    // Use the provided threadpool or default parameters
-    struct ggml_threadpool * pool = (params && params->threadpool) ? params->threadpool : NULL;
-    int n_threads = (params && params->nth > 0) ? params->nth : 1;
-    
-    struct ggml_cplan cplan = ggml_graph_plan(temp_graph, n_threads, pool);
-    
-    // Use provided work buffer or temporary work buffer
-    if (params && params->wdata && params->wsize >= cplan.work_size) {
-        cplan.work_data = params->wdata;
-    } else if (temp_work_buffer && temp_work_size >= cplan.work_size) {
-        cplan.work_data = temp_work_buffer;
-    } else if (cplan.work_size > 0) {
-        GGML_LOG_WARN("Insufficient work buffer for operation %s: need %zu bytes, have %zu\n", 
-                      ggml_op_name(operation->op), cplan.work_size, 
-                      temp_work_buffer ? temp_work_size : 0);
-    }
-    
-    // Execute the graph
-    enum ggml_status status = ggml_graph_compute(temp_graph, &cplan);
-    
-    // Cleanup
-    ggml_free(temp_ctx);
-    
-    // Clean up temporary work buffer if allocated
-    if (temp_work_buffer) {
-        numa_free(temp_work_buffer, temp_work_size);
-        GGML_LOG_DEBUG("Freed temporary work buffer for operation %s\n", ggml_op_name(operation->op));
-    }
-    
-    GGML_LOG_DEBUG("Fallback execution completed for operation %s\n", ggml_op_name(operation->op));
-    return GGML_STATUS_SUCCESS;
 }
 
 // ================================================================================================
