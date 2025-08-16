@@ -8,17 +8,35 @@
 #define GGML_NUMA_COORDINATOR_H
 
 #include "ggml.h"
+#include "ggml-cpu-impl.h"  // For ggml_compute_params structure definition
 // Note: Minimal includes to avoid path issues from tests
 // Full implementation includes are in the .c file
 
-// Execution Strategy - moved here to avoid circular dependencies
+// NUMA Node Distribution Strategy - how work is distributed across NUMA nodes
 typedef enum {
-    NUMA_EXECUTION_SINGLE_NODE,     // Execute on primary node only
-    NUMA_EXECUTION_DATA_PARALLEL,   // Distribute data across nodes
-    NUMA_EXECUTION_TASK_PARALLEL,   // Distribute different tasks across nodes  
-    NUMA_EXECUTION_HYBRID,          // Combination of strategies
-    NUMA_EXECUTION_CUSTOM           // Operation-specific strategy
+    NUMA_NODE_STRATEGY_SINGLE_NODE,       // Execute on primary node only
+    NUMA_NODE_STRATEGY_DATA_PARALLEL,     // Distribute data across all nodes
+    NUMA_NODE_STRATEGY_TASK_PARALLEL      // Distribute different tasks across nodes
+} ggml_numa_node_strategy_t;
+
+// On-Node Execution Strategy - how work is executed within a single NUMA node
+typedef enum {
+    NUMA_ON_NODE_STRATEGY_SINGLE_THREAD,  // Single thread execution
+    NUMA_ON_NODE_STRATEGY_MULTI_THREAD     // Multi-threaded execution using all available threads
+} ggml_numa_on_node_strategy_t;
+
+// Combined Execution Strategy
+typedef struct {
+    ggml_numa_node_strategy_t node_strategy;      // How to distribute across nodes
+    ggml_numa_on_node_strategy_t on_node_strategy; // How to execute within each node
 } ggml_numa_execution_strategy_t;
+
+// Generic work function pointer type for coordinator execution
+// The coordinator calls this function with provided context data and compute parameters
+typedef enum ggml_status (*ggml_numa_work_function_t)(
+    void * work_context,                    // Function-specific context data
+    struct ggml_compute_params * params     // Compute parameters (threads, buffer, etc.)
+);
 
 #ifdef __cplusplus
 extern "C" {
@@ -29,7 +47,6 @@ struct ggml_numa_coordinator_manager;
 struct ggml_work_item;
 struct ggml_work_queue;
 struct ggml_coordinator_thread;
-struct ggml_compute_params;  // Forward declaration to avoid include path issues
 
 /**
  * Memory management strategy for the NUMA coordinator
@@ -107,6 +124,11 @@ struct ggml_numa_coordinator_manager * ggml_numa_coordinator_manager_get_global_
 void ggml_numa_coordinator_manager_free(struct ggml_numa_coordinator_manager * mgr);
 
 /**
+ * Free global NUMA coordinator manager (for backend cleanup)
+ */
+void ggml_numa_coordinator_manager_free_global(void);
+
+/**
  * Set cgraph for all NUMA nodes (each gets full copy)
  * 
  * @param mgr Manager instance
@@ -145,6 +167,26 @@ int ggml_numa_coordinator_manager_submit_work(struct ggml_numa_coordinator_manag
                                               struct ggml_tensor * tensor,
                                               int numa_node_hint,
                                               ggml_numa_execution_strategy_t execution_strategy);
+
+/**
+ * Submit work function with generic function pointer (NEW APPROACH)
+ * The coordinator will execute the provided function with specified threading and buffer parameters.
+ * The coordinator has no knowledge of what the function does - it's completely operation-agnostic.
+ * 
+ * @param mgr Coordinator manager instance
+ * @param work_function Function pointer to execute
+ * @param work_context Context data to pass to the function
+ * @param numa_node_hint Preferred NUMA node (-1 for auto-selection)
+ * @param execution_strategy How to execute the work
+ * @param required_buffer_size Buffer size required for execution
+ * @return Work ID (>= 0) on success, -1 on failure
+ */
+int ggml_numa_coordinator_manager_submit_work_function(struct ggml_numa_coordinator_manager * mgr,
+                                                       ggml_numa_work_function_t work_function,
+                                                       void * work_context,
+                                                       int numa_node_hint,
+                                                       ggml_numa_execution_strategy_t execution_strategy,
+                                                       size_t required_buffer_size);
 
 /**
  * Submit tensor with data parallelism across multiple NUMA nodes

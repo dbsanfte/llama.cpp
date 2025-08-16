@@ -7,14 +7,15 @@ This document provides instructions for AI assistants (GitHub Copilot, Claude, e
 This is a fork of llama.cpp with **NUMA-aware improvements** for better CPU threading and memory allocation. The project includes:
 
 - **NUMA-aware Coordinator and Node/Thread assignment** - `ggml/src/ggml-cpu/ggml-numa-coordinator.c`
-- **Work-in-Progress dispatcher to the Coordinator** - `ggml/src/ggml-cpu/ggml-numa-operation-dispatch.c`
+- **Work-in-Progress Operation Dispatcher to the Coordinator** - `ggml/src/ggml-cpu/ggml-numa-operation-dispatch.c`
+- **Fallback Operations to older implementation for ops that aren't NUMA-parallelized yet to use the Coordinator** - `ggml/src/ggml-cpu/ggml-numa-fallback.c`
 - **Development container** - Ubuntu 24.04 with all dependencies for consistent building
 
 ### Goal
 
-Our goal is to implement a NUMA-aware scheduling and execution model for the llama.cpp project, improving performance on multi-socket systems. Our main consumer will be `src/llama-context.cpp` via `ggml/src/ggml-cpu/ggml-cpu.c`.
+Our goal is to implement a NUMA-aware Operation Dispatch and Coordinator-based Execution model for the llama.cpp project, improving performance on multi-socket systems. Our main consumers will be `src/llama-context.cpp` via `ggml/src/ggml-cpu/ggml-cpu.c`, which dispatches to our Dispatcher, which then Executes via the Coordinator via an interface.
 
-We must implement the complete 193-item set of arithmetic operations in `ggml/src/ggml-cpu/ops.h` in our dispatcher.
+We must implement the complete 85-ish set of arithmetic operations in `ggml/src/ggml-cpu/ops.h` in our dispatcher.
 
 The plan for this can be found in: `.devcontainer/changelog/2025-08-14-operation-analysis-big-bang-strategy.md`
 
@@ -88,17 +89,33 @@ New command-line arguments for `llama-server` should be added to the file above.
 3. Write functional tests in `tests/test-numa-coordinator.cpp`
 4. Verify tests pass and no regressions
 
-#### Modifying Dispatcher/Operation Logic
+#### Modifying Dispatcher/Operation Logic and Adding New NUMA Parallelized Operations
 1. Check the operations list in `ggml/src/ggml-cpu/ops.h`
-2. Implement the operation in `ggml/src/ggml-cpu/ggml-numa-operation-dispatch.c`
-3. Write functional tests in `tests/test-numa-dispatcher.cpp`
-4. Verify tests pass and no regressions
+2. Check the existing fallback operations in `ggml/src/ggml-cpu/ggml-numa-fallback.c`
+3. Implement the new NUMA-parallelized operation in `ggml/src/ggml-cpu/ggml-numa-operation-dispatch.c`
+4. Write functional tests in `tests/test-numa-dispatcher.cpp`
+5. Write a mathematical correctness test that compares the fallback "mathematical kernel" vs the new NUMA parallelization in `tests/test-numa-mathematical-correctness.cpp`
+6. Verify tests pass and no regressions
 
 ### Debugging Approach
 
 ```bash
-# Troubleshoot a segfault with gdb
+# Strategy 1: Catch a segfault directly and do a backtrace with gdb:
 gdb --batch --ex run --ex bt --ex quit --args ./build/bin/${testFileName}
+
+# Strategy 2: Get a core dump and fetch a backtrace from gdb (useful for multithreading issues where a segfault can't be cleanly caught directly):
+
+## First, enable core dumps to current folder
+echo 'core' | sudo tee /proc/sys/kernel/core_pattern
+ulimit -c unlimited
+
+## Next, run the program to generate a coredump
+./build/bin/llama-cli -m ./.devcontainer/qwen2.5-0.5b-instruct-q8_0.gguf -v -no-cnv -n 1 -p "Repeat after me: Hello, world!" --numa mirror
+
+"Segmentation fault: core dumped"
+
+## Now debug the core dump in the local folder
+gdb --batch --ex "file ./build/bin/llama-cli" --ex "core-file ./core" --ex "bt" --ex "info threads" --ex "thread apply all bt" --ex quit
 ```
 
 ## 📝 Code Standards

@@ -991,10 +991,12 @@ int main(int argc, char ** argv) {
 
     common_sampler_free(smpl);
 
-    llama_backend_free();
-
+    // CRITICAL: Free threadpools BEFORE backend cleanup to prevent race conditions
+    // Worker threads must be fully shut down before model memory is freed
     ggml_threadpool_free_fn(threadpool);
     ggml_threadpool_free_fn(threadpool_batch);
+
+    llama_backend_free();
 
     return 0;
 }

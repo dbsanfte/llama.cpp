@@ -1251,8 +1251,6 @@ void ggml_compute_forward_mul_mat_one_chunk_legacy(
     const int64_t r2 = ne12 / ne02;
     const int64_t r3 = ne13 / ne03;
 
-    //printf("ir0_start = %6lld, ir0_end = %6lld, ir1_start = %6lld, ir1_end = %6lld\n", ir0_start, ir0_end, ir1_start, ir1_end);
-
     // threads with no work simply yield (not sure if it helps)
     if (ir0_start >= ir0_end || ir1_start >= ir1_end) {
         return;
@@ -1333,77 +1331,75 @@ void ggml_compute_forward_mul_mat_one_chunk(
 
     GGML_TENSOR_BINARY_OP_LOCALS
 
-    // Early exit for empty work
+    const bool src1_cont = ggml_is_contiguous(src1);
+
+    ggml_vec_dot_t const vec_dot      = type_traits_cpu[type].vec_dot;
+    enum ggml_type const vec_dot_type = type_traits_cpu[type].vec_dot_type;
+
+    // broadcast factors
+    const int64_t r2 = ne12 / ne02;
+    const int64_t r3 = ne13 / ne03;
+
+    // threads with no work simply yield (not sure if it helps)
     if (ir0_start >= ir0_end || ir1_start >= ir1_end) {
         return;
     }
 
-    // Get optimized vector dot function for this type
-    ggml_vec_dot_t const vec_dot = type_traits_cpu[type].vec_dot;
-    enum ggml_type const vec_dot_type = type_traits_cpu[type].vec_dot_type;
-    
-    // Determine data source and row characteristics
-    const bool src1_cont = ggml_is_contiguous(src1);
     const void * wdata = (src1->type == vec_dot_type) ? tensor_data(src1) : params->wdata;
     const size_t row_size = ggml_row_size(vec_dot_type, ne10);
-    
-    // Broadcasting factors (how many times to repeat src0 dimensions)
-    const int64_t r2 = ne12 / ne02;  // Batch dimension 2 broadcast factor
-    const int64_t r3 = ne13 / ne03;  // Batch dimension 3 broadcast factor
-    
-    // Validate broadcasting requirements
+
     assert(ne12 % ne02 == 0);
     assert(ne13 % ne03 == 0);
 
-    // Cache-friendly block sizes
-    const int64_t block_size_rows = 16;
-    const int64_t block_size_cols = 16;
-    
-    // Memory stride for src1 columns
+    // block-tiling attempt - use same values as legacy
+    const int64_t blck_0 = 16;
+    const int64_t blck_1 = 16;
+
     const size_t src1_col_stride = src1_cont || src1->type != vec_dot_type ? row_size : nb11;
 
-    // Process the chunk in cache-friendly blocks
-    for (int64_t block_col_start = ir1_start; block_col_start < ir1_end; block_col_start += block_size_cols) {
-        const int64_t block_col_end = MIN(block_col_start + block_size_cols, ir1_end);
-        
-        for (int64_t block_row_start = ir0_start; block_row_start < ir0_end; block_row_start += block_size_rows) {
-            const int64_t block_row_end = MIN(block_row_start + block_size_rows, ir0_end);
-            
-            // Process each column in the current block
-            for (int64_t col = block_col_start; col < block_col_end; col += num_rows_per_vec_dot) {
-                
-                // Calculate tensor indices for broadcasting
-                const int64_t i13 = col / (ne12 * ne1);      // Batch index 3
-                const int64_t i12 = (col - i13 * ne12 * ne1) / ne1;  // Batch index 2  
-                const int64_t i11 = col - i13 * ne12 * ne1 - i12 * ne1;  // Column index
-                
-                // Apply broadcasting to get src0 indices
-                const int64_t i03 = i13 / r3;  // Broadcasted batch index 3
-                const int64_t i02 = i12 / r2;  // Broadcasted batch index 2
-                
-                // Get pointers to the current data slices
-                const char * src0_base = (const char*)tensor_data(src0) + (i02 * nb02 + i03 * nb03);
-                
+    // Mirror the exact same iteration pattern as legacy implementation
+    for (int64_t iir1 = ir1_start; iir1 < ir1_end; iir1 += blck_1) {
+        for (int64_t iir0 = ir0_start; iir0 < ir0_end; iir0 += blck_0) {
+            for (int64_t ir1 = iir1; ir1 < iir1 + blck_1 && ir1 < ir1_end; ir1 += num_rows_per_vec_dot) {
+                const int64_t i13 = (ir1 / (ne12 * ne1));
+                const int64_t i12 = (ir1 - i13 * ne12 * ne1) / ne1;
+                const int64_t i11 = (ir1 - i13 * ne12 * ne1 - i12 * ne1);
+
+                // broadcast src0 into src1
+                const int64_t i03 = i13 / r3;
+                const int64_t i02 = i12 / r2;
+
+                const int64_t i1 = i11;
+                const int64_t i2 = i12;
+                const int64_t i3 = i13;
+
+                const char * src0_row = (const char*)tensor_data(src0) + (0 + i02 * nb02 + i03 * nb03);
+
+                // desc: when src1 is not a contiguous memory block we have to calculate the offset using the strides
+                //       if it is, then we have either copied the data to params->wdata and made it contiguous or we are using
+                //       the original src1 data pointer, so we should index using the indices directly
+                // TODO: this is a bit of a hack, we should probably have a better way to handle this
                 const char * src1_col = (const char*)wdata +
                     (src1_cont || src1->type != vec_dot_type
                         ? (i11 + i12 * ne11 + i13 * ne12 * ne11) * row_size
                         : (i11 * nb11 + i12 * nb12 + i13 * nb13));
-                        
-                float * dst_base = (float*)((char*)tensor_data(dst) + (i11 * nb1 + i12 * nb2 + i13 * nb3));
-                
-                // Process rows in this block for current column
-                for (int64_t row = block_row_start; row < block_row_end; row += num_rows_per_vec_dot) {
-                    const char * src0_row = src0_base + row * nb01;
-                    float * dst_ptr = dst_base + row;  // Fixed: direct indexing, not stride multiplication
-                    
-                    // Perform the core mathematical operation: dot product
-                    vec_dot(ne00, dst_ptr, 
-                           (num_rows_per_vec_dot > 1 ? 16 : 0), 
-                           src0_row, 
-                           (num_rows_per_vec_dot > 1 ? nb01 : 0), 
-                           src1_col, 
-                           (num_rows_per_vec_dot > 1 ? src1_col_stride : 0), 
-                           num_rows_per_vec_dot);
+                float * dst_col = (float*)((char*)tensor_data(dst) + (i1 * nb1 + i2 * nb2 + i3 * nb3));
+
+                // Direct assignment version of the legacy logic (no tmp buffer)
+                for (int64_t ir0 = iir0; ir0 < iir0 + blck_0 && ir0 < ir0_end; ir0 += num_rows_per_vec_dot) {
+                    if (num_rows_per_vec_dot == 1) {
+                        // Simple case: mirror the memcpy pattern &dst_col[iir0 + ...]
+                        vec_dot(ne00, &dst_col[ir0], 0, src0_row + ir0*nb01, 0, src1_col, 0, 1);
+                    } else {
+                        // Multi-row case: mirror the tmp buffer logic but write directly
+                        for (int cn = 0; cn < num_rows_per_vec_dot; ++cn) {
+                            float * dst_ptr = &dst_col[ir0 + cn * nb1 / nb0];
+                            const char * src0_ptr = src0_row + (ir0 + cn) * nb01;
+                            const char * src1_ptr = src1_col + cn * src1_col_stride;
+                            
+                            vec_dot(ne00, dst_ptr, 0, src0_ptr, 0, src1_ptr, 0, 1);
+                        }
+                    }
                 }
             }
         }

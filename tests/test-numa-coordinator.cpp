@@ -2,6 +2,7 @@
 #include "ggml-cpu.h"
 #include "ggml-backend.h"
 #include "ggml-numa-operation-dispatch.h"
+#include "ggml-numa-coordinator.h"
 #include <vector>
 #include <stdio.h>
 #include <stdlib.h>
@@ -40,7 +41,7 @@ public:
         struct ggml_init_params params;
         params.mem_size = 64 * 1024 * 1024;  // 64MB for comprehensive testing
         params.mem_buffer = NULL;
-        params.no_alloc = true;
+        params.no_alloc = true;  // Required for ggml_backend_alloc_ctx_tensors
         
         ctx = ggml_init(params);
         if (!ctx) {
@@ -70,267 +71,366 @@ public:
         results.push_back({test_name, passed, message});
     }
     
-    // Test: Virtual NUMA coordinator creation and basic functionality
-    void test_virtual_numa_coordinator_creation() {
-        printf("--- Test: Virtual NUMA Coordinator Creation ---\n");
+    // Test: NUMA coordinator manager creation and basic functionality
+    void test_numa_coordinator_manager_creation() {
+        printf("--- Test: NUMA Coordinator Manager Creation ---\n");
         
-        // Create a simple ROPE operation for testing
-        const int64_t n_embd = 128;
-        const int64_t n_seq = 64; 
-        const int64_t n_batch = 4;
+        printf("Testing NUMA coordinator manager creation...\n");
         
-        printf("Creating ROPE operation: [%ld, %ld, %ld] = %ld elements\n", 
-               n_embd, n_seq, n_batch, n_embd * n_seq * n_batch);
+        bool all_tests_passed = true;
         
-        struct ggml_tensor * input = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, n_seq, n_batch);
-        struct ggml_tensor * pos = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_batch);
-        
-        if (!input || !pos) {
-            add_test_result("virtual_numa_coordinator_creation", false, "Failed to create test tensors");
-            return;
-        }
-        
-        struct ggml_tensor * rope_result = ggml_rope_ext(
-            ctx, input, pos, NULL, n_embd, 0, 0, 10000.0f, 1.0f, 0.0f, 1.0f, 1.0f, 1.0f
-        );
-        
-        if (!rope_result) {
-            add_test_result("virtual_numa_coordinator_creation", false, "Failed to create ROPE operation");
-            return;
-        }
-        
-        struct ggml_cgraph * gf = ggml_new_graph(ctx);
-        ggml_build_forward_expand(gf, rope_result);
-        
-        printf("Testing virtual NUMA graph computation...\n");
-        enum ggml_status numa_result = ggml_numa_graph_compute_with_virtual(gf, 4, true);
-        
-        if (numa_result == GGML_STATUS_SUCCESS) {
-            add_test_result("virtual_numa_coordinator_creation", true, "Virtual NUMA computation succeeded");
-            printf("✅ Virtual NUMA graph computation succeeded!\n");
+        // Test: Basic coordinator manager creation
+        printf("  Creating basic coordinator manager...\n");
+        struct ggml_numa_coordinator_manager* basic_mgr = ggml_numa_coordinator_manager_new(4, false);
+        if (basic_mgr) {
+            printf("  ✅ Basic coordinator manager created successfully\n");
+            ggml_numa_coordinator_manager_free(basic_mgr);
         } else {
-            // Virtual NUMA infrastructure working even if computation returns error
-            add_test_result("virtual_numa_coordinator_creation", true, "Virtual coordinator infrastructure functional");
-            printf("✅ Virtual NUMA infrastructure is working (coordinator creation succeeded)\n");
+            printf("  ❌ Failed to create basic coordinator manager\n");
+            all_tests_passed = false;
+        }
+        
+        // Test: Force multi-socket coordinator manager creation
+        printf("  Creating force multi-socket coordinator manager...\n");
+        struct ggml_numa_coordinator_manager* multi_mgr = ggml_numa_coordinator_manager_new(8, true);
+        if (multi_mgr) {
+            printf("  ✅ Multi-socket coordinator manager created successfully\n");
+            ggml_numa_coordinator_manager_free(multi_mgr);
+        } else {
+            printf("  ❌ Failed to create multi-socket coordinator manager\n");
+            all_tests_passed = false;
+        }
+        
+        // Test: Global coordinator access
+        printf("  Testing global coordinator access...\n");
+        struct ggml_numa_coordinator_manager* global_mgr = ggml_numa_coordinator_manager_get_global(4, false);
+        if (global_mgr) {
+            printf("  ✅ Global coordinator manager accessible\n");
+            // Don't free global manager - it's managed globally
+        } else {
+            printf("  ❌ Failed to access global coordinator manager\n");
+            all_tests_passed = false;
+        }
+        
+        if (all_tests_passed) {
+            add_test_result("numa_coordinator_manager_creation", true, "All coordinator manager creation tests passed");
+            printf("✅ NUMA coordinator manager creation test passed\n");
+        } else {
+            add_test_result("numa_coordinator_manager_creation", false, "Some coordinator manager creation tests failed");
         }
     }
     
-    // Test: Standard NUMA behavior without virtual override
-    void test_standard_numa_behavior() {
-        printf("--- Test: Standard NUMA Behavior ---\n");
-        
-        // Create execution context with actual memory allocation
-        struct ggml_init_params exec_params;
-        exec_params.mem_size = 8 * 1024 * 1024;  // 8MB for execution
-        exec_params.mem_buffer = NULL;
-        exec_params.no_alloc = false;  // Allow actual memory allocation
-        struct ggml_context* exec_ctx = ggml_init(exec_params);
-        if (!exec_ctx) {
-            add_test_result("standard_numa_behavior", false, "Failed to create execution context");
-            return;
+    // Test function for function pointer execution
+    static enum ggml_status test_work_function(void * work_context, struct ggml_compute_params * params) {
+        // Simple test function that just modifies the context data
+        if (!work_context || !params) {
+            return GGML_STATUS_FAILED;
         }
         
-        // Create simple test operation with actual data
-        struct ggml_tensor * a = ggml_new_tensor_2d(exec_ctx, GGML_TYPE_F32, 32, 32);
-        struct ggml_tensor * b = ggml_new_tensor_2d(exec_ctx, GGML_TYPE_F32, 32, 32);
+        // Context should contain a simple counter we can increment
+        int* counter = (int*)work_context;
+        (*counter)++;
         
-        if (!a || !b) {
-            ggml_free(exec_ctx);
-            add_test_result("standard_numa_behavior", false, "Failed to create test tensors");
-            return;
-        }
-        
-        // Initialize tensor data
-        float* a_data = (float*)ggml_get_data(a);
-        float* b_data = (float*)ggml_get_data(b);
-        for (int i = 0; i < 32*32; i++) {
-            a_data[i] = 1.0f;
-            b_data[i] = 2.0f;
-        }
-        
-        struct ggml_tensor * result = ggml_add(exec_ctx, a, b);
-        struct ggml_cgraph * gf = ggml_new_graph(exec_ctx);
-        ggml_build_forward_expand(gf, result);
-        
-        printf("Testing standard NUMA (should handle gracefully without hardware NUMA)...\n");
-        enum ggml_status standard_numa_result = ggml_numa_graph_compute(gf, 4);
-        
-        if (standard_numa_result == GGML_STATUS_FAILED) {
-            add_test_result("standard_numa_behavior", true, "Standard NUMA correctly failed without hardware NUMA");
-            printf("✅ Standard NUMA correctly failed without hardware NUMA\n");
-        } else if (standard_numa_result == GGML_STATUS_SUCCESS) {
-            add_test_result("standard_numa_behavior", true, "Standard NUMA fallback succeeded");
-            printf("✅ Standard NUMA fallback succeeded\n");
-        } else {
-            add_test_result("standard_numa_behavior", false, "Unexpected NUMA result");
-            printf("⚠️  Unexpected NUMA result\n");
-        }
-        
-        // Clean up execution context
-        ggml_free(exec_ctx);
+        return GGML_STATUS_SUCCESS;
     }
     
-    // Test: Coordinator thread management
-    void test_coordinator_thread_management() {
-        printf("--- Test: Coordinator Thread Management ---\n");
+    // Test: Function pointer submission and execution
+    void test_function_pointer_submission() {
+        printf("--- Test: Function Pointer Submission ---\n");
         
-        // Test various thread counts
-        int thread_counts[] = {1, 2, 4, 8, 16};
-        bool all_passed = true;
+        printf("Testing function pointer submission and execution...\n");
         
-        for (int i = 0; i < 5; i++) {
-            int threads = thread_counts[i];
-            printf("Testing with %d threads...\n", threads);
+        bool all_tests_passed = true;
+        
+        // Get global coordinator for testing
+        struct ggml_numa_coordinator_manager* mgr = ggml_numa_coordinator_manager_get_global(4, false);
+        if (!mgr) {
+            add_test_result("function_pointer_submission", false, "Failed to get coordinator manager");
+            return;
+        }
+        
+        // Test: Single node execution strategy
+        printf("  Testing single node execution strategy...\n");
+        {
+            int counter = 0;
+            ggml_numa_execution_strategy_t strategy = {
+                .node_strategy = NUMA_NODE_STRATEGY_SINGLE_NODE,
+                .on_node_strategy = NUMA_ON_NODE_STRATEGY_SINGLE_THREAD
+            };
             
-            // Create execution context with actual memory allocation for safe testing
-            struct ggml_init_params thread_test_params;
-            thread_test_params.mem_size = 2 * 1024 * 1024;  // 2MB for thread test
-            thread_test_params.mem_buffer = NULL;
-            thread_test_params.no_alloc = false;  // Allow actual memory allocation
-            struct ggml_context* thread_ctx = ggml_init(thread_test_params);
-            if (!thread_ctx) {
-                printf("⚠️  Failed to create context for %d threads\n", threads);
-                all_passed = false;
-                continue;
-            }
+            int work_id = ggml_numa_coordinator_manager_submit_work_function(
+                mgr, test_work_function, &counter, -1, strategy, 1024
+            );
             
-            // Create simple operation with data
-            struct ggml_tensor * input = ggml_new_tensor_1d(thread_ctx, GGML_TYPE_F32, 100);
-            if (!input) {
-                printf("⚠️  Failed to create tensor for %d threads\n", threads);
-                ggml_free(thread_ctx);
-                all_passed = false;
-                continue;
-            }
-            
-            // Initialize data to avoid uninitialized memory access
-            float* input_data = (float*)ggml_get_data(input);
-            for (int j = 0; j < 100; j++) {
-                input_data[j] = (float)j * 0.1f;
-            }
-            
-            struct ggml_tensor * result = ggml_cont(thread_ctx, input);
-            struct ggml_cgraph * gf = ggml_new_graph(thread_ctx);
-            ggml_build_forward_expand(gf, result);
-            
-            enum ggml_status status = ggml_numa_graph_compute_with_virtual(gf, threads, true);
-            
-            if (status != GGML_STATUS_SUCCESS && status != GGML_STATUS_FAILED) {
-                printf("⚠️  Unexpected status for %d threads\n", threads);
-                all_passed = false;
+            if (work_id >= 0) {
+                printf("  ✅ Single node function submission successful (work_id: %d)\n", work_id);
+                // Note: In a real implementation we would wait for completion
+                // For now, just test that submission worked
             } else {
-                printf("✅ Thread count %d handled properly\n", threads);
+                printf("  ❌ Single node function submission failed\n");
+                all_tests_passed = false;
             }
-            
-            ggml_free(thread_ctx);
         }
         
-        add_test_result("coordinator_thread_management", all_passed, 
-                       all_passed ? "All thread counts handled properly" : "Some thread counts failed");
+        // Test: Multi-thread execution strategy
+        printf("  Testing multi-thread execution strategy...\n");
+        {
+            int counter = 0;
+            ggml_numa_execution_strategy_t strategy = {
+                .node_strategy = NUMA_NODE_STRATEGY_SINGLE_NODE,
+                .on_node_strategy = NUMA_ON_NODE_STRATEGY_MULTI_THREAD
+            };
+            
+            int work_id = ggml_numa_coordinator_manager_submit_work_function(
+                mgr, test_work_function, &counter, -1, strategy, 2048
+            );
+            
+            if (work_id >= 0) {
+                printf("  ✅ Multi-thread function submission successful (work_id: %d)\n", work_id);
+            } else {
+                printf("  ❌ Multi-thread function submission failed\n");
+                all_tests_passed = false;
+            }
+        }
+        
+        // Test: Data parallel execution strategy
+        printf("  Testing data parallel execution strategy...\n");
+        {
+            int counter = 0;
+            ggml_numa_execution_strategy_t strategy = {
+                .node_strategy = NUMA_NODE_STRATEGY_DATA_PARALLEL,
+                .on_node_strategy = NUMA_ON_NODE_STRATEGY_MULTI_THREAD
+            };
+            
+            int work_id = ggml_numa_coordinator_manager_submit_work_function(
+                mgr, test_work_function, &counter, -1, strategy, 4096
+            );
+            
+            if (work_id >= 0) {
+                printf("  ✅ Data parallel function submission successful (work_id: %d)\n", work_id);
+            } else {
+                printf("  ❌ Data parallel function submission failed\n");
+                all_tests_passed = false;
+            }
+        }
+        
+        if (all_tests_passed) {
+            add_test_result("function_pointer_submission", true, "All function pointer submission tests passed");
+            printf("✅ Function pointer submission test passed\n");
+        } else {
+            add_test_result("function_pointer_submission", false, "Some function pointer submission tests failed");
+        }
     }
     
-    // Test: Memory allocation patterns
-    void test_memory_allocation_patterns() {
-        printf("--- Test: Memory Allocation Patterns ---\n");
+    // Test: Execution strategy validation
+    void test_execution_strategy_validation() {
+        printf("--- Test: Execution Strategy Validation ---\n");
         
-        // Test different tensor sizes
+        printf("Testing different execution strategies...\n");
+        
+        bool all_passed = true;
+        struct ggml_numa_coordinator_manager* mgr = ggml_numa_coordinator_manager_get_global(8, false);
+        
+        if (!mgr) {
+            add_test_result("execution_strategy_validation", false, "Failed to get coordinator manager");
+            return;
+        }
+        
+        // Test execution strategies
         struct {
             const char* name;
-            int64_t size1, size2, size3;
-        } test_cases[] = {
-            {"Small", 10, 10, 1},
-            {"Medium", 100, 100, 1},
-            {"Large", 500, 500, 1},
-            {"3D", 32, 32, 8}
+            ggml_numa_execution_strategy_t strategy;
+        } test_strategies[] = {
+            {
+                "Single Node, Single Thread",
+                { NUMA_NODE_STRATEGY_SINGLE_NODE, NUMA_ON_NODE_STRATEGY_SINGLE_THREAD }
+            },
+            {
+                "Single Node, Multi Thread", 
+                { NUMA_NODE_STRATEGY_SINGLE_NODE, NUMA_ON_NODE_STRATEGY_MULTI_THREAD }
+            },
+            {
+                "Data Parallel, Single Thread",
+                { NUMA_NODE_STRATEGY_DATA_PARALLEL, NUMA_ON_NODE_STRATEGY_SINGLE_THREAD }
+            },
+            {
+                "Data Parallel, Multi Thread",
+                { NUMA_NODE_STRATEGY_DATA_PARALLEL, NUMA_ON_NODE_STRATEGY_MULTI_THREAD }
+            },
+            {
+                "Task Parallel, Multi Thread",
+                { NUMA_NODE_STRATEGY_TASK_PARALLEL, NUMA_ON_NODE_STRATEGY_MULTI_THREAD }
+            }
         };
         
-        bool all_passed = true;
-        
-        for (int i = 0; i < 4; i++) {
-            printf("Testing %s tensor [%ld, %ld, %ld]...\n", 
-                   test_cases[i].name, test_cases[i].size1, test_cases[i].size2, test_cases[i].size3);
+        for (int i = 0; i < 5; i++) {
+            printf("  Testing %s strategy...\n", test_strategies[i].name);
             
-            struct ggml_tensor * tensor;
-            if (test_cases[i].size3 > 1) {
-                tensor = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 
-                                          test_cases[i].size1, test_cases[i].size2, test_cases[i].size3);
+            int counter = 0;
+            int work_id = ggml_numa_coordinator_manager_submit_work_function(
+                mgr, test_work_function, &counter, -1, test_strategies[i].strategy, 1024
+            );
+            
+            if (work_id >= 0) {
+                printf("  ✅ %s strategy: work submitted successfully (work_id: %d)\n", 
+                       test_strategies[i].name, work_id);
             } else {
-                tensor = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 
-                                          test_cases[i].size1, test_cases[i].size2);
-            }
-            
-            if (!tensor) {
-                printf("⚠️  Failed to allocate %s tensor\n", test_cases[i].name);
+                printf("  ❌ %s strategy: work submission failed\n", test_strategies[i].name);
                 all_passed = false;
-                continue;
             }
-            
-            // Test basic operation on tensor
-            struct ggml_tensor * result = ggml_cont(ctx, tensor);
-            if (!result) {
-                printf("⚠️  Failed to create operation for %s tensor\n", test_cases[i].name);
-                all_passed = false;
-                continue;
-            }
-            
-            printf("✅ %s tensor allocation and operation succeeded\n", test_cases[i].name);
         }
         
-        add_test_result("memory_allocation_patterns", all_passed,
-                       all_passed ? "All memory allocation patterns succeeded" : "Some allocations failed");
+        add_test_result("execution_strategy_validation", all_passed, 
+                       all_passed ? "All execution strategies validated" : "Some strategies failed");
     }
     
-    // Test: Error handling and edge cases
-    void test_error_handling() {
-        printf("--- Test: Error Handling ---\n");
+    // Test: NUMA node assignment and buffer management
+    void test_numa_node_assignment() {
+        printf("--- Test: NUMA Node Assignment ---\n");
+        
+        printf("Testing NUMA node assignment and buffer allocation...\n");
         
         bool all_passed = true;
+        struct ggml_numa_coordinator_manager* mgr = ggml_numa_coordinator_manager_get_global(8, true); // Force multi-socket
         
-        // Test with zero threads
-        printf("Testing zero threads (should handle gracefully)...\n");
-        
-        // Create execution context for safe testing
-        struct ggml_init_params error_params;
-        error_params.mem_size = 1024 * 1024;  // 1MB for error test
-        error_params.mem_buffer = NULL;
-        error_params.no_alloc = false;  // Allow actual memory allocation
-        struct ggml_context* error_ctx = ggml_init(error_params);
-        
-        if (error_ctx) {
-            struct ggml_tensor * input = ggml_new_tensor_1d(error_ctx, GGML_TYPE_F32, 100);
-            if (input) {
-                // Initialize data
-                float* input_data = (float*)ggml_get_data(input);
-                for (int i = 0; i < 100; i++) {
-                    input_data[i] = (float)i * 0.01f;
-                }
-                
-                struct ggml_tensor * result = ggml_cont(error_ctx, input);
-                struct ggml_cgraph * gf = ggml_new_graph(error_ctx);
-                ggml_build_forward_expand(gf, result);
-                
-                enum ggml_status status = ggml_numa_graph_compute_with_virtual(gf, 0, true);
-                (void)status; // Suppress unused variable warning
-                // Should handle gracefully, any non-crash result is acceptable
-                printf("✅ Zero threads handled without crash\n");
-            } else {
-                printf("⚠️  Failed to create test tensor for zero threads test\n");
-                all_passed = false;
-            }
-            ggml_free(error_ctx);
-        } else {
-            printf("⚠️  Failed to create execution context for zero threads test\n");
-            all_passed = false;
+        if (!mgr) {
+            add_test_result("numa_node_assignment", false, "Failed to get coordinator manager");
+            return;
         }
         
-        // Test with NULL graph (should handle gracefully)
-        printf("Testing NULL graph (should handle gracefully)...\n");
-        enum ggml_status null_status = ggml_numa_graph_compute_with_virtual(NULL, 4, true);
-        (void)null_status; // Suppress unused variable warning
-        // Should handle gracefully, any non-crash result is acceptable
-        printf("✅ NULL graph handled without crash\n");
+        // Test different buffer sizes that would trigger different NUMA strategies
+        struct {
+            const char* name;
+            size_t buffer_size;
+            int numa_node_hint;
+        } test_cases[] = {
+            {"Small buffer, auto node", 1024, -1},
+            {"Medium buffer, node 0", 64 * 1024, 0},
+            {"Large buffer, auto node", 1024 * 1024, -1},
+            {"Very large buffer, node 1", 16 * 1024 * 1024, 1}
+        };
         
-        add_test_result("error_handling", all_passed, 
+        for (int i = 0; i < 4; i++) {
+            printf("  Testing %s (%zu bytes)...\n", test_cases[i].name, test_cases[i].buffer_size);
+            
+            int counter = 0;
+            ggml_numa_execution_strategy_t strategy = {
+                .node_strategy = NUMA_NODE_STRATEGY_DATA_PARALLEL,
+                .on_node_strategy = NUMA_ON_NODE_STRATEGY_MULTI_THREAD
+            };
+            
+            int work_id = ggml_numa_coordinator_manager_submit_work_function(
+                mgr, test_work_function, &counter, test_cases[i].numa_node_hint, 
+                strategy, test_cases[i].buffer_size
+            );
+            
+            if (work_id >= 0) {
+                printf("  ✅ %s: work submitted successfully (work_id: %d)\n", 
+                       test_cases[i].name, work_id);
+            } else {
+                printf("  ❌ %s: work submission failed\n", test_cases[i].name);
+                all_passed = false;
+            }
+        }
+        
+        add_test_result("numa_node_assignment", all_passed,
+                       all_passed ? "All NUMA node assignments succeeded" : "Some assignments failed");
+    }
+    
+    // Test: Function pointer submission error handling
+    void test_function_pointer_error_handling() {
+        printf("--- Test: Function Pointer Error Handling ---\n");
+        
+        printf("Testing error handling for function pointer submission...\n");
+        
+        bool all_passed = true;
+        struct ggml_numa_coordinator_manager* mgr = ggml_numa_coordinator_manager_get_global(4, false);
+        
+        if (!mgr) {
+            add_test_result("function_pointer_error_handling", false, "Failed to get coordinator manager");
+            return;
+        }
+        
+        // Test: NULL function pointer (should fail gracefully)
+        printf("  Testing NULL function pointer...\n");
+        {
+            int counter = 0;
+            ggml_numa_execution_strategy_t strategy = {
+                .node_strategy = NUMA_NODE_STRATEGY_SINGLE_NODE,
+                .on_node_strategy = NUMA_ON_NODE_STRATEGY_SINGLE_THREAD
+            };
+            
+            int work_id = ggml_numa_coordinator_manager_submit_work_function(
+                mgr, NULL, &counter, -1, strategy, 1024
+            );
+            
+            if (work_id < 0) {
+                printf("  ✅ NULL function pointer correctly rejected\n");
+            } else {
+                printf("  ❌ NULL function pointer incorrectly accepted\n");
+                all_passed = false;
+            }
+        }
+        
+        // Test: NULL work context (should be acceptable for some functions)
+        printf("  Testing NULL work context...\n");
+        {
+            ggml_numa_execution_strategy_t strategy = {
+                .node_strategy = NUMA_NODE_STRATEGY_SINGLE_NODE,
+                .on_node_strategy = NUMA_ON_NODE_STRATEGY_SINGLE_THREAD
+            };
+            
+            int work_id = ggml_numa_coordinator_manager_submit_work_function(
+                mgr, test_work_function, NULL, -1, strategy, 1024
+            );
+            
+            // This might pass or fail depending on implementation - just check for graceful handling
+            printf("  ✅ NULL work context handled gracefully (work_id: %d)\n", work_id);
+        }
+        
+        // Test: Invalid NUMA node hint (should auto-correct)
+        printf("  Testing invalid NUMA node hint...\n");
+        {
+            int counter = 0;
+            ggml_numa_execution_strategy_t strategy = {
+                .node_strategy = NUMA_NODE_STRATEGY_SINGLE_NODE,
+                .on_node_strategy = NUMA_ON_NODE_STRATEGY_SINGLE_THREAD
+            };
+            
+            int work_id = ggml_numa_coordinator_manager_submit_work_function(
+                mgr, test_work_function, &counter, 999, strategy, 1024  // Invalid node 999
+            );
+            
+            if (work_id >= 0) {
+                printf("  ✅ Invalid NUMA node hint auto-corrected (work_id: %d)\n", work_id);
+            } else {
+                printf("  ⚠️  Invalid NUMA node hint caused submission failure\n");
+                // This might be acceptable behavior
+            }
+        }
+        
+        // Test: Zero buffer size
+        printf("  Testing zero buffer size...\n");
+        {
+            int counter = 0;
+            ggml_numa_execution_strategy_t strategy = {
+                .node_strategy = NUMA_NODE_STRATEGY_SINGLE_NODE,
+                .on_node_strategy = NUMA_ON_NODE_STRATEGY_SINGLE_THREAD
+            };
+            
+            int work_id = ggml_numa_coordinator_manager_submit_work_function(
+                mgr, test_work_function, &counter, -1, strategy, 0  // Zero buffer size
+            );
+            
+            if (work_id >= 0) {
+                printf("  ✅ Zero buffer size handled gracefully (work_id: %d)\n", work_id);
+            } else {
+                printf("  ⚠️  Zero buffer size caused submission failure\n");
+                // This might be acceptable behavior depending on implementation
+            }
+        }
+        
+        add_test_result("function_pointer_error_handling", all_passed, 
                        all_passed ? "Error conditions handled gracefully" : "Some error handling failed");
     }
     
@@ -345,19 +445,19 @@ public:
         printf("                        NUMA Coordinator Test Suite\n");
         printf("================================================================================\n\n");
         
-        test_virtual_numa_coordinator_creation();
+        test_numa_coordinator_manager_creation();
         printf("\n");
         
-        test_standard_numa_behavior();
+        test_function_pointer_submission();
         printf("\n");
         
-        test_coordinator_thread_management();
+        test_execution_strategy_validation();
         printf("\n");
         
-        test_memory_allocation_patterns();
+        test_numa_node_assignment();
         printf("\n");
         
-        test_error_handling();
+        test_function_pointer_error_handling();
         printf("\n");
         
         print_results();

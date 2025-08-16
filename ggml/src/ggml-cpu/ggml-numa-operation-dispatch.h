@@ -298,6 +298,10 @@ const ggml_numa_dispatch_stats_t * ggml_numa_dispatch_get_stats(void);
 // Reset statistics
 void ggml_numa_dispatch_reset_stats(void);
 
+// Per-thread work buffer management
+bool ggml_numa_dispatch_ensure_work_buffer_for_thread(int numa_node, int thread_id, size_t required_size);
+void* ggml_numa_dispatch_get_work_buffer_for_thread(int numa_node, int thread_id, size_t* buffer_size);
+
 #ifdef __cplusplus
 }
 #endif

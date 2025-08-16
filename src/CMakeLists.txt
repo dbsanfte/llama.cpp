@@ -39,6 +39,7 @@ add_library(llama
 
 target_include_directories(llama PRIVATE .)
 target_include_directories(llama PUBLIC ../include)
+target_include_directories(llama PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src/ggml-cpu)
 target_compile_features   (llama PRIVATE cxx_std_17) # don't bump
 
 target_link_libraries(llama PUBLIC ggml)
