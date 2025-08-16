@@ -262,3 +262,21 @@ configure_file(cmake/llama.pc.in
 
 install(FILES "${CMAKE_CURRENT_BINARY_DIR}/llama.pc"
         DESTINATION ${CMAKE_INSTALL_LIBDIR}/pkgconfig)
+
+# Custom kernel test
+add_executable(test-custom-kernel test_custom_kernel.c)
+target_link_libraries(test-custom-kernel PRIVATE ggml common)
+target_include_directories(test-custom-kernel PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/ggml/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+)
+
+# Test ggml mul_mat tensor creation
+add_executable(test-ggml-mulmat test_ggml_mulmat.c)
+target_link_libraries(test-ggml-mulmat PRIVATE ggml common)
+target_include_directories(test-ggml-mulmat PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/ggml/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+)

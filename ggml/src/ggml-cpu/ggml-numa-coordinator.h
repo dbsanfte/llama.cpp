@@ -14,9 +14,8 @@
 
 // NUMA Node Distribution Strategy - how work is distributed across NUMA nodes
 typedef enum {
-    NUMA_NODE_STRATEGY_SINGLE_NODE,       // Execute on primary node only
-    NUMA_NODE_STRATEGY_DATA_PARALLEL,     // Distribute data across all nodes
-    NUMA_NODE_STRATEGY_TASK_PARALLEL      // Distribute different tasks across nodes
+    NUMA_NODE_STRATEGY_SINGLE,            // Execute on a single node
+    NUMA_NODE_STRATEGY_DATA_PARALLEL      // Distribute data across multiple nodes
 } ggml_numa_node_strategy_t;
 
 // On-Node Execution Strategy - how work is executed within a single NUMA node
@@ -166,7 +165,8 @@ int ggml_numa_coordinator_manager_start(struct ggml_numa_coordinator_manager * m
 int ggml_numa_coordinator_manager_submit_work(struct ggml_numa_coordinator_manager * mgr,
                                               struct ggml_tensor * tensor,
                                               int numa_node_hint,
-                                              ggml_numa_execution_strategy_t execution_strategy);
+                                              ggml_numa_execution_strategy_t execution_strategy,
+                                              size_t required_buffer_size);
 
 /**
  * Submit work function with generic function pointer (NEW APPROACH)

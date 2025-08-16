@@ -148,7 +148,7 @@ private:
                 const int N = c->ne[0];  // Number of columns in result
                 
                 struct ggml_compute_params params = {
-                    .ith = 0, .nth = 1, .wsize = 0, .wdata = nullptr
+                    0, 1, 0, nullptr
                 };
                 
                 ggml_compute_forward_mul_mat_one_chunk(&params, c, GGML_TYPE_F32, 1, 0, M, 0, N);

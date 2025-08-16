@@ -11,9 +11,6 @@
 #include <sched.h>
 #include <numa.h>
 
-// Forward declaration for fallback execution function
-extern "C" enum ggml_status ggml_numa_fallback_execute(struct ggml_tensor * tensor, struct ggml_cplan * cplan);
-
 // Test framework structures
 struct TestResult {
     const char* test_name;
@@ -31,9 +28,12 @@ public:
     NumaDispatcherTestSuite() : backend(nullptr), ctx(nullptr) {
         printf("🧪 NUMA Dispatcher Test Suite Initialization...\n");
         
-        // Initialize NUMA system
-        printf("Initializing NUMA with DISTRIBUTE strategy...\n");
-        ggml_numa_init(GGML_NUMA_STRATEGY_DISTRIBUTE);
+        // Initialize NUMA system with MIRROR strategy and force_multi_socket for testing
+        printf("Initializing NUMA with MIRROR strategy and force_multi_socket...\n");
+        struct ggml_threadpool_params tpp;
+        ggml_threadpool_params_init(&tpp, -1);  // Use default thread count
+        tpp.force_multi_socket = true;  // Enable force multi-socket for testing
+        ggml_numa_init_with_threadpool_params(GGML_NUMA_STRATEGY_MIRROR, &tpp);
         
         // Initialize backend
         backend = ggml_backend_cpu_init();
@@ -263,7 +263,7 @@ public:
                 if (result) {
                     // Test via NUMA intercept (this should route to function pointer)
                     struct ggml_compute_params params = {
-                        .ith = 0, .nth = 1, .wsize = 0, .wdata = nullptr
+                        0, 1, 0, nullptr
                     };
                     
                     enum ggml_status status = ggml_numa_intercept_operation(result, &params);
@@ -302,7 +302,7 @@ public:
                 if (result) {
                     // Test via NUMA intercept
                     struct ggml_compute_params params = {
-                        .ith = 0, .nth = 4, .wsize = 0, .wdata = nullptr
+                        0, 4, 0, nullptr
                     };
                     
                     enum ggml_status status = ggml_numa_intercept_operation(result, &params);
@@ -464,6 +464,10 @@ public:
     // Test: Fallback system mathematical correctness
     void test_fallback_mathematical_correctness() {
         printf("--- Test: Fallback Mathematical Correctness ---\n");
+        
+        // Skip coordinator synchronization to avoid threading conflicts
+        // The fallback tests run independently and don't need coordinator sync
+        printf("  Running fallback mathematical correctness tests without coordinator sync...\n");
         
         struct ggml_init_params params;
         params.mem_size = 4 * 1024 * 1024;
@@ -863,7 +867,7 @@ public:
                 struct ggml_tensor* add_result = ggml_add(test_ctx, a1, b1);
                 if (add_result) {
                     // Test fallback execution
-                    enum ggml_status status = ggml_numa_fallback_execute(add_result, nullptr);
+                    enum ggml_status status = ggml_numa_execute_operation_fallback(add_result, nullptr);
                     if (status == GGML_STATUS_SUCCESS) {
                         printf("  ✅ ADD operation: Fallback execution successful\n");
                     } else {
@@ -894,7 +898,7 @@ public:
                     
                     struct ggml_tensor* mul_result = ggml_mul(test_ctx, a2, b2);
                     if (mul_result) {
-                        enum ggml_status status = ggml_numa_fallback_execute(mul_result, nullptr);
+                        enum ggml_status status = ggml_numa_execute_operation_fallback(mul_result, nullptr);
                         if (status == GGML_STATUS_SUCCESS) {
                             printf("  ✅ MUL operation: Fallback execution successful\n");
                         } else {
@@ -925,7 +929,7 @@ public:
                     struct ggml_tensor* matmul_result = ggml_mul_mat(test_ctx, a3, b3);
                     if (matmul_result) {
                         // Test that fallback correctly rejects MUL_MAT (this should fail with GGML_STATUS_FAILED)
-                        enum ggml_status fallback_status = ggml_numa_fallback_execute(matmul_result, nullptr);
+                        enum ggml_status fallback_status = ggml_numa_execute_operation_fallback(matmul_result, nullptr);
                         if (fallback_status == GGML_STATUS_FAILED) {
                             printf("  ✅ MUL_MAT operation: Correctly rejected by fallback system\n");
                             printf("  ✅ MUL_MAT routing: Fallback properly routes to dispatcher\n");
@@ -1101,24 +1105,17 @@ public:
                 continue;
             }
             
-            // Execute via dispatcher
-            struct ggml_numa_coordinator_manager * manager = ggml_numa_coordinator_manager_get_global(-1, false);
-            if (!manager) {
-                printf("  ❌ Failed to get coordinator manager for %s\n", test_case.size_name);
-                ggml_free(test_ctx);
-                correctness_test_passed = false;
-                failure_reason = "Failed to get coordinator manager";
-                continue;
-            }
-            
-            ggml_numa_work_context_t context = ggml_numa_create_work_context(result, manager);
-            enum ggml_status dispatch_result = ggml_numa_dispatch_operation(manager, result, &context);
+            // Execute via NUMA dispatcher (proper path for MUL_MAT operations)
+            struct ggml_compute_params compute_params = {
+                0, 1, 0, nullptr, nullptr
+            };
+            enum ggml_status dispatch_result = ggml_numa_intercept_operation(result, &compute_params);
             
             if (dispatch_result != GGML_STATUS_SUCCESS) {
-                printf("  ❌ Dispatcher execution failed for %s (status=%d)\n", test_case.size_name, dispatch_result);
+                printf("  ❌ NUMA dispatch failed for %s (status=%d)\n", test_case.size_name, dispatch_result);
                 ggml_free(test_ctx);
                 correctness_test_passed = false;
-                failure_reason = "Dispatcher execution failed";
+                failure_reason = "NUMA dispatch failed";
                 continue;
             }
             
@@ -1185,16 +1182,15 @@ public:
         }
         
         // Create large matrix that should trigger chunking (complexity > 10M)
-        // 128x128 * 128x64 = 1,048,576 elements, complexity = 128*128*64 = 1,048,576 ops
-        // We need bigger matrices to exceed 10M threshold
-        const int large_size = 256;  // 256x256 * 256x128 = 4.2M ops, still not enough
+        // Fixed: For A(M×K) * B(K×N) = C(M×N), we need K dimensions to match
+        // A: [400, 400] (400×400), B: [200, 400] (400×200) = Result: [200, 400] (400×200)
         const int xl_size = 400;     // 400x400 * 400x200 = 32M ops - should trigger chunking
         
         printf("  Testing XL matrices (%dx%d * %dx%d = %d ops)...\n", 
                xl_size, xl_size, xl_size, xl_size/2, xl_size * xl_size * (xl_size/2));
         
         struct ggml_tensor* a = ggml_new_tensor_2d(test_ctx, GGML_TYPE_F32, xl_size, xl_size);
-        struct ggml_tensor* b = ggml_new_tensor_2d(test_ctx, GGML_TYPE_F32, xl_size, xl_size/2);
+        struct ggml_tensor* b = ggml_new_tensor_2d(test_ctx, GGML_TYPE_F32, xl_size, xl_size/2);  // [400, 200] to match A's ne[0]=400
         
         if (!a || !b) {
             printf("  ❌ Failed to create XL test tensors\n");
@@ -1202,6 +1198,19 @@ public:
             add_test_result("mul_mat_parallel_chunking", false, "Failed to create large test tensors");
             return;
         }
+        
+        // Debug: Print actual tensor dimensions
+        printf("  🔍 DEBUG: Tensor A dimensions: ne[0]=%ld, ne[1]=%ld, ne[2]=%ld, ne[3]=%ld\n", 
+               a->ne[0], a->ne[1], a->ne[2], a->ne[3]);
+        printf("  🔍 DEBUG: Tensor B dimensions: ne[0]=%ld, ne[1]=%ld, ne[2]=%ld, ne[3]=%ld\n", 
+               b->ne[0], b->ne[1], b->ne[2], b->ne[3]);
+        printf("  🔍 DEBUG: ggml_can_mul_mat checks:\n");
+        printf("    - A->ne[0] == B->ne[0]: %ld == %ld? %s\n", 
+               a->ne[0], b->ne[0], (a->ne[0] == b->ne[0]) ? "YES" : "NO");
+        printf("    - B->ne[2] %% A->ne[2] == 0: %ld %% %ld = %ld\n", 
+               b->ne[2], a->ne[2], b->ne[2] % a->ne[2]);
+        printf("    - B->ne[3] %% A->ne[3] == 0: %ld %% %ld = %ld\n", 
+               b->ne[3], a->ne[3], b->ne[3] % a->ne[3]);
         
         // Initialize with known values
         float* a_data = (float*)ggml_get_data(a);
@@ -1213,7 +1222,7 @@ public:
         for (int i = 0; i < ggml_nelements(b); i++) {
             b_data[i] = 0.02f;
         }
-        
+
         // Create MUL_MAT operation
         struct ggml_tensor* result = ggml_mul_mat(test_ctx, a, b);
         if (!result) {
@@ -1224,30 +1233,24 @@ public:
         }
         
         printf("  ✅ XL MUL_MAT operation created: %dx%d * %dx%d -> %dx%d\n",
-               xl_size, xl_size, xl_size/2, xl_size, xl_size, xl_size/2);
+               xl_size, xl_size, xl_size, xl_size/2, xl_size, xl_size/2);
         
         // Execute via dispatcher to test chunking logic
-        struct ggml_numa_coordinator_manager * manager = ggml_numa_coordinator_manager_get_global(-1, false);
-        if (!manager) {
-            printf("  ❌ Failed to get coordinator manager\n");
-            ggml_free(test_ctx);
-            add_test_result("mul_mat_parallel_chunking", false, "Failed to get coordinator manager");
-            return;
-        }
+        printf("  🚀 Testing chunked NUMA dispatcher execution on XL matrix...\n");
         
-        printf("  🚀 Testing chunked dispatcher execution on XL matrix...\n");
-        
-        ggml_numa_work_context_t context = ggml_numa_create_work_context(result, manager);
-        enum ggml_status dispatch_result = ggml_numa_dispatch_operation(manager, result, &context);
+        struct ggml_compute_params compute_params = {
+            0, 1, 0, nullptr, nullptr
+        };
+        enum ggml_status dispatch_result = ggml_numa_intercept_operation(result, &compute_params);
         
         if (dispatch_result != GGML_STATUS_SUCCESS) {
-            printf("  ❌ XL matrix dispatcher execution failed (status=%d)\n", dispatch_result);
+            printf("  ❌ XL matrix NUMA dispatch failed (status=%d)\n", dispatch_result);
             ggml_free(test_ctx);
-            add_test_result("mul_mat_parallel_chunking", false, "XL matrix dispatcher execution failed");
+            add_test_result("mul_mat_parallel_chunking", false, "XL matrix fallback execution failed");
             return;
         }
         
-        printf("  ✅ XL matrix dispatcher execution: SUCCESS\n");
+        printf("  ✅ XL matrix fallback execution: SUCCESS\n");
         
         // Verify mathematical correctness for chunked execution
         float* result_data = (float*)ggml_get_data(result);
@@ -1336,21 +1339,15 @@ public:
                         // Test the actual chunked dispatcher execution
                         printf("  🚀 Testing MUL_MAT chunked dispatcher execution...\n");
                         
-                        // Get the global coordinator manager (should already be initialized)
-                        struct ggml_numa_coordinator_manager * manager = ggml_numa_coordinator_manager_get_global(-1, false);
-                        if (!manager) {
-                            printf("  ❌ Failed to get global coordinator manager\n");
-                            failure_reason = "Failed to get global coordinator manager";
-                            execution_test_passed = false;
-                        } else {
-                            // Create work context for the operation
-                            ggml_numa_work_context_t context = ggml_numa_create_work_context(result, manager);
+                        // Execute via NUMA dispatcher system to test dispatcher backend
+                        struct ggml_compute_params compute_params = {
+                            0, 1, 0, nullptr, nullptr
+                        };
+                        enum ggml_status dispatch_result = ggml_numa_intercept_operation(result, &compute_params);
                             
-                            enum ggml_status dispatch_result = ggml_numa_dispatch_operation(manager, result, &context);
-                            
-                            if (dispatch_result == GGML_STATUS_SUCCESS) {
-                                printf("  ✅ MUL_MAT dispatcher execution: SUCCESS\n");
-                                printf("  🎉 Chunked approach resolved segfault issues!\n");
+                        if (dispatch_result == GGML_STATUS_SUCCESS) {
+                            printf("  ✅ MUL_MAT NUMA dispatcher execution: SUCCESS\n");
+                            printf("  🎉 Execution completed successfully!\n");
                                 
                                 // Mathematical correctness validation
                                 printf("  📐 Validating mathematical correctness of MUL_MAT results...\n");
@@ -1386,11 +1383,10 @@ public:
                                     failure_reason = "MUL_MAT mathematical results incorrect";
                                     execution_test_passed = false;
                                 }
-                            } else {
-                                printf("  ❌ MUL_MAT dispatcher execution: FAILED (status=%d)\n", dispatch_result);
-                                failure_reason = "MUL_MAT chunked dispatcher execution failed";
-                                execution_test_passed = false;
-                            }
+                        } else {
+                            printf("  ❌ MUL_MAT NUMA dispatcher execution: FAILED (status=%d)\n", dispatch_result);
+                            failure_reason = "MUL_MAT NUMA dispatcher execution failed";
+                            execution_test_passed = false;
                         }
                     } else {
                         printf("  ❌ MUL_MAT operation: Incorrect structure for dispatch\n");
