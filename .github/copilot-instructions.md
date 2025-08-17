@@ -43,9 +43,28 @@ cmake --build build --parallel
 
 ### Quick sanity check against a real model:
 ```bash
-# Test the app against a real model for sanity, should exit with code 0
+# Test llama-server with NUMA mirror mode for production-ready validation
 wget -c -O ./.devcontainer/qwen2.5-0.5b-instruct-q8_0.gguf https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF/resolve/main/qwen2.5-0.5b-instruct-q8_0.gguf
-./build/bin/llama-cli -m ./.devcontainer/qwen2.5-0.5b-instruct-q8_0.gguf -v -no-cnv -n 1 -p "Repeat after me: Hello, world!" --numa mirror || echo "failed!"
+
+# Start server in background with NUMA mirror mode
+./build/bin/llama-server -m ./.devcontainer/qwen2.5-0.5b-instruct-q8_0.gguf --host 0.0.0.0 --numa mirror --port 8080 &
+
+# Wait for server to start up
+while ! curl -s http://localhost:8080/; do sleep 1; done
+
+# Test chat completion API
+curl -X POST http://localhost:8080/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "qwen2.5-0.5b-instruct",
+    "messages": [{"role": "user", "content": "Hello! Can you respond with just a short greeting?"}],
+    "max_tokens": 20,
+    "temperature": 0.1
+  }'
+
+# Verify JSON response contains a sensible greeting (e.g., "Hello!" or similar)
+# Kill background server
+kill %1
 ```
 
 ## 🧠 Key Areas of Focus
