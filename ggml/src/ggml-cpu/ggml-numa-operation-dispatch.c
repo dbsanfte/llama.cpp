@@ -66,6 +66,7 @@ static enum ggml_status ggml_numa_work_function_fallback(void * work_context, st
 static enum ggml_status ggml_numa_work_function_mul_mat_single(void * work_context, struct ggml_compute_params * params);
 static enum ggml_status ggml_numa_work_function_mul_mat_chunk(void * work_context, struct ggml_compute_params * params);
 static enum ggml_status ggml_numa_work_function_soft_max(void * work_context, struct ggml_compute_params * params);
+static enum ggml_status ggml_numa_work_function_rope_chunk(void * work_context, struct ggml_compute_params * params);
 
 // Work context creation and management functions
 static ggml_numa_dispatcher_work_context_t * ggml_numa_dispatcher_create_work_context(
@@ -114,6 +115,13 @@ static enum ggml_status ggml_numa_execute_mul_mat_chunked(
 
 // SOFT_MAX chunked execution using row-wise parallelization
 static enum ggml_status ggml_numa_execute_soft_max_chunked(
+    struct ggml_numa_coordinator_manager * manager,
+    const struct ggml_tensor * operation,
+    const ggml_numa_work_context_t * context
+);
+
+// ROPE chunked execution using data parallelization across NUMA nodes
+static enum ggml_status ggml_numa_execute_rope_data_parallel(
     struct ggml_numa_coordinator_manager * manager,
     const struct ggml_tensor * operation,
     const ggml_numa_work_context_t * context
@@ -578,13 +586,12 @@ static enum ggml_status ggml_numa_execute_data_parallel(
     GGML_LOG_DEBUG("Executing %s with data parallelism across %d NUMA nodes using function pointers\n", 
                    ggml_op_name(operation->op), context->numa_nodes);
     
-    // Special handling for NUMA-aware operations
+    // Special handling for operations that need custom data parallel execution
     switch (operation->op) {
         case GGML_OP_ROPE: {
-            // FIXED: ROPE cannot be safely parallelized across multiple NUMA nodes
-            // Multiple nodes writing to same tensor causes data corruption
-            GGML_LOG_DEBUG("ROPE requires single-node execution to avoid data corruption\n");
-            return ggml_numa_execute_single_node(manager, operation, context);
+            // ROPE uses specialized data parallel execution with NUMA-aware buffer management
+            GGML_LOG_DEBUG("Routing ROPE to specialized data parallel execution\n");
+            return ggml_numa_execute_rope_data_parallel(manager, operation, context);
         }
         
         default:
@@ -1165,9 +1172,9 @@ static enum ggml_status ggml_numa_execute_soft_max_chunked(
         return GGML_STATUS_FAILED;
     }
     
-    // Calculate required work buffer size: (ne00 + CACHE_LINE_SIZE_F32) * sizeof(float) * num_threads
-    const int num_threads = context->threads_per_node;
-    const size_t work_buffer_size = (ne00 + CACHE_LINE_SIZE_F32) * sizeof(float) * num_threads;
+    // Calculate required work buffer size: (ne00 + CACHE_LINE_SIZE_F32) * sizeof(float)
+    // Since we use single-threaded params (ith=0, nth=1), only need space for one thread per node
+    const size_t work_buffer_size = (ne00 + CACHE_LINE_SIZE_F32) * sizeof(float);
     
     // Set up execution strategy for SOFT_MAX
     ggml_numa_execution_strategy_t strategy = {
@@ -1192,6 +1199,73 @@ static enum ggml_status ggml_numa_execute_soft_max_chunked(
     }
     
     GGML_LOG_DEBUG("Submitted SOFT_MAX function pointer work (ID: %d)\n", work_id);
+    
+    // Note: work_context will be freed by the coordinator after execution
+    
+    return GGML_STATUS_SUCCESS;
+}
+
+// NUMA-aware ROPE execution with data parallelization across NUMA nodes
+static enum ggml_status ggml_numa_execute_rope_data_parallel(
+    struct ggml_numa_coordinator_manager * manager,
+    const struct ggml_tensor * operation,
+    const ggml_numa_work_context_t * context) {
+    
+    if (!manager || !operation || !context) {
+        GGML_LOG_ERROR("Invalid parameters for ROPE data parallel execution\n");
+        return GGML_STATUS_FAILED;
+    }
+    
+    const int64_t ne00 = operation->ne[0];  // Head dimension
+    const int64_t ne01 = operation->ne[1];  // Sequence length
+    const int64_t ne02 = operation->ne[2];  // Number of heads / batch
+    const int64_t ne03 = operation->ne[3];  // Batch dimension
+    
+    GGML_LOG_INFO("NUMA ROPE data parallel execution: [%ld, %ld, %ld, %ld] across %d NUMA nodes\n", 
+                  ne00, ne01, ne02, ne03, context->numa_nodes);
+    
+    // Calculate work buffer size for ROPE operations
+    // ROPE needs cache space for sin/cos values: (ne00 + CACHE_LINE_SIZE_F32) * sizeof(float) per node
+    // Since we use single-threaded params (ith=0, nth=1) on each node, each node needs this much
+    const size_t rope_work_buffer_size = (ne00 + CACHE_LINE_SIZE_F32) * sizeof(float);
+    
+    // Create work context for each NUMA node
+    ggml_numa_dispatcher_work_context_t * work_context = ggml_numa_dispatcher_create_work_context(
+        (struct ggml_tensor *)operation,
+        "ROPE_DATA_PARALLEL",
+        NULL,  // No additional context needed - NUMA mirroring handles data distribution
+        0      // No additional context size
+    );
+    
+    if (!work_context) {
+        GGML_LOG_ERROR("Failed to create work context for ROPE data parallel execution\n");
+        return GGML_STATUS_FAILED;
+    }
+    
+    // Set up execution strategy for ROPE data parallelism
+    ggml_numa_execution_strategy_t strategy = {
+        .node_strategy = NUMA_NODE_STRATEGY_DATA_PARALLEL,  // Distribute across NUMA nodes
+        .on_node_strategy = NUMA_ON_NODE_STRATEGY_MULTI_THREAD
+    };
+    
+    // Submit work using specialized ROPE function pointer for data parallel execution
+    int work_id = ggml_numa_coordinator_manager_submit_work_function(
+        manager,
+        ggml_numa_work_function_rope_chunk,  // Specialized ROPE chunk function
+        work_context,                        // Context data
+        -1,                                  // Auto-select NUMA nodes for data parallelism
+        strategy,                            // Data parallel execution strategy
+        rope_work_buffer_size                // Buffer requirements
+    );
+    
+    if (work_id < 0) {
+        GGML_LOG_ERROR("Failed to submit ROPE data parallel function pointer work\n");
+        ggml_numa_dispatcher_free_work_context(work_context);
+        return GGML_STATUS_FAILED;
+    }
+    
+    GGML_LOG_DEBUG("Submitted ROPE data parallel function pointer work (ID: %d) across %d NUMA nodes\n", 
+                   work_id, context->numa_nodes);
     
     // Note: work_context will be freed by the coordinator after execution
     
@@ -2327,10 +2401,16 @@ static size_t ggml_numa_dispatcher_calculate_work_buffer_size(const struct ggml_
     
     switch (operation->op) {
         case GGML_OP_SOFT_MAX: {
-            // SOFT_MAX needs (ne00 + CACHE_LINE_SIZE_F32) * sizeof(float) per thread
+            // SOFT_MAX needs (ne00 + CACHE_LINE_SIZE_F32) * sizeof(float)
+            // Since we use single-threaded params (ith=0, nth=1), only need space for one thread
             const int64_t ne00 = operation->ne[0];
-            const int nth = 22; // Conservative estimate for max threads
-            return (ne00 + CACHE_LINE_SIZE_F32) * sizeof(float) * nth;
+            return (ne00 + CACHE_LINE_SIZE_F32) * sizeof(float);
+        }
+        case GGML_OP_ROPE: {
+            // ROPE operations need cache buffer: (ne0 + CACHE_LINE_SIZE_F32) * sizeof(float)
+            // Since we use single-threaded params (ith=0, nth=1), only need space for one thread
+            const int64_t ne00 = operation->ne[0];
+            return (ne00 + CACHE_LINE_SIZE_F32) * sizeof(float);
         }
         case GGML_OP_NORM:
         case GGML_OP_RMS_NORM: {
@@ -2371,12 +2451,6 @@ static size_t ggml_numa_dispatcher_calculate_work_buffer_size(const struct ggml_
         case GGML_OP_GROUP_NORM: {
             // Group normalization needs working space
             return ggml_nelements(operation) * sizeof(float);
-        }
-        case GGML_OP_ROPE: {
-            // ROPE operations need cache space for sin/cos values
-            const int64_t ne0 = operation->ne[0];
-            const int nth = 1; // Single-threaded fallback
-            return (ne0 + CACHE_LINE_SIZE_F32) * sizeof(float) * nth;
         }
         // Most operations don't need work buffers
         default:
@@ -2603,22 +2677,96 @@ static enum ggml_status ggml_numa_work_function_soft_max(void * work_context, st
     
     GGML_LOG_DEBUG("Executing SOFT_MAX work function with %d threads\n", params->nth);
     
-    // Update compute plan with coordinator parameters
-    if (ctx->cplan) {
-        ctx->cplan->n_threads = params->nth;
-        ctx->cplan->work_size = params->wsize;
-        ctx->cplan->work_data = params->wdata;
-        ctx->cplan->threadpool = params->threadpool;
+    // For SOFT_MAX operations, we need to call the kernel directly but with single-threaded parameters
+    // to avoid conflicts with the NUMA coordinator threading model
+    // Set up single-threaded compute params to process all data on this NUMA node
+    struct ggml_compute_params single_thread_params = {
+        .ith = 0,                  // Process all data (thread index 0)
+        .nth = 1,                  // Single thread (total threads = 1)
+        .wsize = params->wsize,    // Use coordinator's work buffer
+        .wdata = params->wdata,    // Use coordinator's work buffer
+        .threadpool = NULL         // No threadpool conflicts
+    };
+    
+    // Call the SOFT_MAX mathematical kernel directly with single-threaded params
+    ggml_compute_forward_soft_max(&single_thread_params, ctx->operation);
+    
+    GGML_LOG_DEBUG("Successfully executed SOFT_MAX work function\n");
+    
+    return GGML_STATUS_SUCCESS;
+}
+
+// Specialized work function for ROPE operations with NUMA-aware chunking
+static enum ggml_status ggml_numa_work_function_rope_chunk(void * work_context, struct ggml_compute_params * params) {
+    if (!work_context || !params) {
+        GGML_LOG_ERROR("ROPE work function: Invalid parameters\n");
+        return GGML_STATUS_FAILED;
     }
     
-    // Execute using fallback system
-    enum ggml_status result = ggml_numa_fallback_execute(ctx->operation, ctx->cplan);
+    ggml_numa_dispatcher_work_context_t * ctx = (ggml_numa_dispatcher_work_context_t *)work_context;
     
-    if (result == GGML_STATUS_SUCCESS) {
-        GGML_LOG_DEBUG("Successfully executed SOFT_MAX work function\n");
+    if (!ctx->operation) {
+        GGML_LOG_ERROR("ROPE work function: Operation is NULL\n");
+        return GGML_STATUS_FAILED;
+    }
+    
+    GGML_LOG_DEBUG("ROPE work function: operation=%p, type=%d, elements=%ld\n", 
+                   (void*)ctx->operation, ctx->operation->op, ggml_nelements(ctx->operation));
+    
+    // Check SOURCE tensor data (src[0] is where ROPE reads input from)
+    if (ctx->operation->src[0]) {
+        void *src_data = ggml_get_data(ctx->operation->src[0]);
+        if (src_data) {
+            float *data = (float*)src_data;
+            GGML_LOG_DEBUG("ROPE work function: First few SOURCE values: %.6f %.6f %.6f %.6f\n", 
+                           data[0], data[1], data[2], data[3]);
+        } else {
+            GGML_LOG_WARN("ROPE work function: src[0] data is NULL\n");
+        }
     } else {
-        GGML_LOG_ERROR("Failed to execute SOFT_MAX work function\n");
+        GGML_LOG_ERROR("ROPE work function: src[0] is NULL\n");
+        return GGML_STATUS_FAILED;
     }
     
-    return result;
+    // Check destination tensor (should start as zeros)
+    void *dst_data = ggml_get_data(ctx->operation);
+    if (dst_data) {
+        float *data = (float*)dst_data;
+        GGML_LOG_DEBUG("ROPE work function: First few DESTINATION values (before): %.6f %.6f %.6f %.6f\n", 
+                       data[0], data[1], data[2], data[3]);
+    }
+    
+    GGML_LOG_DEBUG("Executing ROPE chunk work function with %d threads on NUMA node (current CPU: %d)\n", 
+                   params->nth, sched_getcpu());
+    
+    // For ROPE operations, we need to call the kernel directly but with single-threaded parameters
+    // to avoid conflicts with the NUMA coordinator threading model
+    // Set up single-threaded compute params to process all data on this NUMA node
+    struct ggml_compute_params single_thread_params = {
+        .ith = 0,                  // Process all data (thread index 0)
+        .nth = 1,                  // Single thread (total threads = 1)
+        .wsize = params->wsize,    // Use coordinator's work buffer
+        .wdata = params->wdata,    // Use coordinator's work buffer
+        .threadpool = NULL         // No threadpool conflicts
+    };
+    
+    GGML_LOG_DEBUG("ROPE work function: Calling ggml_compute_forward_rope with single_thread_params (ith=%d, nth=%d)\n",
+                   single_thread_params.ith, single_thread_params.nth);
+    
+    // Call the ROPE mathematical kernel directly with single-threaded params
+    ggml_compute_forward_rope(&single_thread_params, ctx->operation);
+    
+    // Add memory barrier to ensure all writes are visible before returning
+    __sync_synchronize();
+    
+    // Check output values
+    if (dst_data) {
+        float *data = (float*)dst_data;
+        GGML_LOG_DEBUG("ROPE work function: First few DESTINATION values (after): %.6f %.6f %.6f %.6f\n", 
+                       data[0], data[1], data[2], data[3]);
+    }
+    
+    GGML_LOG_DEBUG("Successfully executed ROPE chunk work function\n");
+    
+    return GGML_STATUS_SUCCESS;
 }

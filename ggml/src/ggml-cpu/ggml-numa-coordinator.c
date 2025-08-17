@@ -1176,6 +1176,10 @@ static void * ggml_coordinator_thread_func(void * arg) {
     }
 #endif
     
+    // Set thread-local NUMA node variable for tensor_data() access
+    extern __thread int ggml_current_numa_node;
+    ggml_current_numa_node = coordinator->numa_node;
+    
     atomic_store(&coordinator->active, true);
     
     // Main coordinator loop - processes complete operations 
