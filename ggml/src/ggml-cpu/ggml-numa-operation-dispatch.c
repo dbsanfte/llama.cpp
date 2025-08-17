@@ -71,6 +71,7 @@ static enum ggml_status ggml_numa_work_function_soft_max(void * work_context, st
 static enum ggml_status ggml_numa_work_function_rope_chunk(void * work_context, struct ggml_compute_params * params);
 static enum ggml_status ggml_numa_work_function_add_chunk(void * work_context, struct ggml_compute_params * params);
 static enum ggml_status ggml_numa_work_function_glu_chunk(void * work_context, struct ggml_compute_params * params);
+static enum ggml_status ggml_numa_work_function_rms_norm_chunk(void * work_context, struct ggml_compute_params * params);
 
 // Work context creation and management functions
 static ggml_numa_dispatcher_work_context_t * ggml_numa_dispatcher_create_work_context(
@@ -271,6 +272,7 @@ extern const ggml_numa_operation_handler_t ggml_numa_handler_elementwise;
 extern const ggml_numa_operation_handler_t ggml_numa_handler_mul_mat_enhanced;
 extern const ggml_numa_operation_handler_t ggml_numa_handler_soft_max;
 extern const ggml_numa_operation_handler_t ggml_numa_handler_glu;
+extern const ggml_numa_operation_handler_t ggml_numa_handler_rms_norm;
 extern const ggml_numa_operation_handler_t ggml_numa_handler_complex;
 
 //
@@ -341,6 +343,7 @@ void ggml_numa_dispatch_init(void) {
     ggml_numa_dispatch_register_handler(&ggml_numa_handler_mul_mat_enhanced);  // Use enhanced MUL_MAT handler
     ggml_numa_dispatch_register_handler(&ggml_numa_handler_soft_max);         // NUMA-aware SOFT_MAX handler
     ggml_numa_dispatch_register_handler(&ggml_numa_handler_glu);              // NUMA-aware GLU handler
+    ggml_numa_dispatch_register_handler(&ggml_numa_handler_rms_norm);         // NUMA-aware RMS_NORM handler
     ggml_numa_dispatch_register_handler(&ggml_numa_handler_complex);
     
     // Skip atexit registration to avoid segfaults during program termination
@@ -1980,6 +1983,23 @@ const ggml_numa_operation_handler_t ggml_numa_handler_glu = {
     .analyze = NULL  // Use default strategy
 };
 
+// RMS_NORM handler - row-wise normalization with NUMA data parallelism
+const ggml_numa_operation_handler_t ggml_numa_handler_rms_norm = {
+    .operation_type = GGML_OP_RMS_NORM,
+    .default_strategy = {
+        .node_strategy = NUMA_NODE_STRATEGY_DATA_PARALLEL,  // Data parallel for row-wise operations
+        .on_node_strategy = NUMA_ON_NODE_STRATEGY_MULTI_THREAD
+    },
+    .complexity = NUMA_OP_COMPLEXITY_MODERATE,  // Has reduction phase per row but still parallelizable
+    .workload_type = NUMA_OP_COMPUTE_BOUND,     // Involves square, sum, sqrt operations
+    .min_elements_for_parallel = 10000,         // Higher threshold due to per-row reduction overhead
+    .optimal_chunk_size = 256 * 1024,           // 256KB chunks for good cache performance
+    .parallel_efficiency_estimate = 0.85f,      // Good efficiency but reduction phase adds overhead
+    .requires_synchronization = false,          // Each row is independent
+    .supports_in_place = true,                  // RMS_NORM can write to same memory location
+    .analyze = NULL  // Use default strategy
+};
+
 //
 // Coordinator Interface Implementation
 //
@@ -2999,6 +3019,95 @@ static enum ggml_status ggml_numa_work_function_glu_chunk(void * work_context, s
     }
     
     GGML_LOG_DEBUG("Successfully executed GLU chunk work function\n");
+    
+    return GGML_STATUS_SUCCESS;
+}
+
+// RMS_NORM chunk work function - handles row-wise normalization with data parallel execution
+static enum ggml_status ggml_numa_work_function_rms_norm_chunk(void * work_context, struct ggml_compute_params * params) {
+    if (!work_context || !params) {
+        GGML_LOG_ERROR("RMS_NORM work function: Invalid parameters\n");
+        return GGML_STATUS_FAILED;
+    }
+    
+    ggml_numa_dispatcher_work_context_t * ctx = (ggml_numa_dispatcher_work_context_t *)work_context;
+    
+    if (!ctx->operation) {
+        GGML_LOG_ERROR("RMS_NORM work function: Operation is NULL\n");
+        return GGML_STATUS_FAILED;
+    }
+    
+    GGML_LOG_DEBUG("RMS_NORM work function: operation=%p, type=%d, elements=%ld\n", 
+                   (void*)ctx->operation, ctx->operation->op, ggml_nelements(ctx->operation));
+    
+    // Check source tensor - RMS_NORM has one input tensor
+    const struct ggml_tensor * src0 = ctx->operation->src[0];
+    
+    if (!src0) {
+        GGML_LOG_ERROR("RMS_NORM work function: Missing source tensor\n");
+        return GGML_STATUS_FAILED;
+    }
+    
+    // Check source tensor data
+    void *src_data = ggml_get_data(src0);
+    if (!src_data) {
+        GGML_LOG_ERROR("RMS_NORM work function: Source tensor data is NULL\n");
+        return GGML_STATUS_FAILED;
+    }
+    
+    // Check destination tensor
+    void *dst_data = ggml_get_data(ctx->operation);
+    if (!dst_data) {
+        GGML_LOG_ERROR("RMS_NORM work function: Destination tensor data is NULL\n");
+        return GGML_STATUS_FAILED;
+    }
+    
+    GGML_LOG_DEBUG("Executing RMS_NORM chunk work function with %d threads on NUMA node (current CPU: %d)\n", 
+                   params->nth, sched_getcpu());
+    
+    // Extract tensor dimensions (similar to GGML_TENSOR_UNARY_OP_LOCALS)
+    const int64_t ne00 = src0->ne[0];  // Elements per row
+    const int64_t ne01 = src0->ne[1];  // Number of rows  
+    const int64_t ne02 = src0->ne[2];  // Batch dimension 2
+    const int64_t ne03 = src0->ne[3];  // Batch dimension 3
+    
+    const size_t nb01 = src0->nb[1];   // Row stride in bytes
+    const size_t nb02 = src0->nb[2];   // Batch stride 2 in bytes
+    const size_t nb03 = src0->nb[3];   // Batch stride 3 in bytes
+    
+    const size_t nb1 = ctx->operation->nb[1];   // Destination row stride in bytes
+    const size_t nb2 = ctx->operation->nb[2];   // Destination batch stride 2 in bytes
+    const size_t nb3 = ctx->operation->nb[3];   // Destination batch stride 3 in bytes
+    
+    // Get epsilon parameter
+    float eps;
+    memcpy(&eps, ctx->operation->op_params, sizeof(float));
+    GGML_ASSERT(eps >= 0.0f);
+    
+    // For RMS_NORM NUMA parallelization, we parallelize over rows (i01 dimension)
+    // Each NUMA node processes a subset of rows independently
+    // NOTE: The original kernel already has threading over i01, so we leverage that pattern
+    
+    // Call the RMS_NORM mathematical kernel with modified threading parameters
+    // Use params->ith and params->nth to ensure proper row distribution across NUMA nodes
+    struct ggml_compute_params rms_norm_params = {
+        .ith = params->ith,        // Thread index from coordinator
+        .nth = params->nth,        // Total threads from coordinator
+        .wsize = params->wsize,    // Use coordinator's work buffer
+        .wdata = params->wdata,    // Use coordinator's work buffer
+        .threadpool = NULL         // No threadpool conflicts
+    };
+    
+    GGML_LOG_DEBUG("RMS_NORM work function: Calling ggml_compute_forward_rms_norm with threading params (ith=%d, nth=%d, rows=%ld)\n",
+                   rms_norm_params.ith, rms_norm_params.nth, ne01);
+    
+    // Call the RMS_NORM mathematical kernel directly - it handles row distribution via ith/nth
+    ggml_compute_forward_rms_norm(&rms_norm_params, ctx->operation);
+    
+    // Add memory barrier to ensure all writes are visible before returning
+    __sync_synchronize();
+    
+    GGML_LOG_DEBUG("Successfully executed RMS_NORM chunk work function\n");
     
     return GGML_STATUS_SUCCESS;
 }

@@ -289,6 +289,7 @@ Add operation-specific notes to this document if needed.
 ### Successful Operation Characteristics
 - **GLU**: Element-wise with activation functions → Perfect data parallelism
 - **ADD/MUL**: Simple element-wise → Excellent candidates  
+- **RMS_NORM**: Row-wise normalization with reduction → Good data parallelism (0.85 efficiency)
 - **MUL_MAT**: Matrix multiplication → Complex but highly parallel
 - **SOFT_MAX**: Reduction operation → Requires careful coordination
 

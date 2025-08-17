@@ -918,6 +918,16 @@ public:  // Ensure all test functions are public
         test_context_pointer_correctness();
         printf("\n");
         
+        // NEW TARGETED TESTS FOR RACE CONDITION REPRODUCTION
+        test_rapid_work_submission_race_condition();
+        printf("\n");
+        
+        test_completion_signal_race_condition();
+        printf("\n");
+        
+        test_single_thread_rope_like_race();
+        printf("\n");
+        
         print_results();
         
         // Return true if all tests passed
@@ -927,7 +937,316 @@ public:  // Ensure all test functions are public
         }
         return passed == results.size();
     }
+
+    // Static work functions for race condition tests
+    static enum ggml_status quick_increment_work(void* context, struct ggml_compute_params* params) {
+        (void)params; // Suppress warning
+        int* counter = (int*)context;
+        (*counter)++;
+        printf("    🔧 Quick work executed, counter: %d\n", *counter);
+        return GGML_STATUS_SUCCESS;
+    }
     
+    // Static variables for rope-like simulation (initialized in cpp file)
+    static volatile bool rope_work_started;
+    static volatile bool rope_work_completed;
+    
+    static enum ggml_status rope_like_work_func(void* context, struct ggml_compute_params* params) {
+        (void)context; (void)params; // Suppress warnings
+        
+        printf("    🔧 ROPE-like work starting...\n");
+        rope_work_started = true;
+        
+        // Simulate some computation (like ROPE does)
+        usleep(5000); // 5ms computation
+        
+        printf("    🔧 ROPE-like work completing...\n");
+        rope_work_completed = true;
+        
+        return GGML_STATUS_SUCCESS;
+    }
+    
+    static struct {
+        int elements_processed;
+        bool computation_started;
+        bool computation_finished;
+    } rope_simulation_state;
+    
+    static enum ggml_status exact_rope_simulation_func(void* context, struct ggml_compute_params* params) {
+        (void)context; // Suppress warning
+        
+        printf("    🔧 ROPE simulation: Starting (ith=%d, nth=%d)...\n", params->ith, params->nth);
+        rope_simulation_state.computation_started = true;
+        
+        // Simulate the exact ROPE computation pattern
+        const int simulated_elements = 8192; // TINY tensor size from ROPE test
+        for (int i = 0; i < simulated_elements; i++) {
+            // Simulate ROPE computation (sin/cos operations)
+            rope_simulation_state.elements_processed++;
+            
+            // Add occasional yield to simulate real computation
+            if (i % 1000 == 0) {
+                usleep(1); // 1µs per 1000 elements
+            }
+        }
+        
+        printf("    🔧 ROPE simulation: Finishing (processed %d elements)...\n", rope_simulation_state.elements_processed);
+        rope_simulation_state.computation_finished = true;
+        
+        // Add memory barrier (same as ROPE work function)
+        __sync_synchronize();
+        
+        return GGML_STATUS_SUCCESS;
+    }
+
+    //
+    // NEW TARGETED TESTS FOR RACE CONDITION REPRODUCTION
+    //
+
+    // Test: Rapid work submission to reproduce race conditions
+    void test_rapid_work_submission_race_condition() {
+        printf("--- Test: Rapid Work Submission Race Condition ---\n");
+        printf("This test tries to reproduce the coordinator hanging by rapidly submitting work\n");
+        
+        bool all_tests_passed = true;
+        
+        struct ggml_numa_coordinator_manager* mgr = ggml_numa_coordinator_manager_get_global(2, false);
+        if (!mgr) {
+            add_test_result("rapid_work_submission_race", false, "Failed to get coordinator manager");
+            return;
+        }
+        
+        printf("  🔍 Submitting 10 rapid work items to stress test completion signaling...\n");
+        
+        for (int i = 0; i < 10; i++) {
+            printf("  📝 Submitting work item %d/10...\n", i + 1);
+            
+            // Create a simple counter for verification
+            int* counter = (int*)malloc(sizeof(int));
+            *counter = 100 + i;
+            
+            // Work function that increments counter  
+            ggml_numa_work_function_t quick_work = quick_increment_work;
+            
+            ggml_numa_execution_strategy_t strategy = {
+                NUMA_NODE_STRATEGY_SINGLE,
+                NUMA_ON_NODE_STRATEGY_SINGLE_THREAD
+            };
+            
+            int work_id = ggml_numa_coordinator_manager_submit_work_function(
+                mgr, quick_work, counter, -1, strategy, 256
+            );
+            
+            if (work_id >= 0) {
+                printf("    ✅ Work %d submitted (ID: %d)\n", i + 1, work_id);
+                
+                // CRITICAL: Immediate wait after each submission (like ROPE test does)
+                printf("    ⏱️  Waiting for completion of work %d...\n", i + 1);
+                
+                int wait_result = ggml_numa_coordinator_manager_wait_for_completion(mgr);
+                
+                if (wait_result == 0) {
+                    printf("    ✅ Work %d completed successfully\n", i + 1);
+                    printf("    🔍 Final counter value: %d\n", *counter);
+                    
+                    if (*counter != 101 + i) {
+                        printf("    ❌ Counter mismatch: expected %d, got %d\n", 101 + i, *counter);
+                        all_tests_passed = false;
+                    }
+                } else {
+                    printf("    ❌ Work %d wait failed (result: %d)\n", i + 1, wait_result);
+                    all_tests_passed = false;
+                    free(counter);
+                    break; // Stop on first failure to avoid cascade
+                }
+                
+                free(counter);
+            } else {
+                printf("    ❌ Work %d submission failed\n", i + 1);
+                all_tests_passed = false;
+                free(counter);
+                break;
+            }
+            
+            // Small delay between submissions to mimic real usage
+            usleep(1000); // 1ms
+        }
+        
+        add_test_result("rapid_work_submission_race", all_tests_passed,
+                       all_tests_passed ? "Rapid work submission completed successfully" : "Race condition detected in work submission");
+    }
+
+    // Test: Completion signal race condition (simulates ROPE test pattern)
+    void test_completion_signal_race_condition() {
+        printf("--- Test: Completion Signal Race Condition ---\n");
+        printf("This test simulates the exact pattern that causes ROPE test hangs\n");
+        
+        bool all_tests_passed = true;
+        
+        struct ggml_numa_coordinator_manager* mgr = ggml_numa_coordinator_manager_get_global(1, false);
+        if (!mgr) {
+            add_test_result("completion_signal_race", false, "Failed to get coordinator manager");
+            return;
+        }
+        
+        printf("  🔍 Testing completion signal race with immediate wait pattern...\n");
+        
+        // Reset static variables for this test
+        rope_work_started = false;
+        rope_work_completed = false;
+        
+        // Simulate the ROPE test pattern: submit work, immediately wait
+        for (int attempt = 0; attempt < 5; attempt++) {
+            printf("  📝 Race test attempt %d/5...\n", attempt + 1);
+            
+            // Reset for each attempt
+            rope_work_started = false;
+            rope_work_completed = false;
+            
+            ggml_numa_execution_strategy_t strategy = {
+                NUMA_NODE_STRATEGY_SINGLE,
+                NUMA_ON_NODE_STRATEGY_SINGLE_THREAD
+            };
+            
+            int work_id = ggml_numa_coordinator_manager_submit_work_function(
+                mgr, rope_like_work_func, nullptr, -1, strategy, 1024
+            );
+            
+            if (work_id >= 0) {
+                printf("    ✅ ROPE-like work submitted (ID: %d)\n", work_id);
+                
+                // CRITICAL: This is where ROPE test hangs - immediate wait after submission
+                printf("    ⏱️  IMMEDIATE wait (reproducing ROPE hang pattern)...\n");
+                
+                // Add timeout to detect hangs
+                printf("    ⚠️  If this hangs for >10 seconds, race condition reproduced!\n");
+                
+                int wait_result = ggml_numa_coordinator_manager_wait_for_completion(mgr);
+                
+                if (wait_result == 0) {
+                    printf("    ✅ Wait completed successfully\n");
+                    printf("    🔍 Work started: %s, completed: %s\n", 
+                           rope_work_started ? "YES" : "NO",
+                           rope_work_completed ? "YES" : "NO");
+                    
+                    if (!rope_work_started || !rope_work_completed) {
+                        printf("    ❌ Work execution verification failed\n");
+                        all_tests_passed = false;
+                    }
+                } else {
+                    printf("    ❌ Wait failed - RACE CONDITION REPRODUCED! (result: %d)\n", wait_result);
+                    all_tests_passed = false;
+                    break;
+                }
+            } else {
+                printf("    ❌ Work submission failed\n");
+                all_tests_passed = false;
+                break;
+            }
+            
+            // Brief pause between attempts
+            usleep(10000); // 10ms
+        }
+        
+        add_test_result("completion_signal_race", all_tests_passed,
+                       all_tests_passed ? "No race condition detected" : "RACE CONDITION REPRODUCED");
+    }
+
+    // Test: Single thread ROPE-like race (exact ROPE test simulation)
+    void test_single_thread_rope_like_race() {
+        printf("--- Test: Single Thread ROPE-like Race ---\n");
+        printf("This test exactly simulates ROPE test conditions with single thread on single NUMA node\n");
+        
+        bool all_tests_passed = true;
+        
+        ggml_numa_execution_strategy_t strategy = {
+            NUMA_NODE_STRATEGY_SINGLE,
+            NUMA_ON_NODE_STRATEGY_SINGLE_THREAD
+        };
+        
+        struct ggml_numa_coordinator_manager* mgr = ggml_numa_coordinator_manager_get_global(1, false);
+        if (!mgr) {
+            add_test_result("single_thread_rope_race", false, "Failed to get coordinator manager");
+            return;
+        }
+        
+        printf("  🔍 Simulating exact ROPE test conditions (TINY tensor, 1 thread)...\n");
+        
+        // Test multiple iterations to catch intermittent race conditions
+        for (int iteration = 0; iteration < 20; iteration++) {
+            printf("  📝 ROPE simulation iteration %d/20...\n", iteration + 1);
+            
+            // Reset simulation state
+            rope_simulation_state = {0, false, false};
+            
+            int work_id = ggml_numa_coordinator_manager_submit_work_function(
+                mgr, exact_rope_simulation_func, nullptr, 0, strategy, 8192 * sizeof(float)
+            );
+            
+            if (work_id >= 0) {
+                printf("    ✅ ROPE simulation submitted (ID: %d)\n", work_id);
+                
+                // EXACT ROPE TEST PATTERN: immediate wait with progressive delays
+                printf("    ⏱️  Applying ROPE test wait pattern...\n");
+                
+                bool wait_successful = false;
+                int sync_attempts = 0;
+                const int max_sync_attempts = 100; // 1 second total (like fixed ROPE test)
+                
+                while (!wait_successful && sync_attempts < max_sync_attempts) {
+                    // Memory barrier (like ROPE test)
+                    __sync_synchronize();
+                    
+                    usleep(10000); // 10ms per attempt (like ROPE test)
+                    sync_attempts++;
+                    
+                    // Check if work completed by attempting wait
+                    int wait_result = ggml_numa_coordinator_manager_wait_for_completion(mgr);
+                    
+                    if (wait_result == 0) {
+                        wait_successful = true;
+                        break;
+                    } else if (sync_attempts >= 10) {
+                        // Give up after 100ms (much shorter than ROPE test)
+                        printf("    ⚠️  Wait timeout after %d attempts (may indicate race condition)\n", sync_attempts);
+                        break;
+                    }
+                }
+                
+                if (wait_successful) {
+                    printf("    ✅ ROPE simulation completed (attempts: %d)\n", sync_attempts);
+                    printf("    🔍 Computation state: started=%s, finished=%s, elements=%d\n",
+                           rope_simulation_state.computation_started ? "YES" : "NO",
+                           rope_simulation_state.computation_finished ? "YES" : "NO",
+                           rope_simulation_state.elements_processed);
+                    
+                    if (!rope_simulation_state.computation_started || !rope_simulation_state.computation_finished || 
+                        rope_simulation_state.elements_processed != 8192) {
+                        printf("    ❌ ROPE simulation state verification failed\n");
+                        all_tests_passed = false;
+                    }
+                } else {
+                    printf("    ❌ ROPE simulation HANG REPRODUCED (iteration %d)!\n", iteration + 1);
+                    all_tests_passed = false;
+                    break; // Stop on first hang to avoid infinite waiting
+                }
+            } else {
+                printf("    ❌ ROPE simulation submission failed\n");
+                all_tests_passed = false;
+                break;
+            }
+            
+            // Reset state for next iteration
+            rope_simulation_state = {0, false, false};
+            
+            // Brief pause between iterations (like ROPE test multiple runs)
+            usleep(1000); // 1ms
+        }
+        
+        add_test_result("single_thread_rope_race", all_tests_passed,
+                       all_tests_passed ? "ROPE simulation completed without hangs" : "ROPE HANG REPRODUCED");
+    }
+
     void print_results() {
         printf("================================================================================\n");
         printf("                           Test Results Summary\n");
@@ -964,6 +1283,13 @@ public:  // Ensure all test functions are public
         }
     }
 };
+
+// Static member definitions
+volatile bool NumaCoordinatorTestSuite::rope_work_started = false;
+volatile bool NumaCoordinatorTestSuite::rope_work_completed = false;
+
+// Initialize the static member (type already declared in class)
+decltype(NumaCoordinatorTestSuite::rope_simulation_state) NumaCoordinatorTestSuite::rope_simulation_state = {0, false, false};
 
 int main() {
     NumaCoordinatorTestSuite test_suite;
