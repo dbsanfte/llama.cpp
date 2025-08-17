@@ -132,6 +132,7 @@ CMake tests live in the `tests/` folder and are built into `build/bin/`. Build a
 
 **Important:** ALWAYS add tests to the `tests/` folder, never to the project root!
 **Important:** ALWAYS use the CMake build/test apparatus for compiling tests!
+**Important:** ALWAYS run `./tests/run-numa-tests.sh` as the final validation step!
 
 1. Write tests in one of the following two files:
    - `tests/test-numa-dispatcher.cpp`
@@ -157,7 +158,71 @@ CMake tests live in the `tests/` folder and are built into `build/bin/`. Build a
 
 6. Verify sane test output, no errors, no overflowing variables, no hanging/segfaults, etc.
 
+7. **Final validation with comprehensive test suite**:
+   ```bash
+   ./tests/run-numa-tests.sh
+   ```
+   This script runs all NUMA tests and provides timing information. It MUST return exit code 0.
+
 A feature isn't done until it has comprehensive, working tests in one of these files!
+
+### Mathematical Correctness Test Template
+
+**IMPORTANT: Use the provided template instead of writing test frameworks from scratch!**
+
+For testing mathematical correctness of new NUMA operations, use the comprehensive template:
+
+- **Template file**: `tests/test-numa-mathematical-correctness-template.cpp`
+- **Working example**: `tests/test-numa-mathematical-correctness.cpp` (MUL_MAT implementation)
+
+#### Template Usage Instructions:
+
+1. **Copy the template**:
+   ```bash
+   cp tests/test-numa-mathematical-correctness-template.cpp tests/test-numa-mathematical-correctness-YOUR_OPERATION.cpp
+   ```
+
+2. **Customize for your operation**:
+   - Replace all instances of `TEMPLATE_OPERATION` with your operation name (e.g., `ADD`, `MUL`, `CONV`, etc.)
+   - Update test dimensions in `test_cases[]` array to match your operation's requirements
+   - Implement `test_single_YOUR_OPERATION_case()` with:
+     - Appropriate tensor creation for your operation
+     - Deterministic test data generation
+     - NUMA operation execution via `ggml_numa_intercept_operation`
+     - Reference implementation (serial computation or direct mathematical kernel)
+     - Result comparison using `compare_float_arrays()`
+
+3. **Add to CMake** (if needed):
+   ```cmake
+   set(LLAMA_TEST_NAME test-numa-mathematical-correctness-YOUR_OPERATION)
+   llama_build_and_test(test-numa-mathematical-correctness-YOUR_OPERATION.cpp)
+   target_link_libraries(${LLAMA_TEST_NAME} PRIVATE ggml ggml-cpu common)
+   ```
+
+4. **Build and test**:
+   ```bash
+   cmake --build build --target test-numa-mathematical-correctness-YOUR_OPERATION
+   ./build/bin/test-numa-mathematical-correctness-YOUR_OPERATION
+   ```
+
+#### Template Features:
+
+- **Multi-dimensional testing**: Tests across TINY, SMALL, MEDIUM, LARGE tensor sizes
+- **Multi-threading strategies**: Tests with 1, 2, 4, 6, 8 threads to verify coordinator behavior
+- **Comprehensive error reporting**: Detailed mismatch information with absolute and relative error tracking
+- **Modular design**: Easy to extend for new operations
+- **Mathematical equivalence validation**: Strict comparison between NUMA parallel and serial reference implementations
+
+#### Key Design Principles:
+
+- Tests must be **deterministic and reproducible**
+- Each operation should be tested across **multiple tensor dimensions**
+- **Multiple thread strategies** verify coordinator execution behavior
+- **Mathematical equivalence should be exact** (within floating-point tolerance)
+- **Comprehensive error reporting** helps debug failures
+- Use `compare_float_arrays()` utility for consistent comparison logic
+
+**DO NOT write mathematical correctness test frameworks from scratch - always start with the provided template!**
 
 ## 🐛 Common Issues and Solutions
 
@@ -180,21 +245,128 @@ cmake --build build --parallel --verbose
 - `.devcontainer/README.md` - Dev container usage guide
 - `docs/build.md` - Official build instructions
 
+## 🧪 NUMA Test Suite
+
+### Running Tests
+
+**ALWAYS run the NUMA test suite after making changes** to validate your work:
+
+```bash
+./tests/run-numa-tests.sh
+```
+
+This comprehensive test suite runs all NUMA-related tests and provides detailed timing information:
+- `test-numa-coordinator` - Basic coordinator functionality
+- `test-numa-coordinator-wait` - Advanced coordinator operations and strategy validation  
+- `test-numa-dispatcher` - Operation dispatch and routing
+- `test-numa-mathematical-correctness` - Mathematical accuracy validation
+
+### Test Requirements
+
+**A change is NOT complete until ALL tests pass.** The test script:
+- ✅ Returns exit code 0 if all tests pass
+- ❌ Returns exit code 1 if any test fails
+- 📊 Shows precise timing for performance monitoring
+- 🔍 Provides detailed failure information
+
+### Adding New Tests
+
+When adding features, **you MUST add corresponding tests**:
+
+1. **Add tests to existing files** in `tests/`:
+   - `test-numa-coordinator.cpp` - For coordinator functionality
+   - `test-numa-dispatcher.cpp` - For operation dispatch features
+   - `test-numa-mathematical-correctness.cpp` - For mathematical validation
+
+2. **Ensure tests fail properly**:
+   ```cpp
+   // ❌ Bad: void function can't signal failure
+   void test_my_feature() {
+       if (condition_fails) {
+           printf("❌ Test failed!\n");
+           return; // Test appears to pass!
+       }
+   }
+   
+   // ✅ Good: bool function properly signals failure
+   bool test_my_feature() {
+       if (condition_fails) {
+           printf("❌ Test failed!\n");
+           return false; // Test actually fails
+       }
+       return true;
+   }
+   ```
+
+3. **Update main() functions** to call your new tests and check return values:
+   ```cpp
+   int main() {
+       bool all_passed = true;
+       all_passed &= test_existing_feature();
+       all_passed &= test_my_new_feature(); // Add your test here
+       
+       if (all_passed) {
+           printf("🎉 ALL TESTS PASSED!\n");
+           return 0;
+       } else {
+           printf("💥 Some tests failed.\n");
+           return 1; // Critical: return error code
+       }
+   }
+   ```
+
+4. **Test compilation** - tests are built automatically with CMake:
+   ```bash
+   cmake --build build --target test-numa-coordinator
+   cmake --build build --target test-numa-dispatcher
+   ```
+
+### Test Design Guidelines
+
+- **Mathematical Correctness**: Always validate that NUMA operations produce identical results to fallback implementations
+- **Error Conditions**: Test both success and failure paths
+- **Performance**: Include tests that validate performance improvements don't break correctness
+- **Thread Safety**: Validate that multi-threaded operations work correctly
+- **Memory Safety**: Ensure no memory leaks or buffer overflows
+
 ## 🎯 Success Criteria for Changes
 
 1. **Builds successfully** in dev container
 2. **No compilation errors** across all modified files
 3. **Test coverage** for new features
-4. **No failing tests** in `tests/` after changes
+4. **✅ ALL NUMA TESTS PASS** - Run `./tests/run-numa-tests.sh` and verify exit code 0
+5. **No failing tests** in `tests/` after changes
 
 ## 💡 Tips for AI Agents
 
 1. **Always use the dev container** - it has all dependencies and correct environment
-2. **Test incrementally** - build and test after each significant change
-3. **Check multiple scenarios** - different thread counts, NUMA configurations
-4. **Read existing code carefully** - NUMA and threading logic is subtle
-5. **Check for platform-specific code** - many features are Linux-only
-6. **Validate with real tests** - not just compilation success
+2. **Run tests FIRST and LAST** - `./tests/run-numa-tests.sh` before starting and after finishing
+3. **Test incrementally** - build and test after each significant change
+4. **Add tests for new features** - a feature isn't done until it has working tests
+5. **Check multiple scenarios** - different thread counts, NUMA configurations
+6. **Read existing code carefully** - NUMA and threading logic is subtle
+7. **Check for platform-specific code** - many features are Linux-only
+8. **Validate with real tests** - not just compilation success
+9. **Check exit codes** - tests must return proper error codes on failure
+
+### Critical Workflow:
+```bash
+# 1. Start with passing tests
+./tests/run-numa-tests.sh && echo "✅ Starting with clean state"
+
+# 2. Make your changes
+# ... implement features ...
+
+# 3. Build incrementally
+cmake --build build --parallel
+
+# 4. Test frequently during development
+./build/bin/test-numa-coordinator
+./build/bin/test-numa-dispatcher
+
+# 5. Final validation - ALL tests must pass
+./tests/run-numa-tests.sh && echo "🎉 Change is complete!" || echo "❌ Fix failures before finishing"
+```
 
 Remember: NUMA and CPU topology changes can have subtle effects. Always validate performance and correctness thoroughly before considering changes complete.
 

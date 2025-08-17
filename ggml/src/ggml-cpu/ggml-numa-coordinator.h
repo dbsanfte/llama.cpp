@@ -443,6 +443,13 @@ int64_t ggml_numa_cache_aware_chunk_size(const struct ggml_numa_cache_info * cac
  */
 int ggml_numa_coordinator_get_active_nodes(struct ggml_numa_coordinator_manager * mgr, int * nodes, int max_nodes);
 
+/**
+ * Virtual NUMA node functions (for testing in simulated environments)
+ * These functions allow tests to determine which virtual NUMA coordinator is executing work
+ */
+void ggml_numa_set_virtual_node(int node);
+int ggml_numa_get_virtual_node(void);
+
 #ifdef __cplusplus
 }
 #endif

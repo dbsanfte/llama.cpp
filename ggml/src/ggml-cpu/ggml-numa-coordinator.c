@@ -28,6 +28,18 @@
 #include <time.h>
 #include <math.h>
 
+// Thread-local storage for virtual NUMA node (for simulated environments)
+static __thread int g_virtual_numa_node = -1;
+
+// Functions to manage virtual NUMA node for testing
+void ggml_numa_set_virtual_node(int node) {
+    g_virtual_numa_node = node;
+}
+
+int ggml_numa_get_virtual_node(void) {
+    return g_virtual_numa_node;
+}
+
 #ifdef __linux__
 #include <sched.h>
 #include <numa.h>
@@ -386,6 +398,10 @@ static enum ggml_status ggml_numa_node_execute_operation(
                        (void*)work_item, work_item->work_context);
         GGML_LOG_ERROR("�🚀 NUMA%d: About to call work_function %p with context %p\n", 
                        coordinator->numa_node, (void*)work_item->work_function, work_item->work_context);
+        
+        // Set virtual NUMA node for testing purposes (thread-local storage)
+        ggml_numa_set_virtual_node(coordinator->numa_node);
+        
         enum ggml_status status = work_item->work_function(work_item->work_context, &params);
         GGML_LOG_ERROR("🚀 NUMA%d: Work function returned status %d\n", coordinator->numa_node, (int)status);
         
@@ -2410,60 +2426,109 @@ int ggml_numa_coordinator_manager_submit_work_function(struct ggml_numa_coordina
         return -1;
     }
     
-    // Determine target NUMA node
-    int target_numa = numa_node_hint;
-    if (target_numa < 0 || target_numa >= mgr->num_numa_nodes) {
-        if (mgr->num_numa_nodes > 0) {
-            target_numa = atomic_load(&mgr->total_work_items) % mgr->num_numa_nodes; // Round-robin
-        } else {
-            GGML_LOG_ERROR("Cannot submit function work: no NUMA coordinators available\n");
+    // Determine target NUMA node(s) based on execution strategy
+    if (execution_strategy.node_strategy == NUMA_NODE_STRATEGY_DATA_PARALLEL) {
+        // Data parallel: submit work to ALL available NUMA nodes
+        GGML_LOG_DEBUG("Data parallel execution: submitting to all %d NUMA nodes\n", mgr->num_numa_nodes);
+        
+        int first_work_id = -1;
+        
+        // Submit identical work to each NUMA node
+        for (int i = 0; i < mgr->num_numa_nodes; i++) {
+            // Create work item for this NUMA node
+            struct ggml_work_item * work_item = malloc(sizeof(struct ggml_work_item));
+            if (!work_item) {
+                GGML_LOG_ERROR("Failed to allocate work item for NUMA node %d in data parallel execution\n", i);
+                return -1;
+            }
+            
+            // Set up function-based work item
+            work_item->work_function = work_function;
+            work_item->work_context = work_context;
+            work_item->operation = NULL;  // Using function pointer approach
+            
+            // Work item metadata
+            work_item->assigned_numa_node = i;
+            work_item->dependencies = NULL;
+            work_item->num_dependencies = 0;
+            atomic_init(&work_item->dependencies_ready, true);
+            atomic_init(&work_item->completed, false);
+            work_item->next = NULL;
+            work_item->work_id = atomic_fetch_add(&mgr->total_work_items, 1);
+            work_item->required_work_buffer_size = required_buffer_size;
+            work_item->execution_strategy = execution_strategy;
+            
+            // Submit to this NUMA node's coordinator
+            ggml_work_queue_enqueue(&mgr->coordinators[i].work_queue, work_item);
+            
+            GGML_LOG_ERROR("🔧 SUBMIT: Created work item %p with context %p for NUMA %d\n", 
+                           (void*)work_item, work_context, i);
+            GGML_LOG_ERROR("🔧 SUBMIT: Enqueued work item %p to NUMA %d (data parallel)\n", 
+                           (void*)work_item, i);
+            
+            if (first_work_id < 0) {
+                first_work_id = work_item->work_id;  // Return the first work ID
+            }
+        }
+        
+        GGML_LOG_DEBUG("Submitted data parallel work to %d NUMA nodes (first ID: %d)\n", 
+                       mgr->num_numa_nodes, first_work_id);
+        return first_work_id;
+        
+    } else {
+        // Single node execution: use existing logic
+        int target_numa = numa_node_hint;
+        if (target_numa < 0 || target_numa >= mgr->num_numa_nodes) {
+            if (mgr->num_numa_nodes > 0) {
+                // Default to node 0 for single node strategy when no hint specified
+                target_numa = 0;
+            } else {
+                GGML_LOG_ERROR("Cannot submit function work: no NUMA coordinators available\n");
+                return -1;
+            }
+        }
+        
+        // Additional safety check - ensure target NUMA node is valid
+        if (target_numa < 0 || target_numa >= mgr->num_numa_nodes || !mgr->coordinators) {
+            GGML_LOG_ERROR("Invalid target NUMA node %d for function work (available: 0-%d)\n", 
+                           target_numa, mgr->num_numa_nodes - 1);
             return -1;
         }
+        
+        // Create work item for single-node execution
+        struct ggml_work_item * work_item = malloc(sizeof(struct ggml_work_item));
+        if (!work_item) return -1;
+        
+        // Set up function-based work item
+        work_item->work_function = work_function;
+        work_item->work_context = work_context;
+        work_item->operation = NULL;  // Using function pointer approach
+        
+        GGML_LOG_ERROR("🔧 SUBMIT: Created work item %p with context %p\n", 
+                       (void*)work_item, work_context);
+        
+        // Work item metadata
+        work_item->assigned_numa_node = target_numa;
+        work_item->dependencies = NULL;
+        work_item->num_dependencies = 0;
+        atomic_init(&work_item->dependencies_ready, true);
+        atomic_init(&work_item->completed, false);
+        work_item->next = NULL;
+        work_item->work_id = atomic_fetch_add(&mgr->total_work_items, 1);
+        work_item->required_work_buffer_size = required_buffer_size;
+        work_item->execution_strategy = execution_strategy;
+        
+        // Submit to target coordinator
+        ggml_work_queue_enqueue(&mgr->coordinators[target_numa].work_queue, work_item);
+        
+        GGML_LOG_ERROR("🔧 SUBMIT: Enqueued work item %p to NUMA %d\n", 
+                       (void*)work_item, target_numa);
+        
+        GGML_LOG_DEBUG("Submitted generic function work (ID: %d) to NUMA node %d\n", 
+                       work_item->work_id, target_numa);
+        
+        return work_item->work_id;
     }
-    
-    // Additional safety check - ensure target NUMA node is valid
-    if (target_numa < 0 || target_numa >= mgr->num_numa_nodes || !mgr->coordinators) {
-        GGML_LOG_ERROR("Invalid target NUMA node %d for function work (available: 0-%d)\n", 
-                       target_numa, mgr->num_numa_nodes - 1);
-        return -1;
-    }
-    
-    // Create work item for generic function execution
-    struct ggml_work_item * work_item = malloc(sizeof(struct ggml_work_item));
-    if (!work_item) return -1;
-    
-    // Set up generic function-based work item
-    // NEW APPROACH: Function pointer execution
-    work_item->work_function = work_function;    // Function to execute
-    work_item->work_context = work_context;      // Context data for function
-    
-    GGML_LOG_ERROR("🔧 SUBMIT: Created work item %p with context %p\n", 
-                   (void*)work_item, work_context);
-    
-    // LEGACY APPROACH: Clear operation field since we're using function pointer
-    work_item->operation = NULL;                 // No tensor operation - using function pointer
-    
-    // Work item metadata
-    work_item->assigned_numa_node = target_numa;
-    work_item->dependencies = NULL;
-    work_item->num_dependencies = 0;
-    atomic_init(&work_item->dependencies_ready, true); // Ready to execute
-    atomic_init(&work_item->completed, false);
-    work_item->next = NULL;
-    work_item->work_id = atomic_fetch_add(&mgr->total_work_items, 1);
-    work_item->required_work_buffer_size = required_buffer_size;
-    work_item->execution_strategy = execution_strategy;
-    
-    // Submit to coordinator for execution
-    ggml_work_queue_enqueue(&mgr->coordinators[target_numa].work_queue, work_item);
-    
-    GGML_LOG_ERROR("🔧 SUBMIT: Enqueued work item %p to NUMA %d\n", 
-                   (void*)work_item, target_numa);
-    
-    GGML_LOG_DEBUG("Submitted generic function work (ID: %d) to NUMA node %d\n", 
-                   work_item->work_id, target_numa);
-    
-    return work_item->work_id;
 }
 
 // Submit tensor for data parallel processing across multiple NUMA nodes

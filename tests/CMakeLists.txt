@@ -238,6 +238,27 @@ target_link_libraries(${LLAMA_TEST_NAME} PRIVATE ggml ggml-cpu common)
 # Prioritize ggml/src/ggml-cpu/ to get the full implementation headers and add ggml/src for ggml-impl.h
 target_include_directories(${LLAMA_TEST_NAME} PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src/ggml-cpu ${CMAKE_SOURCE_DIR}/ggml/src ${CMAKE_SOURCE_DIR}/ggml/include)
 
+# test-numa-mathematical-correctness-soft-max
+set(LLAMA_TEST_NAME test-numa-mathematical-correctness-soft-max)
+llama_build_and_test(test-numa-mathematical-correctness-soft-max.cpp)
+target_link_libraries(${LLAMA_TEST_NAME} PRIVATE ggml ggml-cpu common)
+# Prioritize ggml/src/ggml-cpu/ to get the full implementation headers and add ggml/src for ggml-impl.h
+target_include_directories(${LLAMA_TEST_NAME} PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src/ggml-cpu ${CMAKE_SOURCE_DIR}/ggml/src ${CMAKE_SOURCE_DIR}/ggml/include)
+
+# test-numa-mathematical-correctness-rope
+set(LLAMA_TEST_NAME test-numa-mathematical-correctness-rope)
+llama_build_and_test(test-numa-mathematical-correctness-rope.cpp)
+target_link_libraries(${LLAMA_TEST_NAME} PRIVATE ggml ggml-cpu common)
+# Prioritize ggml/src/ggml-cpu/ to get the full implementation headers and add ggml/src for ggml-impl.h
+target_include_directories(${LLAMA_TEST_NAME} PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src/ggml-cpu ${CMAKE_SOURCE_DIR}/ggml/src ${CMAKE_SOURCE_DIR}/ggml/include)
+
+# test-numa-mathematical-correctness-matmul
+set(LLAMA_TEST_NAME test-numa-mathematical-correctness-matmul)
+llama_build_and_test(test-numa-mathematical-correctness-matmul.cpp)
+target_link_libraries(${LLAMA_TEST_NAME} PRIVATE ggml ggml-cpu common)
+# Prioritize ggml/src/ggml-cpu/ to get the full implementation headers and add ggml/src for ggml-impl.h
+target_include_directories(${LLAMA_TEST_NAME} PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src/ggml-cpu ${CMAKE_SOURCE_DIR}/ggml/src ${CMAKE_SOURCE_DIR}/ggml/include)
+
 # test-numa-coordinator-wait
 set(LLAMA_TEST_NAME test-numa-coordinator-wait)
 llama_build_and_test(test-numa-coordinator-wait.cpp)

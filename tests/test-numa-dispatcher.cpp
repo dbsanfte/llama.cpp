@@ -1492,10 +1492,10 @@ public:
     }
     
     // Run all tests
-    void run_all_tests() {
+    bool run_all_tests() {
         if (!is_initialized()) {
             printf("❌ Test suite not properly initialized\n");
-            return;
+            return false;
         }
         
         printf("================================================================================\n");
@@ -1545,6 +1545,13 @@ public:
         printf("\n");
         
         print_results();
+        
+        // Return true if all tests passed
+        int passed = 0;
+        for (const auto& result : results) {
+            if (result.passed) passed++;
+        }
+        return passed == results.size();
     }
     
     void print_results() {
@@ -1595,12 +1602,17 @@ int main() {
         return 1;
     }
     
-    test_suite.run_all_tests();
+    bool all_passed = test_suite.run_all_tests();
     
     printf("\n🎉 NUMA Dispatcher testing completed!\n");
     printf("✅ Key Achievement: Dispatcher infrastructure validated\n");
     printf("✅ Operation creation and graph building tested\n");
     printf("✅ Foundation established for advanced dispatch testing\n");
     
-    return 0;
+    if (all_passed) {
+        return 0;
+    } else {
+        printf("💥 Some tests failed.\n");
+        return 1;
+    }
 }

@@ -41,6 +41,7 @@ RUN apt-get update && \
         valgrind \
         strace \
         sudo \
+        bc \
         gh && \
     update-ca-certificates && \
     apt-get autoremove -y && \
