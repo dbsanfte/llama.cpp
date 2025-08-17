@@ -335,8 +335,8 @@ private:
 int main() {
     printf("🌟 Initializing NUMA system for mathematical correctness testing...\n");
     
-    // Initialize the NUMA coordinator system
-    struct ggml_numa_coordinator_manager* mgr = ggml_numa_coordinator_manager_get_global(8, false);
+    // Initialize the NUMA coordinator system with force_multi_socket for testing
+    struct ggml_numa_coordinator_manager* mgr = ggml_numa_coordinator_manager_get_global(8, true);
     if (!mgr) {
         printf("❌ Failed to initialize NUMA coordinator manager\n");
         return 1;
