@@ -70,6 +70,7 @@ static enum ggml_status ggml_numa_work_function_mul_mat_chunk(void * work_contex
 static enum ggml_status ggml_numa_work_function_soft_max(void * work_context, struct ggml_compute_params * params);
 static enum ggml_status ggml_numa_work_function_rope_chunk(void * work_context, struct ggml_compute_params * params);
 static enum ggml_status ggml_numa_work_function_add_chunk(void * work_context, struct ggml_compute_params * params);
+static enum ggml_status ggml_numa_work_function_glu_chunk(void * work_context, struct ggml_compute_params * params);
 
 // Work context creation and management functions
 static ggml_numa_dispatcher_work_context_t * ggml_numa_dispatcher_create_work_context(
@@ -549,6 +550,9 @@ static enum ggml_status ggml_numa_execute_single_node(
     } else if (operation->op == GGML_OP_ADD) {
         work_function = ggml_numa_work_function_add_chunk;
         GGML_LOG_DEBUG("Using specialized ADD chunk work function for single node\n");
+    } else if (operation->op == GGML_OP_GLU) {
+        work_function = ggml_numa_work_function_glu_chunk;
+        GGML_LOG_DEBUG("Using specialized GLU chunk work function for single node\n");
     } else {
         work_function = ggml_numa_work_function_fallback;
         GGML_LOG_DEBUG("Using generic fallback work function for %s\n", ggml_op_name(operation->op));
@@ -654,6 +658,10 @@ static enum ggml_status ggml_numa_execute_data_parallel(
         work_function = ggml_numa_work_function_add_chunk;
         GGML_LOG_DEBUG("🔧 DEBUG: Selected ADD chunk work function %p\n", (void*)work_function);
         GGML_LOG_DEBUG("Using specialized ADD chunk work function for data parallelism\n");
+    } else if (operation->op == GGML_OP_GLU) {
+        work_function = ggml_numa_work_function_glu_chunk;
+        GGML_LOG_DEBUG("🔧 DEBUG: Selected GLU chunk work function %p\n", (void*)work_function);
+        GGML_LOG_DEBUG("Using specialized GLU chunk work function for data parallelism\n");
     } else {
         work_function = ggml_numa_work_function_fallback;
         GGML_LOG_DEBUG("🔧 DEBUG: Selected fallback work function %p for %s\n", (void*)work_function, ggml_op_name(operation->op));
@@ -1959,14 +1967,14 @@ const ggml_numa_operation_handler_t ggml_numa_handler_soft_max = {
 const ggml_numa_operation_handler_t ggml_numa_handler_glu = {
     .operation_type = GGML_OP_GLU,
     .default_strategy = {
-        .node_strategy = NUMA_NODE_STRATEGY_SINGLE,  // Single node to ensure data consistency
+        .node_strategy = NUMA_NODE_STRATEGY_DATA_PARALLEL,  // Data parallel for element-wise operations
         .on_node_strategy = NUMA_ON_NODE_STRATEGY_MULTI_THREAD
     },
     .complexity = NUMA_OP_COMPLEXITY_SIMPLE,
     .workload_type = NUMA_OP_COMPUTE_BOUND,
-    .min_elements_for_parallel = 5000,   // Lower threshold due to SILU computation
+    .min_elements_for_parallel = 5000,   // Lower threshold due to activation computation
     .optimal_chunk_size = 512 * 1024,    // 512KB chunks for good cache performance
-    .parallel_efficiency_estimate = 0.85f,  // High efficiency for element-wise operations
+    .parallel_efficiency_estimate = 0.95f,  // Very high efficiency for element-wise operations
     .requires_synchronization = false,
     .supports_in_place = false,  // GLU typically writes to different tensor
     .analyze = NULL  // Use default strategy
@@ -2894,6 +2902,103 @@ static enum ggml_status ggml_numa_work_function_add_chunk(void * work_context, s
     }
     
     GGML_LOG_DEBUG("Successfully executed ADD chunk work function\n");
+    
+    return GGML_STATUS_SUCCESS;
+}
+
+// Specialized work function for GLU operations with NUMA-aware chunking
+static enum ggml_status ggml_numa_work_function_glu_chunk(void * work_context, struct ggml_compute_params * params) {
+    if (!work_context || !params) {
+        GGML_LOG_ERROR("GLU work function: Invalid parameters\n");
+        return GGML_STATUS_FAILED;
+    }
+    
+    ggml_numa_dispatcher_work_context_t * ctx = (ggml_numa_dispatcher_work_context_t *)work_context;
+    
+    if (!ctx->operation) {
+        GGML_LOG_ERROR("GLU work function: Operation is NULL\n");
+        return GGML_STATUS_FAILED;
+    }
+    
+    GGML_LOG_DEBUG("GLU work function: operation=%p, type=%d, elements=%ld\n", 
+                   (void*)ctx->operation, ctx->operation->op, ggml_nelements(ctx->operation));
+    
+    // Check source tensors - GLU can have one or two source tensors
+    const struct ggml_tensor * src0 = ctx->operation->src[0];
+    const struct ggml_tensor * src1 = ctx->operation->src[1];
+    
+    if (!src0) {
+        GGML_LOG_ERROR("GLU work function: Missing primary source tensor\n");
+        return GGML_STATUS_FAILED;
+    }
+    
+    // Check SOURCE tensor data
+    void *src0_data = ggml_get_data(src0);
+    if (src0_data) {
+        float *data0 = (float*)src0_data;
+        GGML_LOG_DEBUG("GLU work function: First few SOURCE0 values: %.6f %.6f %.6f %.6f\n", 
+                       data0[0], data0[1], data0[2], data0[3]);
+    } else {
+        GGML_LOG_ERROR("GLU work function: Source tensor data is NULL\n");
+        return GGML_STATUS_FAILED;
+    }
+    
+    // Check second source tensor if present
+    if (src1) {
+        void *src1_data = ggml_get_data(src1);
+        if (src1_data) {
+            float *data1 = (float*)src1_data;
+            GGML_LOG_DEBUG("GLU work function: First few SOURCE1 values: %.6f %.6f %.6f %.6f\n", 
+                           data1[0], data1[1], data1[2], data1[3]);
+        } else {
+            GGML_LOG_WARN("GLU work function: Second source tensor data is NULL\n");
+        }
+    } else {
+        GGML_LOG_DEBUG("GLU work function: Single source tensor mode (split tensor)\n");
+    }
+    
+    // Check destination tensor (should start as zeros or uninitialized)
+    void *dst_data = ggml_get_data(ctx->operation);
+    if (dst_data) {
+        float *data = (float*)dst_data;
+        GGML_LOG_DEBUG("GLU work function: First few DESTINATION values (before): %.6f %.6f %.6f %.6f\n", 
+                       data[0], data[1], data[2], data[3]);
+    } else {
+        GGML_LOG_ERROR("GLU work function: Destination tensor data is NULL\n");
+        return GGML_STATUS_FAILED;
+    }
+    
+    GGML_LOG_DEBUG("Executing GLU chunk work function with %d threads on NUMA node (current CPU: %d)\n", 
+                   params->nth, sched_getcpu());
+    
+    // For GLU operations, we need to call the kernel directly but with single-threaded parameters
+    // to avoid conflicts with the NUMA coordinator threading model
+    // Set up single-threaded compute params to process all data on this NUMA node
+    struct ggml_compute_params single_thread_params = {
+        .ith = 0,                  // Process all data (thread index 0)
+        .nth = 1,                  // Single thread (total threads = 1)
+        .wsize = params->wsize,    // Use coordinator's work buffer
+        .wdata = params->wdata,    // Use coordinator's work buffer
+        .threadpool = NULL         // No threadpool conflicts
+    };
+    
+    GGML_LOG_DEBUG("GLU work function: Calling ggml_compute_forward_glu with single_thread_params (ith=%d, nth=%d)\n",
+                   single_thread_params.ith, single_thread_params.nth);
+    
+    // Call the GLU mathematical kernel directly with single-threaded params
+    ggml_compute_forward_glu(&single_thread_params, ctx->operation);
+    
+    // Add memory barrier to ensure all writes are visible before returning
+    __sync_synchronize();
+    
+    // Check output values
+    if (dst_data) {
+        float *data = (float*)dst_data;
+        GGML_LOG_DEBUG("GLU work function: First few DESTINATION values (after): %.6f %.6f %.6f %.6f\n", 
+                       data[0], data[1], data[2], data[3]);
+    }
+    
+    GGML_LOG_DEBUG("Successfully executed GLU chunk work function\n");
     
     return GGML_STATUS_SUCCESS;
 }

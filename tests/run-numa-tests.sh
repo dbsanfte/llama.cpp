@@ -28,6 +28,7 @@ NUMA_TESTS=(
     "test-numa-mathematical-correctness-soft-max"
     "test-numa-mathematical-correctness-rope"
     "test-numa-mathematical-correctness-add"
+    "test-numa-mathematical-correctness-glu-proper"
 )
 
 # Statistics
