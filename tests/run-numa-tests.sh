@@ -4,7 +4,7 @@
 # Runs all NUMA-related tests sequentially and reports results
 # Exits with error code if any test fails
 
-set -e  # Exit on any error
+# Don't use set -e as we need to capture test exit codes manually
 
 # Colors for output
 RED='\033[0;31m'
@@ -27,6 +27,7 @@ NUMA_TESTS=(
     "test-numa-mathematical-correctness"
     "test-numa-mathematical-correctness-soft-max"
     "test-numa-mathematical-correctness-rope"
+    "test-numa-mathematical-correctness-add"
 )
 
 # Statistics
@@ -102,7 +103,8 @@ run_test() {
     
     # Run the test with timeout (5 minutes max per test)
     local exit_code=0
-    timeout 300 "$test_binary" || exit_code=$?
+    timeout 300 "$test_binary"
+    exit_code=$?
     
     # Record end time
     local end_time=$(date +%s.%N)

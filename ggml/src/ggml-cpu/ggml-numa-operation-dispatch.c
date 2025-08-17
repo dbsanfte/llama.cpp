@@ -17,6 +17,8 @@
 #include "unary-ops.h"      // Unary operations (sin, cos, log, etc.)
 #include "binary-ops.h"     // Binary operations (add, sub, mul, div)
 
+#include <unistd.h>         // For usleep
+
 #ifdef __linux__
 #include <numa.h>
 #include <numaif.h>
@@ -67,6 +69,7 @@ static enum ggml_status ggml_numa_work_function_mul_mat_single(void * work_conte
 static enum ggml_status ggml_numa_work_function_mul_mat_chunk(void * work_context, struct ggml_compute_params * params);
 static enum ggml_status ggml_numa_work_function_soft_max(void * work_context, struct ggml_compute_params * params);
 static enum ggml_status ggml_numa_work_function_rope_chunk(void * work_context, struct ggml_compute_params * params);
+static enum ggml_status ggml_numa_work_function_add_chunk(void * work_context, struct ggml_compute_params * params);
 
 // Work context creation and management functions
 static ggml_numa_dispatcher_work_context_t * ggml_numa_dispatcher_create_work_context(
@@ -543,6 +546,9 @@ static enum ggml_status ggml_numa_execute_single_node(
     if (operation->op == GGML_OP_MUL_MAT) {
         work_function = ggml_numa_work_function_mul_mat_single;
         GGML_LOG_DEBUG("Using specialized MUL_MAT single work function\n");
+    } else if (operation->op == GGML_OP_ADD) {
+        work_function = ggml_numa_work_function_add_chunk;
+        GGML_LOG_DEBUG("Using specialized ADD chunk work function for single node\n");
     } else {
         work_function = ggml_numa_work_function_fallback;
         GGML_LOG_DEBUG("Using generic fallback work function for %s\n", ggml_op_name(operation->op));
@@ -566,12 +572,30 @@ static enum ggml_status ggml_numa_execute_single_node(
     
     GGML_LOG_DEBUG("Submitted function pointer work (ID: %d) for operation %s\n", work_id, ggml_op_name(operation->op));
     
-    // Wait for work completion instead of using unreliable sleep
-    int wait_result = ggml_numa_coordinator_manager_wait_for_completion(manager);
+    // Wait for work completion with enhanced debugging and synchronization
+    GGML_LOG_ERROR("🔧 DISPATCH: About to wait for work completion (work_id=%d)\n", work_id);
+    
+    // Multiple wait attempts with debugging
+    int wait_result = -1;
+    for (int attempt = 0; attempt < 10; attempt++) {
+        wait_result = ggml_numa_coordinator_manager_wait_for_completion(manager);
+        if (wait_result == 0) {
+            GGML_LOG_ERROR("🔧 DISPATCH: Wait completed successfully on attempt %d\n", attempt + 1);
+            break;
+        }
+        GGML_LOG_ERROR("🔧 DISPATCH: Wait attempt %d failed with result %d, retrying...\n", attempt + 1, wait_result);
+        usleep(1000); // 1ms delay between attempts
+    }
+    
     if (wait_result != 0) {
-        GGML_LOG_WARN("Failed to wait for work completion (result: %d)\n", wait_result);
+        GGML_LOG_WARN("Failed to wait for work completion after 10 attempts (final result: %d)\n", wait_result);
         // Continue anyway, work might have completed
     }
+    
+    // Additional memory barrier to ensure all coordinator work is visible
+    __sync_synchronize();
+    
+    GGML_LOG_ERROR("🔧 DISPATCH: Work completion wait finished (final result: %d)\n", wait_result);
     
     // Note: work_context will be freed by the coordinator after execution
     
@@ -626,6 +650,10 @@ static enum ggml_status ggml_numa_execute_data_parallel(
         work_function = ggml_numa_work_function_mul_mat_chunk;
         GGML_LOG_DEBUG("🔧 DEBUG: Selected MUL_MAT chunk work function %p\n", (void*)work_function);
         GGML_LOG_DEBUG("Using specialized MUL_MAT chunk work function for data parallelism\n");
+    } else if (operation->op == GGML_OP_ADD) {
+        work_function = ggml_numa_work_function_add_chunk;
+        GGML_LOG_DEBUG("🔧 DEBUG: Selected ADD chunk work function %p\n", (void*)work_function);
+        GGML_LOG_DEBUG("Using specialized ADD chunk work function for data parallelism\n");
     } else {
         work_function = ggml_numa_work_function_fallback;
         GGML_LOG_DEBUG("🔧 DEBUG: Selected fallback work function %p for %s\n", (void*)work_function, ggml_op_name(operation->op));
@@ -655,9 +683,25 @@ static enum ggml_status ggml_numa_execute_data_parallel(
     // Wait for work completion instead of using unreliable sleep
     int wait_result = ggml_numa_coordinator_manager_wait_for_completion(manager);
     if (wait_result != 0) {
-        GGML_LOG_WARN("Failed to wait for work completion (result: %d)\n", wait_result);
-        // Continue anyway, work might have completed
+        GGML_LOG_WARN("Failed to wait for work completion (result: %d), trying additional sync\n", wait_result);
+        
+        // Add explicit synchronization barrier to ensure all writes are complete
+        __sync_synchronize();
+        
+        // Brief sleep to allow coordinator threads to complete any pending writes
+        usleep(1000);  // 1ms sleep for thread synchronization
+        
+        // Try to wait again
+        wait_result = ggml_numa_coordinator_manager_wait_for_completion(manager);
+        if (wait_result != 0) {
+            GGML_LOG_ERROR("Second wait also failed (result: %d) - may have race condition\n", wait_result);
+            ggml_numa_dispatcher_free_work_context(work_context);
+            return GGML_STATUS_FAILED;  // Return failure instead of continuing
+        }
     }
+    
+    // Add final memory barrier to ensure all coordinator writes are visible
+    __sync_synchronize();
     
     // Note: work_context will be freed by the coordinator after execution
     
@@ -702,6 +746,9 @@ static enum ggml_status ggml_numa_execute_complex_graph(
     if (operation->op == GGML_OP_MUL_MAT) {
         work_function = ggml_numa_work_function_mul_mat_single;
         GGML_LOG_DEBUG("Using specialized MUL_MAT single work function for complex execution\n");
+    } else if (operation->op == GGML_OP_ADD) {
+        work_function = ggml_numa_work_function_add_chunk;
+        GGML_LOG_DEBUG("Using specialized ADD chunk work function for complex execution\n");
     } else {
         work_function = ggml_numa_work_function_fallback;
         GGML_LOG_DEBUG("Using generic fallback work function for complex %s\n", ggml_op_name(operation->op));
@@ -2767,6 +2814,86 @@ static enum ggml_status ggml_numa_work_function_rope_chunk(void * work_context, 
     }
     
     GGML_LOG_DEBUG("Successfully executed ROPE chunk work function\n");
+    
+    return GGML_STATUS_SUCCESS;
+}
+
+// Specialized work function for ADD operations with NUMA-aware chunking
+static enum ggml_status ggml_numa_work_function_add_chunk(void * work_context, struct ggml_compute_params * params) {
+    if (!work_context || !params) {
+        GGML_LOG_ERROR("ADD work function: Invalid parameters\n");
+        return GGML_STATUS_FAILED;
+    }
+    
+    ggml_numa_dispatcher_work_context_t * ctx = (ggml_numa_dispatcher_work_context_t *)work_context;
+    
+    if (!ctx->operation) {
+        GGML_LOG_ERROR("ADD work function: Operation is NULL\n");
+        return GGML_STATUS_FAILED;
+    }
+    
+    GGML_LOG_DEBUG("ADD work function: operation=%p, type=%d, elements=%ld\n", 
+                   (void*)ctx->operation, ctx->operation->op, ggml_nelements(ctx->operation));
+    
+    // Check SOURCE tensor data (src[0] and src[1] for ADD operation)
+    if (ctx->operation->src[0] && ctx->operation->src[1]) {
+        void *src0_data = ggml_get_data(ctx->operation->src[0]);
+        void *src1_data = ggml_get_data(ctx->operation->src[1]);
+        if (src0_data && src1_data) {
+            float *data0 = (float*)src0_data;
+            float *data1 = (float*)src1_data;
+            GGML_LOG_DEBUG("ADD work function: First few SOURCE0 values: %.6f %.6f %.6f %.6f\n", 
+                           data0[0], data0[1], data0[2], data0[3]);
+            GGML_LOG_DEBUG("ADD work function: First few SOURCE1 values: %.6f %.6f %.6f %.6f\n", 
+                           data1[0], data1[1], data1[2], data1[3]);
+        } else {
+            GGML_LOG_WARN("ADD work function: Source tensor data is NULL (src0=%p, src1=%p)\n", src0_data, src1_data);
+        }
+    } else {
+        GGML_LOG_ERROR("ADD work function: Missing source tensors (src[0]=%p, src[1]=%p)\n", 
+                       (void*)ctx->operation->src[0], (void*)ctx->operation->src[1]);
+        return GGML_STATUS_FAILED;
+    }
+    
+    // Check destination tensor (should start as zeros or uninitialized)
+    void *dst_data = ggml_get_data(ctx->operation);
+    if (dst_data) {
+        float *data = (float*)dst_data;
+        GGML_LOG_DEBUG("ADD work function: First few DESTINATION values (before): %.6f %.6f %.6f %.6f\n", 
+                       data[0], data[1], data[2], data[3]);
+    }
+    
+    GGML_LOG_DEBUG("Executing ADD chunk work function with %d threads on NUMA node (current CPU: %d)\n", 
+                   params->nth, sched_getcpu());
+    
+    // For ADD operations, we need to call the kernel directly but with single-threaded parameters
+    // to avoid conflicts with the NUMA coordinator threading model
+    // Set up single-threaded compute params to process all data on this NUMA node
+    struct ggml_compute_params single_thread_params = {
+        .ith = 0,                  // Process all data (thread index 0)
+        .nth = 1,                  // Single thread (total threads = 1)
+        .wsize = params->wsize,    // Use coordinator's work buffer
+        .wdata = params->wdata,    // Use coordinator's work buffer
+        .threadpool = NULL         // No threadpool conflicts
+    };
+    
+    GGML_LOG_DEBUG("ADD work function: Calling ggml_compute_forward_add with single_thread_params (ith=%d, nth=%d)\n",
+                   single_thread_params.ith, single_thread_params.nth);
+    
+    // Call the ADD mathematical kernel directly with single-threaded params
+    ggml_compute_forward_add(&single_thread_params, ctx->operation);
+    
+    // Add memory barrier to ensure all writes are visible before returning
+    __sync_synchronize();
+    
+    // Check output values
+    if (dst_data) {
+        float *data = (float*)dst_data;
+        GGML_LOG_DEBUG("ADD work function: First few DESTINATION values (after): %.6f %.6f %.6f %.6f\n", 
+                       data[0], data[1], data[2], data[3]);
+    }
+    
+    GGML_LOG_DEBUG("Successfully executed ADD chunk work function\n");
     
     return GGML_STATUS_SUCCESS;
 }

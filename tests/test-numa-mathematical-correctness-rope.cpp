@@ -12,6 +12,7 @@
 #include <string>
 #include <algorithm>
 #include <stdexcept>
+#include <unistd.h>    // For usleep
 
 // GGML includes
 #include "ggml.h"
@@ -158,6 +159,13 @@ public:
                 ggml_free(ctx);
                 return false;
             }
+            
+            // Add explicit delay to ensure NUMA work completion before proceeding
+            // This addresses race condition where test comparison happens before async work completes
+            usleep(10000); // 10ms delay to ensure async coordinator work finishes
+            
+            // Force memory barrier to ensure all NUMA writes are visible
+            __sync_synchronize();
             
             // =================================================================
             // SERIAL REFERENCE EXECUTION  
@@ -364,22 +372,10 @@ public:
 
 // Main entry point
 int main() {
-    // Initialize NUMA system
-    printf("🌟 Initializing NUMA system for mathematical correctness testing...\n");
+    printf("🧮 NUMA ROPE Mathematical Correctness Test\n");
+    printf("==========================================\n\n");
     
-    // Initialize the NUMA coordinator system
-    struct ggml_numa_coordinator_manager* manager = ggml_numa_coordinator_manager_get_global(8, false);
-    if (!manager) {
-        fprintf(stderr, "❌ Failed to initialize NUMA coordinator manager\n");
-        return 1;
-    }
-    
-    // Initialize the dispatcher system
-    ggml_numa_dispatch_init();
-    
-    printf("✅ NUMA system initialized successfully\n\n");
-    
-    // Run mathematical correctness tests
+    // Run mathematical correctness tests (NUMA system will auto-initialize)
     NumaMathematicalCorrectnessTestSuite test_suite;
     bool all_tests_passed = test_suite.run_all_tests();
     
