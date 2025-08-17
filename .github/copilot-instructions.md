@@ -62,9 +62,11 @@ curl -X POST http://localhost:8080/v1/chat/completions \
     "temperature": 0.1
   }'
 
-# Verify JSON response contains a sensible greeting (e.g., "Hello!" or similar)
+# Verify JSON response contains a sensible greeting (e.g., "Hello!" or similar), e.g.:
+#  ` "message":{"role":"assistant","content":"Hello!"} `
+
 # Kill background server
-kill %1
+ps aux | grep llama-server | grep -v grep | awk '{print $2}' | xargs kill -9
 ```
 
 ## 🧠 Key Areas of Focus
