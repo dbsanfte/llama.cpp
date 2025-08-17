@@ -19,6 +19,315 @@ We must implement the complete 85-ish set of arithmetic operations in `ggml/src/
 
 The plan for this can be found in: `.devcontainer/changelog/2025-08-14-operation-analysis-big-bang-strategy.md`
 
+## 🔧 NUMA Operation Parallelization Workflow
+
+This section documents the complete workflow for fully NUMA parallelizing operations like GLU, ROPE, MUL_MAT, etc. Follow this systematic approach for any new operation implementation.
+
+### Step 1: Operation Analysis & Mathematical Kernel Discovery
+
+#### 1.1 Identify the Operation
+```bash
+# Find the operation in the ggml operation list
+grep -r "GGML_OP_YOUR_OPERATION" ggml/src/ggml-cpu/
+# Look for existing implementations in ops.h and related files
+```
+
+#### 1.2 Locate Mathematical Kernels
+Operations typically have mathematical kernels in these locations:
+- **Primary location**: `ggml/src/ggml-cpu/ggml-cpu.c` - Main CPU implementations
+- **Operation headers**: `ggml/src/ggml-cpu/ops.h` - Operation interfaces and utilities
+- **Specialized kernels**: `ggml/src/ggml-cpu/ggml-cpu-*` files for specific optimizations
+
+**Key functions to identify:**
+```c
+// Look for functions like:
+ggml_compute_forward_your_operation()        // Main computation function
+ggml_compute_forward_your_operation_f32()   // Float32 variant
+ggml_your_operation_impl_*()                // Implementation variants
+```
+
+#### 1.3 Analyze Operation Characteristics
+Determine if the operation is suitable for data parallelism:
+
+**✅ Excellent candidates (Data Parallel):**
+- Element-wise operations (GLU, ADD, MUL)
+- Independent computations per output element
+- Linear memory access patterns
+- No inter-element dependencies
+
+**⚠️ Complex candidates (Require careful analysis):**
+- Matrix operations (MUL_MAT) - need specialized splitting
+- Reduction operations (SOFT_MAX) - need coordination
+- Sequence operations (ROPE) - may have positional dependencies
+
+**❌ Poor candidates:**
+- Operations requiring global synchronization
+- Complex inter-element dependencies
+- Operations that don't benefit from NUMA distribution
+
+### Step 2: Current Implementation Assessment
+
+#### 2.1 Check Existing NUMA Status
+```bash
+# Search for existing handler in dispatcher
+grep -A 10 -B 5 "GGML_OP_YOUR_OPERATION" ggml/src/ggml-cpu/ggml-numa-operation-dispatch.c
+```
+
+Look for:
+- Current strategy: `NUMA_NODE_STRATEGY_SINGLE` vs `NUMA_NODE_STRATEGY_DATA_PARALLEL`
+- Efficiency estimate
+- Work function assignment
+
+#### 2.2 Analyze Fallback Usage
+```bash
+# Check if operation falls back to old implementation
+grep -r "your_operation" ggml/src/ggml-cpu/ggml-numa-fallback.c
+```
+
+### Step 3: Mathematical Kernel Extraction & Understanding
+
+#### 3.1 Study the Core Algorithm
+Examine the main computation function:
+```c
+// Example: For GLU operation
+static void ggml_compute_forward_glu_f32(
+    const struct ggml_compute_params * params,
+    struct ggml_tensor * dst) {
+    
+    // Key aspects to understand:
+    // 1. Input tensor structure and dimensions
+    // 2. Output tensor generation logic  
+    // 3. Mathematical computation per element
+    // 4. Memory access patterns
+    // 5. Threading model (ith, nth parameters)
+}
+```
+
+#### 3.2 Identify Tensor Access Patterns
+```c
+// Understand how the operation accesses data:
+const float * src0_ptr = (float *)src0->data;  // Input tensors
+float * dst_ptr = (float *)dst->data;          // Output tensor
+
+// Memory stride and offset calculations
+// Element indexing and addressing
+// Batch processing logic
+```
+
+#### 3.3 Extract Pure Mathematical Logic
+Isolate the core computation that can be parallelized:
+```c
+// Example: GLU core computation
+for (int64_t i = 0; i < ne; i++) {
+    const float x = src0_ptr[i];
+    const float y = src0_ptr[i + ne];
+    dst_ptr[i] = x * activation_function(y);  // Core math
+}
+```
+
+### Step 4: NUMA Work Function Implementation
+
+#### 4.1 Design Work Function Interface
+```c
+// Standard work function signature
+static int ggml_numa_work_function_your_operation_chunk(void* context) {
+    // Extract operation details from context
+    // Handle tensor slicing for NUMA data parallelism
+    // Execute mathematical kernel on assigned chunk
+    // Return 0 for success, non-zero for failure
+}
+```
+
+#### 4.2 Implement Tensor Slicing Logic
+```c
+// For data-parallel operations:
+// 1. Calculate work distribution across NUMA nodes
+int64_t total_elements = ggml_nelements(operation->dst);
+int64_t elements_per_node = total_elements / num_numa_nodes;
+int64_t start_idx = numa_node * elements_per_node;
+int64_t end_idx = (numa_node == last_node) ? total_elements : start_idx + elements_per_node;
+
+// 2. Adjust tensor pointers for local slice
+float* local_src_ptr = src_ptr + start_idx;
+float* local_dst_ptr = dst_ptr + start_idx;
+int64_t local_elements = end_idx - start_idx;
+```
+
+#### 4.3 Integrate Mathematical Kernel
+```c
+// Option A: Call existing kernel with modified parameters
+struct ggml_compute_params single_thread_params = {
+    .ith = 0,           // Always 0 for single-threaded execution per node
+    .nth = 1,           // Single thread per NUMA node
+    .wsize = 0,
+    .wdata = NULL,
+    .threadpool = NULL
+};
+
+// Modify tensor to represent local slice and call existing function
+ggml_compute_forward_your_operation_f32(&single_thread_params, local_tensor);
+
+// Option B: Implement optimized NUMA-aware computation directly
+// Use the extracted mathematical logic with local pointers
+```
+
+### Step 5: Dispatcher Integration
+
+#### 5.1 Update Operation Handler
+Add or modify the case in `ggml/src/ggml-cpu/ggml-numa-operation-dispatch.c`:
+
+```c
+case GGML_OP_YOUR_OPERATION: {
+    // Set efficiency based on operation characteristics
+    efficiency = 0.95f;  // High for element-wise, lower for complex ops
+    
+    // Choose appropriate strategy
+    strategy = NUMA_NODE_STRATEGY_DATA_PARALLEL;  // For most operations
+    // strategy = NUMA_NODE_STRATEGY_SINGLE;     // For problematic operations
+    
+    // Assign work function
+    work_function = ggml_numa_work_function_your_operation_chunk;
+    break;
+}
+```
+
+#### 5.2 Efficiency Guidelines
+- **0.95-0.98**: Element-wise operations (GLU, ADD, MUL)
+- **0.80-0.90**: Matrix operations with good parallelization (MUL_MAT)
+- **0.60-0.80**: Operations with some coordination overhead (SOFT_MAX)
+- **0.40-0.60**: Complex operations with significant NUMA overhead
+
+### Step 6: Comprehensive Testing Implementation
+
+#### 6.1 Create Mathematical Correctness Test
+```bash
+# Use the proven template approach
+cp tests/test-numa-mathematical-correctness-template.cpp \
+   tests/test-numa-mathematical-correctness-your-operation.cpp
+```
+
+#### 6.2 Customize Test Implementation
+Key areas to modify in the template:
+
+```cpp
+// 1. Update class name and operation references
+class NumaYourOperationMathematicalCorrectnessTestSuite
+
+// 2. Define test cases with appropriate tensor dimensions
+struct TestCase test_cases[] = {
+    {"YOUR_OPERATION-TINY", 64, 64, 1, "your_operation"},
+    {"YOUR_OPERATION-SMALL", 128, 128, 1, "your_operation"},
+    {"YOUR_OPERATION-MEDIUM", 256, 256, 1, "your_operation"},
+    // Add operation-specific test dimensions
+};
+
+// 3. Implement test logic for your specific operation
+bool test_single_your_operation_case(/*...*/) {
+    // Create appropriate tensors for your operation
+    // Generate deterministic test data
+    // Execute NUMA parallel version via ggml_numa_intercept_operation
+    // Execute serial reference implementation
+    // Compare results with compare_float_arrays()
+}
+```
+
+#### 6.3 Add to Build System
+Update `tests/CMakeLists.txt`:
+```cmake
+set(LLAMA_TEST_NAME test-numa-mathematical-correctness-your-operation)
+llama_build_and_test(test-numa-mathematical-correctness-your-operation.cpp)
+target_link_libraries(${LLAMA_TEST_NAME} PRIVATE ggml ggml-cpu common)
+```
+
+Update `tests/run-numa-tests.sh`:
+```bash
+NUMA_TESTS=(
+    # ... existing tests ...
+    "test-numa-mathematical-correctness-your-operation"
+)
+```
+
+### Step 7: Validation & Performance Testing
+
+#### 7.1 Mathematical Correctness Validation
+```bash
+# Build and run individual test
+cmake --build build --target test-numa-mathematical-correctness-your-operation
+./build/bin/test-numa-mathematical-correctness-your-operation
+
+# Run comprehensive test suite
+./tests/run-numa-tests.sh
+```
+
+#### 7.2 Performance Validation
+```bash
+# Test with real model to ensure no regressions
+./build/bin/llama-server -m ./.devcontainer/qwen2.5-0.5b-instruct-q8_0.gguf \
+  --host 0.0.0.0 --numa mirror --port 8080 &
+
+# Verify functionality with actual inference
+curl -X POST http://localhost:8080/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model": "qwen2.5-0.5b-instruct", "messages": [{"role": "user", "content": "Test"}]}'
+```
+
+### Step 8: Documentation & Changelog
+
+#### 8.1 Create Detailed Changelog
+Document in `.devcontainer/changelog/YYYY-MM-DD-operation-numa-implementation.md`:
+- Analysis findings
+- Implementation details
+- Performance characteristics
+- Test results
+- Future optimization opportunities
+
+#### 8.2 Update Copilot Instructions
+Add operation-specific notes to this document if needed.
+
+## 🔍 Common Patterns & Best Practices
+
+### Successful Operation Characteristics
+- **GLU**: Element-wise with activation functions → Perfect data parallelism
+- **ADD/MUL**: Simple element-wise → Excellent candidates  
+- **MUL_MAT**: Matrix multiplication → Complex but highly parallel
+- **SOFT_MAX**: Reduction operation → Requires careful coordination
+
+### Work Function Patterns
+```c
+// Pattern 1: Simple element-wise operations
+static int ggml_numa_work_function_elementwise_chunk(void* context) {
+    // Direct mathematical kernel execution on tensor slice
+    // High efficiency, minimal overhead
+}
+
+// Pattern 2: Complex operations requiring coordination
+static int ggml_numa_work_function_complex_chunk(void* context) {
+    // May require multiple phases
+    // Inter-node communication/synchronization
+    // Lower efficiency due to coordination overhead
+}
+```
+
+### Testing Patterns
+- **Multi-dimensional testing**: TINY → LARGE tensor sizes
+- **Thread strategy validation**: 1, 2, 4, 6, 8 threads
+- **Mathematical equivalence**: Exact comparison with reference
+- **Performance regression**: Real model validation
+
+### Debugging Strategies
+```bash
+# Enable debug output for NUMA operations
+export GGML_NUMA_DEBUG=1
+
+# Use GDB for segfaults
+gdb --batch --ex run --ex bt --ex quit --args ./build/bin/test-your-operation
+
+# Core dump analysis for threading issues
+echo 'core' | sudo tee /proc/sys/kernel/core_pattern
+ulimit -c unlimited
+# Run test and analyze core dump with gdb
+```
+
 ## 🏗️ Build Environment Setup
 
 ### Primary Development Method: Dev Container
@@ -390,6 +699,63 @@ cmake --build build --parallel
 ```
 
 Remember: NUMA and CPU topology changes can have subtle effects. Always validate performance and correctness thoroughly before considering changes complete.
+
+## 📋 Quick Reference: NUMA Operation Implementation
+
+### Essential Files for Operation Implementation
+```
+ggml/src/ggml-cpu/ggml-numa-operation-dispatch.c  # Add operation handler
+ggml/src/ggml-cpu/ggml-cpu.c                      # Find mathematical kernels
+tests/test-numa-mathematical-correctness-*.cpp    # Create correctness tests
+tests/CMakeLists.txt                              # Add test targets
+tests/run-numa-tests.sh                           # Update test runner
+```
+
+### Standard Work Function Template
+```c
+static int ggml_numa_work_function_OPERATION_chunk(void* context) {
+    struct ggml_numa_context* numa_context = (struct ggml_numa_context*)context;
+    struct ggml_tensor* operation = numa_context->operation;
+    
+    // Extract operation parameters and tensor slicing logic
+    // Call existing mathematical kernel or implement NUMA-optimized version
+    // Return 0 for success, non-zero for failure
+}
+```
+
+### Dispatcher Handler Template
+```c
+case GGML_OP_YOUR_OPERATION: {
+    efficiency = 0.95f;  // Adjust based on operation type
+    strategy = NUMA_NODE_STRATEGY_DATA_PARALLEL;
+    work_function = ggml_numa_work_function_your_operation_chunk;
+    break;
+}
+```
+
+### Test Implementation Checklist
+- [ ] Copy template: `cp tests/test-numa-mathematical-correctness-template.cpp tests/test-numa-mathematical-correctness-OPERATION.cpp`
+- [ ] Update class name and operation references
+- [ ] Define operation-specific test cases and dimensions
+- [ ] Implement tensor creation and reference computation
+- [ ] Add CMake target in `tests/CMakeLists.txt`
+- [ ] Update `tests/run-numa-tests.sh` test list
+- [ ] Verify all tests pass: `./tests/run-numa-tests.sh`
+
+### Performance Validation Commands
+```bash
+# Build specific test
+cmake --build build --target test-numa-mathematical-correctness-OPERATION
+
+# Run single test
+./build/bin/test-numa-mathematical-correctness-OPERATION
+
+# Full test suite
+./tests/run-numa-tests.sh
+
+# Real model validation
+./build/bin/llama-server -m model.gguf --numa mirror --port 8080
+```
 
 ## Changelog
 
