@@ -19,6 +19,12 @@
 #include "ops.h"  // For ggml_compute_forward_* functions
 #include "binary-ops.h"  // For binary operation functions
 
+#ifdef __linux__
+#include <sched.h>
+#include <numa.h>
+#include <numaif.h>
+#endif
+
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -36,15 +42,29 @@ void ggml_numa_set_virtual_node(int node) {
     g_virtual_numa_node = node;
 }
 
-int ggml_numa_get_virtual_node(void) {
-    return g_virtual_numa_node;
-}
-
+int ggml_numa_get_current_node(void) {
+    // If we have a virtual node set (test mode), return it
+    if (g_virtual_numa_node >= 0) {
+        return g_virtual_numa_node;
+    }
+    
+    // Otherwise, detect real NUMA node in production environment
 #ifdef __linux__
-#include <sched.h>
-#include <numa.h>
-#include <numaif.h>
+    if (numa_available() >= 0) {
+        // Get current CPU and determine its NUMA node
+        int current_cpu = sched_getcpu();
+        if (current_cpu >= 0) {
+            int current_node = numa_node_of_cpu(current_cpu);
+            if (current_node >= 0) {
+                return current_node;
+            }
+        }
+    }
 #endif
+    
+    // Fallback: return node 0 if detection fails
+    return 0;
+}
 
 #ifndef GGML_NUMA_MAX_NODES
 #define GGML_NUMA_MAX_NODES 8
@@ -213,6 +233,7 @@ struct ggml_coordinator_thread {
 // NUMA Multi-Socket Threadpool Manager (3-tier: main → coordinator → NUMA)
 struct ggml_numa_coordinator_manager {
     int num_numa_nodes;                                   // Number of NUMA nodes
+    bool force_multi_socket;                              // Whether we're in test mode with simulated NUMA nodes
     struct ggml_coordinator_thread * coordinators;        // Array of coordinator threads (one per NUMA node)
     struct ggml_work_queue global_work_queue;             // Global work queue from main thread
     
@@ -1665,6 +1686,7 @@ struct ggml_numa_coordinator_manager * ggml_numa_coordinator_manager_new_with_pa
     
     memset(mgr, 0, sizeof(struct ggml_numa_coordinator_manager));
     mgr->num_numa_nodes = num_numa_nodes;
+    mgr->force_multi_socket = tpp->force_multi_socket;
     atomic_init(&mgr->total_work_items, 0);
     atomic_init(&mgr->completed_work_items, 0);
     atomic_init(&mgr->manager_active, true);
@@ -3566,6 +3588,17 @@ int ggml_numa_coordinator_get_active_nodes(struct ggml_numa_coordinator_manager 
     }
     
     return count;
+}
+
+/**
+ * Get the total number of NUMA nodes from the global coordinator manager
+ * @return Number of NUMA nodes, or 1 if no coordinator is active
+ */
+int ggml_numa_coordinator_get_num_nodes(void) {
+    if (g_global_coordinator_manager == NULL) {
+        return 1; // Default to single node if no coordinator
+    }
+    return g_global_coordinator_manager->num_numa_nodes;
 }
 
 int ggml_numa_coordinator_manager_get_numa_nodes(struct ggml_numa_coordinator_manager * mgr) {

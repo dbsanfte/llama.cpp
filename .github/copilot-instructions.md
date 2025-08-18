@@ -35,24 +35,85 @@ grep -r "GGML_OP_YOUR_OPERATION" ggml/src/ggml-cpu/
 - ⚠️ **Complex**: Matrix ops (MUL_MAT), reductions (SOFT_MAX) - need specialized splitting
 - ❌ **Poor**: Global synchronization, complex dependencies
 
+**🚀 SIMD Optimization Requirements:**
+- **Always use SIMD**: Replace scalar operations with `ggml_vec_*` functions from `ggml/src/ggml-cpu/vec.h`
+- **Common SIMD functions**: `ggml_vec_add_f32()`, `ggml_vec_dot_f32()`, `ggml_vec_scale_f32()`, `ggml_vec_cpy_f32()`
+- **Performance impact**: SIMD provides significant speedup on modern CPUs with AVX2/AVX512 support
+- **Mathematical equivalence**: SIMD operations must produce identical results to scalar reference
+
 ### Step 2: Implementation
-**Work function template:**
+### Step 2: Implementation
+
+**Critical NUMA Data Slicing Pattern:**
+```c
+// For data-parallel operations, ALWAYS slice data across NUMA nodes
+int numa_node = context->numa_node;
+int max_numa_nodes = context->max_numa_nodes;
+
+// Calculate this NUMA node's data slice
+size_t total_elements = tensor->ne[0] * tensor->ne[1] * tensor->ne[2] * tensor->ne[3];
+size_t elements_per_node = total_elements / max_numa_nodes;
+size_t numa_start = numa_node * elements_per_node;
+size_t numa_end = (numa_node == max_numa_nodes - 1) ? total_elements : numa_start + elements_per_node;
+```
+
+**SIMD-Optimized Work Function Template:**
 ```c
 static int ggml_numa_work_function_your_operation_chunk(void* context) {
-    // Extract context, slice tensors for NUMA data parallelism
-    // Execute mathematical kernel on assigned chunk
-    // Return 0 for success, non-zero for failure
+    // 1. Extract context and calculate NUMA data slice
+    const ggml_numa_work_context_t * ctx = context;
+    
+    // 2. Slice tensors for NUMA data parallelism (see pattern above)
+    
+    // 3. Use SIMD operations from vec.h instead of scalar loops:
+    //    - Replace: for(i=0; i<n; i++) dst[i] = src0[i] + src1[i];
+    //    - With: ggml_vec_add_f32(n, dst, src0, src1);
+    
+    // 4. Multi-thread within NUMA node using thread_start/thread_end
+    
+    return 0; // Success
 }
 ```
+
+**Execution Strategy Selection:**
+- **Single-node execution**: Small tensors, poor cache locality, or sequential dependencies
+- **Data-parallel execution**: Large tensors with good NUMA splitting characteristics
+- **Always implement both** strategies like MUL_MAT pattern: `_single` and `_chunk` functions
 
 **Dispatcher handler:**
 ```c
 case GGML_OP_YOUR_OPERATION: {
     efficiency = 0.95f;  // High for element-wise, lower for complex
-    strategy = NUMA_NODE_STRATEGY_DATA_PARALLEL;
+    strategy = NUMA_NODE_STRATEGY_DATA_PARALLEL;  // Or SINGLE for small tensors
     work_function = ggml_numa_work_function_your_operation_chunk;
     break;
 }
+```
+
+**⚠️ Critical Patterns for Proper NUMA Integration:**
+
+**1. Execution Strategy Decision Logic:**
+```c
+// Use single-node for small tensors or poor splitting characteristics
+if (total_elements < 32768 || tensor->ne[0] < 512) {
+    strategy = NUMA_NODE_STRATEGY_SINGLE;
+    work_function = ggml_numa_work_function_your_operation_single;
+} else {
+    strategy = NUMA_NODE_STRATEGY_DATA_PARALLEL;
+    work_function = ggml_numa_work_function_your_operation_chunk;
+}
+```
+
+**2. SIMD Integration Examples:**
+```c
+// Element-wise addition (ADD pattern)
+ggml_vec_add_f32(chunk_size, dst_chunk, src0_chunk, src1_chunk);
+
+// Dot product for reductions (RMS_NORM pattern)  
+float sum_squares = ggml_vec_dot_f32(row_size, row_data, row_data);
+
+// Scaling operations (RMS_NORM pattern)
+ggml_vec_scale_f32(row_size, dst_row, inv_rms);
 ```
 
 **Required strategies for full parallelism:**
@@ -95,6 +156,46 @@ curl -X POST http://localhost:8080/v1/chat/completions -H "Content-Type: applica
 ```
 
 ## 🧠 Key Technical Areas
+
+### NUMA Data Slicing & SIMD Optimization Patterns
+
+**Successful SIMD Implementations:**
+- **ADD Operation**: Element-wise addition using `ggml_vec_add_f32()` with single-node execution strategy
+- **RMS_NORM Operation**: Root mean square normalization using `ggml_vec_dot_f32()` + `ggml_vec_scale_f32()` with data-parallel execution
+
+**Pattern: Element-wise Operations (ADD, MUL, etc.)**
+```c
+// Data slicing for NUMA parallelism
+size_t total_elements = ne[0] * ne[1] * ne[2] * ne[3];
+size_t elements_per_node = total_elements / max_numa_nodes;
+size_t numa_start = numa_node * elements_per_node;
+size_t numa_end = (numa_node == max_numa_nodes - 1) ? total_elements : numa_start + elements_per_node;
+
+// SIMD operation on NUMA slice
+ggml_vec_add_f32(numa_end - numa_start, dst + numa_start, src0 + numa_start, src1 + numa_start);
+```
+
+**Pattern: Reduction Operations (RMS_NORM, SOFT_MAX, etc.)**
+```c
+// Row-wise processing with NUMA distribution
+for (int row = numa_start_row; row < numa_end_row; row++) {
+    float* row_data = (float*)((char*)src + row * src->nb[1]);
+    float* dst_row = (float*)((char*)dst + row * dst->nb[1]);
+    
+    // SIMD dot product for sum of squares
+    float sum_squares = ggml_vec_dot_f32(row_size, row_data, row_data);
+    float scale = 1.0f / sqrtf(sum_squares / row_size + eps);
+    
+    // SIMD scaling
+    ggml_vec_scale_f32(row_size, dst_row, scale);
+}
+```
+
+**Critical SIMD Requirements:**
+- Always prefer `ggml_vec_*` over manual loops
+- Ensure mathematical equivalence with reference implementation
+- Validate with comprehensive multi-dimensional testing
+- Handle edge cases (uneven NUMA splits, remainder elements)
 
 ### NUMA Memory Management
 - **Files**: `ggml-numa-coordinator.c`, `ggml-cpu-numa-buffer.cpp`, `ggml.h`
@@ -154,6 +255,9 @@ cmake --build build --parallel
 - **Add comprehensive tests** - feature isn't done without tests
 - **Validate with real models** - not just compilation
 - **Check exit codes** - tests must properly signal failures
+- **SIMD First**: Always use `ggml_vec_*` functions instead of scalar loops
+- **NUMA Data Slicing**: Implement proper data distribution across NUMA nodes
+- **Dual Strategy**: Create both single-node and data-parallel work functions for optimal performance
 
 ## 📋 Quick Reference
 
@@ -166,9 +270,12 @@ tests/test-numa-mathematical-correctness-*.cpp    # Correctness tests
 
 ### Implementation Checklist
 - [ ] Find mathematical kernel in `ggml-cpu.c`
-- [ ] Implement work function with tensor slicing
-- [ ] Add dispatcher handler with correct strategies
-- [ ] Create test from template
+- [ ] Extract pure mathematical operations (no ggml threading)
+- [ ] Replace scalar loops with SIMD `ggml_vec_*` functions
+- [ ] Implement NUMA data slicing pattern for data-parallel operations
+- [ ] Create both single-node and data-parallel work functions when appropriate
+- [ ] Add dispatcher handler with correct execution strategies
+- [ ] Create test from template with multi-dimensional validation
 - [ ] Add to CMake and test runner
 - [ ] Verify `./tests/run-numa-tests.sh` passes
 

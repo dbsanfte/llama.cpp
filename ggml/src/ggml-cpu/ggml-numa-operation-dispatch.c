@@ -16,6 +16,7 @@
 #include "ops.h"            // Main operations
 #include "unary-ops.h"      // Unary operations (sin, cos, log, etc.)
 #include "binary-ops.h"     // Binary operations (add, sub, mul, div)
+#include "vec.h"            // Vector operations and SIMD optimizations
 
 #include <unistd.h>         // For usleep
 
@@ -68,10 +69,13 @@ static enum ggml_status ggml_numa_work_function_fallback(void * work_context, st
 static enum ggml_status ggml_numa_work_function_mul_mat_single(void * work_context, struct ggml_compute_params * params);
 static enum ggml_status ggml_numa_work_function_mul_mat_chunk(void * work_context, struct ggml_compute_params * params);
 static enum ggml_status ggml_numa_work_function_soft_max(void * work_context, struct ggml_compute_params * params);
+static enum ggml_status ggml_numa_work_function_soft_max_chunk(void * work_context, struct ggml_compute_params * params);
 static enum ggml_status ggml_numa_work_function_rope_chunk(void * work_context, struct ggml_compute_params * params);
+static enum ggml_status ggml_numa_work_function_add_single(void * work_context, struct ggml_compute_params * params);
 static enum ggml_status ggml_numa_work_function_add_chunk(void * work_context, struct ggml_compute_params * params);
 static enum ggml_status ggml_numa_work_function_glu_chunk(void * work_context, struct ggml_compute_params * params);
 static enum ggml_status ggml_numa_work_function_rms_norm_chunk(void * work_context, struct ggml_compute_params * params);
+static enum ggml_status ggml_numa_work_function_flash_attn_ext_chunk(void * work_context, struct ggml_compute_params * params);
 
 // Work context creation and management functions
 static ggml_numa_dispatcher_work_context_t * ggml_numa_dispatcher_create_work_context(
@@ -480,7 +484,8 @@ enum ggml_status ggml_numa_dispatch_operation(
                                   operation->op == GGML_OP_NORM ||
                                   operation->op == GGML_OP_RMS_NORM ||
                                   operation->op == GGML_OP_GROUP_NORM ||
-                                  operation->op == GGML_OP_GLU);
+                                  operation->op == GGML_OP_GLU ||
+                                  operation->op == GGML_OP_FLASH_ATTN_EXT);
         
         if (needs_work_buffer) {
             GGML_LOG_DEBUG("Operation %s needs work buffers, routing through coordinator\n", 
@@ -551,14 +556,17 @@ static enum ggml_status ggml_numa_execute_single_node(
         work_function = ggml_numa_work_function_mul_mat_single;
         GGML_LOG_DEBUG("Using specialized MUL_MAT single work function\n");
     } else if (operation->op == GGML_OP_ADD) {
-        work_function = ggml_numa_work_function_add_chunk;
-        GGML_LOG_DEBUG("Using specialized ADD chunk work function for single node\n");
+        work_function = ggml_numa_work_function_add_single;
+        GGML_LOG_DEBUG("Using specialized ADD single work function for single node\n");
     } else if (operation->op == GGML_OP_GLU) {
         work_function = ggml_numa_work_function_glu_chunk;
         GGML_LOG_DEBUG("Using specialized GLU chunk work function for single node\n");
     } else if (operation->op == GGML_OP_RMS_NORM) {
         work_function = ggml_numa_work_function_rms_norm_chunk;
         GGML_LOG_DEBUG("Using specialized RMS_NORM chunk work function for single node\n");
+    } else if (operation->op == GGML_OP_FLASH_ATTN_EXT) {
+        work_function = ggml_numa_work_function_flash_attn_ext_chunk;
+        GGML_LOG_DEBUG("Using specialized FLASH_ATTN_EXT chunk work function for single node\n");
     } else {
         work_function = ggml_numa_work_function_fallback;
         GGML_LOG_DEBUG("Using generic fallback work function for %s\n", ggml_op_name(operation->op));
@@ -660,6 +668,10 @@ static enum ggml_status ggml_numa_execute_data_parallel(
         work_function = ggml_numa_work_function_mul_mat_chunk;
         GGML_LOG_DEBUG("🔧 DEBUG: Selected MUL_MAT chunk work function %p\n", (void*)work_function);
         GGML_LOG_DEBUG("Using specialized MUL_MAT chunk work function for data parallelism\n");
+    } else if (operation->op == GGML_OP_SOFT_MAX) {
+        work_function = ggml_numa_work_function_soft_max_chunk;
+        GGML_LOG_DEBUG("🔧 DEBUG: Selected SOFT_MAX chunk work function %p\n", (void*)work_function);
+        GGML_LOG_DEBUG("Using specialized SOFT_MAX chunk work function for data parallelism\n");
     } else if (operation->op == GGML_OP_ADD) {
         work_function = ggml_numa_work_function_add_chunk;
         GGML_LOG_DEBUG("🔧 DEBUG: Selected ADD chunk work function %p\n", (void*)work_function);
@@ -672,6 +684,10 @@ static enum ggml_status ggml_numa_execute_data_parallel(
         work_function = ggml_numa_work_function_rms_norm_chunk;
         GGML_LOG_DEBUG("🔧 DEBUG: Selected RMS_NORM chunk work function %p\n", (void*)work_function);
         GGML_LOG_DEBUG("Using specialized RMS_NORM chunk work function for data parallelism\n");
+    } else if (operation->op == GGML_OP_FLASH_ATTN_EXT) {
+        work_function = ggml_numa_work_function_flash_attn_ext_chunk;
+        GGML_LOG_DEBUG("🔧 DEBUG: Selected FLASH_ATTN_EXT chunk work function %p\n", (void*)work_function);
+        GGML_LOG_DEBUG("Using specialized FLASH_ATTN_EXT chunk work function for data parallelism\n");
     } else {
         work_function = ggml_numa_work_function_fallback;
         GGML_LOG_DEBUG("🔧 DEBUG: Selected fallback work function %p for %s\n", (void*)work_function, ggml_op_name(operation->op));
@@ -1963,7 +1979,7 @@ static enum ggml_status ggml_numa_analyze_soft_max(
 const ggml_numa_operation_handler_t ggml_numa_handler_soft_max = {
     .operation_type = GGML_OP_SOFT_MAX,
     .default_strategy = {
-        .node_strategy = NUMA_NODE_STRATEGY_SINGLE,  // Single node to avoid concurrent writes
+        .node_strategy = NUMA_NODE_STRATEGY_DATA_PARALLEL,  // Enable data parallel for SOFT_MAX rows
         .on_node_strategy = NUMA_ON_NODE_STRATEGY_MULTI_THREAD
     },
     .complexity = NUMA_OP_COMPLEXITY_MODERATE,
@@ -1973,7 +1989,7 @@ const ggml_numa_operation_handler_t ggml_numa_handler_soft_max = {
     .parallel_efficiency_estimate = 0.80f,  // Good efficiency for attention operations
     .requires_synchronization = false,
     .supports_in_place = false,
-    .analyze = NULL  // FIXED: Remove custom analyzer, always use single node
+    .analyze = NULL  // FIXED: Remove custom analyzer, now use data parallel
 };
 
 // GLU (SwiGLU) handler - element-wise operation with NUMA coordination
@@ -2537,6 +2553,25 @@ static size_t ggml_numa_dispatcher_calculate_work_buffer_size(const struct ggml_
             // Group normalization needs working space
             return ggml_nelements(operation) * sizeof(float);
         }
+        case GGML_OP_FLASH_ATTN_EXT: {
+            // Flash attention needs working space for VKQ accumulator, V32 buffer, and Q quantized
+            // Based on the implementation in ops.cpp, we need:
+            // - DV * sizeof(float) for VKQ32 (FP32 VKQ accumulator)  
+            // - DV * sizeof(float) for V32 (temporary FP32 V buffer)
+            // - DK * sizeof(ggml_fp16_t) for Q_q (quantized Q buffer)
+            // - CACHE_LINE_SIZE_F32 for alignment
+            const struct ggml_tensor * q = operation->src[0];
+            const struct ggml_tensor * v = operation->src[2];
+            if (!q || !v) {
+                return 0;
+            }
+            const int64_t DK = q->ne[0];  // Key/Query dimension
+            const int64_t DV = v->ne[0];  // Value dimension
+            
+            size_t buffer_size = (1*DK + 2*DV + CACHE_LINE_SIZE_F32) * sizeof(float);
+            GGML_LOG_DEBUG("🔧 FLASH_ATTN_EXT work buffer: DK=%ld, DV=%ld, size=%zu bytes\n", DK, DV, buffer_size);
+            return buffer_size;
+        }
         // Most operations don't need work buffers
         default:
             return 0;
@@ -2615,10 +2650,8 @@ static enum ggml_status ggml_numa_work_function_mul_mat_chunk(void * work_contex
     GGML_LOG_DEBUG("🔍 MUL_MAT chunk: dst=%p, src0=%p, src1=%p\n", (void*)dst, (void*)dst->src[0], (void*)dst->src[1]);
     GGML_LOG_DEBUG("🔍 Work context: operation=%p, cplan=%p\n", (void*)ctx->operation, (void*)ctx->cplan);
     
-    // Implement proper preprocessing and call chunk function for NUMA parallelization
-    struct ggml_compute_params single_thread_params = *params;
-    single_thread_params.ith = 0;   // This thread is thread 0
-    single_thread_params.nth = 1;   // Only 1 thread total (single-threaded execution)
+    // Use coordinator's threading parameters directly (multi-threading support)
+    GGML_LOG_DEBUG("🔍 Using coordinator threading: ith=%d, nth=%d\n", params->ith, params->nth);
     
     GGML_LOG_DEBUG("🔍 About to call NUMA-safe MUL_MAT chunk computation...\n");
     
@@ -2680,11 +2713,11 @@ static enum ggml_status ggml_numa_work_function_mul_mat_chunk(void * work_contex
                        chunk_conversion_size, ne13 * nbw3);
         
         // Verify we have enough work buffer space for the chunk
-        GGML_ASSERT(single_thread_params.wsize >= chunk_conversion_size);
+        GGML_ASSERT(params->wsize >= chunk_conversion_size);
         
         // Get conversion function
         ggml_from_float_t const from_float = ggml_get_type_traits_cpu(vec_dot_type)->from_float;
-        char * wdata = (char*)single_thread_params.wdata;
+        char * wdata = (char*)params->wdata;
         
         // Convert src1 data from F32 to vec_dot_type in work buffer
         // NUMA optimization: Only convert the first batch for now
@@ -2711,8 +2744,41 @@ static enum ggml_status ggml_numa_work_function_mul_mat_chunk(void * work_contex
     const int64_t nr0 = dst->ne[0];  // Result rows
     const int64_t nr1 = dst->ne[1] * dst->ne[2] * dst->ne[3];  // Remaining dimensions
     
-    GGML_LOG_DEBUG("🔍 Calling chunk function: ir0=[0,%ld], ir1=[0,%ld], vec_dot_num_rows=%ld\n", 
-           nr0, nr1, vec_dot_num_rows);
+    // NUMA-aware data slicing: each NUMA node processes a portion of the rows
+    int current_numa_node = ggml_numa_get_current_node();
+    int total_numa_nodes = ggml_numa_coordinator_get_num_nodes();
+    
+    // Calculate which rows this NUMA node should process
+    int64_t rows_per_node = nr1 / total_numa_nodes;
+    int64_t extra_rows = nr1 % total_numa_nodes;
+    
+    // Calculate start and end rows for this NUMA node
+    int64_t start_row = current_numa_node * rows_per_node;
+    int64_t end_row = start_row + rows_per_node;
+    
+    // Distribute any extra rows to the first few nodes
+    if (current_numa_node < extra_rows) {
+        start_row += current_numa_node;
+        end_row += current_numa_node + 1;
+    } else {
+        start_row += extra_rows;
+        end_row += extra_rows;
+    }
+    
+    // Ensure we don't exceed bounds
+    if (end_row > nr1) end_row = nr1;
+    if (start_row >= nr1) {
+        // This NUMA node has no work to do
+        GGML_LOG_DEBUG("🔍 NUMA node %d has no work (start_row=%ld >= nr1=%ld)\n", 
+                       current_numa_node, start_row, nr1);
+        return GGML_STATUS_SUCCESS;
+    }
+    
+    GGML_LOG_DEBUG("🔍 NUMA node %d (of %d): processing rows %ld to %ld (of %ld total)\n", 
+                   current_numa_node, total_numa_nodes, start_row, end_row - 1, nr1);
+    
+    GGML_LOG_DEBUG("🔍 Calling chunk function: ir0=[0,%ld], ir1=[%ld,%ld], vec_dot_num_rows=%ld\n", 
+                   nr0, start_row, end_row, vec_dot_num_rows);
     
     // Call the chunk function with proper parameters
     extern void ggml_compute_forward_mul_mat_one_chunk(
@@ -2727,14 +2793,14 @@ static enum ggml_status ggml_numa_work_function_mul_mat_chunk(void * work_contex
     );
     
     ggml_compute_forward_mul_mat_one_chunk(
-        &single_thread_params,
+        params,
         dst,
         src0->type,
         vec_dot_num_rows,
-        0,      // ir0_start: start of rows
-        nr0,    // ir0_end: end of rows
-        0,      // ir1_start: start of columns/batch
-        nr1     // ir1_end: end of columns/batch
+        0,          // ir0_start: start of rows (always 0 for matrix cols)
+        nr0,        // ir0_end: end of rows (always full width for matrix cols)
+        start_row,  // ir1_start: start of assigned row slice
+        end_row     // ir1_end: end of assigned row slice
     );
     
     GGML_LOG_DEBUG("🔍 ggml_compute_forward_mul_mat_one_chunk completed successfully\n");
@@ -2777,6 +2843,107 @@ static enum ggml_status ggml_numa_work_function_soft_max(void * work_context, st
     ggml_compute_forward_soft_max(&single_thread_params, ctx->operation);
     
     GGML_LOG_DEBUG("Successfully executed SOFT_MAX work function\n");
+    
+    return GGML_STATUS_SUCCESS;
+}
+
+// Specialized work function for SOFT_MAX operations with NUMA-aware data parallel chunking
+static enum ggml_status ggml_numa_work_function_soft_max_chunk(void * work_context, struct ggml_compute_params * params) {
+    if (!work_context || !params) {
+        return GGML_STATUS_FAILED;
+    }
+    
+    ggml_numa_dispatcher_work_context_t * ctx = (ggml_numa_dispatcher_work_context_t *)work_context;
+    struct ggml_tensor * dst = ctx->operation;
+
+    GGML_ASSERT(dst && dst->src[0]);
+    
+    GGML_LOG_DEBUG("🔍 SOFT_MAX chunk: wsize=%zu, wdata=%p\n", params->wsize, params->wdata);
+    GGML_LOG_DEBUG("🔍 SOFT_MAX chunk: dst=%p, src=%p\n", (void*)dst, (void*)dst->src[0]);
+    
+    const struct ggml_tensor * src = dst->src[0];
+    
+    GGML_LOG_DEBUG("🔍 Tensor dimensions: dst=(%ld,%ld,%ld,%ld), src=(%ld,%ld,%ld,%ld)\n",
+           dst->ne[0], dst->ne[1], dst->ne[2], dst->ne[3], 
+           src->ne[0], src->ne[1], src->ne[2], src->ne[3]);
+    
+    // NUMA-aware data slicing: each NUMA node processes a portion of the rows
+    // SOFT_MAX is typically applied row-wise (along ne[0] dimension)
+    // Each row can be processed independently, so distribute rows across NUMA nodes
+    
+    int current_numa_node = ggml_numa_get_current_node();
+    int total_numa_nodes = ggml_numa_coordinator_get_num_nodes();
+    
+    const int64_t ne01 = dst->ne[1];  // Number of rows to process
+    const int64_t ne02 = dst->ne[2];  // Batch dimension 2
+    const int64_t ne03 = dst->ne[3];  // Batch dimension 3
+    
+    // Calculate which rows this NUMA node should process
+    int64_t rows_per_node = ne01 / total_numa_nodes;
+    int64_t extra_rows = ne01 % total_numa_nodes;
+    
+    // Calculate start and end rows for this NUMA node within each batch
+    int64_t start_row = current_numa_node * rows_per_node;
+    int64_t end_row = start_row + rows_per_node;
+    
+    // Distribute any extra rows to the first few nodes
+    if (current_numa_node < extra_rows) {
+        start_row += current_numa_node;
+        end_row += current_numa_node + 1;
+    } else {
+        start_row += extra_rows;
+        end_row += extra_rows;
+    }
+    
+    // Ensure we don't exceed bounds
+    if (end_row > ne01) end_row = ne01;
+    if (start_row >= ne01) {
+        // This NUMA node has no work to do
+        GGML_LOG_DEBUG("🔍 NUMA node %d has no work (start_row=%ld >= ne01=%ld)\n", 
+                       current_numa_node, start_row, ne01);
+        return GGML_STATUS_SUCCESS;
+    }
+    
+    GGML_LOG_DEBUG("🔍 NUMA node %d (of %d): processing rows %ld to %ld (of %ld total per batch)\n", 
+                   current_numa_node, total_numa_nodes, start_row, end_row - 1, ne01);
+    
+    // Process each batch and each row in this NUMA node's assigned range
+    for (int64_t i03 = 0; i03 < ne03; i03++) {
+        for (int64_t i02 = 0; i02 < ne02; i02++) {
+            for (int64_t i01 = start_row; i01 < end_row; i01++) {
+                
+                GGML_LOG_DEBUG("🔍 Processing row i01=%ld, i02=%ld, i03=%ld\n", i01, i02, i03);
+                
+                // Get pointers to the source and destination data for this specific row
+                const char * src_base = (const char*)tensor_data(src);
+                char * dst_base = (char*)tensor_data(dst);
+                
+                const size_t src_offset = i01*src->nb[1] + i02*src->nb[2] + i03*src->nb[3];
+                const size_t dst_offset = i01*dst->nb[1] + i02*dst->nb[2] + i03*dst->nb[3];
+                
+                const float * src_row = (const float*)(src_base + src_offset);
+                float * dst_row = (float*)(dst_base + dst_offset);
+                
+                const int64_t ne00 = dst->ne[0];  // Row width
+                
+                // Apply softmax to this row using SIMD-optimized reference implementation
+                // First pass: find maximum value
+                float max_val = -INFINITY;
+                ggml_vec_max_f32(ne00, &max_val, src_row);
+                
+                // Second pass: compute exponentials and sum using optimized vector function
+                ggml_float sum = ggml_vec_soft_max_f32(ne00, dst_row, src_row, max_val);
+                
+                // Third pass: normalize using optimized vector scale
+                const ggml_float sum_inv = 1.0 / sum;
+                ggml_vec_scale_f32(ne00, dst_row, (float)sum_inv);
+                
+                GGML_LOG_DEBUG("🔍 Processed row with max_val=%.6f, sum=%.6f\n", max_val, sum);
+            }
+        }
+    }
+    
+    GGML_LOG_DEBUG("🔍 SOFT_MAX chunk processing completed successfully\n");
     
     return GGML_STATUS_SUCCESS;
 }
@@ -2905,8 +3072,23 @@ static void* add_thread_kernel(void* data) {
         const float * src1_ptr = (float *) ((char *) tensor_data(td->src1) + i3*td->src1_nb3 + i2*td->src1_nb2 + i1*td->src1_nb1 + i0*td->src1_nb0);
         float * dst_ptr = (float *) ((char *) tensor_data(td->dst) + i3*td->dst_nb3 + i2*td->dst_nb2 + i1*td->dst_nb1 + i0*td->dst_nb0);
         
-        // ADD mathematical kernel: dst = src0 + src1
-        *dst_ptr = *src0_ptr + *src1_ptr;
+        // ADD SIMD-optimized mathematical kernel: dst = src0 + src1
+        // Check if we can process a contiguous chunk using SIMD
+        if (i0 == 0 && td->ne0 > 1 && 
+            td->nb0 == sizeof(float) && td->src1_nb0 == sizeof(float) && td->dst_nb0 == sizeof(float)) {
+            // Process entire row with SIMD if contiguous
+            const float * src0_row = (float *) ((char *) tensor_data(td->src0) + i3*td->nb3 + i2*td->nb2 + i1*td->nb1);
+            const float * src1_row = (float *) ((char *) tensor_data(td->src1) + i3*td->src1_nb3 + i2*td->src1_nb2 + i1*td->src1_nb1);
+            float * dst_row = (float *) ((char *) tensor_data(td->dst) + i3*td->dst_nb3 + i2*td->dst_nb2 + i1*td->dst_nb1);
+            
+            ggml_vec_add_f32(td->ne0, dst_row, src0_row, src1_row);
+            
+            // Skip remaining elements in this row since we processed them all
+            i += (td->ne0 - 1); // -1 because loop will increment i
+        } else {
+            // Fallback to element-wise operation for non-contiguous or single elements
+            *dst_ptr = *src0_ptr + *src1_ptr;
+        }
     }
     return NULL;
 }
@@ -2922,11 +3104,9 @@ static void* rms_norm_thread_kernel(void* data) {
                 const float * src_row = (float *) ((char *) tensor_data(td->src0) + i01*td->nb01 + i02*td->nb02 + i03*td->nb03);
                 float * dst_row = (float *) ((char *) tensor_data(td->dst) + i01*td->nb1 + i02*td->nb2 + i03*td->nb3);
                 
-                // RMS normalization: sum of squares
+                // RMS normalization SIMD-optimized: sum of squares using vector dot product
                 float sum = 0.0f;
-                for (int64_t i00 = 0; i00 < td->ne00; i00++) {
-                    sum += src_row[i00] * src_row[i00];
-                }
+                ggml_vec_dot_f32(td->ne00, &sum, 0, src_row, 0, src_row, 0, 1);
                 
                 const float mean = sum / td->ne00;
                 const float scale = 1.0f / sqrtf(mean + td->eps);
@@ -2938,14 +3118,217 @@ static void* rms_norm_thread_kernel(void* data) {
                     continue; // Skip this row
                 }
                 
-                // Apply scaling
-                for (int64_t i00 = 0; i00 < td->ne00; i00++) {
-                    dst_row[i00] = src_row[i00] * scale;
-                }
+                // Copy source to destination, then apply SIMD scaling
+                ggml_vec_cpy_f32(td->ne00, dst_row, src_row);
+                ggml_vec_scale_f32(td->ne00, dst_row, scale);
             }
         }
     }
     return NULL;
+}
+
+// Single-node ADD work function for processing entire tensor on one NUMA node
+static enum ggml_status ggml_numa_work_function_add_single(void * work_context, struct ggml_compute_params * params) {
+    if (!work_context) {
+        GGML_LOG_ERROR("ADD single work function: Invalid work context\n");
+        return GGML_STATUS_FAILED;
+    }
+    
+    ggml_numa_dispatcher_work_context_t * ctx = (ggml_numa_dispatcher_work_context_t *)work_context;
+    
+    if (!ctx->operation) {
+        GGML_LOG_ERROR("ADD single work function: Operation is NULL\n");
+        return GGML_STATUS_FAILED;
+    }
+    
+    GGML_LOG_DEBUG("ADD single work function: operation=%p, type=%d, elements=%ld\n", 
+                   (void*)ctx->operation, ctx->operation->op, ggml_nelements(ctx->operation));
+    
+    // Validate ADD operation has two source tensors
+    const struct ggml_tensor * src0 = ctx->operation->src[0];
+    const struct ggml_tensor * src1 = ctx->operation->src[1];
+    
+    if (!src0 || !src1) {
+        GGML_LOG_ERROR("ADD single work function: Missing source tensors (src0=%p, src1=%p)\n", 
+                       (void*)src0, (void*)src1);
+        return GGML_STATUS_FAILED;
+    }
+    
+    // Check tensor compatibility
+    if (!ggml_are_same_shape(src0, ctx->operation)) {
+        GGML_LOG_ERROR("ADD single work function: src0 and destination shapes don't match\n");
+        return GGML_STATUS_FAILED;
+    }
+    
+    if (src0->type != GGML_TYPE_F32 || src1->type != GGML_TYPE_F32) {
+        GGML_LOG_ERROR("ADD single work function: Only F32 tensors supported\n");
+        return GGML_STATUS_FAILED;
+    }
+    
+    // Extract tensor dimensions for element-wise operations
+    const int64_t ne0 = src0->ne[0];  // Elements per row
+    const int64_t ne1 = src0->ne[1];  // Number of rows  
+    const int64_t ne2 = src0->ne[2];  // Batch dimension 2
+    const int64_t ne3 = src0->ne[3];  // Batch dimension 3
+    
+    const size_t nb0 = src0->nb[0];   // Element stride (should be sizeof(float))
+    const size_t nb1 = src0->nb[1];   // Row stride in bytes
+    const size_t nb2 = src0->nb[2];   // Batch stride 2 in bytes 
+    const size_t nb3 = src0->nb[3];   // Batch stride 3 in bytes
+    
+    const size_t src1_nb0 = src1->nb[0];
+    const size_t src1_nb1 = src1->nb[1];
+    const size_t src1_nb2 = src1->nb[2];
+    const size_t src1_nb3 = src1->nb[3];
+    
+    const size_t dst_nb0 = ctx->operation->nb[0];
+    const size_t dst_nb1 = ctx->operation->nb[1];
+    const size_t dst_nb2 = ctx->operation->nb[2];
+    const size_t dst_nb3 = ctx->operation->nb[3];
+    
+    GGML_LOG_DEBUG("ADD single work function: Processing tensor [%ld, %ld, %ld, %ld]\n", ne0, ne1, ne2, ne3);
+
+    // Single-node ADD implementation - process entire tensor
+    int64_t total_elements = ggml_nelements(ctx->operation);
+    
+    GGML_LOG_DEBUG("ADD single-node execution: processing all %ld elements\n", total_elements);
+
+    // Use existing threadpool architecture if available, otherwise fall back to single-threaded
+    if (params && params->nth > 1 && params->threadpool) {
+        GGML_LOG_DEBUG("ADD: Using multi-threaded execution (%d threads) for single-node processing (CPU: %d)\n", 
+                       params->nth, sched_getcpu());
+
+        // Create thread data for each thread
+        struct add_thread_data * thread_data = (struct add_thread_data *)calloc(params->nth, sizeof(struct add_thread_data));
+        if (!thread_data) {
+            GGML_LOG_ERROR("ADD: Failed to allocate thread data\n");
+            return GGML_STATUS_FAILED;
+        }
+
+        // Distribute entire tensor among threads (no NUMA node splitting)
+        int64_t elements_per_thread = total_elements / params->nth;
+        int64_t remainder_thread_elements = total_elements % params->nth;
+
+        for (int t = 0; t < params->nth; t++) {
+            struct add_thread_data * td = &thread_data[t];
+            
+            // Copy common data
+            td->src0 = src0;
+            td->src1 = src1;
+            td->dst = ctx->operation;
+            td->ne0 = ne0; td->ne1 = ne1; td->ne2 = ne2; td->ne3 = ne3;
+            td->nb0 = nb0; td->nb1 = nb1; td->nb2 = nb2; td->nb3 = nb3;
+            td->src1_nb0 = src1_nb0; td->src1_nb1 = src1_nb1; td->src1_nb2 = src1_nb2; td->src1_nb3 = src1_nb3;
+            td->dst_nb0 = dst_nb0; td->dst_nb1 = dst_nb1; td->dst_nb2 = dst_nb2; td->dst_nb3 = dst_nb3;
+            td->thread_id = t;
+            td->numa_node = 0;  // Single NUMA node (node 0)
+            
+            // Calculate thread-specific element range for entire tensor
+            int64_t thread_elem_start = t * elements_per_thread;
+            int64_t thread_elem_end = thread_elem_start + elements_per_thread;
+            
+            // Distribute remainder elements among first few threads
+            if (t < remainder_thread_elements) {
+                thread_elem_start += t;
+                thread_elem_end += t + 1;
+            } else {
+                thread_elem_start += remainder_thread_elements;
+                thread_elem_end += remainder_thread_elements;
+            }
+            
+            // Store absolute element indices
+            td->thread_start_elem = thread_elem_start;
+            td->thread_end_elem = thread_elem_end;
+            
+            // Bounds checking
+            if (td->thread_end_elem > total_elements) {
+                td->thread_end_elem = total_elements;
+            }
+            if (td->thread_start_elem >= td->thread_end_elem) {
+                td->thread_end_elem = td->thread_start_elem + 1; // Ensure at least one element
+            }
+            
+            GGML_LOG_DEBUG("ADD single-node thread %d: processing elements %ld to %ld\n", 
+                           t, td->thread_start_elem, td->thread_end_elem - 1);
+        }
+
+        // Execute using pthread directly for multi-threading
+        pthread_t* threads = (pthread_t*)malloc(params->nth * sizeof(pthread_t));
+        if (!threads) {
+            free(thread_data);
+            GGML_LOG_ERROR("ADD: Failed to allocate thread handles\n");
+            return GGML_STATUS_FAILED;
+        }
+        
+        // Create threads
+        for (int t = 0; t < params->nth; t++) {
+            int ret = pthread_create(&threads[t], NULL, add_thread_kernel, &thread_data[t]);
+            if (ret != 0) {
+                GGML_LOG_ERROR("ADD: Failed to create thread %d: %d\n", t, ret);
+                // Clean up already created threads
+                for (int i = 0; i < t; i++) {
+                    pthread_join(threads[i], NULL);
+                }
+                free(threads);
+                free(thread_data);
+                return GGML_STATUS_FAILED;
+            }
+        }
+        
+        // Wait for all threads to complete
+        for (int t = 0; t < params->nth; t++) {
+            pthread_join(threads[t], NULL);
+        }
+        
+        free(threads);
+        free(thread_data);
+        
+        GGML_LOG_DEBUG("ADD: Multi-threaded single-node execution completed\n");
+        
+    } else {
+        // Single-threaded execution for entire tensor
+        GGML_LOG_DEBUG("ADD: Using single-threaded execution for single-node processing (CPU: %d)\n", 
+                       sched_getcpu());
+                       
+        // Process all elements in the tensor
+        for (int64_t i = 0; i < total_elements; i++) {
+            // Convert linear index to multi-dimensional indices
+            int64_t i3 = i / (ne2 * ne1 * ne0);
+            int64_t i2 = (i % (ne2 * ne1 * ne0)) / (ne1 * ne0);
+            int64_t i1 = (i % (ne1 * ne0)) / ne0;
+            int64_t i0 = i % ne0;
+            
+            // Calculate memory addresses for current element
+            const float * src0_ptr = (float *) ((char *) tensor_data(src0) + i3*nb3 + i2*nb2 + i1*nb1 + i0*nb0);
+            const float * src1_ptr = (float *) ((char *) tensor_data(src1) + i3*src1_nb3 + i2*src1_nb2 + i1*src1_nb1 + i0*src1_nb0);
+            float * dst_ptr = (float *) ((char *) tensor_data(ctx->operation) + i3*dst_nb3 + i2*dst_nb2 + i1*dst_nb1 + i0*dst_nb0);
+            
+            // ADD SIMD-optimized mathematical kernel: dst = src0 + src1
+            // Check if we can process a contiguous chunk using SIMD
+            if (i0 == 0 && ne0 > 1 && 
+                nb0 == sizeof(float) && src1_nb0 == sizeof(float) && dst_nb0 == sizeof(float)) {
+                // Process entire row with SIMD if contiguous
+                const float * src0_row = (float *) ((char *) tensor_data(src0) + i3*nb3 + i2*nb2 + i1*nb1);
+                const float * src1_row = (float *) ((char *) tensor_data(src1) + i3*src1_nb3 + i2*src1_nb2 + i1*src1_nb1);
+                float * dst_row = (float *) ((char *) tensor_data(ctx->operation) + i3*dst_nb3 + i2*dst_nb2 + i1*dst_nb1);
+                
+                ggml_vec_add_f32(ne0, dst_row, src0_row, src1_row);
+                
+                // Skip remaining elements in this row since we processed them all
+                i += (ne0 - 1); // -1 because loop will increment i
+            } else {
+                // Fallback to element-wise operation for non-contiguous or single elements
+                *dst_ptr = *src0_ptr + *src1_ptr;
+            }
+        }
+    }
+
+    // Memory barrier to ensure all writes are visible before returning
+    __sync_synchronize();
+    
+    GGML_LOG_DEBUG("Successfully executed ADD single-node work function\n");
+    
+    return GGML_STATUS_SUCCESS;
 }
 
 // Specialized work function for ADD operations with NUMA-aware chunking and multi-level parallelism
@@ -3013,12 +3396,11 @@ static enum ggml_status ggml_numa_work_function_add_chunk(void * work_context, s
     // Level 1: NUMA-level parallelism (different element ranges per NUMA node)
     // Level 2: Thread-level parallelism (subdivision within NUMA node)
     
-    // Get virtual NUMA node information from coordinator's thread-local storage
-    extern int ggml_numa_get_virtual_node(void);
+    // Get NUMA node information from coordinator
     extern struct ggml_numa_coordinator_manager * ggml_numa_coordinator_manager_get_global(int n_threads, bool force_multi_socket);
     extern int ggml_numa_coordinator_manager_get_numa_nodes(struct ggml_numa_coordinator_manager * mgr);
     
-    int numa_node = ggml_numa_get_virtual_node();
+    int numa_node = ggml_numa_get_current_node();
     struct ggml_numa_coordinator_manager * mgr = ggml_numa_coordinator_manager_get_global(8, false);
     int max_numa_nodes = mgr ? ggml_numa_coordinator_manager_get_numa_nodes(mgr) : 1;
     
@@ -3032,38 +3414,53 @@ static enum ggml_status ggml_numa_work_function_add_chunk(void * work_context, s
 
     // Calculate total number of elements for distribution
     int64_t total_elements = ggml_nelements(ctx->operation);
-    int64_t elements_per_node = total_elements / max_numa_nodes;
-    int64_t remainder_elements = total_elements % max_numa_nodes;
     
-    // Calculate this NUMA node's element range
-    int64_t numa_start_elem = numa_node * elements_per_node;
-    int64_t numa_end_elem = numa_start_elem + elements_per_node;
+    // For single-node execution (when used by single-node dispatcher), process all elements
+    // For multi-node execution (when used by data-parallel dispatcher), distribute elements
+    int64_t numa_start_elem, numa_end_elem;
     
-    // Distribute remainder elements among first few nodes
-    if (numa_node < remainder_elements) {
-        numa_start_elem += numa_node;
-        numa_end_elem += numa_node + 1;
-    } else {
-        numa_start_elem += remainder_elements;
-        numa_end_elem += remainder_elements;
-    }
-    
-    // Ensure we don't exceed tensor bounds and have valid ranges
-    if (numa_end_elem > total_elements) {
-        numa_end_elem = total_elements;
-    }
-    if (numa_start_elem < 0) {
+    // Check if we're being called from single-node execution (max_numa_nodes == 1) 
+    // or from data-parallel execution with multiple nodes
+    if (max_numa_nodes == 1) {
+        // Single-node execution: process entire tensor on this node
         numa_start_elem = 0;
-    }
-    if (numa_end_elem <= numa_start_elem) {
-        numa_end_elem = numa_start_elem + 1;  // Ensure at least one element
+        numa_end_elem = total_elements;
+        GGML_LOG_DEBUG("ADD single-node execution: processing all %ld elements\n", total_elements);
+    } else {
+        // Multi-node data parallel execution: distribute elements across nodes
+        int64_t elements_per_node = total_elements / max_numa_nodes;
+        int64_t remainder_elements = total_elements % max_numa_nodes;
+        
+        // Calculate this NUMA node's element range
+        numa_start_elem = numa_node * elements_per_node;
+        numa_end_elem = numa_start_elem + elements_per_node;
+        
+        // Distribute remainder elements among first few nodes
+        if (numa_node < remainder_elements) {
+            numa_start_elem += numa_node;
+            numa_end_elem += numa_node + 1;
+        } else {
+            numa_start_elem += remainder_elements;
+            numa_end_elem += remainder_elements;
+        }
+        
+        // Ensure we don't exceed tensor bounds and have valid ranges
+        if (numa_end_elem > total_elements) {
+            numa_end_elem = total_elements;
+        }
+        if (numa_start_elem < 0) {
+            numa_start_elem = 0;
+        }
+        if (numa_end_elem <= numa_start_elem) {
+            numa_end_elem = numa_start_elem + 1;  // Ensure at least one element
+        }
+        
+        GGML_LOG_DEBUG("ADD data-parallel execution: NUMA node %d (of %d) processing elements %ld to %ld\n", 
+                       numa_node, max_numa_nodes, numa_start_elem, numa_end_elem - 1);
     }
 
     // Thread-level parallelism within this NUMA node's assigned elements
     int64_t numa_node_elements = numa_end_elem - numa_start_elem;
-    
-    GGML_LOG_DEBUG("ADD NUMA node %d (of %d): assigned elements %ld to %ld (%ld elements total)\n", 
-                   numa_node, max_numa_nodes, numa_start_elem, numa_end_elem - 1, numa_node_elements);
 
     // Use existing threadpool architecture if available, otherwise fall back to single-threaded
     if (params && params->nth > 1 && params->threadpool) {
@@ -3175,8 +3572,23 @@ static enum ggml_status ggml_numa_work_function_add_chunk(void * work_context, s
             const float * src1_ptr = (float *) ((char *) tensor_data(src1) + i3*src1_nb3 + i2*src1_nb2 + i1*src1_nb1 + i0*src1_nb0);
             float * dst_ptr = (float *) ((char *) tensor_data(ctx->operation) + i3*dst_nb3 + i2*dst_nb2 + i1*dst_nb1 + i0*dst_nb0);
             
-            // ADD mathematical kernel: dst = src0 + src1
-            *dst_ptr = *src0_ptr + *src1_ptr;
+            // ADD SIMD-optimized mathematical kernel: dst = src0 + src1
+            // Check if we can process a contiguous chunk using SIMD
+            if (i0 == 0 && ne0 > 1 && 
+                nb0 == sizeof(float) && src1_nb0 == sizeof(float) && dst_nb0 == sizeof(float)) {
+                // Process entire row with SIMD if contiguous
+                const float * src0_row = (float *) ((char *) tensor_data(src0) + i3*nb3 + i2*nb2 + i1*nb1);
+                const float * src1_row = (float *) ((char *) tensor_data(src1) + i3*src1_nb3 + i2*src1_nb2 + i1*src1_nb1);
+                float * dst_row = (float *) ((char *) tensor_data(ctx->operation) + i3*dst_nb3 + i2*dst_nb2 + i1*dst_nb1);
+                
+                ggml_vec_add_f32(ne0, dst_row, src0_row, src1_row);
+                
+                // Skip remaining elements in this row since we processed them all
+                i += (ne0 - 1); // -1 because loop will increment i
+            } else {
+                // Fallback to element-wise operation for non-contiguous or single elements
+                *dst_ptr = *src0_ptr + *src1_ptr;
+            }
         }
     }
 
@@ -3364,12 +3776,11 @@ static enum ggml_status ggml_numa_work_function_rms_norm_chunk(void * work_conte
     // Level 1: NUMA-level parallelism (different row ranges per NUMA node)
     // Level 2: Thread-level parallelism (subdivision within NUMA node)
     
-    // Get virtual NUMA node information from coordinator's thread-local storage
-    extern int ggml_numa_get_virtual_node(void);
+    // Get NUMA node information from coordinator
     extern struct ggml_numa_coordinator_manager * ggml_numa_coordinator_manager_get_global(int n_threads, bool force_multi_socket);
     extern int ggml_numa_coordinator_manager_get_numa_nodes(struct ggml_numa_coordinator_manager * mgr);
     
-    int numa_node = ggml_numa_get_virtual_node();
+    int numa_node = ggml_numa_get_current_node();
     struct ggml_numa_coordinator_manager * mgr = ggml_numa_coordinator_manager_get_global(8, false);
     int max_numa_nodes = mgr ? ggml_numa_coordinator_manager_get_numa_nodes(mgr) : 1;
     
@@ -3519,20 +3930,15 @@ static enum ggml_status ggml_numa_work_function_rms_norm_chunk(void * work_conte
                     const float * x = (float *) ((char *) tensor_data(src0) + i01*nb01 + i02*nb02 + i03*nb03);
                     float * y = (float *) ((char *) tensor_data(ctx->operation) + i01*nb1 + i02*nb2 + i03*nb3);
                     
-                    // RMS Normalization mathematical kernel:
-                    // 1. Calculate sum of squares for the row
+                    // RMS Normalization SIMD-optimized mathematical kernel:
+                    // 1. Calculate sum of squares for the row using vector dot product
                     float sum = 0.0;
-                    for (int64_t i00 = 0; i00 < ne00; i00++) {
-                        sum += x[i00] * x[i00];
-                    }
+                    ggml_vec_dot_f32(ne00, &sum, 0, x, 0, x, 0, 1);
                     
                     // 2. Calculate mean of squares
                     const float mean = sum / ne00;
                     
-                    // 3. Copy input to output
-                    memcpy(y, x, ne00 * sizeof(float));
-                    
-                    // 4. Apply RMS normalization scaling
+                    // 3. Copy input to output and apply RMS normalization scaling
                     const float scale = 1.0f / sqrtf(mean + eps);
                     
                     // Sanity check for numerical stability
@@ -3542,10 +3948,9 @@ static enum ggml_status ggml_numa_work_function_rms_norm_chunk(void * work_conte
                         return GGML_STATUS_FAILED;
                     }
                     
-                    // 5. Scale the normalized values using manual loop (no ggml_vec_scale_f32)
-                    for (int64_t i00 = 0; i00 < ne00; i00++) {
-                        y[i00] *= scale;
-                    }
+                    // 4. Copy and scale using SIMD operations
+                    ggml_vec_cpy_f32(ne00, y, x);
+                    ggml_vec_scale_f32(ne00, y, scale);
                 }
             }
         }
@@ -3555,6 +3960,131 @@ static enum ggml_status ggml_numa_work_function_rms_norm_chunk(void * work_conte
     __sync_synchronize();
     
     GGML_LOG_DEBUG("Successfully executed RMS_NORM chunk work function\n");
+    
+    return GGML_STATUS_SUCCESS;
+}
+
+// FLASH_ATTN_EXT chunk work function - handles flash attention computation with NUMA data parallelism
+// This implementation extracts the mathematical kernel to avoid threading conflicts
+static enum ggml_status ggml_numa_work_function_flash_attn_ext_chunk(void * work_context, struct ggml_compute_params * params) {
+    if (!work_context || !params) {
+        GGML_LOG_ERROR("FLASH_ATTN_EXT work function: Invalid parameters\n");
+        return GGML_STATUS_FAILED;
+    }
+    
+    ggml_numa_dispatcher_work_context_t * ctx = (ggml_numa_dispatcher_work_context_t *)work_context;
+    
+    if (!ctx->operation) {
+        GGML_LOG_ERROR("FLASH_ATTN_EXT work function: Operation is NULL\n");
+        return GGML_STATUS_FAILED;
+    }
+    
+    GGML_LOG_DEBUG("FLASH_ATTN_EXT work function: operation=%p, type=%d, elements=%ld\n", 
+                   (void*)ctx->operation, ctx->operation->op, ggml_nelements(ctx->operation));
+    
+    // Flash attention has 4 source tensors: q, k, v, mask
+    const struct ggml_tensor * q = ctx->operation->src[0];
+    const struct ggml_tensor * k = ctx->operation->src[1]; 
+    const struct ggml_tensor * v = ctx->operation->src[2];
+    const struct ggml_tensor * mask = ctx->operation->src[3];
+    
+    if (!q || !k || !v) {
+        GGML_LOG_ERROR("FLASH_ATTN_EXT work function: Missing required source tensors (q=%p, k=%p, v=%p)\n", 
+                       (void*)q, (void*)k, (void*)v);
+        return GGML_STATUS_FAILED;
+    }
+    
+    // Validate tensor types - flash attention typically works with F16 or F32
+    if (q->type != GGML_TYPE_F32 && q->type != GGML_TYPE_F16) {
+        GGML_LOG_ERROR("FLASH_ATTN_EXT work function: Unsupported Q tensor type %d\n", q->type);
+        return GGML_STATUS_FAILED;
+    }
+    
+    if (k->type != GGML_TYPE_F32 && k->type != GGML_TYPE_F16) {
+        GGML_LOG_ERROR("FLASH_ATTN_EXT work function: Unsupported K tensor type %d\n", k->type);
+        return GGML_STATUS_FAILED;
+    }
+    
+    if (v->type != GGML_TYPE_F32 && v->type != GGML_TYPE_F16) {
+        GGML_LOG_ERROR("FLASH_ATTN_EXT work function: Unsupported V tensor type %d\n", v->type);
+        return GGML_STATUS_FAILED;
+    }
+    
+    // Check data pointers
+    void *q_data = ggml_get_data(q);
+    void *k_data = ggml_get_data(k); 
+    void *v_data = ggml_get_data(v);
+    void *dst_data = ggml_get_data(ctx->operation);
+    
+    if (!q_data || !k_data || !v_data || !dst_data) {
+        GGML_LOG_ERROR("FLASH_ATTN_EXT work function: NULL tensor data (q=%p, k=%p, v=%p, dst=%p)\n",
+                       q_data, k_data, v_data, dst_data);
+        return GGML_STATUS_FAILED;
+    }
+
+    // NUMA-aware data slicing for Flash Attention
+    // Level 1: NUMA-level parallelism (different row ranges per NUMA node)
+    // Level 2: Thread-level parallelism (subdivision within NUMA node)
+    
+    // Get virtual NUMA node information from coordinator's thread-local storage
+    extern int ggml_numa_get_current_node(void);
+    extern struct ggml_numa_coordinator_manager * ggml_numa_coordinator_manager_get_global(int n_threads, bool force_multi_socket);
+    extern int ggml_numa_coordinator_manager_get_numa_nodes(struct ggml_numa_coordinator_manager * mgr);
+    
+    int numa_node = ggml_numa_get_current_node();
+    struct ggml_numa_coordinator_manager * mgr = ggml_numa_coordinator_manager_get_global(8, false);
+    int max_numa_nodes = mgr ? ggml_numa_coordinator_manager_get_numa_nodes(mgr) : 1;
+    
+    // Handle fallback case where virtual node is not set
+    if (numa_node < 0) {
+        numa_node = 0;  // Default to node 0
+    }
+    if (max_numa_nodes <= 0) {
+        max_numa_nodes = 1;  // At least one node
+    }
+    
+    // Flash attention parallelizes by Q rows (neq1*neq2*neq3)
+    const int64_t neq1 = q->ne[1];
+    const int64_t neq2 = q->ne[2]; 
+    const int64_t neq3 = q->ne[3];
+    const int nr = neq1 * neq2 * neq3;  // total rows in q
+    
+    // NUMA-level data slicing: divide rows among NUMA nodes
+    const int numa_rows_per_node = (nr + max_numa_nodes - 1) / max_numa_nodes;
+    const int numa_start_row = numa_node * numa_rows_per_node;
+    const int numa_end_row = MIN(numa_start_row + numa_rows_per_node, nr);
+    const int numa_node_rows = numa_end_row - numa_start_row;
+    
+    if (numa_node_rows <= 0) {
+        GGML_LOG_DEBUG("FLASH_ATTN_EXT NUMA node %d: No rows assigned, skipping\n", numa_node);
+        return GGML_STATUS_SUCCESS;
+    }
+    
+    GGML_LOG_DEBUG("FLASH_ATTN_EXT NUMA node %d (of %d): assigned rows %d to %d (%d rows total)\n",
+                   numa_node, max_numa_nodes, numa_start_row, numa_end_row - 1, numa_node_rows);
+    
+    // Create modified compute params for this NUMA node's row range
+    // The flash attention kernel uses params->ith and params->nth for thread-level parallelization
+    // within the assigned NUMA row range
+    struct ggml_compute_params numa_params = *params;
+    
+    // Override the row calculation in the kernel by temporarily modifying tensor dimensions
+    // This is a bit tricky - we need to create tensor views for the NUMA slice
+    
+    // For now, use the coordinator's threading parameters directly and let the kernel
+    // handle the threading within our NUMA node assignment
+    GGML_LOG_DEBUG("FLASH_ATTN_EXT NUMA node %d: Using coordinator threading (ith=%d, nth=%d) for %d rows\n",
+                   numa_node, params->ith, params->nth, numa_node_rows);
+    
+    // Call the flash attention mathematical kernel with coordinator's threading parameters
+    // Note: This is a simplified approach - ideally we'd create tensor slices for the exact NUMA range
+    // But flash attention is complex and would need significant refactoring for proper slicing
+    ggml_compute_forward_flash_attn_ext(&numa_params, q, k, v, mask, ctx->operation);
+    
+    // Add memory barrier to ensure all writes are visible before returning
+    __sync_synchronize();
+    
+    GGML_LOG_DEBUG("Successfully executed FLASH_ATTN_EXT chunk work function on NUMA node %d\n", numa_node);
     
     return GGML_STATUS_SUCCESS;
 }

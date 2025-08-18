@@ -490,8 +490,8 @@ static enum ggml_status test_work_function_execution_tracking(void* context, str
     int numa_node = 0;  // Default fallback
     
     // First: Check if we have virtual NUMA node information (for simulated environments)
-    extern int ggml_numa_get_virtual_node(void);
-    int virtual_node = ggml_numa_get_virtual_node();
+    extern int ggml_numa_get_current_node(void);
+    int virtual_node = ggml_numa_get_current_node();
     if (virtual_node >= 0) {
         // Use virtual NUMA node from coordinator (works in simulated environments)
         numa_node = virtual_node;

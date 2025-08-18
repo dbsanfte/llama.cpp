@@ -25,7 +25,7 @@ private:
     
     // Test a single SOFT_MAX case with specific dimensions and thread count
     bool test_single_soft_max_case(int rows, int cols, int num_threads, const char* size_label) {
-        printf("    🧮 Testing %s: %dx%d tensor (rows=%d, cols=%d, threads=%d)\n", 
+        printf("    🧮 Testing %s: %dx%d tensor (rows=%d, cols=%d, threads=%d) [FORCE_MULTI_SOCKET]\n", 
                size_label, rows, cols, rows, cols, num_threads);
         
         // Create test context with sufficient memory for the tensor
@@ -311,11 +311,12 @@ private:
 };
 
 int main() {
-    // Initialize NUMA system
+    // Initialize NUMA system with FORCE MULTI-SOCKET for real data slicing testing
     printf("🔧 Initializing NUMA system for mathematical correctness testing...\n");
+    printf("🚨 CRITICAL: Using FORCE_MULTI_SOCKET mode to test real data slicing on single-NUMA hardware\n");
     
-    // Initialize the NUMA coordinator system
-    struct ggml_numa_coordinator_manager* manager = ggml_numa_coordinator_manager_get_global(8, false);
+    // Initialize the NUMA coordinator system with force_multi_socket=true for testing
+    struct ggml_numa_coordinator_manager* manager = ggml_numa_coordinator_manager_get_global(8, true);  // <- FORCE MULTI-SOCKET
     if (!manager) {
         fprintf(stderr, "❌ Failed to initialize NUMA coordinator manager\n");
         return 1;

@@ -1,8 +1,30 @@
 /**
- * NUMA Mathematical Correctness Test for ADD Operation
+ * NUMA Mathematical Correctness Test Template
  * 
- * This test validates mathematical equivalence between NUMA parallel ADD operations 
- * and serial reference implementations across various tensor dimensions and thread strategies.
+ * This template provides a comprehensive framework for testing mathematical equivalence
+ * between NUMA parallel operations and serial reference implementations.
+ * 
+ * USAGE INSTRUCTIONS:
+ * 1. Copy this template to create a new test file (e.g., test-numa-mathematical-correctness-OPERATION.cpp)
+ * 2. Replace TEMPLATE_OPERATION with your operation name (e.g., MUL_MAT, ADD, etc.)
+ * 3. Implement test_single_OPERATION_case() for your specific operation
+ * 4. Define appropriate test dimensions and thread strategies for your operation
+ * 5. Update the operation-specific logic in test_OPERATION_mathematical_equivalence()
+ * 6. Add your new test file to CMakeLists.txt in the tests directory
+ * 
+ * KEY DESIGN PRINCIPLES:
+ * - Multi-dimensional testing across various matrix/tensor sizes
+ * - Multiple thread strategies to test coordinator execution
+ * - Direct comparison between NUMA parallel and serial reference implementations
+ * - Comprehensive error reporting with detailed mismatch information
+ * - Modular design for easy extension to new operations
+ * 
+ * TEMPLATE STRUCTURE:
+ * - TestResult: Simple structure for tracking test outcomes
+ * - NumaMathematicalCorrectnessTestSuite: Main test class with helper methods
+ * - test_single_OPERATION_case(): Tests one specific case with given parameters
+ * - test_OPERATION_mathematical_equivalence(): Runs comprehensive multi-dimensional testing
+ * - run_all_tests(): Entry point that orchestrates all tests and provides summary
  */
 
 #include <cstdio>
@@ -18,6 +40,7 @@
 #include "ggml-cpu.h"
 #include "ggml-numa-operation-dispatch.h"
 #include "ggml-numa-coordinator.h"
+#include "ggml-cpu/binary-ops.h"
 
 // Test result structure
 struct TestResult {
@@ -26,316 +49,315 @@ struct TestResult {
     std::string failure_reason;
 };
 
-// Test case definition for ADD operation
-struct AddTestCase {
-    int64_t ne[4];      // Tensor dimensions [x, y, z, w]
-    int numa_threads;    // Number of threads to use
-    const char* description;
-};
-
-class NumaAddMathematicalCorrectnessTestSuite {
+class NumaMathematicalCorrectnessTestSuite {
 private:
-    // Test dimensions - covering a range from small to large tensors
-    static const AddTestCase test_cases[];
+    std::vector<TestResult> results;
     
-    static constexpr size_t num_test_cases = 19;  // Update this to match actual number of test cases
-    
-    // Comparison utility for floating point arrays
-    bool compare_float_arrays(const float* numa_result, const float* reference_result, 
-                             size_t num_elements, const char* test_name,
-                             double* max_abs_error = nullptr, double* max_rel_error = nullptr) {
+    // Utility function to compare float arrays with detailed error reporting
+    bool compare_float_arrays(const float* numa_data, const float* ref_data, int count, const char* operation_name) {
         bool all_match = true;
-        double max_absolute_error = 0.0;
-        double max_relative_error = 0.0;
-        size_t first_mismatch = SIZE_MAX;
+        int error_count = 0;
+        double max_abs_error = 0.0;
+        double max_rel_error = 0.0;
         
-        for (size_t i = 0; i < num_elements; i++) {
-            const float numa_val = numa_result[i];
-            const float ref_val = reference_result[i];
+        for (int i = 0; i < count; i++) {
+            double numa_val = numa_data[i];
+            double ref_val = ref_data[i];
+            double abs_error = fabs(numa_val - ref_val);
+            double rel_error = ref_val != 0.0 ? abs_error / fabs(ref_val) : 0.0;
             
-            // Calculate absolute and relative errors
-            const double abs_error = fabs((double)numa_val - (double)ref_val);
-            const double rel_error = (fabs((double)ref_val) > 1e-10) ? abs_error / fabs((double)ref_val) : abs_error;
+            max_abs_error = fmax(max_abs_error, abs_error);
+            max_rel_error = fmax(max_rel_error, rel_error);
             
-            max_absolute_error = std::max(max_absolute_error, abs_error);
-            max_relative_error = std::max(max_relative_error, rel_error);
-            
-            // Check for significant difference (considering floating point precision)
-            const double tolerance = 1e-5;  // Reasonable tolerance for float32
-            if (abs_error > tolerance && rel_error > tolerance) {
-                if (first_mismatch == SIZE_MAX) {
-                    first_mismatch = i;
-                    printf("❌ First mismatch in %s at index %zu: NUMA=%.10f, Reference=%.10f, abs_err=%.2e, rel_err=%.2e\n",
-                           test_name, i, numa_val, ref_val, abs_error, rel_error);
+            // Use strict tolerance for mathematical equivalence
+            if (abs_error > 1e-6 && rel_error > 1e-6) {
+                if (error_count < 5) { // Show first 5 errors for debugging
+                    printf("      ❌ %s Element[%d]: NUMA=%.8f, Reference=%.8f, AbsErr=%.2e, RelErr=%.2e\n",
+                           operation_name, i, numa_val, ref_val, abs_error, rel_error);
                 }
+                error_count++;
                 all_match = false;
             }
         }
         
-        if (max_abs_error) *max_abs_error = max_absolute_error;
-        if (max_rel_error) *max_rel_error = max_relative_error;
-        
-        if (all_match) {
-            printf("✅ %s: Perfect match (max_abs_err=%.2e, max_rel_err=%.2e)\n", 
-                   test_name, max_absolute_error, max_relative_error);
-        } else {
-            printf("❌ %s: Mismatch detected (max_abs_err=%.2e, max_rel_err=%.2e, first_mismatch=%zu)\n",
-                   test_name, max_absolute_error, max_relative_error, first_mismatch);
+        if (!all_match) {
+            printf("    Total errors: %d/%d, MaxAbsErr=%.2e, MaxRelErr=%.2e\n", 
+                   error_count, count, max_abs_error, max_rel_error);
         }
         
         return all_match;
     }
     
-    // Generate deterministic test data for ADD operation
-    void generate_test_data(float* data, size_t num_elements, int seed_offset = 0) {
-        for (size_t i = 0; i < num_elements; i++) {
-            // Generate deterministic but varied data using a simple PRNG
-            uint32_t x = (uint32_t)(i + seed_offset);
-            x ^= x << 13;
-            x ^= x >> 17;
-            x ^= x << 5;
-            
-            // Convert to float in range [-2.0, 2.0] for reasonable ADD operation results
-            data[i] = ((float)(x % 10000) / 10000.0f) * 4.0f - 2.0f;
+    // Test a single ADD case with specific dimensions and thread count
+    bool test_single_ADD_case(int dim1, int dim2, int dim3, int num_threads, const char* size_label) {
+        printf("    🧮 Testing %s: ADD with dimensions [%d,%d,%d] (threads=%d)\n", 
+               size_label, dim1, dim2, dim3, num_threads);
+        
+        // Create test context with sufficient memory for larger tensors
+        struct ggml_init_params params = {0};
+        params.mem_size = std::max((size_t)(512 * 1024 * 1024), (size_t)(dim1 * dim2 * dim3) * sizeof(float) * 8); // Scale memory with tensor size
+        params.mem_buffer = nullptr;
+        params.no_alloc = false;
+        
+        struct ggml_context* test_ctx = ggml_init(params);
+        if (!test_ctx) {
+            printf("      ❌ Failed to create test context for %s\n", size_label);
+            return false;
         }
+        
+        bool case_passed = false;
+        
+        // Create input tensors for ADD operation (binary operation: A + B = C)
+        struct ggml_tensor* input_a = ggml_new_tensor_3d(test_ctx, GGML_TYPE_F32, dim1, dim2, dim3);
+        struct ggml_tensor* input_b = ggml_new_tensor_3d(test_ctx, GGML_TYPE_F32, dim1, dim2, dim3);
+        
+        if (!input_a || !input_b) {
+            printf("      ❌ Failed to create input tensors for %s\n", size_label);
+            ggml_free(test_ctx);
+            return false;
+        }
+        
+        // Fill tensors with deterministic test data
+        float* a_data = (float*)ggml_get_data(input_a);
+        float* b_data = (float*)ggml_get_data(input_b);
+        int total_elements = ggml_nelements(input_a);
+        
+        for (int i = 0; i < total_elements; i++) {
+            a_data[i] = 0.1f + (i % 37) * 0.01f; // Deterministic test pattern
+            b_data[i] = 0.05f + (i % 23) * 0.015f; // Different pattern for B
+        }
+        
+        // Create ADD operation
+        struct ggml_tensor* numa_result = ggml_add(test_ctx, input_a, input_b);
+        
+        if (!numa_result) {
+            printf("      ❌ Failed to create ADD operation for %s\n", size_label);
+            ggml_free(test_ctx);
+            return false;
+        }
+        
+        // Execute via NUMA intercept
+        struct ggml_compute_params numa_params = {0, num_threads, 0, nullptr};
+        enum ggml_status dispatch_result = ggml_numa_intercept_operation(numa_result, &numa_params);
+        
+        if (dispatch_result != GGML_STATUS_SUCCESS) {
+            printf("      ❌ NUMA dispatch failed for %s: %d\n", size_label, dispatch_result);
+            ggml_free(test_ctx);
+            return false;
+        }
+        
+        // Create reference computation using serial execution
+        struct ggml_tensor* ref_result = ggml_add(test_ctx, input_a, input_b);
+        struct ggml_compute_params ref_params = {0, 1, 0, nullptr}; // Single thread
+        ggml_compute_forward_add_non_quantized(&ref_params, ref_result);
+        
+        // Compare results
+        float* numa_data = (float*)ggml_get_data(numa_result);
+        float* ref_data = (float*)ggml_get_data(ref_result);
+        case_passed = compare_float_arrays(numa_data, ref_data, total_elements, "ADD");
+        
+        if (case_passed) {
+            printf("      ✅ %s ADD case passed (threads=%d)\n", size_label, num_threads);
+        } else {
+            printf("      ❌ %s ADD case failed (threads=%d)\n", size_label, num_threads);
+        }
+        
+        ggml_free(test_ctx);
+        return case_passed;
+    }
+
+    void test_ADD_mathematical_equivalence() {
+        printf("--- Test: ADD Mathematical Equivalence (Multi-Dimensional) ---\n");
+        printf("Testing NUMA parallel ADD vs serial reference implementation...\n");
+        printf("Testing across various tensor sizes with different coordinator execution strategies\n\n");
+        
+        bool overall_test_passed = true;
+        const char* failure_reason = nullptr;
+        
+        // Define test dimensions appropriate for ADD operation (element-wise binary operation)
+        struct {
+            int dim1, dim2, dim3;
+            const char* label;
+        } test_cases[] = {
+            {8, 8, 4, "TINY"},           // Small tensors for basic verification
+            {32, 32, 16, "SMALL"},       // Medium tensors
+            {128, 64, 32, "MEDIUM"},     // Larger tensors
+            {256, 128, 64, "LARGE"}      // Large tensors for stress testing
+        };
+        
+        // Define coordinator execution strategies (various thread counts)
+        int thread_strategies[] = {1, 2, 4, 6, 8};
+        int num_strategies = sizeof(thread_strategies) / sizeof(thread_strategies[0]);
+        int num_test_cases = sizeof(test_cases) / sizeof(test_cases[0]);
+        
+        printf("  🎯 Testing %d tensor dimensions with %d thread strategies (%d total test combinations)\n\n", 
+               num_test_cases, num_strategies, num_test_cases * num_strategies);
+        
+        int total_tests = 0;
+        int passed_tests = 0;
+        
+        // Test each tensor dimension with each thread strategy
+        for (int case_idx = 0; case_idx < num_test_cases; case_idx++) {
+            printf("  📏 Testing %s tensors (%dx%dx%d):\n", 
+                   test_cases[case_idx].label, 
+                   test_cases[case_idx].dim1, 
+                   test_cases[case_idx].dim2, 
+                   test_cases[case_idx].dim3);
+            
+            for (int strategy_idx = 0; strategy_idx < num_strategies; strategy_idx++) {
+                int num_threads = thread_strategies[strategy_idx];
+                
+                bool case_passed = test_single_ADD_case(
+                    test_cases[case_idx].dim1, 
+                    test_cases[case_idx].dim2, 
+                    test_cases[case_idx].dim3, 
+                    num_threads,
+                    test_cases[case_idx].label
+                );
+                
+                total_tests++;
+                if (case_passed) {
+                    passed_tests++;
+                } else {
+                    overall_test_passed = false;
+                    if (!failure_reason) {
+                        failure_reason = "Mathematical mismatch detected in multi-dimensional testing";
+                    }
+                }
+            }
+            printf("\n");
+        }
+        
+        // Print summary for this test
+        printf("  📊 ADD Multi-Dimensional Test Summary:\n");
+        printf("    Total test combinations: %d\n", total_tests);
+        printf("    Passed: %d\n", passed_tests);
+        printf("    Failed: %d\n", total_tests - passed_tests);
+        
+        if (overall_test_passed) {
+            printf("✅ ADD mathematical equivalence (multi-dimensional): VERIFIED\n");
+            printf("  🎉 All tensor dimensions and thread strategies produce mathematically equivalent results!\n\n");
+        } else {
+            printf("❌ ADD mathematical equivalence (multi-dimensional): FAILED - %s\n", failure_reason);
+            printf("  ⚠️  Mathematical mismatches detected across different dimensions or thread strategies\n\n");
+        }
+        
+        results.push_back({"ADD_mathematical_equivalence", overall_test_passed, failure_reason ? failure_reason : ""});
     }
 
 public:
-    // Test a single ADD case with specified dimensions and thread count
-    TestResult test_single_add_case(const AddTestCase& test_case) {
-        TestResult result;
-        result.test_name = test_case.description;
-        result.passed = false;
+    bool run_all_tests() {
+        printf("🧪 NUMA Mathematical Correctness Test Suite - ADD\n");
+        printf("================================================================================\n");
+        printf("🔧 Testing mathematical correctness with function pointer architecture\n");
+        printf("Comparing NUMA parallel execution against serial reference implementation\n");
+        printf("================================================================================\n\n");
         
-        try {
-            printf("\n🧪 Testing ADD: %s\n", test_case.description);
-            
-            // Calculate tensor properties
-            const int64_t ne0 = test_case.ne[0];
-            const int64_t ne1 = test_case.ne[1]; 
-            const int64_t ne2 = test_case.ne[2];
-            const int64_t ne3 = test_case.ne[3];
-            const size_t num_elements = ne0 * ne1 * ne2 * ne3;
-            
-            printf("   Dimensions: [%ld, %ld, %ld, %ld] = %zu elements\n", ne0, ne1, ne2, ne3, num_elements);
-            printf("   Threads: %d\n", test_case.numa_threads);
-            
-            // Initialize GGML context for tensor operations
-            struct ggml_init_params init_params;
-            init_params.mem_size = 256 * 1024 * 1024;  // 256MB should be enough for our tests
-            init_params.mem_buffer = nullptr;
-            init_params.no_alloc = false;
-            
-            struct ggml_context* ctx = ggml_init(init_params);
-            if (!ctx) {
-                result.failure_reason = "Failed to initialize GGML context";
-                return result;
+        // Run mathematical correctness tests
+        test_ADD_mathematical_equivalence();
+        
+        print_summary();
+        
+        // Check if any tests failed
+        bool all_passed = true;
+        for (const auto& result : results) {
+            if (!result.passed) {
+                all_passed = false;
+                break;
             }
-            
-            // Create input tensors for ADD operation
-            struct ggml_tensor* src0 = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, ne0, ne1, ne2, ne3);
-            struct ggml_tensor* src1 = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, ne0, ne1, ne2, ne3);
-            struct ggml_tensor* dst_numa = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, ne0, ne1, ne2, ne3);
-            struct ggml_tensor* dst_reference = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, ne0, ne1, ne2, ne3);
-            
-            if (!src0 || !src1 || !dst_numa || !dst_reference) {
-                ggml_free(ctx);
-                result.failure_reason = "Failed to create tensors";
-                return result;
-            }
-            
-            // Generate deterministic test data
-            generate_test_data((float*)ggml_get_data(src0), num_elements, 1000);
-            generate_test_data((float*)ggml_get_data(src1), num_elements, 2000);
-            
-            // Initialize destination tensors to zero
-            memset(ggml_get_data(dst_numa), 0, ggml_nbytes(dst_numa));
-            memset(ggml_get_data(dst_reference), 0, ggml_nbytes(dst_reference));
-            
-            // Create ADD operations for both NUMA and reference execution
-            struct ggml_tensor* add_numa = ggml_add(ctx, src0, src1);
-            struct ggml_tensor* add_reference = ggml_add(ctx, src0, src1);
-            
-            // Set destination tensors (copy data pointers)
-            memcpy(ggml_get_data(add_numa), ggml_get_data(dst_numa), ggml_nbytes(dst_numa));
-            memcpy(ggml_get_data(add_reference), ggml_get_data(dst_reference), ggml_nbytes(dst_reference));
-            
-            printf("   🔧 Executing NUMA ADD operation...\n");
-            
-            // Execute NUMA ADD operation via dispatcher
-            struct ggml_compute_params numa_params;
-            numa_params.ith = 0;
-            numa_params.nth = test_case.numa_threads;
-            numa_params.wsize = 0;
-            numa_params.wdata = nullptr;
-            numa_params.threadpool = nullptr;
-            
-            enum ggml_status numa_status = ggml_numa_intercept_operation(add_numa, &numa_params);
-            if (numa_status != GGML_STATUS_SUCCESS) {
-                ggml_free(ctx);
-                result.failure_reason = "NUMA ADD operation failed";
-                return result;
-            }
-            
-            printf("   📊 Executing reference ADD operation...\n");
-            
-            // Execute reference ADD operation (serial implementation)
-            struct ggml_compute_params reference_params;
-            reference_params.ith = 0;
-            reference_params.nth = 1;  // Single-threaded reference
-            reference_params.wsize = 0;
-            reference_params.wdata = nullptr;
-            reference_params.threadpool = nullptr;
-            
-            // Manually compute ADD for reference (since ggml_compute_forward_add is internal)
-            const float* src0_data = (const float*)ggml_get_data(src0);
-            const float* src1_data = (const float*)ggml_get_data(src1);
-            float* ref_data = (float*)ggml_get_data(add_reference);
-            
-            for (size_t i = 0; i < num_elements; i++) {
-                ref_data[i] = src0_data[i] + src1_data[i];
-            }
-            
-            printf("   🔍 Comparing results...\n");
-            
-            // Compare NUMA and reference results
-            double max_abs_error, max_rel_error;
-            bool mathematical_correctness = compare_float_arrays(
-                (const float*)ggml_get_data(add_numa),
-                (const float*)ggml_get_data(add_reference),
-                num_elements,
-                test_case.description,
-                &max_abs_error,
-                &max_rel_error
-            );
-            
-            // Print first few values for debugging
-            const float* numa_data = (const float*)ggml_get_data(add_numa);
-            const float* ref_data_debug = (const float*)ggml_get_data(add_reference);
-            
-            printf("   📋 Sample values:\n");
-            for (int i = 0; i < std::min(5, (int)num_elements); i++) {
-                printf("      [%d]: src0=%.6f, src1=%.6f -> numa=%.6f, ref=%.6f\n",
-                       i, src0_data[i], src1_data[i], numa_data[i], ref_data_debug[i]);
-            }
-            
-            ggml_free(ctx);
-            
-            if (mathematical_correctness) {
-                printf("   ✅ %s: Mathematical correctness verified\n", test_case.description);
-                result.passed = true;
-            } else {
-                result.failure_reason = "Mathematical results do not match between NUMA and reference implementations";
-                printf("   ❌ %s: Mathematical correctness FAILED\n", test_case.description);
-            }
-            
-        } catch (const std::exception& e) {
-            result.failure_reason = std::string("Exception: ") + e.what();
-            printf("   💥 %s: Exception occurred: %s\n", test_case.description, e.what());
         }
         
-        return result;
+        return all_passed;
     }
-    
-    // Test ADD mathematical equivalence across multiple dimensions and thread strategies
-    std::vector<TestResult> test_add_mathematical_equivalence() {
-        printf("\n🚀 NUMA ADD Mathematical Correctness Test Suite\n");
-        printf("================================================\n");
-        printf("Testing %zu different ADD scenarios across various dimensions and thread strategies\n\n", num_test_cases);
-        
-        std::vector<TestResult> results;
-        results.reserve(num_test_cases);
-        
-        for (size_t i = 0; i < num_test_cases; i++) {
-            TestResult test_result = test_single_add_case(test_cases[i]);
-            results.push_back(test_result);
-        }
-        
-        return results;
-    }
-    
-    // Run all ADD tests and provide comprehensive summary
-    int run_all_tests() {
-        printf("🔬 NUMA ADD Mathematical Correctness Test Suite\n");
-        printf("===============================================\n\n");
-        
-        std::vector<TestResult> all_results = test_add_mathematical_equivalence();
-        
-        // Generate summary report
-        printf("\n📊 COMPREHENSIVE TEST SUMMARY\n");
-        printf("=============================\n");
+
+private:
+    void print_summary() {
+        printf("\n================================================================================\n");
+        printf("                    Mathematical Correctness Test Results\n");
+        printf("================================================================================\n");
         
         int passed_count = 0;
-        int failed_count = 0;
-        
-        for (const auto& result : all_results) {
-            if (result.passed) {
-                passed_count++;
-                printf("✅ %s\n", result.test_name.c_str());
-            } else {
-                failed_count++;
-                printf("❌ %s: %s\n", result.test_name.c_str(), result.failure_reason.c_str());
+        for (const auto& result : results) {
+            const char* status = result.passed ? "✅" : "❌";
+            printf("%s %s: %s", status, result.test_name.c_str(), 
+                   result.passed ? "PASSED" : "FAILED");
+            
+            if (!result.passed && !result.failure_reason.empty()) {
+                printf(" - %s", result.failure_reason.c_str());
             }
+            printf("\n");
+            
+            if (result.passed) passed_count++;
         }
         
-        printf("\n📈 FINAL RESULTS:\n");
-        printf("  Total tests: %d\n", (int)all_results.size());
-        printf("  Passed: %d\n", passed_count);
-        printf("  Failed: %d\n", failed_count);
-        printf("  Success rate: %.1f%%\n", (100.0 * passed_count) / all_results.size());
+        printf("------------------------------------------------------------------------\n");
+        printf("Total: %d/%zu tests passed", passed_count, results.size());
         
-        if (failed_count == 0) {
-            printf("\n🎉 ALL TESTS PASSED! NUMA ADD implementation is mathematically correct.\n");
-            return 0;
+        if (passed_count == (int)results.size()) {
+            printf(" 🎉 All tests passed!\n");
         } else {
-            printf("\n💥 %d tests failed. NUMA ADD implementation has mathematical correctness issues.\n", failed_count);
-            return 1;
+            printf(" 💥 Some tests failed.\n");
         }
+        
+        printf("================================================================================\n");
+        
+        if (passed_count != (int)results.size()) {
+            printf("❌ NUMA Mathematical Correctness: FAILURES DETECTED\n\n");
+            printf("⚠️  Mathematical mismatch between NUMA parallel and serial execution detected\n");
+        } else {
+            printf("✅ NUMA Mathematical Correctness: ALL TESTS PASSED\n\n");
+            printf("🎯 NUMA parallel execution produces mathematically equivalent results\n");
+        }
+        
+        printf("🧪 Mathematical correctness testing completed!\n\n");
     }
 };
 
-// Define test cases array
-const AddTestCase 
-NumaAddMathematicalCorrectnessTestSuite::test_cases[] = {
-    // Small tensors (TINY)
-    {{32, 32, 1, 1}, 1, "TINY 32x32 single-threaded"},
-    {{32, 32, 1, 1}, 2, "TINY 32x32 dual-threaded"},
-    {{64, 64, 1, 1}, 4, "TINY 64x64 quad-threaded"},
-    
-    // Medium tensors (SMALL)
-    {{256, 256, 1, 1}, 1, "SMALL 256x256 single-threaded"},
-    {{256, 256, 1, 1}, 2, "SMALL 256x256 dual-threaded"},
-    {{256, 256, 1, 1}, 4, "SMALL 256x256 quad-threaded"},
-    
-    // Large tensors (MEDIUM)
-    {{1024, 1024, 1, 1}, 2, "MEDIUM 1024x1024 dual-threaded"},
-    {{1024, 1024, 1, 1}, 4, "MEDIUM 1024x1024 quad-threaded"},
-    {{1024, 1024, 1, 1}, 6, "MEDIUM 1024x1024 six-threaded"},
-    {{1024, 1024, 1, 1}, 8, "MEDIUM 1024x1024 eight-threaded"},
-    
-    // Very large tensors (LARGE)
-    {{2048, 2048, 1, 1}, 4, "LARGE 2048x2048 quad-threaded"},
-    {{2048, 2048, 1, 1}, 8, "LARGE 2048x2048 eight-threaded"},
-    
-    // Multi-dimensional tensors
-    {{128, 128, 4, 1}, 4, "3D 128x128x4 quad-threaded"},
-    {{64, 64, 8, 2}, 8, "4D 64x64x8x2 eight-threaded"},
-    
-    // Vector-like tensors (high aspect ratio)
-    {{4096, 1, 1, 1}, 2, "Vector 4096x1 dual-threaded"},
-    {{1, 4096, 1, 1}, 4, "Vector 1x4096 quad-threaded"},
-    
-    // Broadcasting scenarios
-    {{512, 512, 1, 1}, 4, "Broadcasting 512x512 quad-threaded"},
-    {{256, 1, 1, 1}, 2, "Broadcasting 256x1 dual-threaded"},
-    {{1, 256, 1, 1}, 2, "Broadcasting 1x256 dual-threaded"}
-};
-
-// Main test entry point
+// Main function - entry point for the test
 int main() {
-    printf("🧮 NUMA ADD Mathematical Correctness Test\n");
-    printf("=========================================\n\n");
+    printf("🌟 Initializing NUMA system for mathematical correctness testing...\n");
     
-    NumaAddMathematicalCorrectnessTestSuite test_suite;
-    return test_suite.run_all_tests();
+    // Initialize the NUMA coordinator system
+    struct ggml_numa_coordinator_manager* mgr = ggml_numa_coordinator_manager_get_global(8, true); // true = force_multi_socket
+    if (!mgr) {
+        printf("❌ Failed to initialize NUMA coordinator manager\n");
+        return 1;
+    }
+    
+    printf("✅ NUMA system initialized successfully\n\n");
+    
+    NumaMathematicalCorrectnessTestSuite test_suite;
+    bool all_passed = test_suite.run_all_tests();
+    
+    return all_passed ? 0 : 1;
 }
+
+/**
+ * IMPLEMENTATION CHECKLIST:
+ * 
+ * When adapting this template for a new operation:
+ * 
+ * 1. ✅ Replace all instances of "TEMPLATE_OPERATION" with your operation name
+ * 2. ✅ Update test dimensions in test_cases[] array to match your operation's needs
+ * 3. ✅ Implement test_single_OPERATION_case() with:
+ *    - Appropriate tensor creation for your operation
+ *    - Deterministic test data generation
+ *    - NUMA operation execution via ggml_numa_intercept_operation
+ *    - Reference implementation (serial computation or mathematical kernel)
+ *    - Result comparison using compare_float_arrays()
+ * 4. ✅ Update CMakeLists.txt to include your new test file
+ * 5. ✅ Test your implementation with: ./tests/run-numa-tests.sh
+ * 6. ✅ Verify all test combinations pass before considering complete
+ * 
+ * REFERENCE IMPLEMENTATIONS:
+ * - See test-numa-mathematical-correctness.cpp for working MUL_MAT example
+ * - Mathematical kernels available in ggml/src/ggml-cpu/ggml-cpu-impl.h
+ * - Operation dispatch examples in ggml/src/ggml-cpu/ggml-numa-operation-dispatch.c
+ * 
+ * TESTING PRINCIPLES:
+ * - Each operation should be tested across multiple dimensions
+ * - Multiple thread strategies should be tested to verify coordinator behavior
+ * - Mathematical equivalence should be exact (within floating-point tolerance)
+ * - Tests should be deterministic and reproducible
+ * - Comprehensive error reporting should help debug any failures
+ */

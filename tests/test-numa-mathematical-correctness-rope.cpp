@@ -96,7 +96,7 @@ public:
     bool test_single_rope_case(int seq_len, int n_embd, int batch_size, int n_dims, 
                               int num_threads, const char* size_label) {
         
-        printf("    🧮 Testing %s: ROPE with dimensions [%d seq_len, %d n_embd, %d batch_size] (threads=%d)\n", 
+        printf("    🧮 Testing %s: ROPE with dimensions [%d seq_len, %d n_embd, %d batch_size] (threads=%d) [FORCE_MULTI_SOCKET]\n", 
                size_label, seq_len, n_embd, batch_size, num_threads);
         
         try {
@@ -410,7 +410,23 @@ int main() {
     printf("🧮 NUMA ROPE Mathematical Correctness Test\n");
     printf("==========================================\n\n");
     
-    // Run mathematical correctness tests (NUMA system will auto-initialize)
+    // Initialize NUMA system with FORCE MULTI-SOCKET for real data slicing testing
+    printf("🔧 Initializing NUMA system for mathematical correctness testing...\n");
+    printf("🚨 CRITICAL: Using FORCE_MULTI_SOCKET mode to test real data slicing on single-NUMA hardware\n");
+    
+    // Initialize the NUMA coordinator system with force_multi_socket=true for testing
+    struct ggml_numa_coordinator_manager* manager = ggml_numa_coordinator_manager_get_global(8, true);  // <- FORCE MULTI-SOCKET
+    if (!manager) {
+        fprintf(stderr, "❌ Failed to initialize NUMA coordinator manager\n");
+        return 1;
+    }
+    
+    // Initialize the dispatcher system
+    ggml_numa_dispatch_init();
+    
+    printf("✅ NUMA system initialized successfully\n\n");
+    
+    // Run mathematical correctness tests
     NumaMathematicalCorrectnessTestSuite test_suite;
     bool all_tests_passed = test_suite.run_all_tests();
     

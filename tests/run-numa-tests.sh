@@ -4,6 +4,33 @@
 # Runs all NUMA-related tests sequentially and reports results
 # Exits with error code if any test fails
 
+# Parse command line arguments
+VERBOSE_MODE=false
+for arg in "$@"; do
+    case $arg in
+        --verbose)
+            VERBOSE_MODE=true
+            shift
+            ;;
+        --help|-h)
+            echo "Usage: $0 [--verbose] [--help]"
+            echo ""
+            echo "Options:"
+            echo "  --verbose    Show full test output (default: summary only)"
+            echo "  --help, -h   Show this help message"
+            echo ""
+            echo "By default, tests run in summary-only mode for cleaner output."
+            echo "Use --verbose to see full test execution details."
+            exit 0
+            ;;
+        *)
+            echo "Unknown option: $arg"
+            echo "Use --help for usage information."
+            exit 1
+            ;;
+    esac
+done
+
 # Don't use set -e as we need to capture test exit codes manually
 
 # Colors for output
@@ -30,6 +57,10 @@ NUMA_TESTS=(
     "test-numa-mathematical-correctness-add"
     "test-numa-mathematical-correctness-glu-proper"
     "test-numa-mathematical-correctness-rms-norm"
+    "test-numa-mathematical-correctness-flash-attn-ext"
+    "test-numa-mathematical-correctness-matmul"
+    "test-numa-tensor-corruption-detection"
+    "test-numa-reference-correctness"
 )
 
 # Statistics
@@ -43,6 +74,11 @@ echo "========================================"
 echo "Project: llama.cpp NUMA improvements"
 echo "Build directory: $BUILD_DIR"
 echo "Total tests: $TOTAL_TESTS"
+if [ "$VERBOSE_MODE" = true ]; then
+    echo "Output mode: Full verbose output"
+else
+    echo "Output mode: Summary only (use --verbose for full output)"
+fi
 echo ""
 
 # Check if build directory exists
@@ -103,9 +139,20 @@ run_test() {
     # Record start time
     local start_time=$(date +%s.%N)
     
+    # Determine test arguments based on verbosity mode
+    local test_args=""
+    if [ "$VERBOSE_MODE" = false ]; then
+        test_args="--summary-only"
+    fi
+    
     # Run the test with timeout (5 minutes max per test)
     local exit_code=0
-    timeout 300 "$test_binary"
+    if [ -n "$test_args" ]; then
+        # In summary-only mode, suppress both stdout and stderr from NUMA debug logs
+        timeout 300 "$test_binary" $test_args 2>/dev/null
+    else
+        timeout 300 "$test_binary"
+    fi
     exit_code=$?
     
     # Record end time
@@ -194,6 +241,187 @@ check_requirements() {
     echo ""
 }
 
+# Function to run integration test with llama-server
+run_integration_test() {
+    echo "========================================"
+    echo -e "${BLUE}🧪 NUMA Integration Test with llama-server${NC}"
+    echo "========================================"
+    
+    local model_path="./.devcontainer/qwen2.5-0.5b-instruct-q8_0.gguf"
+    local server_port=8080
+    local test_prompt="Hello!"
+    local expected_response_pattern="Hello"
+    local server_pid=""
+    
+    # Check if model exists, download if needed
+    if [ ! -f "$model_path" ]; then
+        echo "📥 Downloading test model..."
+        wget -c -O "$model_path" https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF/resolve/main/qwen2.5-0.5b-instruct-q8_0.gguf
+        if [ $? -ne 0 ]; then
+            echo -e "${RED}❌ Failed to download test model${NC}"
+            return 1
+        fi
+    fi
+    
+    echo "    🚀 Starting llama-server with NUMA mirror mode..."
+    
+    # Start llama-server in background with NUMA mirror mode
+    "$BIN_DIR/llama-server" -m "$model_path" --host 0.0.0.0 --numa mirror-force --port $server_port > /tmp/llama-server.log 2>&1 &
+    server_pid=$!
+    
+    # Function to cleanup server
+    cleanup_server() {
+        if [ -n "$server_pid" ] && kill -0 "$server_pid" 2>/dev/null; then
+            echo "🛑 Stopping llama-server (PID: $server_pid)..."
+            kill "$server_pid" 2>/dev/null
+            sleep 2
+            # Force kill if still running
+            if kill -0 "$server_pid" 2>/dev/null; then
+                kill -9 "$server_pid" 2>/dev/null
+            fi
+        fi
+        # Also kill any other llama-server processes
+        pkill -f "llama-server.*numa.*mirror" 2>/dev/null || true
+    }
+    
+    # Set up cleanup trap
+    trap cleanup_server EXIT
+    
+    echo "⏳ Waiting for server to start..."
+    local max_attempts=60  # Increased timeout for model loading
+    local attempt=0
+    
+    # Wait for server to become available
+    while [ $attempt -lt $max_attempts ]; do
+        # Check if server process is still alive
+        if ! kill -0 "$server_pid" 2>/dev/null; then
+            echo -e "\n${RED}❌ Server process died during startup (PID: $server_pid)${NC}"
+            echo "Server log:"
+            cat /tmp/llama-server.log 2>/dev/null || echo "No log file found"
+            return 1
+        fi
+        
+        if curl --silent --fail-with-body --show-error http://localhost:$server_port/ >/dev/null 2>&1; then
+            echo "✅ Server is ready!"
+            break
+        fi
+        sleep 1
+        attempt=$((attempt + 1))
+        echo -n "."
+    done
+    echo ""
+    
+    if [ $attempt -eq $max_attempts ]; then
+        echo -e "${RED}❌ Server failed to start within 60 seconds${NC}"
+        echo "Server log:"
+        cat /tmp/llama-server.log 2>/dev/null || echo "No log file found"
+        cleanup_server
+        return 1
+    fi
+    
+    echo "⏳ Waiting for model to finish loading..."
+    local model_loaded=false
+    local load_attempts=30
+    local load_attempt=0
+    
+    # Wait for model to be fully loaded by testing API endpoint
+    while [ $load_attempt -lt $load_attempts ]; do
+        # Check if server process is still alive
+        if ! kill -0 "$server_pid" 2>/dev/null; then
+            echo -e "\n${RED}❌ Server process died during model loading (PID: $server_pid)${NC}"
+            echo "Server log:"
+            cat /tmp/llama-server.log 2>/dev/null || echo "No log file found"
+            return 1
+        fi
+        
+        local health_response=$(curl -s -X POST http://localhost:$server_port/v1/chat/completions \
+            -H "Content-Type: application/json" \
+            -d '{"model": "qwen2.5-0.5b-instruct", "messages": [{"role": "user", "content": "test"}], "max_tokens": 1}' 2>/dev/null)
+        
+        # Check if we get a proper response (not 503 loading error)
+        if echo "$health_response" | grep -q "choices\|content" && ! echo "$health_response" | grep -q "Loading model"; then
+            echo "✅ Model is fully loaded!"
+            model_loaded=true
+            break
+        fi
+        
+        sleep 2
+        load_attempt=$((load_attempt + 1))
+        echo -n "."
+    done
+    echo ""
+    
+    if [ "$model_loaded" = false ]; then
+        echo -e "${RED}❌ Model failed to load within 60 seconds${NC}"
+        echo "Last response: $health_response"
+        echo "Server log:"
+        tail -20 /tmp/llama-server.log 2>/dev/null || echo "No log file found"
+        cleanup_server
+        return 1
+    fi
+    
+    echo "🔍 Testing deterministic response generation..."
+    echo "   Prompt: \"$test_prompt\""
+    echo "   Expected: Response containing \"$expected_response_pattern\""
+    
+    # Make API request with temperature=0.0 for deterministic output
+    local response=$(curl -s -X POST http://localhost:$server_port/v1/chat/completions \
+        -H "Content-Type: application/json" \
+        -d '{
+            "model": "qwen2.5-0.5b-instruct", 
+            "messages": [{"role": "user", "content": "'"$test_prompt"'"}], 
+            "max_tokens": 20,
+            "temperature": 0.0,
+            "top_p": 1.0,
+            "seed": 42
+        }' 2>/dev/null)
+    
+    if [ $? -ne 0 ] || [ -z "$response" ]; then
+        echo -e "${RED}❌ Failed to get response from server${NC}"
+        echo "Server log:"
+        tail -20 /tmp/llama-server.log 2>/dev/null || echo "No log file found"
+        cleanup_server
+        return 1
+    fi
+    
+    echo "📄 Raw response:"
+    echo "$response"
+    echo ""
+    
+    # Extract the content from the JSON response
+    local content=""
+    
+    # Try jq first, fallback to grep/sed if jq is not available
+    if command -v jq >/dev/null 2>&1; then
+        content=$(echo "$response" | jq -r '.choices[0].message.content' 2>/dev/null)
+    else
+        # Fallback JSON parsing using grep and sed
+        content=$(echo "$response" | grep -o '"content":"[^"]*"' | sed 's/"content":"//' | sed 's/"$//' | head -1)
+    fi
+    
+    if [ -z "$content" ] || [ "$content" = "null" ]; then
+        echo -e "${RED}❌ Invalid JSON response or missing content${NC}"
+        cleanup_server
+        return 1
+    fi
+    
+    echo "💬 Generated content: \"$content\""
+    
+    # Check if response contains expected pattern (case-insensitive)
+    if echo "$content" | grep -i "$expected_response_pattern" >/dev/null; then
+        echo -e "${GREEN}✅ Integration test PASSED: Response contains expected pattern${NC}"
+        echo "🎯 NUMA-enabled llama-server is working correctly!"
+        cleanup_server
+        return 0
+    else
+        echo -e "${RED}❌ Integration test FAILED: Response does not contain expected pattern${NC}"
+        echo "   Expected pattern: \"$expected_response_pattern\""
+        echo "   Actual content: \"$content\""
+        cleanup_server
+        return 1
+    fi
+}
+
 # Main execution
 main() {
     check_requirements
@@ -210,9 +438,20 @@ main() {
     # Print final summary
     print_summary
     
-    # Exit with appropriate code
+    # Run integration test only if all individual tests passed
     if [ $FAILED_TESTS -eq 0 ]; then
-        exit 0
+        echo ""
+        echo -e "${BLUE}🔗 All NUMA tests passed! Running integration test...${NC}"
+        run_integration_test
+        integration_exit_code=$?
+        
+        if [ $integration_exit_code -eq 0 ]; then
+            echo -e "${GREEN}🎉 Integration test passed! NUMA system fully validated.${NC}"
+            exit 0
+        else
+            echo -e "${RED}❌ Integration test failed!${NC}"
+            exit 1
+        fi
     else
         exit 1
     fi

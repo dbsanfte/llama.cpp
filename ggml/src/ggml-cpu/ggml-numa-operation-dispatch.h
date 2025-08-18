@@ -22,6 +22,19 @@
 extern "C" {
 #endif
 
+//
+// Enhanced Debugging Macros
+//
+
+// Thread-aware NUMA logging macro that includes thread and NUMA node information
+// Uses ERROR level to ensure visibility in threaded contexts where DEBUG may be filtered
+#define NUMA_THREAD_LOG_DEBUG(fmt, ...) \
+    do { \
+        int current_numa = ggml_numa_get_current_node(); \
+        int thread_id = 0; /* TODO: Get actual thread ID if available */ \
+        GGML_LOG_ERROR("🔧[NUMA%d:T%d] " fmt, current_numa, thread_id, ##__VA_ARGS__); \
+    } while(0)
+
 // Forward declarations
 struct ggml_coordinator_thread;
 struct ggml_numa_coordinator_manager;

@@ -12,6 +12,29 @@
 // Note: Minimal includes to avoid path issues from tests
 // Full implementation includes are in the .c file
 
+/**
+ * NUMA_ASSERT - Assertion macro for NUMA operation handlers
+ * 
+ * This macro provides strict validation for NUMA operations while maintaining
+ * proper coordinator signaling. When the assertion fails:
+ * 1. Logs detailed error information
+ * 2. Returns GGML_STATUS_FAILED (allowing coordinator to signal completion)
+ * 3. Prevents coordinator hangs that would occur with standard GGML_ASSERT
+ * 
+ * Usage: NUMA_ASSERT(condition, error_message, ...)
+ * 
+ * Example:
+ *   NUMA_ASSERT(isfinite(data[i]), "Invalid data at index %d: %f", i, data[i]);
+ */
+#define NUMA_ASSERT(condition, ...) \
+    do { \
+        if (!(condition)) { \
+            GGML_LOG_ERROR("🚨 NUMA_ASSERT FAILED: " __VA_ARGS__); \
+            GGML_LOG_ERROR("🚨 Location: %s:%d in %s()\n", __FILE__, __LINE__, __func__); \
+            return GGML_STATUS_FAILED; \
+        } \
+    } while(0)
+
 // NUMA Node Distribution Strategy - how work is distributed across NUMA nodes
 typedef enum {
     NUMA_NODE_STRATEGY_SINGLE,            // Execute on a single node
@@ -215,9 +238,9 @@ int ggml_numa_coordinator_manager_compute_graph(struct ggml_numa_coordinator_man
  * Wait for all work to complete
  * 
  * @param mgr Manager instance
- * @return 0 on success, -1 on failure
+ * @return GGML_STATUS_SUCCESS if all work completed successfully, GGML_STATUS_FAILED if any work failed, or negative value on error
  */
-int ggml_numa_coordinator_manager_wait_for_completion(struct ggml_numa_coordinator_manager * mgr);
+enum ggml_status ggml_numa_coordinator_manager_wait_for_completion(struct ggml_numa_coordinator_manager * mgr);
 
 /**
  * Wait for a specific work group to complete (used for data parallel work)
@@ -444,11 +467,25 @@ int64_t ggml_numa_cache_aware_chunk_size(const struct ggml_numa_cache_info * cac
 int ggml_numa_coordinator_get_active_nodes(struct ggml_numa_coordinator_manager * mgr, int * nodes, int max_nodes);
 
 /**
- * Virtual NUMA node functions (for testing in simulated environments)
- * These functions allow tests to determine which virtual NUMA coordinator is executing work
+ * Get the total number of NUMA nodes from the global coordinator manager
+ * @return Number of NUMA nodes, or 1 if no coordinator is active
+ */
+int ggml_numa_coordinator_get_num_nodes(void);
+
+/**
+ * NUMA node functions for work functions to determine their assigned node
+ * These functions allow work functions to determine which NUMA coordinator is executing them
  */
 void ggml_numa_set_virtual_node(int node);
-int ggml_numa_get_virtual_node(void);
+int ggml_numa_get_current_node(void);
+
+/**
+ * Reset work status for new work submission
+ * This clears any previous failure status before starting new work
+ * 
+ * @param mgr Manager instance
+ */
+void ggml_numa_coordinator_manager_reset_status(struct ggml_numa_coordinator_manager * mgr);
 
 #ifdef __cplusplus
 }
