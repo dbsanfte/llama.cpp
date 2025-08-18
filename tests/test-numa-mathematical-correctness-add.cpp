@@ -314,12 +314,36 @@ private:
 };
 
 // Main function - entry point for the test
-int main() {
+int main(int argc, char** argv) {
+    // Check for --summary-only flag
+    bool summary_only = false;
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--summary-only") == 0) {
+            summary_only = true;
+            break;
+        }
+    }
+    
+    // Redirect stdout to /dev/null if summary-only mode (but keep final results)
+    FILE* original_stdout = nullptr;
+    if (summary_only) {
+        original_stdout = stdout;
+        stdout = fopen("/dev/null", "w");
+        if (!stdout) {
+            stdout = original_stdout;
+            summary_only = false; // Fall back if redirection fails
+        }
+    }
+    
     printf("🌟 Initializing NUMA system for mathematical correctness testing...\n");
     
     // Initialize the NUMA coordinator system
     struct ggml_numa_coordinator_manager* mgr = ggml_numa_coordinator_manager_get_global(8, true); // true = force_multi_socket
     if (!mgr) {
+        if (summary_only) {
+            fclose(stdout);
+            stdout = original_stdout;
+        }
         printf("❌ Failed to initialize NUMA coordinator manager\n");
         return 1;
     }
@@ -328,6 +352,12 @@ int main() {
     
     NumaMathematicalCorrectnessTestSuite test_suite;
     bool all_passed = test_suite.run_all_tests();
+    
+    // Restore stdout for final results
+    if (summary_only) {
+        fclose(stdout);
+        stdout = original_stdout;
+    }
     
     return all_passed ? 0 : 1;
 }

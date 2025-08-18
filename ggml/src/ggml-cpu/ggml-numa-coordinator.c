@@ -268,6 +268,10 @@ struct ggml_numa_coordinator_manager {
     
     // Memory management strategy
     enum ggml_numa_memory_strategy memory_strategy;       // Current memory management strategy
+    
+    // Work status tracking for critical error handling
+    atomic_int last_work_status;                          // Last work execution status (ggml_status)
+    ggml_mutex_t status_mutex;                           // Mutex for status updates
     ggml_mutex_t strategy_mutex;                          // Mutex for strategy changes
 };
 
@@ -420,11 +424,31 @@ static enum ggml_status ggml_numa_node_execute_operation(
         GGML_LOG_ERROR("�🚀 NUMA%d: About to call work_function %p with context %p\n", 
                        coordinator->numa_node, (void*)work_item->work_function, work_item->work_context);
         
+        // DEBUGGING: Validate function pointer and context before calling
+        GGML_LOG_ERROR("🔍 PRE-CALL: work_function=%p, work_context=%p, params=%p\n", 
+                       (void*)work_item->work_function, work_item->work_context, (void*)&params);
+        GGML_LOG_ERROR("🔍 PRE-CALL: params.ith=%d, params.nth=%d, params.wsize=%zu\n", 
+                       params.ith, params.nth, params.wsize);
+        fprintf(stderr, "🔍 FPRINTF: About to call work function %p with context %p\n", 
+                (void*)work_item->work_function, work_item->work_context);
+        fflush(stderr);
+        
         // Set virtual NUMA node for testing purposes (thread-local storage)
         ggml_numa_set_virtual_node(coordinator->numa_node);
         
         enum ggml_status status = work_item->work_function(work_item->work_context, &params);
+        
+        // This should never be reached if function crashes
         GGML_LOG_ERROR("🚀 NUMA%d: Work function returned status %d\n", coordinator->numa_node, (int)status);
+        fprintf(stderr, "🚀 FPRINTF: Work function returned status %d\n", (int)status);
+        fflush(stderr);
+        
+        // Store work status for critical error handling
+        if (status != GGML_STATUS_SUCCESS) {
+            ggml_mutex_lock(&coordinator->manager->status_mutex);
+            atomic_store(&coordinator->manager->last_work_status, (int)status);
+            ggml_mutex_unlock(&coordinator->manager->status_mutex);
+        }
         
         if (status == GGML_STATUS_SUCCESS) {
             GGML_LOG_DEBUG("NUMA%d: Successfully executed work function\n", coordinator->numa_node);
@@ -461,6 +485,13 @@ static enum ggml_status ggml_numa_node_execute_operation(
         };
         
         enum ggml_status status = ggml_numa_fallback_execute(operation, work_item->required_work_buffer_size > 0 ? &cplan : NULL);
+        
+        // Store work status for critical error handling
+        if (status != GGML_STATUS_SUCCESS) {
+            ggml_mutex_lock(&coordinator->manager->status_mutex);
+            atomic_store(&coordinator->manager->last_work_status, (int)status);
+            ggml_mutex_unlock(&coordinator->manager->status_mutex);
+        }
         
         if (status == GGML_STATUS_SUCCESS) {
             GGML_LOG_DEBUG("NUMA%d: Successfully executed %s operation\n", 
@@ -1254,15 +1285,32 @@ static void * ggml_coordinator_thread_func(void * arg) {
             ggml_mutex_unlock(&coordinator->manager->work_groups.groups_mutex);
         }
         
+        // Extract operation name for logging - try multiple sources
+        const char * op_name = "unknown";
+        if (work_item->operation) {
+            op_name = ggml_op_name(work_item->operation->op);
+        } else if (work_item->work_context) {
+            // Extract operation name from dispatcher work context
+            typedef struct {
+                struct ggml_tensor * operation;
+                struct ggml_cplan * cplan;
+                const char * operation_name;
+                void * additional_context;
+                size_t additional_context_size;
+            } ggml_numa_dispatcher_work_context_t;
+            
+            ggml_numa_dispatcher_work_context_t * ctx = (ggml_numa_dispatcher_work_context_t *)work_item->work_context;
+            if (ctx && ctx->operation_name) {
+                op_name = ctx->operation_name;
+            }
+        }
+        
         if (status != GGML_STATUS_SUCCESS) {
             GGML_LOG_WARN("Coordinator NUMA%d: Operation %s failed with status %d\n",
-                         coordinator->numa_node, 
-                         work_item->operation ? ggml_op_name(work_item->operation->op) : "unknown",
-                         status);
+                         coordinator->numa_node, op_name, status);
         } else {
             GGML_LOG_DEBUG("Coordinator NUMA%d: Operation %s completed successfully\n",
-                          coordinator->numa_node,
-                          work_item->operation ? ggml_op_name(work_item->operation->op) : "unknown");
+                          coordinator->numa_node, op_name);
         }
         
         // Call progress callback if set
@@ -1705,6 +1753,10 @@ struct ggml_numa_coordinator_manager * ggml_numa_coordinator_manager_new_with_pa
     // Initialize memory management strategy
     mgr->memory_strategy = GGML_NUMA_STRATEGY_AUTO;  // Default to adaptive strategy
     ggml_mutex_init(&mgr->strategy_mutex);
+    
+    // Initialize work status tracking
+    atomic_init(&mgr->last_work_status, GGML_STATUS_SUCCESS);
+    ggml_mutex_init(&mgr->status_mutex);
     
     // Log memory strategy information
     const char* strategy_name = "UNKNOWN";
@@ -2770,8 +2822,8 @@ int ggml_numa_coordinator_manager_compute_graph(struct ggml_numa_coordinator_man
 }
 
 // Wait for all work to complete (Step 7: Main thread waits with condition variables)
-int ggml_numa_coordinator_manager_wait_for_completion(struct ggml_numa_coordinator_manager * mgr) {
-    if (!mgr) return -1;
+enum ggml_status ggml_numa_coordinator_manager_wait_for_completion(struct ggml_numa_coordinator_manager * mgr) {
+    if (!mgr) return GGML_STATUS_FAILED;
     
     GGML_LOG_DEBUG("Waiting for all work to complete using condition variables\n");
     
@@ -2803,7 +2855,13 @@ int ggml_numa_coordinator_manager_wait_for_completion(struct ggml_numa_coordinat
     ggml_mutex_unlock(&mgr->main_sync_mutex);
     
     GGML_LOG_DEBUG("All work completed\n");
-    return 0;
+    
+    // Check if any work failed and return the status
+    ggml_mutex_lock(&mgr->status_mutex);
+    enum ggml_status final_status = (enum ggml_status)atomic_load(&mgr->last_work_status);
+    ggml_mutex_unlock(&mgr->status_mutex);
+    
+    return final_status;
 }
 
 // Non-blocking check for work group completion (replaces blocking wait)
@@ -3714,5 +3772,14 @@ enum ggml_status ggml_numa_coordinator_execute_graph_operation(
     ggml_free(temp_ctx);
     
     return status;
+}
+
+// Reset work status for new work submission
+void ggml_numa_coordinator_manager_reset_status(struct ggml_numa_coordinator_manager * mgr) {
+    if (!mgr) return;
+    
+    ggml_mutex_lock(&mgr->status_mutex);
+    atomic_store(&mgr->last_work_status, GGML_STATUS_SUCCESS);
+    ggml_mutex_unlock(&mgr->status_mutex);
 }
 

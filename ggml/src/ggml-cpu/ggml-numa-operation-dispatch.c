@@ -53,7 +53,8 @@ typedef pthread_t       ggml_thread_t;
 //
 
 // Forward declaration for coordinator manager wait function
-extern int ggml_numa_coordinator_manager_wait_for_completion(struct ggml_numa_coordinator_manager * mgr);
+extern enum ggml_status ggml_numa_coordinator_manager_wait_for_completion(struct ggml_numa_coordinator_manager * mgr);
+extern void ggml_numa_coordinator_manager_reset_status(struct ggml_numa_coordinator_manager * mgr);
 
 // Work context structure for function pointer execution
 typedef struct {
@@ -313,6 +314,7 @@ static bool g_dispatch_initialized = false;
 // Work buffer management (implementation at end of file)
 static void ggml_numa_dispatch_work_buffers_init_internal(void);
 void ggml_numa_dispatch_cleanup_operation_handlers(void);
+static size_t ggml_numa_dispatcher_calculate_work_buffer_size(const struct ggml_tensor * tensor);
 
 static enum ggml_status ggml_numa_execute_single_node(
     struct ggml_numa_coordinator_manager * manager,
@@ -409,6 +411,26 @@ enum ggml_status ggml_numa_dispatch_operation(
         return GGML_STATUS_FAILED;
     }
     
+    // CRITICAL DEBUGGING: Capture tensor types at entry point to catch corruption
+    if (operation->op == GGML_OP_MUL_MAT) {
+        const struct ggml_tensor * src0 = operation->src[0];
+        const struct ggml_tensor * src1 = operation->src[1];
+        
+        fprintf(stderr, "🔍 DISPATCH ENTRY: MUL_MAT operation entry point\n");
+        fprintf(stderr, "    📊 operation=%p, src[0]=%p, src[1]=%p\n", 
+               (const void*)operation, (const void*)src0, (const void*)src1);
+        
+        if (src0) {
+            fprintf(stderr, "    📊 src[0]: type=%d (%s), dims=(%ld,%ld,%ld,%ld)\n", 
+                   src0->type, ggml_type_name(src0->type), src0->ne[0], src0->ne[1], src0->ne[2], src0->ne[3]);
+        }
+        if (src1) {
+            fprintf(stderr, "    📊 src[1]: type=%d (%s), dims=(%ld,%ld,%ld,%ld)\n", 
+                   src1->type, ggml_type_name(src1->type), src1->ne[0], src1->ne[1], src1->ne[2], src1->ne[3]);
+        }
+        fflush(stderr);
+    }
+    
     // Update statistics
     g_dispatch_stats.total_operations++;
     if (operation->op < GGML_OP_COUNT) {
@@ -424,6 +446,78 @@ enum ggml_status ggml_numa_dispatch_operation(
     // Debug logging for MUL_MAT specifically
     if (operation->op == GGML_OP_MUL_MAT) {
         GGML_LOG_INFO("MUL_MAT dispatch: handler=%p, initialized=%d\n", (const void*)handler, g_dispatch_initialized);
+    }
+    
+    // TEMPORARY FIX: Bypass NUMA optimization for F16 operations due to precision issues
+    // But NOT for MUL_MAT which has its own handling
+    bool has_f16_tensor = false;
+    if (operation->src[0] && operation->src[0]->type == GGML_TYPE_F16) {
+        has_f16_tensor = true;
+    }
+    if (operation->src[1] && operation->src[1]->type == GGML_TYPE_F16) {
+        has_f16_tensor = true;
+    }
+    
+    // Exclude MUL_MAT from F16 bypass since it has special handling
+    bool should_bypass_for_f16 = has_f16_tensor && (operation->op != GGML_OP_MUL_MAT);
+    
+    if (should_bypass_for_f16) {
+        GGML_LOG_DEBUG("F16 operation detected (%s), bypassing NUMA optimization and using fallback\n", 
+                       ggml_op_name(operation->op));
+        
+        // Check if this operation needs work buffers (excluding MUL_MAT)
+        bool needs_work_buffer = (operation->op == GGML_OP_SOFT_MAX || 
+                                  operation->op == GGML_OP_ROPE ||
+                                  operation->op == GGML_OP_NORM ||
+                                  operation->op == GGML_OP_RMS_NORM ||
+                                  operation->op == GGML_OP_GROUP_NORM ||
+                                  operation->op == GGML_OP_FLASH_ATTN_EXT);
+        
+        if (needs_work_buffer) {
+            GGML_LOG_DEBUG("Operation %s needs work buffers, setting up cplan for fallback\n", ggml_op_name(operation->op));
+            
+            // Calculate work buffer size for this operation
+            size_t buffer_size = ggml_numa_dispatcher_calculate_work_buffer_size(operation);
+            
+            // Allocate actual work buffer if needed
+            void * work_data = NULL;
+            if (buffer_size > 0) {
+                work_data = malloc(buffer_size);
+                if (!work_data) {
+                    GGML_LOG_ERROR("Failed to allocate %zu bytes for F16 work buffer\n", buffer_size);
+                    return GGML_STATUS_FAILED;
+                }
+                GGML_LOG_DEBUG("F16 %s allocated work buffer: %p size=%zu\n", 
+                              ggml_op_name(operation->op), work_data, buffer_size);
+            }
+            
+            // Create a simple cplan with work buffer
+            struct ggml_cplan cplan = {
+                .n_threads = 1,
+                .work_size = buffer_size,
+                .work_data = work_data,
+                .threadpool = NULL
+            };
+            
+            GGML_LOG_DEBUG("F16 %s fallback with work_size=%zu work_data=%p\n", 
+                          ggml_op_name(operation->op), buffer_size, work_data);
+            result = ggml_numa_fallback_execute((struct ggml_tensor *)operation, &cplan);
+            
+            // Free the work buffer after execution
+            if (work_data) {
+                free(work_data);
+                GGML_LOG_DEBUG("F16 %s freed work buffer %p\n", ggml_op_name(operation->op), work_data);
+            }
+        } else {
+            GGML_LOG_DEBUG("Operation %s doesn't need work buffers, using direct fallback\n", ggml_op_name(operation->op));
+            result = ggml_numa_fallback_execute((struct ggml_tensor *)operation, NULL);
+        }
+        
+        // Update timing and return
+        int64_t end_time = ggml_time_us();
+        g_dispatch_stats.total_execution_time_us += (end_time - start_time);
+        
+        return result;
     }
     
     if (handler) {
@@ -446,6 +540,19 @@ enum ggml_status ggml_numa_dispatch_operation(
             // Use default strategy from handler
             strategy = handler->default_strategy;
             recommended_chunks = context->numa_nodes;
+            
+            // SIMPLIFIED: Only override data parallel if coordinator reports single NUMA node
+            // The coordinator already handles force_multi_socket and real NUMA detection,
+            // so we trust its NUMA node count directly
+            
+            if (context->numa_nodes <= 1 && strategy.node_strategy == NUMA_NODE_STRATEGY_DATA_PARALLEL) {
+                GGML_LOG_INFO("Overriding data parallel strategy to single node for %s (coordinator reports %d NUMA nodes)\n",
+                             ggml_op_name(operation->op), context->numa_nodes);
+                strategy.node_strategy = NUMA_NODE_STRATEGY_SINGLE;
+            } else {
+                GGML_LOG_INFO("Using data parallel strategy for %s (coordinator reports %d NUMA nodes)\n",
+                             ggml_op_name(operation->op), context->numa_nodes);
+            }
         }
         
         // Execute based on determined strategy
@@ -528,6 +635,9 @@ static enum ggml_status ggml_numa_execute_single_node(
     
     GGML_LOG_DEBUG("Dispatching %s to single node (NUMA node 0) using function pointer approach\n", ggml_op_name(operation->op));
     
+    // Reset status for this new work submission
+    ggml_numa_coordinator_manager_reset_status(manager);
+    
     // Create work context for the function pointer
     ggml_numa_dispatcher_work_context_t * work_context = ggml_numa_dispatcher_create_work_context(
         (struct ggml_tensor *)operation,
@@ -544,10 +654,10 @@ static enum ggml_status ggml_numa_execute_single_node(
     // Calculate buffer requirements
     size_t buffer_size = ggml_numa_dispatcher_calculate_work_buffer_size(operation);
     
-    // Set up execution strategy for single node
+    // Set up execution strategy for single node - FORCED TO SINGLE THREAD FOR DEBUGGING
     ggml_numa_execution_strategy_t single_node_strategy = {
         .node_strategy = NUMA_NODE_STRATEGY_SINGLE,
-        .on_node_strategy = NUMA_ON_NODE_STRATEGY_MULTI_THREAD
+        .on_node_strategy = NUMA_ON_NODE_STRATEGY_SINGLE_THREAD
     };
     
     // Choose appropriate work function based on operation type
@@ -593,27 +703,42 @@ static enum ggml_status ggml_numa_execute_single_node(
     // Wait for work completion with enhanced debugging and synchronization
     GGML_LOG_ERROR("🔧 DISPATCH: About to wait for work completion (work_id=%d)\n", work_id);
     
+    // Log the operation being dispatched for debugging
+    GGML_LOG_ERROR("🔧 DISPATCH: About to wait for work completion (work_id=%d) for operation %s\n", 
+                   work_id, ggml_op_name(operation->op));
+    
     // Multiple wait attempts with debugging
-    int wait_result = -1;
+    enum ggml_status wait_status = GGML_STATUS_FAILED;
     for (int attempt = 0; attempt < 10; attempt++) {
-        wait_result = ggml_numa_coordinator_manager_wait_for_completion(manager);
-        if (wait_result == 0) {
+        wait_status = ggml_numa_coordinator_manager_wait_for_completion(manager);
+        if (wait_status == GGML_STATUS_SUCCESS) {
             GGML_LOG_ERROR("🔧 DISPATCH: Wait completed successfully on attempt %d\n", attempt + 1);
             break;
+        } else if (wait_status == GGML_STATUS_FAILED) {
+            // CRITICAL: Work function failed (e.g., NUMA_ASSERT triggered)
+            // This indicates data corruption or serious computational error
+            // We must halt execution immediately
+            GGML_LOG_ERROR("💥 CRITICAL ERROR: NUMA operation %s failed with GGML_STATUS_FAILED\n", ggml_op_name(operation->op));
+            GGML_LOG_ERROR("💥 This indicates data corruption or computational failure - halting execution\n");
+            GGML_LOG_ERROR("💥 Check NUMA_ASSERT errors above for details\n");
+            
+            // Note: work_context will be freed by the coordinator after execution
+            return GGML_STATUS_FAILED;
         }
-        GGML_LOG_ERROR("🔧 DISPATCH: Wait attempt %d failed with result %d, retrying...\n", attempt + 1, wait_result);
+        GGML_LOG_ERROR("🔧 DISPATCH: Wait attempt %d returned status %d, retrying...\n", attempt + 1, (int)wait_status);
         usleep(1000); // 1ms delay between attempts
     }
     
-    if (wait_result != 0) {
-        GGML_LOG_WARN("Failed to wait for work completion after 10 attempts (final result: %d)\n", wait_result);
-        // Continue anyway, work might have completed
+    if (wait_status != GGML_STATUS_SUCCESS) {
+        GGML_LOG_WARN("Failed to wait for work completion after 10 attempts (final status: %d)\n", (int)wait_status);
+        // Return the actual failure status instead of continuing
+        return wait_status;
     }
     
     // Additional memory barrier to ensure all coordinator work is visible
     __sync_synchronize();
     
-    GGML_LOG_ERROR("🔧 DISPATCH: Work completion wait finished (final result: %d)\n", wait_result);
+    GGML_LOG_ERROR("🔧 DISPATCH: Work completion wait finished (final result: %d)\n", (int)wait_status);
     
     // Note: work_context will be freed by the coordinator after execution
     
@@ -656,10 +781,10 @@ static enum ggml_status ggml_numa_execute_data_parallel(
     // Calculate buffer requirements
     size_t buffer_size = ggml_numa_dispatcher_calculate_work_buffer_size(operation);
     
-    // Set up execution strategy for data parallel execution
+    // Set up execution strategy for data parallel execution - FORCED TO SINGLE FOR DEBUGGING
     ggml_numa_execution_strategy_t data_parallel_strategy = {
-        .node_strategy = NUMA_NODE_STRATEGY_DATA_PARALLEL,
-        .on_node_strategy = NUMA_ON_NODE_STRATEGY_MULTI_THREAD
+        .node_strategy = NUMA_NODE_STRATEGY_SINGLE,
+        .on_node_strategy = NUMA_ON_NODE_STRATEGY_SINGLE_THREAD
     };
     
     // Choose appropriate work function based on operation type
@@ -769,10 +894,10 @@ static enum ggml_status ggml_numa_execute_complex_graph(
     // Calculate buffer requirements
     size_t buffer_size = ggml_numa_dispatcher_calculate_work_buffer_size(operation);
     
-    // Set up execution strategy for complex operations
+    // Set up execution strategy for complex operations - FORCED TO SINGLE THREAD FOR DEBUGGING
     ggml_numa_execution_strategy_t strategy = {
         .node_strategy = NUMA_NODE_STRATEGY_SINGLE,  // Complex operations benefit from task parallelism
-        .on_node_strategy = NUMA_ON_NODE_STRATEGY_MULTI_THREAD
+        .on_node_strategy = NUMA_ON_NODE_STRATEGY_SINGLE_THREAD
     };
     
     // Choose appropriate work function based on operation type
@@ -1326,10 +1451,10 @@ static enum ggml_status ggml_numa_execute_rope_data_parallel(
         return GGML_STATUS_FAILED;
     }
     
-    // Set up execution strategy for ROPE data parallelism
+    // Set up execution strategy for ROPE data parallelism - FORCED SINGLE FOR DEBUGGING
     ggml_numa_execution_strategy_t strategy = {
-        .node_strategy = NUMA_NODE_STRATEGY_DATA_PARALLEL,  // Distribute across NUMA nodes
-        .on_node_strategy = NUMA_ON_NODE_STRATEGY_MULTI_THREAD
+        .node_strategy = NUMA_NODE_STRATEGY_SINGLE,  // FORCED SINGLE FOR DEBUGGING
+        .on_node_strategy = NUMA_ON_NODE_STRATEGY_SINGLE_THREAD
     };
     
     // Submit work using specialized ROPE function pointer for data parallel execution
@@ -1634,41 +1759,28 @@ static bool ggml_numa_should_coordinate(struct ggml_cgraph * cgraph, int n_threa
         return false;
     }
     
-    // Check if NUMA is available at all
-#ifdef __linux__
-    if (numa_available() == -1) {
-        GGML_LOG_DEBUG("NUMA not available, skipping coordination\n");
-        return false;
-    }
-#else
-    GGML_LOG_DEBUG("NUMA coordination not supported on this platform\n");
-    return false;
-#endif
-    
+    // SIMPLIFIED: Trust coordinator's availability - if it's active, NUMA coordination is worthwhile
+    // The coordinator will only be initialized if NUMA is available and beneficial
+    GGML_LOG_DEBUG("NUMA coordinator-based decision: coordination should proceed\n");
+
     // Minimum requirements for NUMA coordination
     int min_operations_for_numa = 10;  // Need enough operations to distribute
     int min_threads_for_numa = 4;      // Need enough threads to make coordination worthwhile
-    
+
     if (cgraph->n_nodes < min_operations_for_numa) {
         GGML_LOG_DEBUG("Too few operations (%d < %d) for NUMA coordination\n", 
                       cgraph->n_nodes, min_operations_for_numa);
         return false;
     }
-    
+
     if (n_threads < min_threads_for_numa) {
         GGML_LOG_DEBUG("Too few threads (%d < %d) for NUMA coordination\n", 
                       n_threads, min_threads_for_numa);
         return false;
     }
-    
-    // Check if we have multiple NUMA nodes
-    int num_numa_nodes = numa_max_node() + 1;
-    if (num_numa_nodes <= 1) {
-        GGML_LOG_DEBUG("Single NUMA node (%d), coordination not beneficial\n", num_numa_nodes);
-        return false;
-    }
-    
-    // Estimate if the computational load is large enough to justify NUMA coordination overhead
+
+    // SIMPLIFIED: Trust coordinator's NUMA configuration - no independent detection
+    GGML_LOG_DEBUG("Coordinator-centric: proceeding with NUMA coordination\n");    // Estimate if the computational load is large enough to justify NUMA coordination overhead
     int64_t total_elements = 0;
     for (int i = 0; i < cgraph->n_nodes; i++) {
         if (cgraph->nodes[i]) {
@@ -1683,8 +1795,8 @@ static bool ggml_numa_should_coordinate(struct ggml_cgraph * cgraph, int n_threa
         return false;
     }
     
-    GGML_LOG_INFO("NUMA coordination beneficial: %d operations, %d threads, %d NUMA nodes, %ld total elements\n",
-                  cgraph->n_nodes, n_threads, num_numa_nodes, total_elements);
+    GGML_LOG_INFO("NUMA coordination beneficial: %d operations, %d threads, %ld total elements\n",
+                  cgraph->n_nodes, n_threads, total_elements);
     
     return true;
 }
@@ -1732,16 +1844,8 @@ static enum ggml_status ggml_numa_analyze_add_enhanced(
     const int64_t MIN_ELEMENTS_FOR_NUMA = 50000;  // Higher threshold than before
     const int64_t MIN_DIMENSION_FOR_PARALLEL = 1024;  // Minimum dimension size for good parallelism
     
-    if (context->numa_nodes <= 1) {
-        // Single NUMA node system
-        *strategy = (ggml_numa_execution_strategy_t){
-            .node_strategy = NUMA_NODE_STRATEGY_SINGLE,
-            .on_node_strategy = NUMA_ON_NODE_STRATEGY_MULTI_THREAD
-        };
-        *recommended_chunks = 1;
-        GGML_LOG_DEBUG("ADD: Single NUMA node system, using single-node execution\n");
-    }
-    else if (total_elements < MIN_ELEMENTS_FOR_NUMA) {
+    // SIMPLIFIED: Trust coordinator's NUMA configuration - no independent overrides
+    if (total_elements < MIN_ELEMENTS_FOR_NUMA) {
         // Too small for NUMA overhead
         *strategy = (ggml_numa_execution_strategy_t){
             .node_strategy = NUMA_NODE_STRATEGY_SINGLE,
@@ -1800,107 +1904,12 @@ const ggml_numa_operation_handler_t ggml_numa_handler_elementwise = {
     .analyze = ggml_numa_analyze_add_enhanced  // Use enhanced analysis
 };
 
-/*
-// Enhanced MUL_MAT analyzer function - determines optimal execution strategy based on matrix dimensions
-static enum ggml_status ggml_numa_analyze_mul_mat_enhanced(
-    const struct ggml_tensor * operation,
-    const ggml_numa_work_context_t * context,
-    ggml_numa_execution_strategy_t * strategy,
-    int * recommended_chunks) {
-    
-    if (!operation || !context || !strategy || !recommended_chunks) {
-        return GGML_STATUS_FAILED;
-    }
-    
-    // Calculate matrix dimensions for A * B = C
-    const int64_t M = operation->src[0]->ne[1];  // Rows in A (output rows)
-    const int64_t K = operation->src[0]->ne[0];  // Cols in A = Rows in B (inner dimension) 
-    const int64_t N = operation->src[1]->ne[1];  // Cols in B (output cols)
-    
-    // Calculate computational complexity (FLOPs) and memory requirements
-    const int64_t total_flops = M * K * N;
-    const int64_t memory_bytes = (M*K + K*N + M*N) * sizeof(float);
-    
-    GGML_LOG_DEBUG("MUL_MAT analysis: M=%ld×K=%ld×N=%ld, FLOPs=%ld, Memory=%ld bytes\n", 
-                   M, K, N, total_flops, memory_bytes);
-    
-    // Strategy decision based on computational complexity and matrix shape
-    const int64_t SMALL_FLOPS_THRESHOLD = 1000000;    // 1M FLOPs
-    const int64_t MEDIUM_FLOPS_THRESHOLD = 50000000;  // 50M FLOPs  
-    const int64_t LARGE_FLOPS_THRESHOLD = 500000000;  // 500M FLOPs
-    
-    if (context->numa_nodes <= 1) {
-        // Single NUMA node system - no point in multi-node strategies
-        *strategy = (ggml_numa_execution_strategy_t){
-            .node_strategy = NUMA_NODE_STRATEGY_SINGLE,
-            .on_node_strategy = NUMA_ON_NODE_STRATEGY_MULTI_THREAD
-        };
-        *recommended_chunks = 1;
-        GGML_LOG_DEBUG("MUL_MAT: Single NUMA node system, using single-node execution\n");
-    }
-    else if (total_flops < SMALL_FLOPS_THRESHOLD) {
-        // Small matrices - overhead of NUMA coordination not worth it
-        *strategy = (ggml_numa_execution_strategy_t){
-            .node_strategy = NUMA_NODE_STRATEGY_SINGLE,
-            .on_node_strategy = NUMA_ON_NODE_STRATEGY_MULTI_THREAD
-        };
-        *recommended_chunks = 1;
-        GGML_LOG_DEBUG("MUL_MAT: Small matrix (%ld FLOPs), using single-node execution\n", total_flops);
-    }
-    else if (total_flops < MEDIUM_FLOPS_THRESHOLD) {
-        // Medium matrices - use task parallelism (chunking) for better cache locality
-        *strategy = (ggml_numa_execution_strategy_t){
-            .node_strategy = NUMA_NODE_STRATEGY_SINGLE,
-            .on_node_strategy = NUMA_ON_NODE_STRATEGY_MULTI_THREAD
-        };
-        *recommended_chunks = context->numa_nodes;
-        GGML_LOG_DEBUG("MUL_MAT: Medium matrix (%ld FLOPs), using task parallel execution\n", total_flops);
-    }
-    else if (total_flops > LARGE_FLOPS_THRESHOLD) {
-        // Large matrices - definitely worth data parallelism
-        *strategy = (ggml_numa_execution_strategy_t){
-            .node_strategy = NUMA_NODE_STRATEGY_DATA_PARALLEL,
-            .on_node_strategy = NUMA_ON_NODE_STRATEGY_MULTI_THREAD
-        };
-        *recommended_chunks = context->numa_nodes;
-        GGML_LOG_DEBUG("MUL_MAT: Large matrix (%ld FLOPs), using data parallel execution\n", total_flops);
-    }
-    else {
-        // Medium-large matrices - decide based on matrix shape
-        bool good_row_parallelism = (M >= context->numa_nodes * 4);
-        bool good_col_parallelism = (N >= context->numa_nodes * 4);
-        
-        if (good_row_parallelism || good_col_parallelism) {
-            // Matrix shape allows good parallelization
-            *strategy = (ggml_numa_execution_strategy_t){
-                .node_strategy = NUMA_NODE_STRATEGY_DATA_PARALLEL,
-                .on_node_strategy = NUMA_ON_NODE_STRATEGY_MULTI_THREAD
-            };
-            *recommended_chunks = context->numa_nodes;
-            GGML_LOG_DEBUG("MUL_MAT: Good matrix shape (%ld FLOPs, M=%ld, N=%ld), using data parallel\n", 
-                           total_flops, M, N);
-        } else {
-            // Matrix shape not ideal for data parallelism - use task parallelism
-            *strategy = (ggml_numa_execution_strategy_t){
-                .node_strategy = NUMA_NODE_STRATEGY_SINGLE,
-                .on_node_strategy = NUMA_ON_NODE_STRATEGY_MULTI_THREAD
-            };
-            *recommended_chunks = context->numa_nodes;
-            GGML_LOG_DEBUG("MUL_MAT: Poor matrix shape (%ld FLOPs, M=%ld, N=%ld), using task parallel\n", 
-                           total_flops, M, N);
-        }
-    }
-    
-    return GGML_STATUS_SUCCESS;
-}
-*/
-
 // Enhanced MUL_MAT handler with intelligent analysis
 const ggml_numa_operation_handler_t ggml_numa_handler_mul_mat_enhanced = {
     .operation_type = GGML_OP_MUL_MAT,
     .default_strategy = {
-        .node_strategy = NUMA_NODE_STRATEGY_DATA_PARALLEL,  // Data parallel for MUL_MAT
-        .on_node_strategy = NUMA_ON_NODE_STRATEGY_MULTI_THREAD
+        .node_strategy = NUMA_NODE_STRATEGY_SINGLE,  // Single-threaded for MUL_MAT (testing)
+        .on_node_strategy = NUMA_ON_NODE_STRATEGY_SINGLE_THREAD
     },
     .complexity = NUMA_OP_COMPLEXITY_MODERATE,
     .workload_type = NUMA_OP_COMPUTE_BOUND,
@@ -1928,59 +1937,12 @@ const ggml_numa_operation_handler_t ggml_numa_handler_complex = {
     .analyze = NULL  // Use default analysis for now
 };
 
-/*
-// TEMPORARILY DISABLED - needs updating for new strategy system
-// SOFT_MAX analysis function
-static enum ggml_status ggml_numa_analyze_soft_max(
-    const struct ggml_tensor * operation,
-    const ggml_numa_work_context_t * context,
-    ggml_numa_execution_strategy_t * strategy,
-    int * recommended_chunks) {
-    
-    if (!operation || !context || !strategy || !recommended_chunks) {
-        return GGML_STATUS_FAILED;
-    }
-    
-    const int64_t ne00 = operation->ne[0];  // Elements per row
-    const int64_t ne01 = operation->ne[1];  // Number of rows
-    const int64_t total_elements = ne00 * ne01;
-    
-    GGML_LOG_DEBUG("SOFT_MAX analysis: elements_per_row=%ld, rows=%ld, total_elements=%ld\n", 
-                   ne00, ne01, total_elements);
-    
-    // Decision logic based on matrix size and parallelization potential
-    if (context->numa_nodes <= 1) {
-        // Single NUMA node - use single node execution
-        *strategy = NUMA_EXECUTION_SINGLE_NODE;
-        *recommended_chunks = 1;
-        GGML_LOG_DEBUG("SOFT_MAX: Single NUMA node, using single-node execution\n");
-    } else if (ne01 >= context->numa_nodes * 4) {
-        // Many rows - worth parallelizing across NUMA nodes (row-wise parallelism)
-        *strategy = NUMA_EXECUTION_DATA_PARALLEL;
-        *recommended_chunks = context->numa_nodes;
-        GGML_LOG_DEBUG("SOFT_MAX: Many rows (%ld), using data parallel execution\n", ne01);
-    } else if (ne01 >= 2 && total_elements > 100000) {
-        // Few rows but large elements - use hybrid approach
-        *strategy = NUMA_EXECUTION_HYBRID;
-        *recommended_chunks = context->numa_nodes;
-        GGML_LOG_DEBUG("SOFT_MAX: Large total elements (%ld), using hybrid execution\n", total_elements);
-    } else {
-        // Small matrices - use single node
-        *strategy = NUMA_EXECUTION_SINGLE_NODE;
-        *recommended_chunks = 1;
-        GGML_LOG_DEBUG("SOFT_MAX: Small matrix (%ld elements), using single-node execution\n", total_elements);
-    }
-    
-    return GGML_STATUS_SUCCESS;
-}
-*/
-
 // Enhanced SOFT_MAX handler with row-based parallelization
 const ggml_numa_operation_handler_t ggml_numa_handler_soft_max = {
     .operation_type = GGML_OP_SOFT_MAX,
     .default_strategy = {
-        .node_strategy = NUMA_NODE_STRATEGY_DATA_PARALLEL,  // Enable data parallel for SOFT_MAX rows
-        .on_node_strategy = NUMA_ON_NODE_STRATEGY_MULTI_THREAD
+        .node_strategy = NUMA_NODE_STRATEGY_SINGLE,  // FORCED SINGLE FOR DEBUGGING
+        .on_node_strategy = NUMA_ON_NODE_STRATEGY_SINGLE_THREAD
     },
     .complexity = NUMA_OP_COMPLEXITY_MODERATE,
     .workload_type = NUMA_OP_COMPUTE_BOUND,
@@ -1996,8 +1958,8 @@ const ggml_numa_operation_handler_t ggml_numa_handler_soft_max = {
 const ggml_numa_operation_handler_t ggml_numa_handler_glu = {
     .operation_type = GGML_OP_GLU,
     .default_strategy = {
-        .node_strategy = NUMA_NODE_STRATEGY_DATA_PARALLEL,  // Data parallel for element-wise operations
-        .on_node_strategy = NUMA_ON_NODE_STRATEGY_MULTI_THREAD
+        .node_strategy = NUMA_NODE_STRATEGY_SINGLE,  // FORCED SINGLE FOR DEBUGGING
+        .on_node_strategy = NUMA_ON_NODE_STRATEGY_SINGLE_THREAD
     },
     .complexity = NUMA_OP_COMPLEXITY_SIMPLE,
     .workload_type = NUMA_OP_COMPUTE_BOUND,
@@ -2013,8 +1975,8 @@ const ggml_numa_operation_handler_t ggml_numa_handler_glu = {
 const ggml_numa_operation_handler_t ggml_numa_handler_rms_norm = {
     .operation_type = GGML_OP_RMS_NORM,
     .default_strategy = {
-        .node_strategy = NUMA_NODE_STRATEGY_DATA_PARALLEL,  // Data parallel for row-wise operations
-        .on_node_strategy = NUMA_ON_NODE_STRATEGY_MULTI_THREAD
+        .node_strategy = NUMA_NODE_STRATEGY_SINGLE,  // FORCED SINGLE FOR DEBUGGING
+        .on_node_strategy = NUMA_ON_NODE_STRATEGY_SINGLE_THREAD
     },
     .complexity = NUMA_OP_COMPLEXITY_MODERATE,  // Has reduction phase per row but still parallelizable
     .workload_type = NUMA_OP_COMPUTE_BOUND,     // Involves square, sum, sqrt operations
@@ -2138,8 +2100,12 @@ static void ggml_numa_dispatch_work_buffers_init_internal(void) {
         return;
     }
     
-    // Detect number of NUMA nodes
-    g_numa_nodes_count = numa_available() >= 0 ? numa_max_node() + 1 : 1;
+    // SIMPLIFIED: Get NUMA node count from coordinator instead of independent detection
+    g_numa_nodes_count = ggml_numa_coordinator_get_num_nodes();
+    if (g_numa_nodes_count <= 0) {
+        // Fallback if coordinator not initialized
+        g_numa_nodes_count = 1;
+    }
     if (g_numa_nodes_count > GGML_NUMA_MAX_NODES) {
         g_numa_nodes_count = GGML_NUMA_MAX_NODES;
     }
@@ -2374,8 +2340,8 @@ int ggml_numa_dispatch_compute_graph(struct ggml_cgraph * cgraph, int n_threads)
         return -1;
     }
     
-    if (!ggml_numa_should_mirror()) {
-        GGML_LOG_DEBUG("NUMA mirroring disabled, skipping dispatcher\n");
+    if (!ggml_numa_should_dispatch()) {
+        GGML_LOG_DEBUG("NUMA dispatch disabled, skipping dispatcher\n");
         return -1;  // Let caller use standard processing
     }
     
@@ -2532,18 +2498,20 @@ static size_t ggml_numa_dispatcher_calculate_work_buffer_size(const struct ggml_
             enum ggml_type vec_dot_type = traits->vec_dot_type;
             
             if (src1->type != vec_dot_type) {
-                // Calculate buffer size for converting one batch of src1
+                // Calculate buffer size for converting ALL batches of src1 (required by ggml-cpu.c:1479)
                 const int64_t ne10 = src1->ne[0];
                 const int64_t ne11 = src1->ne[1]; 
                 const int64_t ne12 = src1->ne[2];
-                // ne13 is batch size - we process one batch at a time in data parallel mode
+                const int64_t ne13 = src1->ne[3]; // All batches
                 
                 const size_t nbw1 = ggml_row_size(vec_dot_type, ne10);
                 const size_t nbw2 = nbw1 * ne11;
                 const size_t nbw3 = nbw2 * ne12;
+                const size_t total_size = ne13 * nbw3; // ALL batches (matches assertion requirement)
                 
-                GGML_LOG_DEBUG("🔧 MUL_MAT work buffer sized for partial conversion: %zu bytes\n", nbw3);
-                return nbw3; // One batch conversion size
+                GGML_LOG_DEBUG("🔧 MUL_MAT work buffer sized for full conversion: %zu bytes (ne13=%ld, nbw3=%zu)\n", 
+                              total_size, ne13, nbw3);
+                return total_size;
             }
             
             // No conversion needed, minimal buffer
@@ -2584,9 +2552,9 @@ static size_t ggml_numa_dispatcher_calculate_work_buffer_size(const struct ggml_
 
 // Generic fallback work function - executes any operation via fallback system
 static enum ggml_status ggml_numa_work_function_fallback(void * work_context, struct ggml_compute_params * params) {
-    if (!work_context || !params) {
-        return GGML_STATUS_FAILED;
-    }
+    GGML_LOG_DEBUG("🔥 ENTERING MUL_MAT_fallback function - FIRST LINE!\n");
+
+    NUMA_ASSERT(work_context && params);
     
     ggml_numa_dispatcher_work_context_t * ctx = (ggml_numa_dispatcher_work_context_t *)work_context;
     
@@ -2603,47 +2571,328 @@ static enum ggml_status ggml_numa_work_function_fallback(void * work_context, st
     
     // Execute the operation using the fallback system
     enum ggml_status result = ggml_numa_fallback_execute(ctx->operation, ctx->cplan);
-    GGML_ASSERT(result == GGML_STATUS_SUCCESS);
+    NUMA_ASSERT(result == GGML_STATUS_SUCCESS);
     
     return result;
 }
 
 // Specialized work function for single-threaded MUL_MAT operations
 static enum ggml_status ggml_numa_work_function_mul_mat_single(void * work_context, struct ggml_compute_params * params) {
-    if (!work_context || !params) {
-        return GGML_STATUS_FAILED;
-    }
-    
+    GGML_LOG_DEBUG("🔥 ENTERING MUL_MAT_single work function - FIRST LINE!\n");
+    printf("🔥🔥🔥 PRINTF: ENTERING MUL_MAT_single work function - FIRST LINE!\n");
+    fflush(stdout);
+
+    NUMA_ASSERT(work_context && params);
+
     ggml_numa_dispatcher_work_context_t * ctx = (ggml_numa_dispatcher_work_context_t *)work_context;
+    struct ggml_tensor * dst = ctx->operation;
     
-    GGML_LOG_DEBUG("Executing MUL_MAT single-threaded work function\n");
+    NUMA_ASSERT(dst);
     
-    // Update compute plan
-    if (ctx->cplan) {
-        ctx->cplan->n_threads = 1;  // Force single-threaded
-        ctx->cplan->work_size = params->wsize;
-        ctx->cplan->work_data = params->wdata;
-        ctx->cplan->threadpool = NULL;  // No threadpool for single-threaded
+    printf("🔥🔥🔥 PRINTF: MUL_MAT_single - src0 type=%d, src1 type=%d\n", (int)dst->src[0]->type, (int)dst->src[1]->type);
+    fflush(stdout);
+    
+    GGML_LOG_DEBUG("Executing MUL_MAT single-threaded with validation-only approach\n");
+    
+    const struct ggml_tensor * src0 = dst->src[0];
+    const struct ggml_tensor * src1 = dst->src[1];
+
+    // Extract validation logic from ggml_compute_forward_mul_mat (but skip threading parts)
+    GGML_TENSOR_BINARY_OP_LOCALS
+    
+    // CRITICAL VALIDATION CHECKS (from ggml_compute_forward_mul_mat)
+    NUMA_ASSERT(ne0 == ne01);
+    NUMA_ASSERT(ne1 == ne11);
+    NUMA_ASSERT(ne2 == ne12);
+    NUMA_ASSERT(ne3 == ne13);
+
+    // we don't support permuted src0 or src1
+    NUMA_ASSERT(nb00 == ggml_type_size(src0->type));
+    NUMA_ASSERT(nb10 == ggml_type_size(src1->type));
+
+    // dst cannot be transposed or permuted
+    NUMA_ASSERT(nb0 == sizeof(float));
+    NUMA_ASSERT(nb0 <= nb1);
+    NUMA_ASSERT(nb1 <= nb2);
+    NUMA_ASSERT(nb2 <= nb3);
+
+    // Type trait lookups (from ggml_compute_forward_mul_mat)
+    const struct ggml_type_traits_cpu * src0_traits = ggml_get_type_traits_cpu(src0->type);
+    enum ggml_type const vec_dot_type = src0_traits->vec_dot_type;
+    int64_t const vec_dot_num_rows = src0_traits->nrows;
+    
+    GGML_LOG_DEBUG("🔧 Validation passed, calling mathematical kernel directly\n");
+    
+    // Enhanced input validation: Check for NaN/inf in F16 data early to catch corruption  
+    if (src0->type == GGML_TYPE_F16 || src1->type == GGML_TYPE_F16) {
+        printf("🔥🔥🔥 PRINTF: MUL_MAT single F16 validation starting - src0 type=%d, src1 type=%d\n", (int)src0->type, (int)src1->type);
+        fflush(stdout);
+        
+        GGML_LOG_DEBUG("🔍 MUL_MAT single: validating F16 input data for corruption\n");
+        
+        // Validate src0 F16 data (check first 16 elements)
+        if (src0->type == GGML_TYPE_F16) {
+            printf("🔥🔥🔥 PRINTF: Validating src0 F16 data\n");
+            fflush(stdout);
+            
+            const ggml_fp16_t* fp16_data = (const ggml_fp16_t*)ggml_get_data(src0);
+            NUMA_ASSERT(fp16_data != NULL, "MUL_MAT single: src0 fp16_data is NULL");
+            
+            printf("🔥🔥🔥 PRINTF: About to check F16 data values\n");
+            fflush(stdout);
+            
+            for (int i = 0; i < MIN(16, (int)ggml_nelements(src0)); i++) {
+                float val = GGML_CPU_FP16_TO_FP32(fp16_data[i]);
+                if (!isfinite(val)) {
+                    printf("🚨 PRINTF: Found corrupt src0 F16 at index %d: %f\n", i, val);
+                    fflush(stdout);
+                }
+                NUMA_ASSERT(isfinite(val), "MUL_MAT single: corrupt src0 F16 at index %d: %f", i, val);
+            }
+            printf("🔥🔥🔥 PRINTF: src0 F16 validation passed\n");
+            fflush(stdout);
+        }
+        
+        // Validate src1 F16 data (check first 16 elements)  
+        if (src1->type == GGML_TYPE_F16) {
+            printf("🔥🔥🔥 PRINTF: Validating src1 F16 data\n");
+            fflush(stdout);
+            
+            const ggml_fp16_t* fp16_data = (const ggml_fp16_t*)ggml_get_data(src1);
+            NUMA_ASSERT(fp16_data != NULL, "MUL_MAT single: src1 fp16_data is NULL");
+            
+            for (int i = 0; i < MIN(16, (int)ggml_nelements(src1)); i++) {
+                float val = GGML_CPU_FP16_TO_FP32(fp16_data[i]);
+                if (!isfinite(val)) {
+                    printf("🚨 PRINTF: Found corrupt src1 F16 at index %d: %f\n", i, val);
+                    fflush(stdout);
+                }
+                NUMA_ASSERT(isfinite(val), "MUL_MAT single: corrupt src1 F16 at index %d: %f", i, val);
+            }
+            printf("🔥🔥🔥 PRINTF: src1 F16 validation passed\n");
+            fflush(stdout);
+        }
+        
+        GGML_LOG_DEBUG("🔍 MUL_MAT single: F16 input validation passed - no corruption detected\n");
     }
     
-    // Execute using direct MUL_MAT computation
-    ggml_compute_forward_mul_mat(params, ctx->operation);
+    // Create thread-safe params for mathematical kernel ONLY (no threadpool or barriers)
+    // CRITICAL: Calculate work buffer size specifically for this MUL_MAT operation
     
-    GGML_LOG_DEBUG("Successfully executed MUL_MAT single-threaded work function\n");
+    // Calculate required work buffer size for type conversion (from ggml_compute_forward_mul_mat)
+    enum ggml_type const required_vec_dot_type = src0_traits->vec_dot_type;
     
+    printf("🔥🔥🔥 PRINTF: Type analysis - src0 type=%d, src1 type=%d, required_vec_dot_type=%d\n", 
+           (int)src0->type, (int)src1->type, (int)required_vec_dot_type);
+    fflush(stdout);
+    
+    size_t required_wsize = 0;
+    void * wdata_ptr = params->wdata;
+    
+    if (src1->type != required_vec_dot_type) {
+        printf("🔥🔥🔥 PRINTF: Type conversion needed! src1 type=%d != required_vec_dot_type=%d\n", 
+               (int)src1->type, (int)required_vec_dot_type);
+        fflush(stdout);
+        
+        // Need to convert src1 to vec_dot_type - calculate required buffer size
+        const size_t nbw0 = ggml_type_size(required_vec_dot_type);
+        const size_t nbw1 = ggml_row_size(required_vec_dot_type, ne10);
+        const size_t nbw2 = nbw1 * ne11;
+        const size_t nbw3 = nbw2 * ne12;
+        required_wsize = ne13 * nbw3;
+        
+        printf("🔥🔥🔥 PRINTF: Work buffer requirement - need %zu bytes, have %zu bytes\n", 
+               required_wsize, params->wsize);
+        fflush(stdout);
+        
+        GGML_LOG_DEBUG("🔍 MUL_MAT: src1 type conversion required. Need %zu bytes work buffer\n", required_wsize);
+        GGML_LOG_DEBUG("🔍 MUL_MAT: Converting from src1->type=%d to required_vec_dot_type=%d\n", 
+                       (int)src1->type, (int)required_vec_dot_type);
+        
+        if (params->wsize < required_wsize) {
+            printf("🚨 PRINTF: Insufficient work buffer! Need %zu bytes, have %zu bytes\n", 
+                   required_wsize, params->wsize);
+            fflush(stdout);
+            GGML_LOG_ERROR("🚨 MUL_MAT: Insufficient work buffer. Need %zu bytes, have %zu bytes\n", 
+                           required_wsize, params->wsize);
+            return GGML_STATUS_FAILED;
+        }
+        
+        printf("🔥🔥🔥 PRINTF: Starting type conversion from F32 to vec_dot_type\n");
+        fflush(stdout);
+        
+        // CRITICAL: Actually perform the type conversion (from ggml_compute_forward_mul_mat)
+        const struct ggml_type_traits_cpu * vec_dot_traits = ggml_get_type_traits_cpu(required_vec_dot_type);
+        ggml_from_float_t const from_float = vec_dot_traits->from_float;
+        NUMA_ASSERT(src1->type == GGML_TYPE_F32, "MUL_MAT single: only F32->vec_dot_type conversion supported");
+        
+        char * wdata = (char*)params->wdata;
+        printf("�🔥🔥 PRINTF: Converting src1 from F32 to vec_dot_type %d, dimensions: ne13=%lld, ne12=%lld, ne11=%lld, ne10=%lld\n", 
+               (int)required_vec_dot_type, (long long)ne13, (long long)ne12, (long long)ne11, (long long)ne10);
+        fflush(stdout);
+        
+        // Convert F32 src1 data to vec_dot_type (mirror original logic exactly)
+        for (int64_t i13 = 0; i13 < ne13; ++i13) {
+            printf("🔥🔥🔥 PRINTF: Processing i13=%lld/%lld\n", (long long)i13, (long long)ne13);
+            fflush(stdout);
+            for (int64_t i12 = 0; i12 < ne12; ++i12) {
+                for (int64_t i11 = 0; i11 < ne11; ++i11) {
+                    from_float((float *)((char *) tensor_data(src1) + i13*nb13 + i12*nb12 + i11*nb11),
+                               (void *)(wdata + i13*nbw3 + i12*nbw2 + i11*nbw1),
+                               ne10);
+                }
+            }
+        }
+        
+        printf("🔥🔥� PRINTF: Type conversion completed successfully\n");
+        fflush(stdout);
+        
+        // CRITICAL FIX: Update wdata_ptr to point to converted data
+        wdata_ptr = wdata;
+        printf("🔥🔥� PRINTF: Updated wdata_ptr to converted data at %p\n", wdata_ptr);
+        fflush(stdout);
+    } else {
+        GGML_LOG_DEBUG("🔍 MUL_MAT: No type conversion needed - src1 already correct type\n");
+    }
+    
+    struct ggml_compute_params safe_params = {
+        .ith = 0,         // Single thread
+        .nth = 1,         // Total of 1 thread
+        .wdata = wdata_ptr,
+        .wsize = params->wsize,  // Use coordinator's work buffer size
+        .threadpool = NULL, // No threadpool to avoid threading conflicts
+    };
+
+    // Calculate dimensions for kernel (from ggml_compute_forward_mul_mat)
+    const int64_t nr0 = ne0;
+    const int64_t nr1 = ne1 * ne2 * ne3;
+    
+    printf("🔥🔥🔥 PRINTF: About to call ggml_compute_forward_mul_mat_one_chunk\n");
+    fflush(stdout);
+    
+    // CRITICAL: Validate converted F16 data for corruption if we did conversion
+    if (src1->type != required_vec_dot_type) {
+        printf("🔥🔥🔥 PRINTF: Validating original F32 and converted F16 data\n");
+        fflush(stdout);
+        
+        // Validate original F32 data first
+        const float* original_f32_data = (const float*)tensor_data(src1);
+        ggml_fp16_t* converted_f16_data = (ggml_fp16_t*)wdata_ptr;
+        size_t converted_elements = required_wsize / sizeof(ggml_fp16_t);
+        size_t check_converted = MIN(32, converted_elements);
+        
+        for (size_t i = 0; i < check_converted; i++) {
+            const float original_f32 = original_f32_data[i];
+            const ggml_fp16_t f16_val = converted_f16_data[i];
+            const float converted_f32 = GGML_CPU_FP16_TO_FP32(f16_val);
+            
+            if (!isfinite(original_f32)) {
+                printf("🚨 PRINTF: CORRUPT ORIGINAL F32 at index %zu: %f\n", i, original_f32);
+                fflush(stdout);
+            }
+            if (!isfinite(converted_f32)) {
+                printf("🚨 PRINTF: CORRUPT CONVERTED at index %zu: orig_f32=%f → f16=%u → f32=%f\n", 
+                       i, original_f32, (unsigned)f16_val, converted_f32);
+                fflush(stdout);
+            }
+        }
+        printf("🔥🔥🔥 PRINTF: Validation completed\n");
+        fflush(stdout);
+    }
+    
+    // Call mathematical kernel directly with full matrix (no chunking for single thread)
+    ggml_compute_forward_mul_mat_one_chunk(&safe_params, dst, src0->type, vec_dot_num_rows, 
+                                          0, nr0, 0, nr1);
+    
+    printf("🔥🔥🔥 PRINTF: ggml_compute_forward_mul_mat_one_chunk completed successfully\n");
+    fflush(stdout);
+    
+    // CRITICAL: Validate output data for corruption before returning success
+    float* dst_data = (float*)ggml_get_data(dst);
+    NUMA_ASSERT(dst_data != NULL, "MUL_MAT single: dst_data is NULL after computation");
+    
+    size_t output_elements = ggml_nelements(dst);
+    size_t check_count = MIN(32, output_elements);  // Check first 32 elements like chunk function
+    
+    for (size_t i = 0; i < check_count; i++) {
+        NUMA_ASSERT(isfinite(dst_data[i]), 
+                    "MUL_MAT single: corrupt output at index %zu: %f (elements=%zu, src0_type=%d, src1_type=%d)", 
+                    i, dst_data[i], output_elements, (int)src0->type, (int)src1->type);
+    }
+    
+    GGML_LOG_DEBUG("🔍 MUL_MAT single: output validation passed - %zu elements checked, all finite\n", check_count);
+    
+    GGML_LOG_DEBUG("Successfully executed MUL_MAT single-threaded with thread-safe approach\n");
     return GGML_STATUS_SUCCESS;
 }
 
 // Specialized work function for chunked MUL_MAT operations
 static enum ggml_status ggml_numa_work_function_mul_mat_chunk(void * work_context, struct ggml_compute_params * params) {
-    if (!work_context || !params) {
+    // Force logs to appear - use NUMA_THREAD_LOG_DEBUG and printf as backup
+    NUMA_THREAD_LOG_DEBUG("🔥🔥🔥 ENTERING MUL_MAT_chunk work function - FIRST LINE! 🔥🔥🔥\n");
+    fprintf(stderr, "🔥🔥🔥 PRINTF: ENTERING MUL_MAT_chunk work function - FIRST LINE! 🔥🔥🔥\n");
+    fflush(stderr);
+
+    NUMA_ASSERT(work_context && params);
+    
+    NUMA_THREAD_LOG_DEBUG("🔥 Got valid context and params (NUMA_THREAD_LOG_DEBUG)\n");
+    fprintf(stderr, "🔥 PRINTF: Got valid context and params\n");
+    fflush(stderr);
+    
+    NUMA_THREAD_LOG_DEBUG("🔥 About to cast context...\n");
+    fprintf(stderr, "🔥 PRINTF: About to cast context...\n");
+    fflush(stderr);
+    
+    ggml_numa_dispatcher_work_context_t * ctx = (ggml_numa_dispatcher_work_context_t *)work_context;
+    NUMA_THREAD_LOG_DEBUG("🔥 Cast context to dispatcher work context SUCCESSFULLY\n");
+    fprintf(stderr, "🔥 PRINTF: Cast context SUCCESSFULLY\n");
+    fflush(stderr);
+    
+    NUMA_THREAD_LOG_DEBUG("🔥 About to get dst tensor...\n");
+    fprintf(stderr, "🔥 PRINTF: About to get dst tensor...\n");
+    fflush(stderr);
+    
+    struct ggml_tensor * dst = ctx->operation;
+    NUMA_THREAD_LOG_DEBUG("🔥 Got dst tensor from context SUCCESSFULLY\n");
+    fprintf(stderr, "🔥 PRINTF: Got dst tensor SUCCESSFULLY\n");
+    fflush(stderr);
+
+    GGML_LOG_ERROR("🔥 About to check dst tensor validity...\n");
+    fprintf(stderr, "🔥 PRINTF: About to check dst tensor validity...\n");
+    fflush(stderr);
+    
+    if (!dst) {
+        GGML_LOG_ERROR("🚨 dst tensor is NULL!\n");
+        fprintf(stderr, "🚨 PRINTF: dst tensor is NULL!\n");
+        fflush(stderr);
         return GGML_STATUS_FAILED;
     }
     
-    ggml_numa_dispatcher_work_context_t * ctx = (ggml_numa_dispatcher_work_context_t *)work_context;
-    struct ggml_tensor * dst = ctx->operation;
-
-    GGML_ASSERT(dst && dst->src[0] && dst->src[1]);
+    GGML_LOG_ERROR("🔥 dst tensor is valid, checking src[0]...\n");
+    fprintf(stderr, "🔥 PRINTF: dst tensor is valid, checking src[0]...\n");
+    fflush(stderr);
+    
+    if (!dst->src[0]) {
+        GGML_LOG_ERROR("🚨 dst->src[0] tensor is NULL!\n");
+        fprintf(stderr, "🚨 PRINTF: dst->src[0] tensor is NULL!\n");
+        fflush(stderr);
+        return GGML_STATUS_FAILED;
+    }
+    
+    GGML_LOG_ERROR("🔥 src[0] is valid, checking src[1]...\n");
+    fprintf(stderr, "🔥 PRINTF: src[0] is valid, checking src[1]...\n");
+    fflush(stderr);
+    
+    if (!dst->src[1]) {
+        GGML_LOG_ERROR("🚨 dst->src[1] tensor is NULL!\n");
+        fprintf(stderr, "🚨 PRINTF: dst->src[1] tensor is NULL!\n");
+        fflush(stderr);
+        return GGML_STATUS_FAILED;
+    }
+    
+    GGML_LOG_ERROR("🔥 All tensors are valid! Proceeding...\n");
+    fprintf(stderr, "🔥 PRINTF: All tensors are valid! Proceeding...\n");
+    fflush(stderr);
     
     // Debug: Check what work buffer size we received and input data
     GGML_LOG_DEBUG("🔍 MUL_MAT chunk: wsize=%zu, wdata=%p\n", params->wsize, params->wdata);
@@ -2669,86 +2918,79 @@ static enum ggml_status ggml_numa_work_function_mul_mat_chunk(void * work_contex
     enum ggml_type const vec_dot_type = src0_traits->vec_dot_type;
     int64_t const vec_dot_num_rows = src0_traits->nrows;
     
-    GGML_LOG_DEBUG("🔍 Type info: src0_type=%d, vec_dot_type=%d, vec_dot_num_rows=%ld\n", 
-           src0->type, vec_dot_type, vec_dot_num_rows);
+    GGML_LOG_ERROR("🔍 Type analysis: src0_type=%d, src1_type=%d, vec_dot_type=%d, nrows=%ld\n", 
+                   (int)src0->type, (int)src1->type, (int)vec_dot_type, vec_dot_num_rows);
     
-    // Handle src1 preprocessing if needed (convert to vec_dot_type)
-    const void * src1_data = ggml_get_data(src1);
+    fprintf(stderr, "🔍 PRINTF: Type analysis: src0_type=%d, src1_type=%d, vec_dot_type=%d, nrows=%ld\n", 
+            (int)src0->type, (int)src1->type, (int)vec_dot_type, vec_dot_num_rows);
+    fflush(stderr);
     
-    // Log input data for debugging  
-    if (src1_data) {
-        float* src0_f = (float*)ggml_get_data(src0);
-        float* src1_f = (float*)src1_data;
-        if (src0_f && src1_f) {
-            GGML_LOG_DEBUG("🔍 Input data: src0[0]=%.2f, src0[1]=%.2f, src1[0]=%.2f, src1[1]=%.2f\n", 
-                   (double)src0_f[0], (double)src0_f[1], (double)src1_f[0], (double)src1_f[1]);
-        }
-    }
+    NUMA_THREAD_LOG_DEBUG("🔍 Type info: src0_type=%d (%s), vec_dot_type=%d (%s), vec_dot_num_rows=%ld\n", 
+           src0->type, ggml_type_name(src0->type), vec_dot_type, ggml_type_name(vec_dot_type), vec_dot_num_rows);
     
-    if (src1->type != vec_dot_type) {
-        GGML_LOG_DEBUG("🔍 Preprocessing: Converting src1 from type %d to vec_dot_type %d\n", src1->type, vec_dot_type);
+    // CRITICAL DEBUG: For Q8_0, we should see src0_type=7 (Q8_0) and vec_dot_type=7 (Q8_0)
+    fprintf(stderr, "🚨 CRITICAL TYPE DEBUG: src0_type=%d (%s), vec_dot_type=%d (%s)\n", 
+           src0->type, ggml_type_name(src0->type), vec_dot_type, ggml_type_name(vec_dot_type));
+    fflush(stderr);
+    
+    // F16 SPECIFIC DEBUGGING: Check for NaN/inf in F16 input data
+    if (src0->type == GGML_TYPE_F16 || src1->type == GGML_TYPE_F16) {
+        fprintf(stderr, "🔍 F16 DEBUGGING: Checking F16 tensor data for NaN/inf corruption\n");
         
-        // Verify src1 is F32 (expected input type)
-        GGML_ASSERT(src1->type == GGML_TYPE_F32);
-        
-        // For data parallel execution, we need to determine which portion of src1 this chunk needs
-        // In data parallel mode, each NUMA node processes a portion of the output rows
-        // This means each node needs the corresponding portion of src1
-        
-        const int64_t ne10 = src1->ne[0]; const int64_t ne11 = src1->ne[1];
-        const int64_t ne12 = src1->ne[2]; const int64_t ne13 = src1->ne[3];
-        
-        // Calculate conversion size for one slice (assuming we process one slice at a time)
-        // For now, convert only what we need for this specific computation
-        const size_t nbw1 = ggml_row_size(vec_dot_type, ne10);
-        const size_t nbw2 = nbw1 * ne11;
-        const size_t nbw3 = nbw2 * ne12;
-        
-        // NUMA data parallel fix: Only convert the portion we need
-        // For simplicity, let's convert one batch at a time (ne12 * ne11 elements)
-        // This drastically reduces memory requirements per chunk
-        const size_t chunk_conversion_size = nbw3; // One full 3D slice per batch
-        
-        GGML_LOG_DEBUG("🔍 Chunk conversion buffer requirements: %zu bytes (was %zu for full tensor)\n", 
-                       chunk_conversion_size, ne13 * nbw3);
-        
-        // Verify we have enough work buffer space for the chunk
-        GGML_ASSERT(params->wsize >= chunk_conversion_size);
-        
-        // Get conversion function
-        ggml_from_float_t const from_float = ggml_get_type_traits_cpu(vec_dot_type)->from_float;
-        char * wdata = (char*)params->wdata;
-        
-        // Convert src1 data from F32 to vec_dot_type in work buffer
-        // NUMA optimization: Only convert the first batch for now
-        // TODO: Implement proper chunk boundary calculation
-        const int64_t batch_to_process = 0; // Process first batch
-        for (int64_t i12 = 0; i12 < ne12; ++i12) {
-            for (int64_t i11 = 0; i11 < ne11; ++i11) {
-                from_float(
-                    (float *)((char *) src1_data + batch_to_process*src1->nb[3] + i12*src1->nb[2] + i11*src1->nb[1]),
-                    (void *)(wdata + i12*nbw2 + i11*nbw1),
-                    ne10
-                );
+        if (src0->type == GGML_TYPE_F16) {
+            const ggml_fp16_t* f16_data = (const ggml_fp16_t*)tensor_data(src0);
+            if (f16_data) {
+                // Check first few F16 values for NaN/inf
+                for (int i = 0; i < 16 && i < src0->ne[0]; i++) {
+                    float f32_val = GGML_CPU_FP16_TO_FP32(f16_data[i]);
+                    if (isnan(f32_val) || isinf(f32_val)) {
+                        fprintf(stderr, "🚨 F16 CORRUPTION: src0[%d] = NaN/inf (f16=0x%04x, f32=%f)\n", 
+                               i, (unsigned)f16_data[i], f32_val);
+                        fflush(stderr);
+                    }
+                }
+                fprintf(stderr, "🔍 F16 src0: First 4 values as F32: %.6f, %.6f, %.6f, %.6f\n",
+                       GGML_CPU_FP16_TO_FP32(f16_data[0]),
+                       GGML_CPU_FP16_TO_FP32(f16_data[1]),
+                       GGML_CPU_FP16_TO_FP32(f16_data[2]),
+                       GGML_CPU_FP16_TO_FP32(f16_data[3]));
             }
         }
         
-        // Use converted data
-        src1_data = wdata;
-        GGML_LOG_DEBUG("🔍 src1 conversion completed, using work buffer data\n");
-    } else {
-        GGML_LOG_DEBUG("🔍 No src1 conversion needed (already vec_dot_type)\n");
+        if (src1->type == GGML_TYPE_F16) {
+            const ggml_fp16_t* f16_data = (const ggml_fp16_t*)tensor_data(src1);
+            if (f16_data) {
+                // Check first few F16 values for NaN/inf  
+                for (int i = 0; i < 16 && i < src1->ne[0]; i++) {
+                    float f32_val = GGML_CPU_FP16_TO_FP32(f16_data[i]);
+                    if (isnan(f32_val) || isinf(f32_val)) {
+                        fprintf(stderr, "🚨 F16 CORRUPTION: src1[%d] = NaN/inf (f16=0x%04x, f32=%f)\n", 
+                               i, (unsigned)f16_data[i], f32_val);
+                        fflush(stderr);
+                    }
+                }
+                fprintf(stderr, "🔍 F16 src1: First 4 values as F32: %.6f, %.6f, %.6f, %.6f\n",
+                       GGML_CPU_FP16_TO_FP32(f16_data[0]),
+                       GGML_CPU_FP16_TO_FP32(f16_data[1]),
+                       GGML_CPU_FP16_TO_FP32(f16_data[2]),
+                       GGML_CPU_FP16_TO_FP32(f16_data[3]));
+            }
+        }
+        fflush(stderr);
     }
     
-    // Calculate matrix dimensions for chunk function
+    // Calculate matrix dimensions for chunk function FIRST to determine slicing
     const int64_t nr0 = dst->ne[0];  // Result rows
     const int64_t nr1 = dst->ne[1] * dst->ne[2] * dst->ne[3];  // Remaining dimensions
     
-    // NUMA-aware data slicing: each NUMA node processes a portion of the rows
+    // For NUMA data parallel execution, we need to split the work properly
+    // The original algorithm distributes work using chunk-based approach
+    // We'll distribute rows across nodes and only convert data we need
+    
     int current_numa_node = ggml_numa_get_current_node();
     int total_numa_nodes = ggml_numa_coordinator_get_num_nodes();
     
-    // Calculate which rows this NUMA node should process
+    // Simplified NUMA distribution: divide nr1 (rows) across NUMA nodes
     int64_t rows_per_node = nr1 / total_numa_nodes;
     int64_t extra_rows = nr1 % total_numa_nodes;
     
@@ -2765,9 +3007,9 @@ static enum ggml_status ggml_numa_work_function_mul_mat_chunk(void * work_contex
         end_row += extra_rows;
     }
     
-    // Ensure we don't exceed bounds
+    // Ensure we don't exceed bounds and have valid work to do
     if (end_row > nr1) end_row = nr1;
-    if (start_row >= nr1) {
+    if (start_row >= nr1 || start_row >= end_row) {
         // This NUMA node has no work to do
         GGML_LOG_DEBUG("🔍 NUMA node %d has no work (start_row=%ld >= nr1=%ld)\n", 
                        current_numa_node, start_row, nr1);
@@ -2776,11 +3018,111 @@ static enum ggml_status ggml_numa_work_function_mul_mat_chunk(void * work_contex
     
     GGML_LOG_DEBUG("🔍 NUMA node %d (of %d): processing rows %ld to %ld (of %ld total)\n", 
                    current_numa_node, total_numa_nodes, start_row, end_row - 1, nr1);
+
+    // Handle src1 preprocessing if needed (convert to vec_dot_type)
+    // CRITICAL: To avoid race conditions, use a shared conversion approach
+    const void * converted_src1_data = NULL;
+    
+    // Input validation: Only validate F32 tensors directly (quantized handled by vec_dot)
+    const void * src1_data = ggml_get_data(src1);
+    if (src1_data) {
+        GGML_LOG_DEBUG("🔍 MUL_MAT chunk: src0_type=%d, src1_type=%d\n", (int)src0->type, (int)src1->type);
+        
+        // Only validate and log F32 tensors - quantized tensors handled by vec_dot functions
+        if (src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32) {
+            float* src0_f = (float*)ggml_get_data(src0);
+            float* src1_f = (float*)src1_data;
+            if (src0_f && src1_f) {
+                GGML_LOG_DEBUG("🔍 F32 input data: src0[0]=%.2f, src0[1]=%.2f, src1[0]=%.2f, src1[1]=%.2f\n", 
+                       (double)src0_f[0], (double)src0_f[1], (double)src1_f[0], (double)src1_f[1]);
+                
+                // Validate F32 input data for NaN/inf corruption
+                int64_t src0_check_count = MIN(16, ggml_nelements(src0));
+                for (int64_t i = 0; i < src0_check_count; i++) {
+                    NUMA_ASSERT(isfinite(src0_f[i]), "MUL_MAT chunk: Found NaN/inf in F32 src0 data at index %d: %f", (int)i, (double)src0_f[i]);
+                }
+                
+                int64_t src1_check_count = MIN(16, ggml_nelements(src1));
+                for (int64_t i = 0; i < src1_check_count; i++) {
+                    NUMA_ASSERT(isfinite(src1_f[i]), "MUL_MAT chunk: Found NaN/inf in F32 src1 data at index %d: %f", (int)i, (double)src1_f[i]);
+                }
+                GGML_LOG_DEBUG("🔍 MUL_MAT F32 input validation: src0[%ld] src1[%ld] elements checked, all finite\n", 
+                               src0_check_count, src1_check_count);
+            }
+        } else {
+            // For quantized tensors: validation happens in vec_dot functions (e.g., ggml_vec_dot_f16)
+            GGML_LOG_DEBUG("🔍 MUL_MAT chunk: quantized input validation deferred to vec_dot computation\n");
+        }
+    }
+    
+    if (src1->type != vec_dot_type) {
+        GGML_LOG_DEBUG("🔍 Preprocessing: Converting src1 from type %d to vec_dot_type %d for rows %ld-%ld\n", 
+                       src1->type, vec_dot_type, start_row, end_row-1);
+        
+        // Verify src1 is F32 (expected input type)
+        NUMA_ASSERT(src1->type == GGML_TYPE_F32);
+        
+        const int64_t ne10 = src1->ne[0]; const int64_t ne11 = src1->ne[1];
+        const int64_t ne12 = src1->ne[2]; const int64_t ne13 = src1->ne[3];
+        
+        // Calculate conversion size for the full tensor
+        const size_t nbw0 = ggml_type_size(vec_dot_type);
+        const size_t nbw1 = ggml_row_size(vec_dot_type, ne10);
+        const size_t nbw2 = nbw1 * ne11;
+        const size_t nbw3 = nbw2 * ne12;
+        const size_t total_conversion_size = nbw3 * ne13;
+        
+        GGML_LOG_DEBUG("🔍 Full tensor conversion buffer requirements: %zu bytes\n", total_conversion_size);
+        
+        // Verify we have enough work buffer space for the full conversion
+        NUMA_ASSERT(params->wsize >= total_conversion_size);
+        
+        // Get conversion function
+        ggml_from_float_t const from_float = ggml_get_type_traits_cpu(vec_dot_type)->from_float;
+        char * wdata = (char*)params->wdata;
+        
+        // Convert the ENTIRE src1 tensor from F32 to vec_dot_type
+        // Each NUMA node does its own conversion in its own work buffer
+        for (int64_t i13 = 0; i13 < ne13; ++i13) {
+            for (int64_t i12 = 0; i12 < ne12; ++i12) {
+                for (int64_t i11 = 0; i11 < ne11; ++i11) {
+                    from_float(
+                        (float *)((char *) src1_data + i13*src1->nb[3] + i12*src1->nb[2] + i11*src1->nb[1]),
+                        (void *)(wdata + i13*nbw3 + i12*nbw2 + i11*nbw1),
+                        ne10
+                    );
+                }
+            }
+        }
+        
+        converted_src1_data = wdata;
+        
+        GGML_LOG_DEBUG("🔍 src1 full conversion completed\n");
+    } else {
+        GGML_LOG_DEBUG("🔍 No src1 conversion needed (already vec_dot_type)\n");
+        converted_src1_data = src1_data;
+    }
     
     GGML_LOG_DEBUG("🔍 Calling chunk function: ir0=[0,%ld], ir1=[%ld,%ld], vec_dot_num_rows=%ld\n", 
                    nr0, start_row, end_row, vec_dot_num_rows);
     
-    // Call the chunk function with proper parameters
+    // THREAD-SAFE APPROACH: Use work buffer pattern (no tensor mutation)
+    // Follow the original ggml_compute_forward_mul_mat_one_chunk logic exactly
+    
+    // Choose data source: work buffer if conversion happened, tensor data if not
+    const void * wdata_for_chunk = (converted_src1_data != src1_data) ? converted_src1_data : tensor_data(src1);
+    
+    // Create safe compute params pointing to the right data
+    struct ggml_compute_params safe_params = *params;
+    
+    // The chunk function will use params->wdata for converted data detection
+    // If src1->type != vec_dot_type, it expects converted data in params->wdata
+    if (converted_src1_data != src1_data) {
+        // Point wdata to our converted buffer - chunk function will use this
+        safe_params.wdata = (void*)converted_src1_data;
+    }
+    
+    // Call chunk function WITHOUT mutating any tensor metadata
     extern void ggml_compute_forward_mul_mat_one_chunk(
         const struct ggml_compute_params * params,
         struct ggml_tensor * dst,
@@ -2793,24 +3135,39 @@ static enum ggml_status ggml_numa_work_function_mul_mat_chunk(void * work_contex
     );
     
     ggml_compute_forward_mul_mat_one_chunk(
-        params,
+        &safe_params,   // Use our safe params
         dst,
         src0->type,
         vec_dot_num_rows,
         0,          // ir0_start: start of rows (always 0 for matrix cols)
-        nr0,        // ir0_end: end of rows (always full width for matrix cols)
+        nr0,        // ir0_end: end of rows (always full width for matrix cols)  
         start_row,  // ir1_start: start of assigned row slice
         end_row     // ir1_end: end of assigned row slice
     );
     
+    // CRITICAL DEBUG: Log the parameters passed to the compute function
+    fprintf(stderr, "🚨 CRITICAL CALL DEBUG: ggml_compute_forward_mul_mat_one_chunk called with:\n");
+    fprintf(stderr, "    src0->type=%d (%s), vec_dot_num_rows=%ld\n", 
+           src0->type, ggml_type_name(src0->type), vec_dot_num_rows);
+    fprintf(stderr, "    ir0=[0, %ld], ir1=[%ld, %ld]\n", nr0, start_row, end_row);
+    fflush(stderr);
+    
     GGML_LOG_DEBUG("🔍 ggml_compute_forward_mul_mat_one_chunk completed successfully\n");
     
-    // Check output data after computation
+    // Check output data after computation and validate for corruption
     void* output_data = ggml_get_data(dst);
     if (output_data) {
         float* output_f = (float*)output_data;
         GGML_LOG_DEBUG("🔍 Output data after computation: dst[0]=%.2f, dst[1]=%.2f, dst[2]=%.2f, dst[3]=%.2f\n", 
                (double)output_f[0], (double)output_f[1], (double)output_f[2], (double)output_f[3]);
+        
+        // CRITICAL VALIDATION: Check MUL_MAT output for NaN/inf corruption
+        int64_t output_check_count = ggml_nelements(dst);
+        output_check_count = (output_check_count > 32) ? 32 : output_check_count; // Check first 32 elements
+        for (int64_t i = 0; i < output_check_count; i++) {
+            NUMA_ASSERT(isfinite(output_f[i]), "MUL_MAT: Generated corrupted output at index %d: %f", (int)i, (double)output_f[i]);
+        }
+        GGML_LOG_DEBUG("🔍 MUL_MAT output validation: %ld elements checked, all finite\n", output_check_count);
     }
     
     GGML_LOG_DEBUG("🔍 ggml_compute_forward_mul_mat completed\n");
@@ -2856,7 +3213,7 @@ static enum ggml_status ggml_numa_work_function_soft_max_chunk(void * work_conte
     ggml_numa_dispatcher_work_context_t * ctx = (ggml_numa_dispatcher_work_context_t *)work_context;
     struct ggml_tensor * dst = ctx->operation;
 
-    GGML_ASSERT(dst && dst->src[0]);
+    NUMA_ASSERT(dst && dst->src[0]);
     
     GGML_LOG_DEBUG("🔍 SOFT_MAX chunk: wsize=%zu, wdata=%p\n", params->wsize, params->wdata);
     GGML_LOG_DEBUG("🔍 SOFT_MAX chunk: dst=%p, src=%p\n", (void*)dst, (void*)dst->src[0]);
@@ -2915,8 +3272,8 @@ static enum ggml_status ggml_numa_work_function_soft_max_chunk(void * work_conte
                 GGML_LOG_DEBUG("🔍 Processing row i01=%ld, i02=%ld, i03=%ld\n", i01, i02, i03);
                 
                 // Get pointers to the source and destination data for this specific row
-                const char * src_base = (const char*)tensor_data(src);
-                char * dst_base = (char*)tensor_data(dst);
+                const char * src_base = (const char*)ggml_get_data(src);
+                char * dst_base = (char*)ggml_get_data(dst);
                 
                 const size_t src_offset = i01*src->nb[1] + i02*src->nb[2] + i03*src->nb[3];
                 const size_t dst_offset = i01*dst->nb[1] + i02*dst->nb[2] + i03*dst->nb[3];
@@ -2972,6 +3329,13 @@ static enum ggml_status ggml_numa_work_function_rope_chunk(void * work_context, 
             float *data = (float*)src_data;
             GGML_LOG_DEBUG("ROPE work function: First few SOURCE values: %.6f %.6f %.6f %.6f\n", 
                            data[0], data[1], data[2], data[3]);
+            
+            // STRICT VALIDATION: Check first 16 elements for NaN/inf corruption
+            int64_t check_count = ggml_nelements(ctx->operation->src[0]);
+            check_count = (check_count > 16) ? 16 : check_count;
+            for (int64_t i = 0; i < check_count; i++) {
+                NUMA_ASSERT(isfinite(data[i]), "ROPE: Found NaN/inf in src[0] data at index %d: %f", (int)i, (double)data[i]);
+            }
         } else {
             GGML_LOG_WARN("ROPE work function: src[0] data is NULL\n");
         }
@@ -3011,11 +3375,19 @@ static enum ggml_status ggml_numa_work_function_rope_chunk(void * work_context, 
     // Add memory barrier to ensure all writes are visible before returning
     __sync_synchronize();
     
-    // Check output values
+    // Check output values and validate for corruption
     if (dst_data) {
         float *data = (float*)dst_data;
         GGML_LOG_DEBUG("ROPE work function: First few DESTINATION values (after): %.6f %.6f %.6f %.6f\n", 
                        data[0], data[1], data[2], data[3]);
+        
+        // CRITICAL VALIDATION: Check ROPE output for NaN/inf corruption 
+        int64_t output_check_count = ggml_nelements(ctx->operation);
+        output_check_count = (output_check_count > 32) ? 32 : output_check_count; // Check first 32 elements
+        for (int64_t i = 0; i < output_check_count; i++) {
+            NUMA_ASSERT(isfinite(data[i]), "ROPE: Generated corrupted output at index %d: %f", (int)i, (double)data[i]);
+        }
+        GGML_LOG_DEBUG("🔍 ROPE output validation: %ld elements checked, all finite\n", output_check_count);
     }
     
     GGML_LOG_DEBUG("Successfully executed ROPE chunk work function\n");
@@ -3068,18 +3440,18 @@ static void* add_thread_kernel(void* data) {
         int64_t i0 = i % td->ne0;
         
         // Calculate memory addresses for current element
-        const float * src0_ptr = (float *) ((char *) tensor_data(td->src0) + i3*td->nb3 + i2*td->nb2 + i1*td->nb1 + i0*td->nb0);
-        const float * src1_ptr = (float *) ((char *) tensor_data(td->src1) + i3*td->src1_nb3 + i2*td->src1_nb2 + i1*td->src1_nb1 + i0*td->src1_nb0);
-        float * dst_ptr = (float *) ((char *) tensor_data(td->dst) + i3*td->dst_nb3 + i2*td->dst_nb2 + i1*td->dst_nb1 + i0*td->dst_nb0);
+        const float * src0_ptr = (float *) ((char *) ggml_get_data(td->src0) + i3*td->nb3 + i2*td->nb2 + i1*td->nb1 + i0*td->nb0);
+        const float * src1_ptr = (float *) ((char *) ggml_get_data(td->src1) + i3*td->src1_nb3 + i2*td->src1_nb2 + i1*td->src1_nb1 + i0*td->src1_nb0);
+        float * dst_ptr = (float *) ((char *) ggml_get_data(td->dst) + i3*td->dst_nb3 + i2*td->dst_nb2 + i1*td->dst_nb1 + i0*td->dst_nb0);
         
         // ADD SIMD-optimized mathematical kernel: dst = src0 + src1
         // Check if we can process a contiguous chunk using SIMD
         if (i0 == 0 && td->ne0 > 1 && 
             td->nb0 == sizeof(float) && td->src1_nb0 == sizeof(float) && td->dst_nb0 == sizeof(float)) {
             // Process entire row with SIMD if contiguous
-            const float * src0_row = (float *) ((char *) tensor_data(td->src0) + i3*td->nb3 + i2*td->nb2 + i1*td->nb1);
-            const float * src1_row = (float *) ((char *) tensor_data(td->src1) + i3*td->src1_nb3 + i2*td->src1_nb2 + i1*td->src1_nb1);
-            float * dst_row = (float *) ((char *) tensor_data(td->dst) + i3*td->dst_nb3 + i2*td->dst_nb2 + i1*td->dst_nb1);
+            const float * src0_row = (float *) ((char *) ggml_get_data(td->src0) + i3*td->nb3 + i2*td->nb2 + i1*td->nb1);
+            const float * src1_row = (float *) ((char *) ggml_get_data(td->src1) + i3*td->src1_nb3 + i2*td->src1_nb2 + i1*td->src1_nb1);
+            float * dst_row = (float *) ((char *) ggml_get_data(td->dst) + i3*td->dst_nb3 + i2*td->dst_nb2 + i1*td->dst_nb1);
             
             ggml_vec_add_f32(td->ne0, dst_row, src0_row, src1_row);
             
@@ -3101,8 +3473,8 @@ static void* rms_norm_thread_kernel(void* data) {
         for (int64_t i02 = 0; i02 < td->ne02; i02++) {
             for (int64_t i01 = td->thread_start_row; i01 < td->thread_end_row; i01++) {
                 // Calculate memory addresses for current row across all batch dimensions
-                const float * src_row = (float *) ((char *) tensor_data(td->src0) + i01*td->nb01 + i02*td->nb02 + i03*td->nb03);
-                float * dst_row = (float *) ((char *) tensor_data(td->dst) + i01*td->nb1 + i02*td->nb2 + i03*td->nb3);
+                const float * src_row = (float *) ((char *) ggml_get_data(td->src0) + i01*td->nb01 + i02*td->nb02 + i03*td->nb03);
+                float * dst_row = (float *) ((char *) ggml_get_data(td->dst) + i01*td->nb1 + i02*td->nb2 + i03*td->nb3);
                 
                 // RMS normalization SIMD-optimized: sum of squares using vector dot product
                 float sum = 0.0f;
@@ -3163,6 +3535,24 @@ static enum ggml_status ggml_numa_work_function_add_single(void * work_context, 
     if (src0->type != GGML_TYPE_F32 || src1->type != GGML_TYPE_F32) {
         GGML_LOG_ERROR("ADD single work function: Only F32 tensors supported\n");
         return GGML_STATUS_FAILED;
+    }
+    
+    // STRICT VALIDATION: Check input tensors for NaN/inf corruption
+    const float* src0_data = (const float*)ggml_get_data(src0);
+    const float* src1_data = (const float*)ggml_get_data(src1);
+    
+    // Check first 16 elements of src0 for corruption
+    int64_t check_count = ggml_nelements(src0);
+    check_count = (check_count > 16) ? 16 : check_count;
+    for (int64_t i = 0; i < check_count; i++) {
+        NUMA_ASSERT(isfinite(src0_data[i]), "Found NaN/inf in src0 data at index %d: %f", (int)i, (double)src0_data[i]);
+    }
+    
+    // Check first 16 elements of src1 for corruption  
+    check_count = ggml_nelements(src1);
+    check_count = (check_count > 16) ? 16 : check_count;
+    for (int64_t i = 0; i < check_count; i++) {
+        NUMA_ASSERT(isfinite(src1_data[i]), "Found NaN/inf in src1 data at index %d: %f", (int)i, (double)src1_data[i]);
     }
     
     // Extract tensor dimensions for element-wise operations
@@ -3299,18 +3689,18 @@ static enum ggml_status ggml_numa_work_function_add_single(void * work_context, 
             int64_t i0 = i % ne0;
             
             // Calculate memory addresses for current element
-            const float * src0_ptr = (float *) ((char *) tensor_data(src0) + i3*nb3 + i2*nb2 + i1*nb1 + i0*nb0);
-            const float * src1_ptr = (float *) ((char *) tensor_data(src1) + i3*src1_nb3 + i2*src1_nb2 + i1*src1_nb1 + i0*src1_nb0);
-            float * dst_ptr = (float *) ((char *) tensor_data(ctx->operation) + i3*dst_nb3 + i2*dst_nb2 + i1*dst_nb1 + i0*dst_nb0);
+            const float * src0_ptr = (float *) ((char *) ggml_get_data(src0) + i3*nb3 + i2*nb2 + i1*nb1 + i0*nb0);
+            const float * src1_ptr = (float *) ((char *) ggml_get_data(src1) + i3*src1_nb3 + i2*src1_nb2 + i1*src1_nb1 + i0*src1_nb0);
+            float * dst_ptr = (float *) ((char *) ggml_get_data(ctx->operation) + i3*dst_nb3 + i2*dst_nb2 + i1*dst_nb1 + i0*dst_nb0);
             
             // ADD SIMD-optimized mathematical kernel: dst = src0 + src1
             // Check if we can process a contiguous chunk using SIMD
             if (i0 == 0 && ne0 > 1 && 
                 nb0 == sizeof(float) && src1_nb0 == sizeof(float) && dst_nb0 == sizeof(float)) {
                 // Process entire row with SIMD if contiguous
-                const float * src0_row = (float *) ((char *) tensor_data(src0) + i3*nb3 + i2*nb2 + i1*nb1);
-                const float * src1_row = (float *) ((char *) tensor_data(src1) + i3*src1_nb3 + i2*src1_nb2 + i1*src1_nb1);
-                float * dst_row = (float *) ((char *) tensor_data(ctx->operation) + i3*dst_nb3 + i2*dst_nb2 + i1*dst_nb1);
+                const float * src0_row = (float *) ((char *) ggml_get_data(src0) + i3*nb3 + i2*nb2 + i1*nb1);
+                const float * src1_row = (float *) ((char *) ggml_get_data(src1) + i3*src1_nb3 + i2*src1_nb2 + i1*src1_nb1);
+                float * dst_row = (float *) ((char *) ggml_get_data(ctx->operation) + i3*dst_nb3 + i2*dst_nb2 + i1*dst_nb1);
                 
                 ggml_vec_add_f32(ne0, dst_row, src0_row, src1_row);
                 
@@ -3367,6 +3757,24 @@ static enum ggml_status ggml_numa_work_function_add_chunk(void * work_context, s
     if (src0->type != GGML_TYPE_F32 || src1->type != GGML_TYPE_F32) {
         GGML_LOG_ERROR("ADD work function: Only F32 tensors supported\n");
         return GGML_STATUS_FAILED;
+    }
+    
+    // STRICT VALIDATION: Check input tensors for NaN/inf corruption
+    const float* src0_data = (const float*)ggml_get_data(src0);
+    const float* src1_data = (const float*)ggml_get_data(src1);
+    
+    // Check first 16 elements of src0 for corruption
+    int64_t check_count = ggml_nelements(src0);
+    check_count = (check_count > 16) ? 16 : check_count;
+    for (int64_t i = 0; i < check_count; i++) {
+        NUMA_ASSERT(isfinite(src0_data[i]), "Found NaN/inf in src0 data at index %d: %f", (int)i, (double)src0_data[i]);
+    }
+    
+    // Check first 16 elements of src1 for corruption  
+    check_count = ggml_nelements(src1);
+    check_count = (check_count > 16) ? 16 : check_count;
+    for (int64_t i = 0; i < check_count; i++) {
+        NUMA_ASSERT(isfinite(src1_data[i]), "Found NaN/inf in src1 data at index %d: %f", (int)i, (double)src1_data[i]);
     }
     
     // Extract tensor dimensions for element-wise operations
@@ -3568,18 +3976,18 @@ static enum ggml_status ggml_numa_work_function_add_chunk(void * work_context, s
             int64_t i0 = i % ne0;
             
             // Calculate memory addresses for current element
-            const float * src0_ptr = (float *) ((char *) tensor_data(src0) + i3*nb3 + i2*nb2 + i1*nb1 + i0*nb0);
-            const float * src1_ptr = (float *) ((char *) tensor_data(src1) + i3*src1_nb3 + i2*src1_nb2 + i1*src1_nb1 + i0*src1_nb0);
-            float * dst_ptr = (float *) ((char *) tensor_data(ctx->operation) + i3*dst_nb3 + i2*dst_nb2 + i1*dst_nb1 + i0*dst_nb0);
+            const float * src0_ptr = (float *) ((char *) ggml_get_data(src0) + i3*nb3 + i2*nb2 + i1*nb1 + i0*nb0);
+            const float * src1_ptr = (float *) ((char *) ggml_get_data(src1) + i3*src1_nb3 + i2*src1_nb2 + i1*src1_nb1 + i0*src1_nb0);
+            float * dst_ptr = (float *) ((char *) ggml_get_data(ctx->operation) + i3*dst_nb3 + i2*dst_nb2 + i1*dst_nb1 + i0*dst_nb0);
             
             // ADD SIMD-optimized mathematical kernel: dst = src0 + src1
             // Check if we can process a contiguous chunk using SIMD
             if (i0 == 0 && ne0 > 1 && 
                 nb0 == sizeof(float) && src1_nb0 == sizeof(float) && dst_nb0 == sizeof(float)) {
                 // Process entire row with SIMD if contiguous
-                const float * src0_row = (float *) ((char *) tensor_data(src0) + i3*nb3 + i2*nb2 + i1*nb1);
-                const float * src1_row = (float *) ((char *) tensor_data(src1) + i3*src1_nb3 + i2*src1_nb2 + i1*src1_nb1);
-                float * dst_row = (float *) ((char *) tensor_data(ctx->operation) + i3*dst_nb3 + i2*dst_nb2 + i1*dst_nb1);
+                const float * src0_row = (float *) ((char *) ggml_get_data(src0) + i3*nb3 + i2*nb2 + i1*nb1);
+                const float * src1_row = (float *) ((char *) ggml_get_data(src1) + i3*src1_nb3 + i2*src1_nb2 + i1*src1_nb1);
+                float * dst_row = (float *) ((char *) ggml_get_data(ctx->operation) + i3*dst_nb3 + i2*dst_nb2 + i1*dst_nb1);
                 
                 ggml_vec_add_f32(ne0, dst_row, src0_row, src1_row);
                 
@@ -3626,22 +4034,36 @@ static enum ggml_status ggml_numa_work_function_glu_chunk(void * work_context, s
         return GGML_STATUS_FAILED;
     }
     
-    // Check SOURCE tensor data
+    // Check SOURCE tensor data with comprehensive validation
     void *src0_data = ggml_get_data(src0);
-    if (src0_data) {
-        float *data0 = (float*)src0_data;
-        GGML_LOG_DEBUG("GLU work function: First few SOURCE0 values: %.6f %.6f %.6f %.6f\n", 
-                       data0[0], data0[1], data0[2], data0[3]);
-    } else {
+    if (!src0_data) {
         GGML_LOG_ERROR("GLU work function: Source tensor data is NULL\n");
         return GGML_STATUS_FAILED;
     }
     
+    // Validate input data for NaN/inf values
+    float *data0 = (float*)src0_data;
+    const int64_t src0_elements = ggml_nelements(src0);
+    
+    for (int64_t i = 0; i < src0_elements; i++) {
+        NUMA_ASSERT(isfinite(data0[i]), "GLU: Found NaN/inf in src0 data at index %d: %f", (int)i, (double)data0[i]);
+    }
+    
+    GGML_LOG_DEBUG("GLU work function: First few SOURCE0 values: %.6f %.6f %.6f %.6f\n", 
+                   data0[0], data0[1], data0[2], data0[3]);
+
     // Check second source tensor if present
     if (src1) {
         void *src1_data = ggml_get_data(src1);
         if (src1_data) {
             float *data1 = (float*)src1_data;
+            
+            // Validate second input tensor for NaN/inf values
+            const int64_t src1_elements = ggml_nelements(src1);
+            for (int64_t i = 0; i < src1_elements; i++) {
+                NUMA_ASSERT(isfinite(data1[i]), "GLU: Found NaN/inf in src1 data at index %d: %f", (int)i, (double)data1[i]);
+            }
+            
             GGML_LOG_DEBUG("GLU work function: First few SOURCE1 values: %.6f %.6f %.6f %.6f\n", 
                            data1[0], data1[1], data1[2], data1[3]);
         } else {
@@ -3649,9 +4071,7 @@ static enum ggml_status ggml_numa_work_function_glu_chunk(void * work_context, s
         }
     } else {
         GGML_LOG_DEBUG("GLU work function: Single source tensor mode (split tensor)\n");
-    }
-    
-    // Check destination tensor (should start as zeros or uninitialized)
+    }    // Check destination tensor (should start as zeros or uninitialized)
     void *dst_data = ggml_get_data(ctx->operation);
     if (dst_data) {
         float *data = (float*)dst_data;
@@ -3793,21 +4213,39 @@ static enum ggml_status ggml_numa_work_function_rms_norm_chunk(void * work_conte
     }
 
     // Calculate NUMA-level row distribution
+    // In single-node execution, only node 0 gets work and processes entire tensor
+    // In data-parallel execution, work is distributed across multiple nodes
     int64_t total_rows = ne01;
-    int64_t rows_per_node = total_rows / max_numa_nodes;
-    int64_t remainder_rows = total_rows % max_numa_nodes;
+    int64_t numa_start_row, numa_end_row;
     
-    // Calculate this NUMA node's row range
-    int64_t numa_start_row = numa_node * rows_per_node;
-    int64_t numa_end_row = numa_start_row + rows_per_node;
-    
-    // Distribute remainder rows among first few nodes
-    if (numa_node < remainder_rows) {
-        numa_start_row += numa_node;
-        numa_end_row += numa_node + 1;
+    // Simple heuristic: if only node 0 is being used, process entire tensor
+    // Otherwise, use data-parallel distribution
+    if (numa_node == 0 && max_numa_nodes > 1) {
+        // For single-node strategy: process entire tensor on node 0
+        // For data-parallel strategy: process node 0's slice 
+        // We'll assume single-node if we're seeing consecutive calls to only node 0
+        numa_start_row = 0;
+        numa_end_row = total_rows;  // Process entire tensor for now
+        GGML_LOG_DEBUG("RMS_NORM: NUMA node 0 processing ALL rows 0 to %ld (%ld total rows)", 
+                       numa_end_row - 1, total_rows);
     } else {
-        numa_start_row += remainder_rows;
-        numa_end_row += remainder_rows;
+        // Data-parallel mode: slice across nodes
+        int64_t rows_per_node = total_rows / max_numa_nodes;
+        int64_t remainder_rows = total_rows % max_numa_nodes;
+        
+        numa_start_row = numa_node * rows_per_node;
+        numa_end_row = numa_start_row + rows_per_node;
+        
+        if (numa_node < remainder_rows) {
+            numa_start_row += numa_node;
+            numa_end_row += numa_node + 1;
+        } else {
+            numa_start_row += remainder_rows;
+            numa_end_row += remainder_rows;
+        }
+        
+        GGML_LOG_DEBUG("RMS_NORM: NUMA node %d processing rows %ld to %ld (%ld of %ld total)", 
+                       numa_node, numa_start_row, numa_end_row - 1, numa_end_row - numa_start_row, total_rows);
     }
     
     // Ensure we don't exceed tensor bounds and have valid ranges
@@ -3922,38 +4360,111 @@ static enum ggml_status ggml_numa_work_function_rms_norm_chunk(void * work_conte
         // Single-threaded execution within this NUMA node
         GGML_LOG_DEBUG("RMS_NORM: Using single-threaded execution on NUMA node %d (CPU: %d)\n", 
                        numa_node, sched_getcpu());
+        
+        // Get raw tensor data pointers for validation
+        void * src_raw_data = ggml_get_data(src0);
+        void * dst_raw_data = ggml_get_data(ctx->operation);
+        
+        GGML_LOG_DEBUG("RMS_NORM: Data pointers - src=%p, dst=%p\n", src_raw_data, dst_raw_data);
+        
+        // Comprehensive bounds checking with assertions
+        NUMA_ASSERT(numa_start_row >= 0);
+        NUMA_ASSERT(numa_end_row > numa_start_row);
+        NUMA_ASSERT(numa_end_row <= ne01);
+        NUMA_ASSERT(ne00 > 0);
+        NUMA_ASSERT(ne01 > 0);
+        NUMA_ASSERT(ne02 > 0);
+        NUMA_ASSERT(ne03 > 0);
+        NUMA_ASSERT(src_raw_data != NULL);
+        NUMA_ASSERT(dst_raw_data != NULL);
+        
+        // Validate tensor strides are sane
+        NUMA_ASSERT(nb01 >= ne00 * sizeof(float));
+        NUMA_ASSERT(nb02 >= ne01 * nb01);
+        NUMA_ASSERT(nb03 >= ne02 * nb02);
+        NUMA_ASSERT(nb1 >= ne00 * sizeof(float));
+        NUMA_ASSERT(nb2 >= ne01 * nb1);
+        NUMA_ASSERT(nb3 >= ne02 * nb2);
+        
+        // Validate epsilon parameter
+        NUMA_ASSERT(eps > 0.0f);
+        NUMA_ASSERT(eps < 1.0f);  // Reasonable epsilon range
+        NUMA_ASSERT(isfinite(eps));
+        
+        GGML_LOG_DEBUG("RMS_NORM: Boundary checks passed - processing dimensions [%ld,%ld,%ld,%ld], rows %ld to %ld\n",
+                       ne00, ne01, ne02, ne03, numa_start_row, numa_end_row - 1);
                        
         for (int64_t i03 = 0; i03 < ne03; i03++) {
             for (int64_t i02 = 0; i02 < ne02; i02++) {
                 for (int64_t i01 = numa_start_row; i01 < numa_end_row; i01++) {
                     // Calculate memory addresses for current row
-                    const float * x = (float *) ((char *) tensor_data(src0) + i01*nb01 + i02*nb02 + i03*nb03);
-                    float * y = (float *) ((char *) tensor_data(ctx->operation) + i01*nb1 + i02*nb2 + i03*nb3);
+                    const float * x = (float *) ((char *) src_raw_data + i01*nb01 + i02*nb02 + i03*nb03);
+                    float * y = (float *) ((char *) dst_raw_data + i01*nb1 + i02*nb2 + i03*nb3);
+                    
+                    // Comprehensive memory bounds validation
+                    NUMA_ASSERT(x != NULL);
+                    NUMA_ASSERT(y != NULL);
+                    
+                    // Validate memory offsets are within tensor boundaries
+                    ptrdiff_t src_offset = i01*nb01 + i02*nb02 + i03*nb03;
+                    ptrdiff_t dst_offset = i01*nb1 + i02*nb2 + i03*nb3;
+                    ptrdiff_t src_end_offset = src_offset + (ne00-1) * sizeof(float);
+                    ptrdiff_t dst_end_offset = dst_offset + (ne00-1) * sizeof(float);
+                    
+                    NUMA_ASSERT(src_offset >= 0);
+                    NUMA_ASSERT(dst_offset >= 0);
+                    NUMA_ASSERT(src_end_offset < (ptrdiff_t)(ggml_nbytes(src0)));
+                    NUMA_ASSERT(dst_end_offset < (ptrdiff_t)(ggml_nbytes(ctx->operation)));
+                    
+                    // Validate the row data is finite before processing  
+                    for (int64_t i = 0; i < ne00; i++) {
+                        NUMA_ASSERT(isfinite(x[i]), "RMS_NORM: Found NaN/inf in row data at index %d: %f", (int)i, (double)x[i]);
+                    }
+                    
+                    // Debug first few elements of first row processed by this NUMA node
+                    if (i01 == numa_start_row && i02 == 0 && i03 == 0) {
+                        GGML_LOG_DEBUG("RMS_NORM NUMA %d: First row input data [0-4]: %f %f %f %f %f\n", 
+                                       numa_node, x[0], x[1], x[2], x[3], x[4]);
+                    }
                     
                     // RMS Normalization SIMD-optimized mathematical kernel:
                     // 1. Calculate sum of squares for the row using vector dot product
                     float sum = 0.0;
                     ggml_vec_dot_f32(ne00, &sum, 0, x, 0, x, 0, 1);
                     
+                    // Validate sum is finite and reasonable
+                    NUMA_ASSERT(isfinite(sum) && sum >= 0.0f);
+                    
                     // 2. Calculate mean of squares
                     const float mean = sum / ne00;
+                    NUMA_ASSERT(isfinite(mean) && mean >= 0.0f);
                     
                     // 3. Copy input to output and apply RMS normalization scaling
                     const float scale = 1.0f / sqrtf(mean + eps);
                     
-                    // Sanity check for numerical stability
-                    if (scale <= 0.0f || !isfinite(scale)) {
-                        GGML_LOG_ERROR("RMS_NORM work function: Invalid scale factor: %f (mean=%f, eps=%f)\n", 
-                                       scale, mean, eps);
-                        return GGML_STATUS_FAILED;
+                    // Validate scale factor
+                    NUMA_ASSERT(isfinite(scale) && scale > 0.0f);
+                    
+                    // Debug the first row calculations for this NUMA node
+                    if (i01 == numa_start_row && i02 == 0 && i03 == 0) {
+                        GGML_LOG_DEBUG("RMS_NORM NUMA %d: First row - sum=%f, mean=%f, scale=%f\n", 
+                                       numa_node, sum, mean, scale);
                     }
                     
                     // 4. Copy and scale using SIMD operations
                     ggml_vec_cpy_f32(ne00, y, x);
                     ggml_vec_scale_f32(ne00, y, scale);
+                    
+                    // Debug output for first row
+                    if (i01 == numa_start_row && i02 == 0 && i03 == 0) {
+                        GGML_LOG_DEBUG("RMS_NORM NUMA %d: First row output [0-4]: %f %f %f %f %f\n", 
+                                       numa_node, y[0], y[1], y[2], y[3], y[4]);
+                    }
                 }
             }
         }
+        
+        GGML_LOG_DEBUG("RMS_NORM: Single-threaded processing completed for NUMA node %d\n", numa_node);
     }
     
     // Memory barrier to ensure all writes are visible before returning

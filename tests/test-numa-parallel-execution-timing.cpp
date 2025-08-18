@@ -156,7 +156,27 @@ bool test_parallel_execution_timing() {
     return wait_result == 0;
 }
 
-int main() {
+int main(int argc, char* argv[]) {
+    // Parse command line arguments for --summary-only flag
+    bool summary_only = false;
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--summary-only") == 0) {
+            summary_only = true;
+            break;
+        }
+    }
+    
+    // If summary_only mode, redirect verbose output to /dev/null
+    FILE* dev_null = nullptr;
+    FILE* original_stdout = nullptr;
+    if (summary_only) {
+        dev_null = fopen("/dev/null", "w");
+        if (dev_null) {
+            original_stdout = stdout;
+            stdout = dev_null;
+        }
+    }
+    
     printf("===========================================\n");
     printf("🕰️ NUMA Parallel Execution Timing Test\n");
     printf("===========================================\n");
@@ -171,6 +191,13 @@ int main() {
         printf("❌ Parallel execution timing test: FAILED\n");
     }
     printf("===========================================\n");
+    
+    // Restore stdout and close dev_null if summary_only mode was used
+    if (summary_only && dev_null && original_stdout) {
+        stdout = original_stdout;
+        fclose(dev_null);
+        printf("✅ NUMA Parallel Execution Timing Test %s\n", success ? "PASSED" : "FAILED");
+    }
     
     return success ? 0 : 1;
 }

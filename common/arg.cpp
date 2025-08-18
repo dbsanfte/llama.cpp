@@ -2345,6 +2345,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         "- isolate N: only spawn threads on CPUs on NUMA node N (if valid)\n"
         "- numactl: use the CPU map provided by numactl\n"
         "- mirror: enable coordinator data parallelism with NUMA-aware KV cache\n"
+        "- mirror-force: enable virtual NUMA coordinator even on single-node systems\n"
         "if run without this previously, it is recommended to drop the system page cache before using this\n"
         "see https://github.com/ggml-org/llama.cpp/issues/1437",
         [](common_params & params, const std::string & value) {
@@ -2369,6 +2370,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
             else if (value == "numactl") { params.numa = GGML_NUMA_STRATEGY_NUMACTL; }
             else if (value == "mirror") { params.numa = GGML_NUMA_STRATEGY_MIRROR; }
+            else if (value == "mirror-force") { params.numa = GGML_NUMA_STRATEGY_MIRROR_FORCE; }
             else { throw std::invalid_argument("invalid value"); }
         }
     ).set_env("LLAMA_ARG_NUMA"));

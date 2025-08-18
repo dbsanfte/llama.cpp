@@ -332,7 +332,27 @@ private:
 };
 
 // Main function - entry point for the test
-int main() {
+int main(int argc, char* argv[]) {
+    // Parse command line arguments for --summary-only flag
+    bool summary_only = false;
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--summary-only") == 0) {
+            summary_only = true;
+            break;
+        }
+    }
+    
+    // If summary_only mode, redirect verbose output to /dev/null
+    FILE* dev_null = nullptr;
+    FILE* original_stdout = nullptr;
+    if (summary_only) {
+        dev_null = fopen("/dev/null", "w");
+        if (dev_null) {
+            original_stdout = stdout;
+            stdout = dev_null;
+        }
+    }
+    
     printf("🌟 Initializing NUMA system for mathematical correctness testing...\n");
     
     // Initialize the NUMA coordinator system with force_multi_socket for testing
@@ -346,6 +366,13 @@ int main() {
     
     NumaRmsNormMathematicalCorrectnessTestSuite test_suite;
     bool all_passed = test_suite.run_all_tests();
+    
+    // Restore stdout and close dev_null if summary_only mode was used
+    if (summary_only && dev_null && original_stdout) {
+        stdout = original_stdout;
+        fclose(dev_null);
+        printf("✅ NUMA RMS_NORM Mathematical Correctness Test %s\n", all_passed ? "PASSED" : "FAILED");
+    }
     
     return all_passed ? 0 : 1;
 }

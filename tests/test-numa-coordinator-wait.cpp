@@ -992,7 +992,27 @@ bool test_execution_strategy_mixed_workload() {
     return mixed_correct;
 }
 
-int main() {
+int main(int argc, char** argv) {
+    // Check for --summary-only flag
+    bool summary_only = false;
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--summary-only") == 0) {
+            summary_only = true;
+            break;
+        }
+    }
+    
+    // Redirect stdout to /dev/null if summary-only mode (but keep final results)
+    FILE* original_stdout = nullptr;
+    if (summary_only) {
+        original_stdout = stdout;
+        stdout = fopen("/dev/null", "w");
+        if (!stdout) {
+            stdout = original_stdout;
+            summary_only = false; // Fall back if redirection fails
+        }
+    }
+    
     printf("🧪 NUMA Coordinator Comprehensive Test Suite\n");
     printf("============================================\n");
     printf("Testing coordinator wait-for-completion AND execution strategies...\n\n");
@@ -1085,6 +1105,28 @@ int main() {
     
     bool all_tests_passed = (passed == num_tests) && (strategy_passed == num_strategy_tests);
     
+    // Restore stdout for final results
+    if (summary_only) {
+        fclose(stdout);
+        stdout = original_stdout;
+    }
+    
+    printf("========================================================================\n");
+    
+    printf("WAIT-FOR-COMPLETION TESTS:\n");
+    for (int i = 0; i < num_tests; i++) {
+        printf("%-30s %s\n", tests[i].name, tests[i].result ? "✅ PASS" : "❌ FAIL");
+    }
+    
+    printf("\nEXECUTION STRATEGY TESTS:\n");
+    for (int i = 0; i < num_strategy_tests; i++) {
+        printf("%-30s %s\n", strategy_tests[i].name, strategy_tests[i].result ? "✅ PASS" : "❌ FAIL");
+    }
+    
+    printf("------------------------------------------------------------------------\n");
+    printf("Wait Tests: %d/%d passed ", passed, num_tests);
+    printf("| Strategy Tests: %d/%d passed\n", strategy_passed, num_strategy_tests);
+    
     if (all_tests_passed) {
         printf("🎉 ALL TESTS PASSED!\n");
     } else {
@@ -1098,10 +1140,6 @@ int main() {
     
     printf("📊 Strategy tests verify coordinator follows assigned execution patterns\n");
     printf("========================================================================\n");
-    
-    // Cleanup
-    printf("\n🧹 Cleaning up coordinator...\n");
-    // Note: ggml_numa_cleanup doesn't exist, coordinator cleanup happens automatically
     
     printf("✅ Comprehensive coordinator testing completed!\n");
     

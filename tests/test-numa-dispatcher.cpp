@@ -1594,15 +1594,45 @@ public:
     }
 };
 
-int main() {
+int main(int argc, char** argv) {
+    // Check for --summary-only flag
+    bool summary_only = false;
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--summary-only") == 0) {
+            summary_only = true;
+            break;
+        }
+    }
+    
+    // Redirect stdout to /dev/null if summary-only mode (but keep final results)
+    FILE* original_stdout = nullptr;
+    if (summary_only) {
+        original_stdout = stdout;
+        stdout = fopen("/dev/null", "w");
+        if (!stdout) {
+            stdout = original_stdout;
+            summary_only = false; // Fall back if redirection fails
+        }
+    }
+    
     NumaDispatcherTestSuite test_suite;
     
     if (!test_suite.is_initialized()) {
+        if (summary_only) {
+            fclose(stdout);
+            stdout = original_stdout;
+        }
         printf("❌ Failed to initialize test suite\n");
         return 1;
     }
     
     bool all_passed = test_suite.run_all_tests();
+    
+    // Restore stdout for final results
+    if (summary_only) {
+        fclose(stdout);
+        stdout = original_stdout;
+    }
     
     printf("\n🎉 NUMA Dispatcher testing completed!\n");
     printf("✅ Key Achievement: Dispatcher infrastructure validated\n");

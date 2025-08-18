@@ -1442,8 +1442,8 @@ ggml_status llama_context::graph_compute(
     ggml_threadpool_t tp = batched ? threadpool_batch        : threadpool;
 
 #ifdef GGML_NUMA_MIRROR
-    // Try to use NUMA dispatcher if available (replaces direct coordinator access)
-    if (numa_coordinator) {
+    // Try to use NUMA dispatcher only if NUMA is actually enabled
+    if (numa_coordinator && ggml_get_numa_strategy() != GGML_NUMA_STRATEGY_DISABLED) {
         LLAMA_LOG_DEBUG("%s: using NUMA dispatcher for graph computation\n", __func__);
         
         // Route through dispatcher instead of coordinator directly

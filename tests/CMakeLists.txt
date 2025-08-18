@@ -259,6 +259,20 @@ target_link_libraries(${LLAMA_TEST_NAME} PRIVATE ggml ggml-cpu common)
 # Prioritize ggml/src/ggml-cpu/ to get the full implementation headers and add ggml/src for ggml-impl.h
 target_include_directories(${LLAMA_TEST_NAME} PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src/ggml-cpu ${CMAKE_SOURCE_DIR}/ggml/src ${CMAKE_SOURCE_DIR}/ggml/include)
 
+# test-numa-tensor-corruption-detection
+add_executable(test-numa-tensor-corruption-detection test-numa-tensor-corruption-detection.cpp)
+target_link_libraries(test-numa-tensor-corruption-detection PRIVATE common ggml ggml-cpu)
+target_include_directories(test-numa-tensor-corruption-detection PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src/ggml-cpu ${CMAKE_SOURCE_DIR}/ggml/src ${CMAKE_SOURCE_DIR}/ggml/include)
+install(TARGETS test-numa-tensor-corruption-detection RUNTIME)
+llama_test(test-numa-tensor-corruption-detection)
+
+# test-numa-reference-correctness
+add_executable(test-numa-reference-correctness test-numa-reference-correctness.cpp)
+target_link_libraries(test-numa-reference-correctness PRIVATE common ggml ggml-cpu)
+target_include_directories(test-numa-reference-correctness PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src/ggml-cpu ${CMAKE_SOURCE_DIR}/ggml/src ${CMAKE_SOURCE_DIR}/ggml/include)
+install(TARGETS test-numa-reference-correctness RUNTIME)
+llama_test(test-numa-reference-correctness)
+
 # test-numa-mathematical-correctness-add
 set(LLAMA_TEST_NAME test-numa-mathematical-correctness-add)
 llama_build_and_test(test-numa-mathematical-correctness-add.cpp)

@@ -77,11 +77,7 @@ enum ggml_status ggml_numa_fallback_execute(struct ggml_tensor * tensor, struct 
         DISPATCH_SIMPLE(GGML_OP_GLU, glu)
         
         // Matrix operations
-        case GGML_OP_MUL_MAT:
-            // NOTE: MUL_MAT operations should be handled by NUMA coordinator, not fallback
-            // Reject these operations so they get routed to the proper dispatcher
-            GGML_LOG_DEBUG("MUL_MAT operations should be handled by NUMA coordinator, not fallback\n");
-            return GGML_STATUS_FAILED;
+        DISPATCH_SIMPLE(GGML_OP_MUL_MAT, mul_mat)
         
         // View operations (no computation)
         DISPATCH_SIMPLE(GGML_OP_VIEW, view)

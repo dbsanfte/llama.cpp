@@ -2351,6 +2351,7 @@ void cpu_print_comprehensive_topology(const cpu_params & params, const common_pa
             break;
         case GGML_NUMA_STRATEGY_DISTRIBUTE:
         case GGML_NUMA_STRATEGY_MIRROR:
+        case GGML_NUMA_STRATEGY_MIRROR_FORCE:
         case GGML_NUMA_STRATEGY_NUMACTL:
         default:
             effective_numa_nodes = numa_available ? numa_nodes : 1;
@@ -2375,6 +2376,7 @@ void cpu_print_comprehensive_topology(const cpu_params & params, const common_pa
             break;
         case GGML_NUMA_STRATEGY_NUMACTL:    numa_strategy_name = "numactl"; break;
         case GGML_NUMA_STRATEGY_MIRROR:     numa_strategy_name = "mirror"; break;
+        case GGML_NUMA_STRATEGY_MIRROR_FORCE: numa_strategy_name = "mirror-force"; break;
         default:                           numa_strategy_name = "unknown"; break;
     }
     
@@ -2453,6 +2455,9 @@ void cpu_print_comprehensive_topology(const cpu_params & params, const common_pa
                 break;
             case GGML_NUMA_STRATEGY_MIRROR:
                 distribution_desc = "NUMA-aware data parallelism with mirroring";
+                break;
+            case GGML_NUMA_STRATEGY_MIRROR_FORCE:
+                distribution_desc = "Forced NUMA mirroring (virtual NUMA for testing)";
                 break;
             case GGML_NUMA_STRATEGY_NUMACTL:
                 distribution_desc = "Using numactl CPU map";

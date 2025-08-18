@@ -310,9 +310,28 @@ private:
     }
 };
 
-int main() {
-    // Initialize NUMA system with FORCE MULTI-SOCKET for real data slicing testing
-    printf("🔧 Initializing NUMA system for mathematical correctness testing...\n");
+int main(int argc, char** argv) {
+    // Check for --summary-only flag
+    bool summary_only = false;
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--summary-only") == 0) {
+            summary_only = true;
+            break;
+        }
+    }
+    
+    // Redirect stdout to /dev/null if summary-only mode (but keep final results)
+    FILE* original_stdout = nullptr;
+    if (summary_only) {
+        original_stdout = stdout;
+        stdout = fopen("/dev/null", "w");
+        if (!stdout) {
+            stdout = original_stdout;
+            summary_only = false; // Fall back if redirection fails
+        }
+    }
+    
+    printf("🌟 Initializing NUMA system for mathematical correctness testing...\n");
     printf("🚨 CRITICAL: Using FORCE_MULTI_SOCKET mode to test real data slicing on single-NUMA hardware\n");
     
     // Initialize the NUMA coordinator system with force_multi_socket=true for testing
@@ -331,10 +350,16 @@ int main() {
     NumaMathematicalCorrectnessTestSuite suite;
     bool all_passed = suite.run_all_tests();
     
+    // Restore stdout for final results and close dev_null
+    if (summary_only && original_stdout) {
+        fclose(stdout);
+        stdout = original_stdout;
+        printf("✅ NUMA SOFT_MAX Mathematical Correctness Test %s\n", all_passed ? "PASSED" : "FAILED");
+    }
+    
     if (all_passed) {
         return 0;
     } else {
-        printf("💥 Some tests failed.\n");
         return 1;
     }
 }

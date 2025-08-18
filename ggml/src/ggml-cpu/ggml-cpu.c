@@ -622,6 +622,7 @@ static void ggml_numa_init_coordinator(enum ggml_numa_strategy numa_strategy, co
                 break;
             case GGML_NUMA_STRATEGY_DISTRIBUTE:
             case GGML_NUMA_STRATEGY_MIRROR:
+            case GGML_NUMA_STRATEGY_MIRROR_FORCE:
             case GGML_NUMA_STRATEGY_NUMACTL:
             default:
                 // For these strategies, use actual system NUMA node count
@@ -698,13 +699,23 @@ int ggml_numa_node_count(void) {
 
 #ifdef GGML_NUMA_MIRROR
 bool ggml_numa_should_mirror(void) {
-    // Enable mirroring/dispatcher if:
-    // 1. NUMA is initialized and enabled
-    // 2. Strategy is specifically MIRROR (even on single-node systems for testing/virtual NUMA)
+    // Enable mirroring ONLY when there are actually multiple physical NUMA nodes
+    // AND we're using a mirroring strategy (not MIRROR_FORCE which is for virtual testing)
     return g_numa_state.initialized && 
            g_numa_state.numa_enabled &&
+           g_numa_state.numa_nodes > 1 &&
            g_numa_state.strategy == GGML_NUMA_STRATEGY_MIRROR;
-    // Note: Removed numa_nodes > 1 check to allow single-node dispatcher usage
+    // Note: MIRROR_FORCE is for coordinator testing with virtual nodes,
+    // but tensor data access should still use regular pointers on single-node systems
+}
+
+bool ggml_numa_should_dispatch(void) {
+    // Enable dispatcher for both real NUMA and virtual NUMA testing
+    // This allows coordinator/dispatcher to work in force_multi_socket mode
+    return g_numa_state.initialized && 
+           g_numa_state.numa_enabled &&
+           (g_numa_state.strategy == GGML_NUMA_STRATEGY_MIRROR ||
+            g_numa_state.strategy == GGML_NUMA_STRATEGY_MIRROR_FORCE);
 }
 #endif
 
@@ -1875,8 +1886,8 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
     }
 
 #ifdef GGML_NUMA_MIRROR
-    // NUMA dispatch intercept - route operations to NUMA coordinator when NUMA mirroring is enabled
-    if (ggml_numa_should_mirror() && params->ith == 0) {
+    // NUMA dispatch intercept - route operations to NUMA coordinator when NUMA dispatch is enabled
+    if (ggml_numa_should_dispatch() && params->ith == 0) {
         extern enum ggml_status ggml_numa_intercept_operation(struct ggml_tensor * tensor, struct ggml_compute_params * params);
         enum ggml_status numa_result = ggml_numa_intercept_operation(tensor, params);
         

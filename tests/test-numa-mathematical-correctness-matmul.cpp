@@ -5,6 +5,7 @@
 #include "ggml-numa-coordinator.h"
 #include "ggml-cpu-impl.h"
 #include "ggml-cpu/ops.h"
+#include "numa-test-utils.h"
 #include <vector>
 #include <stdio.h>
 #include <stdlib.h>
@@ -144,38 +145,38 @@ private:
                                 float* ref_data = (float*)ggml_get_data(ref_result);
                                 int total_elements = ggml_nelements(numa_result);
                                 
-                                case_passed = true;
-                                int error_count = 0;
-                                double max_abs_error = 0.0;
-                                double max_rel_error = 0.0;
+                                // ENHANCED: Check for corruption in NUMA result first
+                                printf("        🔍 Checking NUMA result for corruption...\n");
+                                auto numa_analysis = NumaTestUtils::analyze_tensor_corruption(numa_data, total_elements, "NUMA_result", false);
                                 
-                                for (int i = 0; i < total_elements; i++) {
-                                    double numa_val = numa_data[i];
-                                    double ref_val = ref_data[i];
-                                    double abs_error = fabs(numa_val - ref_val);
-                                    double rel_error = ref_val != 0.0 ? abs_error / fabs(ref_val) : 0.0;
-                                    
-                                    max_abs_error = fmax(max_abs_error, abs_error);
-                                    max_rel_error = fmax(max_rel_error, rel_error);
-                                    
-                                    // Use strict tolerance for mathematical equivalence
-                                    if (abs_error > 1e-6 && rel_error > 1e-6) {
-                                        if (error_count < 3) { // Show first 3 errors for brevity
-                                            printf("        ❌ Element[%d]: NUMA=%.8f, Reference=%.8f, AbsErr=%.2e, RelErr=%.2e\n",
-                                                    i, numa_val, ref_val, abs_error, rel_error);
-                                        }
-                                        error_count++;
-                                        case_passed = false;
-                                    }
-                                }
-                                
-                                if (case_passed) {
-                                    printf("      ✅ %s (%d threads): MATHEMATICALLY EQUIVALENT (MaxAbsErr=%.2e, MaxRelErr=%.2e)\n",
-                                            size_label, num_threads, max_abs_error, max_rel_error);
+                                if (numa_analysis.has_corruption) {
+                                    printf("        🚨 CRITICAL: NUMA result contains corruption!\n");
+                                    NumaTestUtils::print_corruption_report(numa_analysis, "NUMA_result");
+                                    case_passed = false;
                                 } else {
-                                    printf("      ❌ %s (%d threads): MATHEMATICAL MISMATCH (%d/%d elements differ)\n",
-                                            size_label, num_threads, error_count, total_elements);
-                                    printf("        MaxAbsErr=%.2e, MaxRelErr=%.2e\n", max_abs_error, max_rel_error);
+                                    printf("        ✅ NUMA result is clean (no NaN/inf detected)\n");
+                                    
+                                    // Also check reference for corruption (shouldn't happen but be safe)
+                                    auto ref_analysis = NumaTestUtils::analyze_tensor_corruption(ref_data, total_elements, "reference_result", false);
+                                    if (ref_analysis.has_corruption) {
+                                        printf("        ⚠️  WARNING: Reference result contains corruption! Test invalid.\n");
+                                        NumaTestUtils::print_corruption_report(ref_analysis, "reference_result");
+                                        case_passed = false;
+                                    } else {
+                                        // Both results are clean, do mathematical comparison
+                                        printf("        🧮 Comparing mathematical correctness...\n");
+                                        case_passed = NumaTestUtils::tensors_equal(numa_data, ref_data, total_elements, 1e-6, 1e-6, true);
+                                        
+                                        if (case_passed) {
+                                            printf("      ✅ %s (%d threads): MATHEMATICALLY EQUIVALENT AND CORRUPTION-FREE\n",
+                                                    size_label, num_threads);
+                                            printf("         NUMA stats: mean=%.6f, variance=%.6e, range=[%.6f, %.6f]\n",
+                                                   numa_analysis.mean, numa_analysis.variance, numa_analysis.min_val, numa_analysis.max_val);
+                                        } else {
+                                            printf("      ❌ %s (%d threads): MATHEMATICAL MISMATCH (but no corruption)\n",
+                                                    size_label, num_threads);
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -190,15 +191,147 @@ private:
     }
 
 public:
+    // Test Q8_0×F32 matrix multiplication (where corruption occurs)
+    bool test_q8_0_mul_mat_case(int M, int K, int N, int num_threads, const char* size_label) {
+        printf("    🧮 Testing Q8_0×F32 %s: %dx%d * %dx%d = %dx%d (M=%d, K=%d, N=%d, threads=%d) [FORCE_DATA_PARALLEL]\n", 
+               size_label, M, K, K, N, M, N, M, K, N, num_threads);
+        
+        // Create test context with sufficient memory
+        struct ggml_init_params params = {0};
+        params.mem_size = std::max((size_t)(512 * 1024 * 1024), (size_t)(M * K + K * N + M * N) * sizeof(float) * 4);
+        params.mem_buffer = nullptr;
+        params.no_alloc = false;
+        
+        struct ggml_context* test_ctx = ggml_init(params);
+        if (!test_ctx) {
+            printf("      ❌ Failed to create test context for Q8_0 %s\n", size_label);
+            return false;
+        }
+        
+        bool case_passed = false;
+        
+        // Create Q8_0 matrix A and F32 matrix B
+        struct ggml_tensor* a_f32 = ggml_new_tensor_2d(test_ctx, GGML_TYPE_F32, K, M);
+        struct ggml_tensor* a_q8_0 = ggml_new_tensor_2d(test_ctx, GGML_TYPE_Q8_0, K, M);
+        struct ggml_tensor* b = ggml_new_tensor_2d(test_ctx, GGML_TYPE_F32, K, N);
+        
+        if (!a_f32 || !a_q8_0 || !b) {
+            printf("      ❌ Failed to create Q8_0 test matrices for %s\n", size_label);
+        } else {
+            // Debug: Print tensor dimensions
+            printf("      🔍 Tensor dimensions: a_q8_0=(%ld,%ld,%ld,%ld), b=(%ld,%ld,%ld,%ld)\n",
+                   a_q8_0->ne[0], a_q8_0->ne[1], a_q8_0->ne[2], a_q8_0->ne[3], 
+                   b->ne[0], b->ne[1], b->ne[2], b->ne[3]);
+            
+            // Fill F32 matrices with deterministic test data
+            float* a_f32_data = (float*)ggml_get_data(a_f32);
+            float* b_data = (float*)ggml_get_data(b);
+            
+            int seed_a = M + K;
+            int seed_b = K + N;
+            
+            for (int i = 0; i < ggml_nelements(a_f32); i++) {
+                a_f32_data[i] = 0.1f + ((i + seed_a) % 37) * 0.01f;
+            }
+            for (int i = 0; i < ggml_nelements(b); i++) {
+                b_data[i] = 0.2f + ((i + seed_b) % 41) * 0.01f;
+            }
+            
+            // Quantize matrix A to Q8_0
+            ggml_quantize_chunk(GGML_TYPE_Q8_0, (const float*)a_f32_data, ggml_get_data(a_q8_0), 0, ggml_nrows(a_f32), ggml_row_size(GGML_TYPE_F32, a_f32->ne[0]), nullptr);
+            
+            // Create Q8_0×F32 MUL_MAT operation (this is where corruption occurs)
+            struct ggml_tensor* numa_result = ggml_mul_mat(test_ctx, a_q8_0, b);
+            if (!numa_result) {
+                printf("      ❌ Failed to create Q8_0×F32 MUL_MAT operation for %s\n", size_label);
+            } else {
+                // FORCE DATA-PARALLEL EXECUTION by directly calling the data-parallel work function
+                // This bypasses the NUMA hardware detection that forces single-node fallback
+                
+                // Set up compute parameters for multi-threaded NUMA execution
+                struct ggml_compute_params numa_params = {
+                    0,               // ith
+                    num_threads,     // nth
+                    0,               // wsize
+                    nullptr,         // wdata
+                    nullptr          // threadpool
+                };
+                
+                printf("        🚀 Using NUMA coordinator settings for data-parallel execution...\n");
+                
+                // Execute NUMA dispatcher - coordinator already configured for multi-socket
+                enum ggml_status dispatch_result = ggml_numa_intercept_operation(numa_result, &numa_params);
+                
+                if (dispatch_result != GGML_STATUS_SUCCESS) {
+                    printf("      ❌ Q8_0×F32 NUMA dispatcher execution failed for %s (status=%d, threads=%d)\n", 
+                           size_label, dispatch_result, num_threads);
+                } else {
+                    // Create F32×F32 reference for comparison
+                    struct ggml_tensor* ref_result = ggml_mul_mat(test_ctx, a_f32, b);
+                    if (!ref_result) {
+                        printf("      ❌ Failed to create F32×F32 reference for %s\n", size_label);
+                    } else {
+                        struct ggml_compute_params ref_params = {
+                            0,           // ith
+                            1,           // nth - single thread reference
+                            0,           // wsize
+                            nullptr,     // wdata
+                            nullptr      // threadpool
+                        };
+                        
+                        // Execute reference with single-threaded standard ggml
+                        ggml_compute_forward_mul_mat(&ref_params, ref_result);
+                        
+                        // Compare Q8_0×F32 NUMA result with F32×F32 reference
+                        float* numa_data = (float*)ggml_get_data(numa_result);
+                        float* ref_data = (float*)ggml_get_data(ref_result);
+                        int total_elements = ggml_nelements(numa_result);
+                        
+                        // CRITICAL: Check for corruption in Q8_0×F32 NUMA result
+                        printf("        🔍 Checking Q8_0×F32 NUMA result for corruption...\n");
+                        auto numa_analysis = NumaTestUtils::analyze_tensor_corruption(numa_data, total_elements, "Q8_0×F32_NUMA_result", false);
+                        
+                        if (numa_analysis.has_corruption) {
+                            printf("        🚨 CRITICAL: Q8_0×F32 NUMA result contains corruption! BUG DETECTED!\n");
+                            NumaTestUtils::print_corruption_report(numa_analysis, "Q8_0×F32_NUMA_result");
+                            case_passed = false;
+                        } else {
+                            printf("        ✅ Q8_0×F32 NUMA result is clean (no NaN/inf detected)\n");
+                            
+                            // Compare with F32×F32 reference (allowing for quantization error)
+                            printf("        🧮 Comparing Q8_0×F32 NUMA vs F32×F32 reference...\n");
+                            case_passed = NumaTestUtils::tensors_equal(numa_data, ref_data, total_elements, 1e-3, 1e-3, true); // Higher tolerance for quantization
+                            
+                            if (case_passed) {
+                                printf("      ✅ Q8_0×F32 %s (%d threads): MATHEMATICALLY EQUIVALENT AND CORRUPTION-FREE\n",
+                                        size_label, num_threads);
+                            } else {
+                                printf("      ❌ Q8_0×F32 %s (%d threads): MATHEMATICAL MISMATCH (check quantization tolerance)\n",
+                                        size_label, num_threads);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        
+        ggml_free(test_ctx);
+        return case_passed;
+    }
+
     bool run_all_tests() {
         printf("🧪 NUMA Mathematical Correctness Test Suite\n");
         printf("================================================================================\n");
         printf("🔧 Testing mathematical correctness with the new function pointer architecture\n");
         printf("Comparing NUMA parallel execution against serial reference implementations\n");
+        printf("🚨 ENHANCED: Now includes Q8_0×F32 corruption detection tests\n");
         printf("================================================================================\n\n");
         
         // Run mathematical correctness tests with updated function pointer API
         test_mul_mat_mathematical_equivalence();
+        
+        // NEW: Run Q8_0×F32 corruption detection tests
+        test_q8_0_corruption_detection();
         
         // Test data parallel type conversion buffer sizing (regression test)
         test_data_parallel_type_conversion_buffer_sizing();
@@ -294,6 +427,87 @@ private:
         }
         
         results.push_back({"mul_mat_mathematical_equivalence", overall_test_passed, failure_reason ? failure_reason : ""});
+    }
+    
+    // NEW: Q8_0×F32 corruption detection test
+    void test_q8_0_corruption_detection() {
+        printf("--- Test: Q8_0×F32 Corruption Detection (Critical Bug Detection) ---\n");
+        printf("Testing Q8_0×F32 matrix multiplication for NaN/inf corruption...\n");
+        printf("This test specifically targets the Q8_0×F32 corruption bug that produces garbage output\n\n");
+        
+        bool overall_test_passed = true;
+        const char* failure_reason = nullptr;
+        
+        // IMPORTANT: Q8_0 has a block size of 32 (QK8_0), so K dimension must be divisible by 32
+        // Otherwise ggml_row_size() will fail with assertion: `ne % ggml_blck_size(type) == 0'
+        
+        // Test Q8_0×F32 with dimensions aligned to Q8_0 block size (32)
+        struct {
+            int M, K, N;
+            const char* label;
+        } q8_0_test_cases[] = {
+            {8, 32, 4, "TINY_Q8_0"},     // K=32, aligned to Q8_0 block size
+            {32, 64, 16, "SMALL_Q8_0"},  // K=64, aligned to Q8_0 block size
+            {64, 128, 32, "MEDIUM_Q8_0"} // K=128, aligned to Q8_0 block size
+        };
+        
+        // Test with multiple threads to trigger NUMA dispatch
+        int thread_strategies[] = {2, 4, 6};
+        int num_strategies = sizeof(thread_strategies) / sizeof(thread_strategies[0]);
+        int num_test_cases = sizeof(q8_0_test_cases) / sizeof(q8_0_test_cases[0]);
+        
+        printf("  🎯 Testing %d Q8_0×F32 matrix dimensions with %d thread strategies (%d total combinations)\n\n", 
+               num_test_cases, num_strategies, num_test_cases * num_strategies);
+        
+        int total_tests = 0;
+        int passed_tests = 0;
+        
+        // Test each Q8_0×F32 matrix dimension with each thread strategy
+        for (int case_idx = 0; case_idx < num_test_cases; case_idx++) {
+            printf("  📏 Testing Q8_0×F32 %s matrices (%dx%d * %dx%d):\n", 
+                   q8_0_test_cases[case_idx].label, 
+                   q8_0_test_cases[case_idx].M, q8_0_test_cases[case_idx].K,
+                   q8_0_test_cases[case_idx].K, q8_0_test_cases[case_idx].N);
+                   
+            for (int strategy_idx = 0; strategy_idx < num_strategies; strategy_idx++) {
+                int num_threads = thread_strategies[strategy_idx];
+                total_tests++;
+                
+                bool case_passed = test_q8_0_mul_mat_case(
+                    q8_0_test_cases[case_idx].M,
+                    q8_0_test_cases[case_idx].K, 
+                    q8_0_test_cases[case_idx].N,
+                    num_threads,
+                    q8_0_test_cases[case_idx].label
+                );
+                
+                if (case_passed) {
+                    passed_tests++;
+                } else {
+                    overall_test_passed = false;
+                    if (!failure_reason) {
+                        failure_reason = "Q8_0×F32 corruption or mathematical mismatch detected";
+                    }
+                }
+            }
+            printf("\n");
+        }
+        
+        // Print summary for Q8_0×F32 test
+        printf("  📊 Q8_0×F32 Corruption Detection Test Summary:\n");
+        printf("    Total test combinations: %d\n", total_tests);
+        printf("    Passed: %d\n", passed_tests);
+        printf("    Failed: %d\n", total_tests - passed_tests);
+        
+        if (overall_test_passed) {
+            printf("✅ Q8_0×F32 corruption detection: VERIFIED\n");
+            printf("  🎉 All Q8_0×F32 operations produce clean results without corruption!\n\n");
+        } else {
+            printf("❌ Q8_0×F32 corruption detection: FAILED - %s\n", failure_reason);
+            printf("  🚨 CRITICAL: Q8_0×F32 operations are producing corrupted output! BUG CONFIRMED!\n\n");
+        }
+        
+        results.push_back({"q8_0_corruption_detection", overall_test_passed, failure_reason ? failure_reason : ""});
     }
     
     // Regression test for data parallel type conversion buffer sizing issue
@@ -484,7 +698,27 @@ private:
     }
 };
 
-int main() {
+int main(int argc, char* argv[]) {
+    // Parse command line arguments for --summary-only flag
+    bool summary_only = false;
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--summary-only") == 0) {
+            summary_only = true;
+            break;
+        }
+    }
+    
+    // If summary_only mode, redirect verbose output to /dev/null
+    FILE* dev_null = nullptr;
+    FILE* original_stdout = nullptr;
+    if (summary_only) {
+        dev_null = fopen("/dev/null", "w");
+        if (dev_null) {
+            original_stdout = stdout;
+            stdout = dev_null;
+        }
+    }
+    
     // Initialize NUMA system with FORCE MULTI-SOCKET for real data slicing testing
     printf("🔧 Initializing NUMA system for mathematical correctness testing...\n");
     printf("🚨 CRITICAL: Using FORCE_MULTI_SOCKET mode to test real data slicing on single-NUMA hardware\n");
@@ -504,6 +738,13 @@ int main() {
     // Run mathematical correctness tests
     NumaMathematicalCorrectnessTestSuite suite;
     bool all_passed = suite.run_all_tests();
+    
+    // Restore stdout and close dev_null if summary_only mode was used
+    if (summary_only && dev_null && original_stdout) {
+        stdout = original_stdout;
+        fclose(dev_null);
+        printf("✅ NUMA MUL_MAT Mathematical Correctness Test %s\n", all_passed ? "PASSED" : "FAILED");
+    }
     
     if (all_passed) {
         return 0;

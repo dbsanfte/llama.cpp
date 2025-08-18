@@ -149,10 +149,17 @@ cmake --build build --parallel
 # Download test model
 wget -c -O ./.devcontainer/qwen2.5-0.5b-instruct-q8_0.gguf https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF/resolve/main/qwen2.5-0.5b-instruct-q8_0.gguf
 
-# Test with NUMA mirror mode
-./build/bin/llama-server -m ./.devcontainer/qwen2.5-0.5b-instruct-q8_0.gguf --host 0.0.0.0 --numa mirror --port 8080 &
+# Test with NUMA in forced mirror mode in full coordinator run:
+./build/bin/llama-server -m ./.devcontainer/qwen2.5-0.5b-instruct-q8_0.gguf --host 0.0.0.0 --numa mirror-force --port 8080 &
+
+while ! curl --fail --silent http://localhost:8080/; do sleep 1; done
 
 curl -X POST http://localhost:8080/v1/chat/completions -H "Content-Type: application/json" -d '{"model": "qwen2.5-0.5b-instruct", "messages": [{"role": "user", "content": "Hello!"}], "max_tokens": 20}'
+
+# (Check the JSON response looks sane with a proper model response, not garbage)
+
+# Kill the coordinator once done:
+ps aux | grep llama-server | grep -v grep | awk '{print $2}' | xargs kill -9
 ```
 
 ## 🧠 Key Technical Areas
@@ -287,4 +294,4 @@ cmake --build build --target test-numa-mathematical-correctness-OPERATION
 ```
 
 ## Changelog
-Document completed tasks in `.devcontainer/changelog/YYYY-MM-DD-description.md` with current date.
+Document completed tasks in `.devcontainer/changelog/YYYY-MM-DD-description.md`. Always use `date +%Y-%m-%d` to fetch the current date.

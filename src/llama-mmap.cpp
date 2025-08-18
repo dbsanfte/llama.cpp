@@ -391,6 +391,11 @@ struct llama_mmap::impl {
                     should_distribute = false;
                     LLAMA_LOG_INFO("NUMA mirror mode - replicating model data on each NUMA node\n");
                     break;
+                case GGML_NUMA_STRATEGY_MIRROR_FORCE:
+                    should_mirror = true;
+                    should_distribute = false;
+                    LLAMA_LOG_INFO("NUMA mirror force mode - replicating model data (virtual NUMA for testing)\n");
+                    break;
                 default:
                     should_mirror = true;  // Default to mirroring for other strategies
                     should_distribute = false;
@@ -447,6 +452,16 @@ struct llama_mmap::impl {
 #endif // ifndef GGML_NUMA_MIRROR
 
 #ifdef GGML_NUMA_MIRROR
+        int flags = MAP_SHARED;
+        if (numa) { prefetch = 0; }
+#ifdef __linux__
+        if (posix_fadvise(fd, 0, 0, POSIX_FADV_SEQUENTIAL)) {
+            LLAMA_LOG_WARN("warning: posix_fadvise(.., POSIX_FADV_SEQUENTIAL) failed: %s\n",
+                    strerror(errno));
+        }
+        if (prefetch) { flags |= MAP_POPULATE; }
+#endif
+        
         int oldpolicy;
         struct bitmask* oldmask = numa_allocate_nodemask();
         if (get_mempolicy(&oldpolicy, oldmask->maskp,
@@ -462,6 +477,45 @@ struct llama_mmap::impl {
             num_nodes = 1;
         }
         LLAMA_LOG_INFO("Detected %d NUMA nodes for mirror mode\n", num_nodes);
+
+        // Validate NUMA mirroring request based on strategy and hardware
+        if (num_nodes <= 1) {
+            if (strategy == GGML_NUMA_STRATEGY_MIRROR) {
+                // Regular mirror mode on single-node system - this is likely an error
+                LLAMA_LOG_ERROR("NUMA mirror mode requested but only %d NUMA node(s) detected\n", num_nodes);
+                LLAMA_LOG_ERROR("NUMA mirroring requires multiple NUMA nodes to be effective\n");
+                LLAMA_LOG_ERROR("Use '--numa mirror-force' to force virtual NUMA mirroring for testing purposes\n");
+                throw std::runtime_error("NUMA mirror mode requires multiple NUMA nodes (use 'mirror-force' to override)");
+            } else if (strategy == GGML_NUMA_STRATEGY_MIRROR_FORCE) {
+                // Force mirror mode on single-node system - fall back to regular mmap for safety
+                LLAMA_LOG_INFO("Forcing NUMA mirroring on single-node system - falling back to regular mmap() for compatibility\n");
+                
+                // Use regular mmap instead of NUMA allocation on single-node systems
+                addr = mmap(NULL, file->size(), PROT_READ, flags, fd, 0);
+                if (addr == MAP_FAILED) {
+                    throw std::runtime_error(format("mmap failed: %s", strerror(errno)));
+                }
+
+                if (prefetch > 0) {
+                    if (posix_madvise(addr, std::min(file->size(), prefetch), POSIX_MADV_WILLNEED)) {
+                        LLAMA_LOG_WARN("warning: posix_madvise(.., POSIX_MADV_WILLNEED) failed: %s\n",
+                                strerror(errno));
+                    }
+                }
+                if (numa) {
+                    if (posix_madvise(addr, file->size(), POSIX_MADV_RANDOM)) {
+                        LLAMA_LOG_WARN("warning: posix_madvise(.., POSIX_MADV_RANDOM) failed: %s\n",
+                                strerror(errno));
+                    }
+                }
+                
+                mapped_fragments.emplace_back(0, file->size());
+                LLAMA_LOG_INFO("Single-node mirror-force: successfully mapped %zu bytes using regular mmap()\n", file->size());
+                return; // Skip NUMA allocation code below
+            } else {
+                throw std::runtime_error(format("Unknown NUMA mirroring strategy: %d", strategy));
+            }
+        }
 
         size_t total_size = file->size();
         

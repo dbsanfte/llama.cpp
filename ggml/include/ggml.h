@@ -653,6 +653,8 @@ extern "C" {
     extern __thread int ggml_current_numa_node;
     // Function to check if NUMA mirroring should be active at runtime
     extern bool ggml_numa_should_mirror(void);
+    // Function to check if NUMA dispatch/coordinator should be active at runtime
+    extern bool ggml_numa_should_dispatch(void);
 #endif
 
     static inline void * tensor_data(const struct ggml_tensor * tensor) {
