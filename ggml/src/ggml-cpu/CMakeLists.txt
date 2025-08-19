@@ -28,6 +28,21 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
         ggml-cpu/ggml-numa-operation-dispatch.c
         ggml-cpu/ggml-numa-operation-dispatch.h
         ggml-cpu/ggml-numa-fallback.c
+        ggml-cpu/ggml-numa-work-shared.h
+        ggml-cpu/numa-work/ggml-numa-add.c
+        ggml-cpu/numa-work/ggml-numa-add.h
+        ggml-cpu/numa-work/ggml-numa-mulmat.c
+        ggml-cpu/numa-work/ggml-numa-mulmat.h
+        ggml-cpu/numa-work/ggml-numa-softmax.c
+        ggml-cpu/numa-work/ggml-numa-softmax.h
+        ggml-cpu/numa-work/ggml-numa-rope.c
+        ggml-cpu/numa-work/ggml-numa-rope.h
+        ggml-cpu/numa-work/ggml-numa-glu.c
+        ggml-cpu/numa-work/ggml-numa-glu.h
+        ggml-cpu/numa-work/ggml-numa-rms-norm.c
+        ggml-cpu/numa-work/ggml-numa-rms-norm.h
+        ggml-cpu/numa-work/ggml-numa-flash-attn-ext.c
+        ggml-cpu/numa-work/ggml-numa-flash-attn-ext.h
         ggml-work-item.c
         ggml-cpu/repack.cpp
         ggml-cpu/repack.h

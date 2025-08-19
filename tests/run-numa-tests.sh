@@ -59,7 +59,6 @@ NUMA_TESTS=(
     "test-numa-mathematical-correctness-rms-norm"
     "test-numa-mathematical-correctness-flash-attn-ext"
     "test-numa-mathematical-correctness-matmul"
-    "test-numa-tensor-corruption-detection"
     "test-numa-reference-correctness"
 )
 

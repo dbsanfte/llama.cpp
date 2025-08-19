@@ -150,7 +150,7 @@ cmake --build build --parallel
 wget -c -O ./.devcontainer/qwen2.5-0.5b-instruct-q8_0.gguf https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF/resolve/main/qwen2.5-0.5b-instruct-q8_0.gguf
 
 # Test with NUMA in forced mirror mode in full coordinator run:
-./build/bin/llama-server -m ./.devcontainer/qwen2.5-0.5b-instruct-q8_0.gguf --host 0.0.0.0 --numa mirror-force --port 8080 &
+./build/bin/llama-server -m ./.devcontainer/qwen2.5-0.5b-instruct-q8_0.gguf --host 0.0.0.0 --numa mirror --port 8080 &
 
 while ! curl --fail --silent http://localhost:8080/; do sleep 1; done
 
