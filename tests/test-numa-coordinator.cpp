@@ -29,8 +29,8 @@ public:
         printf("🧪 NUMA Coordinator Test Suite Initialization...\n");
         
         // Initialize NUMA system
-        printf("Initializing NUMA with DISTRIBUTE strategy...\n");
-        ggml_numa_init(GGML_NUMA_STRATEGY_DISTRIBUTE);
+        printf("Initializing NUMA with MIRROR strategy...\n");
+        ggml_numa_init(GGML_NUMA_STRATEGY_MIRROR);
         
         // Initialize ggml backend
         backend = ggml_backend_cpu_init();

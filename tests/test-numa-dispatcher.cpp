@@ -28,11 +28,10 @@ public:
     NumaDispatcherTestSuite() : backend(nullptr), ctx(nullptr) {
         printf("🧪 NUMA Dispatcher Test Suite Initialization...\n");
         
-        // Initialize NUMA system with MIRROR strategy and force_multi_socket for testing
-        printf("Initializing NUMA with MIRROR strategy and force_multi_socket...\n");
+        // Initialize NUMA system with MIRROR strategy
+        printf("Initializing NUMA with MIRROR strategy...\n");
         struct ggml_threadpool_params tpp;
         ggml_threadpool_params_init(&tpp, -1);  // Use default thread count
-        tpp.force_multi_socket = true;  // Enable force multi-socket for testing
         ggml_numa_init_with_threadpool_params(GGML_NUMA_STRATEGY_MIRROR, &tpp);
         
         // Initialize backend

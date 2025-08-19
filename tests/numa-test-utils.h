@@ -229,7 +229,6 @@ inline bool tensors_equal(const float* a, const float* b, size_t num_elements,
 struct TestConfig {
     bool test_quantized_types;
     bool verbose_output;
-    bool force_multi_socket;
     int num_threads;
     double corruption_tolerance;
     double comparison_tolerance;
@@ -240,7 +239,6 @@ inline TestConfig default_test_config() {
     TestConfig config = {};
     config.test_quantized_types = true;
     config.verbose_output = true;
-    config.force_multi_socket = true;
     config.num_threads = 4;
     config.corruption_tolerance = 1e-10;
     config.comparison_tolerance = 1e-5;

@@ -84,11 +84,11 @@ enum ggml_status ggml_numa_work_function_flash_attn_ext_chunk(void * work_contex
     
     // Get virtual NUMA node information from coordinator's thread-local storage
     extern int ggml_numa_get_current_node(void);
-    extern struct ggml_numa_coordinator_manager * ggml_numa_coordinator_manager_get_global(int n_threads, bool force_multi_socket);
+    extern struct ggml_numa_coordinator_manager * ggml_numa_coordinator_manager_get_global(int n_threads);
     extern int ggml_numa_coordinator_manager_get_numa_nodes(struct ggml_numa_coordinator_manager * mgr);
     
     int numa_node = ggml_numa_get_current_node();
-    struct ggml_numa_coordinator_manager * mgr = ggml_numa_coordinator_manager_get_global(8, false);
+    struct ggml_numa_coordinator_manager * mgr = ggml_numa_coordinator_manager_get_global(8);
     int max_numa_nodes = mgr ? ggml_numa_coordinator_manager_get_numa_nodes(mgr) : 1;
     
     // Handle fallback case where virtual node is not set

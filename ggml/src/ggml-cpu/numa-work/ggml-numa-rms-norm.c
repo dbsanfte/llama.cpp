@@ -100,11 +100,11 @@ enum ggml_status ggml_numa_work_function_rms_norm_chunk(void * work_context, str
     // Level 2: Thread-level parallelism (subdivision within NUMA node)
     
     // Get NUMA node information from coordinator
-    extern struct ggml_numa_coordinator_manager * ggml_numa_coordinator_manager_get_global(int n_threads, bool force_multi_socket);
+    extern struct ggml_numa_coordinator_manager * ggml_numa_coordinator_manager_get_global(int n_threads);
     extern int ggml_numa_coordinator_manager_get_numa_nodes(struct ggml_numa_coordinator_manager * mgr);
     
     int numa_node = ggml_numa_get_current_node();
-    struct ggml_numa_coordinator_manager * mgr = ggml_numa_coordinator_manager_get_global(8, false);
+    struct ggml_numa_coordinator_manager * mgr = ggml_numa_coordinator_manager_get_global(8);
     int max_numa_nodes = mgr ? ggml_numa_coordinator_manager_get_numa_nodes(mgr) : 1;
     
     // Handle fallback case where virtual node is not set

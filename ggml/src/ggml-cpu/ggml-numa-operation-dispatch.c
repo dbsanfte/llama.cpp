@@ -77,6 +77,11 @@ static enum ggml_status ggml_numa_work_function_fallback(void * work_context, st
 // Forward Declarations for Internal Functions
 //
 
+// Direct MUL_MAT execution function that bypasses coordinator
+static enum ggml_status ggml_numa_mul_mat_execute_direct(
+    const struct ggml_tensor * operation,
+    const ggml_numa_work_context_t * context);
+
 // Helper function to determine if NUMA coordination would be beneficial for a given graph
 static bool ggml_numa_should_coordinate(struct ggml_cgraph * cgraph, int n_threads);
 
@@ -285,6 +290,90 @@ static enum ggml_status ggml_numa_execute_data_parallel(
 );
 
 //
+// Direct MUL_MAT Execution Implementation
+//
+
+static enum ggml_status ggml_numa_mul_mat_execute_direct(
+    const struct ggml_tensor * operation,
+    const ggml_numa_work_context_t * context) {
+    
+    GGML_LOG_DEBUG("Direct MUL_MAT execution: analyzing strategy\n");
+    
+    GGML_ASSERT(operation);
+    GGML_ASSERT(context);
+    GGML_ASSERT(operation->op == GGML_OP_MUL_MAT);
+    
+    // Analyze operation to determine optimal strategy
+    ggml_numa_execution_strategy_t strategy;
+    ggml_numa_work_function_t work_function;
+    size_t work_buffer_size;
+    
+    enum ggml_status analysis_result = ggml_numa_mul_mat_analyze_strategy(
+        operation, context, &strategy, &work_function, &work_buffer_size);
+    
+    if (analysis_result != GGML_STATUS_SUCCESS) {
+        GGML_LOG_ERROR("Failed to analyze MUL_MAT strategy\n");
+        return GGML_STATUS_FAILED;
+    }
+    
+    GGML_LOG_DEBUG("Direct MUL_MAT: strategy=%s, buffer_size=%zu\n",
+                   (strategy.node_strategy == NUMA_NODE_STRATEGY_SINGLE) ? "single" : "parallel",
+                   work_buffer_size);
+    
+    // Create work context for the operation
+    ggml_numa_dispatcher_work_context_t * work_context = ggml_numa_dispatcher_create_work_context(
+        (struct ggml_tensor *)operation,
+        "MUL_MAT_DIRECT",
+        NULL,  // No additional context
+        0      // No additional context size
+    );
+    
+    if (!work_context) {
+        GGML_LOG_ERROR("Failed to create work context for direct MUL_MAT\n");
+        return GGML_STATUS_FAILED;
+    }
+    
+    // Allocate work buffer if needed
+    void * work_buffer = NULL;
+    if (work_buffer_size > 0) {
+        work_buffer = malloc(work_buffer_size);
+        if (!work_buffer) {
+            GGML_LOG_ERROR("Failed to allocate work buffer (%zu bytes) for direct MUL_MAT\n", work_buffer_size);
+            ggml_numa_dispatcher_free_work_context(work_context);
+            return GGML_STATUS_FAILED;
+        }
+        GGML_LOG_DEBUG("Allocated work buffer: %p (%zu bytes)\n", work_buffer, work_buffer_size);
+    }
+    
+    // Set up compute params for the work function
+    struct ggml_compute_params params = {
+        .ith = 0,           // Thread 0 (single-threaded execution)
+        .nth = 1,           // Total threads = 1
+        .wsize = work_buffer_size,
+        .wdata = work_buffer
+    };
+    
+    // Execute the work function directly
+    GGML_LOG_DEBUG("Executing MUL_MAT work function directly\n");
+    enum ggml_status result = work_function(work_context, &params);
+    
+    // Cleanup
+    if (work_buffer) {
+        free(work_buffer);
+        GGML_LOG_DEBUG("Freed work buffer: %p\n", work_buffer);
+    }
+    ggml_numa_dispatcher_free_work_context(work_context);
+    
+    if (result == GGML_STATUS_SUCCESS) {
+        GGML_LOG_DEBUG("Direct MUL_MAT execution completed successfully\n");
+    } else {
+        GGML_LOG_ERROR("Direct MUL_MAT execution failed\n");
+    }
+    
+    return result;
+}
+
+//
 // Core Dispatch System Implementation
 //
 
@@ -477,10 +566,10 @@ enum ggml_status ggml_numa_dispatch_operation(
     }
     
     if (handler) {
-        // Special case: MUL_MAT operations use dedicated dispatch function
+        // Special case: MUL_MAT operations use direct execution with our mathematical kernels
         if (operation->op == GGML_OP_MUL_MAT) {
-            GGML_LOG_DEBUG("Using dedicated MUL_MAT dispatch function\n");
-            result = ggml_numa_mul_mat_dispatch(manager, operation, context);
+            GGML_LOG_DEBUG("Using direct MUL_MAT execution with NUMA mathematical kernels\n");
+            result = ggml_numa_mul_mat_execute_direct(operation, context);
         } else {
             // Use registered handler to analyze and execute for other operations
             ggml_numa_execution_strategy_t strategy;
@@ -1236,27 +1325,27 @@ enum ggml_status ggml_numa_graph_compute(struct ggml_cgraph * cgraph, int n_thre
                   cgraph->n_nodes, n_threads);
     
     // Get or create the global NUMA coordinator manager  
-    struct ggml_numa_coordinator_manager * mgr = ggml_numa_coordinator_manager_get_global(n_threads, false);
+    struct ggml_numa_coordinator_manager * mgr = ggml_numa_coordinator_manager_get_global(n_threads);
     if (!mgr) {
         GGML_LOG_ERROR("Failed to create NUMA coordinator manager\n");
         return GGML_STATUS_FAILED;
     }
     
-    // Process each operation in the graph through fallback execution for simplicity
+    // Process each operation in the graph through proper dispatch (not fallback)
     for (int i = 0; i < cgraph->n_nodes; i++) {
         struct ggml_tensor * operation = cgraph->nodes[i];
         if (!operation) continue;
 
-        // Use fallback execution which is simpler and doesn't need work context setup
-        enum ggml_status result = ggml_numa_execute_operation_fallback(operation, NULL);
+        // Use proper dispatch which includes direct MUL_MAT execution
+        enum ggml_status result = ggml_numa_dispatch_operation(mgr, operation, NULL);
         
         if (result != GGML_STATUS_SUCCESS) {
-            GGML_LOG_ERROR("Fallback execution failed for operation %d (%s)\n", 
+            GGML_LOG_ERROR("NUMA dispatch failed for operation %d (%s)\n", 
                           i, ggml_op_name(operation->op));
             return GGML_STATUS_FAILED;
         }
         
-        GGML_LOG_DEBUG("Successfully executed operation %d (%s) via fallback\n", 
+        GGML_LOG_DEBUG("Successfully executed operation %d (%s) via NUMA dispatch\n", 
                       i, ggml_op_name(operation->op));
     }    GGML_LOG_INFO("NUMA graph computation completed successfully via dispatcher\n");
     return GGML_STATUS_SUCCESS;
@@ -1276,7 +1365,7 @@ enum ggml_status ggml_numa_graph_compute_with_virtual(struct ggml_cgraph * cgrap
         GGML_LOG_INFO("Virtual NUMA mode enabled for operation dispatch testing\n");
         
         // Get or create the global NUMA coordinator manager with virtual NUMA forced
-        struct ggml_numa_coordinator_manager * mgr = ggml_numa_coordinator_manager_get_global(n_threads, force_virtual_numa);
+        struct ggml_numa_coordinator_manager * mgr = ggml_numa_coordinator_manager_get_global(n_threads);
         if (!mgr) {
             GGML_LOG_ERROR("Failed to create virtual NUMA coordinator manager\n");
             return GGML_STATUS_FAILED;
@@ -1856,8 +1945,8 @@ enum ggml_status ggml_numa_intercept_operation(struct ggml_tensor * tensor, stru
     // Get or create global manager through dispatcher initialization
     static struct ggml_numa_coordinator_manager * s_global_manager = NULL;
     if (!s_global_manager) {
-        extern struct ggml_numa_coordinator_manager * ggml_numa_coordinator_manager_get_global(int n_threads, bool force_multi_socket);
-        s_global_manager = ggml_numa_coordinator_manager_get_global(params->nth, false);
+        extern struct ggml_numa_coordinator_manager * ggml_numa_coordinator_manager_get_global(int n_threads);
+        s_global_manager = ggml_numa_coordinator_manager_get_global(params->nth);
         if (!s_global_manager) {
             GGML_LOG_DEBUG("No NUMA manager available, falling back to standard execution\n");
             return GGML_STATUS_FAILED;  // No NUMA manager available
@@ -1894,8 +1983,8 @@ int ggml_numa_dispatch_compute_graph(struct ggml_cgraph * cgraph, int n_threads)
     ggml_numa_dispatch_init();
     
     // Get coordinator manager (should already be initialized by llama-context.cpp)
-    extern struct ggml_numa_coordinator_manager * ggml_numa_coordinator_manager_get_global(int n_threads, bool force_multi_socket);
-    struct ggml_numa_coordinator_manager * manager = ggml_numa_coordinator_manager_get_global(n_threads, false);  // Use existing coordinator settings
+    extern struct ggml_numa_coordinator_manager * ggml_numa_coordinator_manager_get_global(int n_threads);
+    struct ggml_numa_coordinator_manager * manager = ggml_numa_coordinator_manager_get_global(n_threads);  // Use existing coordinator settings
     if (!manager) {
         GGML_LOG_ERROR("No NUMA coordinator available for dispatcher\n");
         return -1;

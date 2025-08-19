@@ -629,12 +629,12 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                     break;
                 }
                 std::string value(argv[i]);
-                if (value == "distribute" || value == "") {
-                    params.numa = GGML_NUMA_STRATEGY_DISTRIBUTE;
-                } else if (value == "isolate") {
+                if (value == "isolate" || value == "") {
                     params.numa = GGML_NUMA_STRATEGY_ISOLATE;
                 } else if (value == "numactl") {
                     params.numa = GGML_NUMA_STRATEGY_NUMACTL;
+                } else if (value == "mirror") {
+                    params.numa = GGML_NUMA_STRATEGY_MIRROR;
                 } else {
                     invalid_param = true;
                     break;

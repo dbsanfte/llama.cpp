@@ -22,7 +22,6 @@
 
 // Work function for chunking up a MUL_MAT operation
 enum ggml_status ggml_numa_work_function_mul_mat_chunking(void * work_context, struct ggml_compute_params * params) {
-    NUMA_THREAD_LOG_DEBUG_AUTO("MUL_MAT", "ENTERING chunking work function\n");
     NUMA_ASSERT(work_context);
     NUMA_ASSERT(params);
 
@@ -33,6 +32,8 @@ enum ggml_status ggml_numa_work_function_mul_mat_chunking(void * work_context, s
     struct ggml_tensor * dst = (struct ggml_tensor *)ctx->operation;
     const struct ggml_tensor * src0 = dst->src[0];
     const struct ggml_tensor * src1 = dst->src[1];
+    
+    NUMA_THREAD_LOG_DEBUG_TENSOR(dst, "ENTERING chunking work function\n");
 
     NUMA_ASSERT(src0);
     NUMA_ASSERT(src1);
@@ -41,7 +42,7 @@ enum ggml_status ggml_numa_work_function_mul_mat_chunking(void * work_context, s
     // The chunking function is typically called once per NUMA node, and then each call
     // to the chunk function handles the threading within that NUMA node
     
-    NUMA_THREAD_LOG_DEBUG_AUTO("MUL_MAT", "Delegating to chunk function for NUMA-aware processing\n");
+    NUMA_THREAD_LOG_DEBUG_TENSOR(dst, "Delegating to chunk function for NUMA-aware processing\n");
     
     // Simply call the chunk function which handles both NUMA and thread-level parallelism
     return ggml_numa_work_function_mul_mat_chunk(work_context, params);
@@ -49,7 +50,6 @@ enum ggml_status ggml_numa_work_function_mul_mat_chunking(void * work_context, s
 
 // Work function for single-thread MUL_MAT operations
 enum ggml_status ggml_numa_work_function_mul_mat_single(void * work_context, struct ggml_compute_params * params) {
-    NUMA_THREAD_LOG_DEBUG_AUTO("MUL_MAT", "ENTERING single-thread work function\n");
     NUMA_ASSERT(work_context);
     NUMA_ASSERT(params);
 
@@ -58,6 +58,8 @@ enum ggml_status ggml_numa_work_function_mul_mat_single(void * work_context, str
 
     // Get dst tensor (we'll access src0 and src1 through it)
     struct ggml_tensor * dst = (struct ggml_tensor *)ctx->operation;
+    
+    NUMA_THREAD_LOG_DEBUG_TENSOR(dst, "ENTERING single-thread work function\n");
     const struct ggml_tensor * src0 = dst->src[0];
     const struct ggml_tensor * src1 = dst->src[1];
 
@@ -86,19 +88,18 @@ enum ggml_status ggml_numa_work_function_mul_mat_single(void * work_context, str
         .thread_id = params->ith
     };
 
-    NUMA_THREAD_LOG_DEBUG_AUTO("MUL_MAT", "Single-thread processing full matrix: ir0=[%ld,%ld), ir1=[%ld,%ld)\n", 
+    NUMA_THREAD_LOG_DEBUG_TENSOR(dst, "Single-thread processing full matrix: ir0=[%ld,%ld), ir1=[%ld,%ld)\n", 
                                 ir0_start, ir0_end, ir1_start, ir1_end);
 
     // Call the mathematical kernel directly
     mul_mat_thread_kernel(&thread_data);
 
-    NUMA_THREAD_LOG_DEBUG_AUTO("MUL_MAT", "Single-thread work function completed\n");
+    NUMA_THREAD_LOG_DEBUG_TENSOR(dst, "Single-thread work function completed\n");
     return GGML_STATUS_SUCCESS;
 }
 
 // Work function for individual chunks of MUL_MAT
 enum ggml_status ggml_numa_work_function_mul_mat_chunk(void * work_context, struct ggml_compute_params * params) {
-    NUMA_THREAD_LOG_DEBUG_AUTO("MUL_MAT", "ENTERING individual chunk work function\n");
     NUMA_ASSERT(work_context);
     NUMA_ASSERT(params);
 
@@ -107,6 +108,8 @@ enum ggml_status ggml_numa_work_function_mul_mat_chunk(void * work_context, stru
 
     // Get dst tensor (we'll access src0 and src1 through it)
     struct ggml_tensor * dst = (struct ggml_tensor *)ctx->operation;
+    
+    NUMA_THREAD_LOG_DEBUG_TENSOR(dst, "ENTERING individual chunk work function\n");
     const struct ggml_tensor * src0 = dst->src[0];
     const struct ggml_tensor * src1 = dst->src[1];
 
@@ -121,10 +124,10 @@ enum ggml_status ggml_numa_work_function_mul_mat_chunk(void * work_context, stru
     int numa_node = ggml_numa_get_current_node();
     if (numa_node < 0) numa_node = 0;  // Fallback
     
-    extern struct ggml_numa_coordinator_manager * ggml_numa_coordinator_manager_get_global(int n_threads, bool force_multi_socket);
+    extern struct ggml_numa_coordinator_manager * ggml_numa_coordinator_manager_get_global(int n_threads);
     extern int ggml_numa_coordinator_manager_get_numa_nodes(struct ggml_numa_coordinator_manager * mgr);
     
-    struct ggml_numa_coordinator_manager * mgr = ggml_numa_coordinator_manager_get_global(8, false);
+    struct ggml_numa_coordinator_manager * mgr = ggml_numa_coordinator_manager_get_global(8);
     int max_numa_nodes = mgr ? ggml_numa_coordinator_manager_get_numa_nodes(mgr) : 1;
     if (max_numa_nodes <= 0) max_numa_nodes = 1;
 
@@ -160,21 +163,19 @@ enum ggml_status ggml_numa_work_function_mul_mat_chunk(void * work_context, stru
         .thread_id = ith
     };
 
-    NUMA_THREAD_LOG_DEBUG_AUTO("MUL_MAT", "Chunk processing: NUMA[%d/%d], Thread[%d/%d], ir0=[%ld,%ld), ir1=[%ld,%ld)\n", 
+    NUMA_THREAD_LOG_DEBUG_TENSOR(dst, "Chunk processing: NUMA[%d/%d], Thread[%d/%d], ir0=[%ld,%ld), ir1=[%ld,%ld)\n", 
                                 numa_node, max_numa_nodes, ith, nth, ir0_start, ir0_end, thread_ir1_start, thread_ir1_end);
 
     // Call the mathematical kernel for this chunk
     mul_mat_thread_kernel(&thread_data);
 
-    NUMA_THREAD_LOG_DEBUG_AUTO("MUL_MAT", "Chunk work function completed\n");
+    NUMA_THREAD_LOG_DEBUG_TENSOR(dst, "Chunk work function completed\n");
     return GGML_STATUS_SUCCESS;
 }
 
 // Kernel function for MUL_MAT mathematical computation
 // Self-contained implementation based on ggml_compute_forward_mul_mat_one_chunk() logic
 void* mul_mat_thread_kernel(void* data) {
-    NUMA_THREAD_LOG_DEBUG_AUTO("MUL_MAT", "ENTERING mathematical kernel\n");
-    
     // Cast the input parameter to our thread data structure
     ggml_numa_mulmat_thread_data_t* thread_data = (ggml_numa_mulmat_thread_data_t*)data;
     NUMA_ASSERT(thread_data);
@@ -187,6 +188,8 @@ void* mul_mat_thread_kernel(void* data) {
     NUMA_ASSERT(src0);
     NUMA_ASSERT(src1);
     NUMA_ASSERT(dst);
+    
+    NUMA_THREAD_LOG_DEBUG_TENSOR(dst, "ENTERING mathematical kernel\n");
     
     // Get tensor dimensions and strides using GGML pattern
     // GGML_TENSOR_BINARY_OP_LOCALS equivalent
@@ -203,14 +206,26 @@ void* mul_mat_thread_kernel(void* data) {
     enum ggml_type const vec_dot_type = traits->vec_dot_type;
     int64_t const vec_dot_num_rows = traits->nrows;
     
+    // Original ggml asserts src1 is f32 when type conversion is needed
+    // This is because src0 is weights (can be quantized), src1 is activations (f32)
+    NUMA_ASSERT(src1->type == GGML_TYPE_F32);
+    NUMA_ASSERT(dst->type == GGML_TYPE_F32);
+    
     // Check tensor compatibility (same as original ggml logic)
     NUMA_ASSERT(ne0 == ne01);
     NUMA_ASSERT(ne1 == ne11);
     NUMA_ASSERT(ne2 == ne12);
     NUMA_ASSERT(ne3 == ne13);
+    
+    // we don't support permuted src0 or src1
     NUMA_ASSERT(nb00 == ggml_type_size(src0->type));
     NUMA_ASSERT(nb10 == ggml_type_size(src1->type));
+    
+    // dst cannot be transposed or permuted
     NUMA_ASSERT(nb0 == sizeof(float));
+    NUMA_ASSERT(nb0 <= nb1);
+    NUMA_ASSERT(nb1 <= nb2);
+    NUMA_ASSERT(nb2 <= nb3);
     
     // Broadcast factors
     const int64_t r2 = ne12 / ne02;
@@ -225,13 +240,13 @@ void* mul_mat_thread_kernel(void* data) {
     
     // If type conversion is needed and we don't have a work buffer, we can't proceed
     if (src1->type != vec_dot_type && !thread_data->work_buffer) {
-        NUMA_THREAD_LOG_DEBUG_AUTO("MUL_MAT", "ERROR: Type conversion needed but no work buffer provided\n");
+        NUMA_THREAD_LOG_DEBUG_TENSOR(dst, "ERROR: Type conversion needed but no work buffer provided\n");
         return NULL;
     }
     
     // Perform type conversion if needed (same logic as ggml_compute_forward_mul_mat)
     if (src1->type != vec_dot_type && thread_data->work_buffer) {
-        NUMA_THREAD_LOG_DEBUG_AUTO("MUL_MAT", "Performing type conversion from %d to %d\n", src1->type, vec_dot_type);
+        NUMA_THREAD_LOG_DEBUG_TENSOR(dst, "Performing type conversion from %s to %s\n", ggml_type_name(src1->type), ggml_type_name(vec_dot_type));
         
         const struct ggml_type_traits_cpu * src1_traits = ggml_get_type_traits_cpu(vec_dot_type);
         ggml_from_float_t const from_float = src1_traits->from_float;
@@ -260,12 +275,12 @@ void* mul_mat_thread_kernel(void* data) {
     
     // If this thread has no work, return early
     if (ir0_start >= ir0_end || ir1_start >= ir1_end) {
-        NUMA_THREAD_LOG_DEBUG_AUTO("MUL_MAT", "No work for this thread: ir0=[%ld,%ld), ir1=[%ld,%ld)\n", 
+        NUMA_THREAD_LOG_DEBUG_TENSOR(dst, "No work for this thread: ir0=[%ld,%ld), ir1=[%ld,%ld)\n", 
                                     ir0_start, ir0_end, ir1_start, ir1_end);
         return NULL;
     }
     
-    NUMA_THREAD_LOG_DEBUG_AUTO("MUL_MAT", "Processing ranges: ir0=[%ld,%ld), ir1=[%ld,%ld)\n", 
+    NUMA_THREAD_LOG_DEBUG_TENSOR(dst, "Processing ranges: ir0=[%ld,%ld), ir1=[%ld,%ld)\n", 
                                 ir0_start, ir0_end, ir1_start, ir1_end);
     
     // Block tiling for cache efficiency (same as original)
@@ -285,7 +300,7 @@ void* mul_mat_thread_kernel(void* data) {
         num_rows_per_vec_dot = 1;
     }
     
-    NUMA_THREAD_LOG_DEBUG_AUTO("MUL_MAT", "Using %ld rows per vec_dot operation\n", num_rows_per_vec_dot);
+    NUMA_THREAD_LOG_DEBUG_TENSOR(dst, "Using %ld rows per vec_dot operation\n", num_rows_per_vec_dot);
     
     // Main computation loop - block tiled matrix multiplication
     for (int64_t iir1 = ir1_start; iir1 < ir1_end; iir1 += blck_1) {
@@ -336,7 +351,7 @@ void* mul_mat_thread_kernel(void* data) {
         }
     }
     
-    NUMA_THREAD_LOG_DEBUG_AUTO("MUL_MAT", "Thread kernel completed successfully\n");
+    NUMA_THREAD_LOG_DEBUG_TENSOR(dst, "Thread kernel completed successfully\n");
     return NULL;
 }
 
@@ -415,20 +430,20 @@ enum ggml_status ggml_numa_mul_mat_analyze_strategy(
     const bool use_chunked = (context->numa_nodes > 1) && (complexity > COMPLEXITY_THRESHOLD);
     
     if (use_chunked) {
-        NUMA_THREAD_LOG_DEBUG_AUTO("MUL_MAT", "strategy: chunked execution (complexity=%ld, numa_nodes=%d)\n",
+        NUMA_THREAD_LOG_DEBUG_TENSOR(operation, "strategy: chunked execution (complexity=%ld, numa_nodes=%d)\n",
                                     complexity, context->numa_nodes);
         *work_function = ggml_numa_work_function_mul_mat_chunking;
         strategy->node_strategy = NUMA_NODE_STRATEGY_DATA_PARALLEL;
         strategy->on_node_strategy = NUMA_ON_NODE_STRATEGY_MULTI_THREAD;
     } else {
-        NUMA_THREAD_LOG_DEBUG_AUTO("MUL_MAT", "strategy: single execution (complexity=%ld)\n",
+        NUMA_THREAD_LOG_DEBUG_TENSOR(operation, "strategy: single execution (complexity=%ld)\n",
                                     complexity);
         *work_function = ggml_numa_work_function_mul_mat_single;
         strategy->node_strategy = NUMA_NODE_STRATEGY_SINGLE;
         strategy->on_node_strategy = NUMA_ON_NODE_STRATEGY_SINGLE_THREAD;
     }
 
-    NUMA_THREAD_LOG_DEBUG_AUTO("MUL_MAT", "analysis: dimensions=%ldx%ld * %ldx%ld, complexity=%ld, work_buffer=%zu\n",
+    NUMA_THREAD_LOG_DEBUG_TENSOR(operation, "analysis: dimensions=%ldx%ld * %ldx%ld, complexity=%ld, work_buffer=%zu\n",
                                 ne01, ne00, ne11, src1->ne[0], complexity, *work_buffer_size);
 
     return GGML_STATUS_SUCCESS;
@@ -440,7 +455,7 @@ enum ggml_status ggml_numa_mul_mat_dispatch(
     const struct ggml_tensor * operation,
     const ggml_numa_work_context_t * context) {
 
-    NUMA_THREAD_LOG_DEBUG_AUTO("MUL_MAT", "dispatch: starting\n");
+    NUMA_THREAD_LOG_DEBUG_TENSOR(operation, "dispatch: starting\n");
     
     NUMA_ASSERT(manager);
     NUMA_ASSERT(operation);
@@ -448,7 +463,7 @@ enum ggml_status ggml_numa_mul_mat_dispatch(
     
     NUMA_ASSERT(operation->op == GGML_OP_MUL_MAT);
     
-    NUMA_THREAD_LOG_DEBUG_AUTO("MUL_MAT", "dispatch: analyzing strategy for operation\n");
+    NUMA_THREAD_LOG_DEBUG_TENSOR(operation, "dispatch: analyzing strategy for operation\n");
     
     // Analyze operation to determine optimal strategy
     ggml_numa_execution_strategy_t strategy;
@@ -481,15 +496,15 @@ enum ggml_status ggml_numa_mul_mat_dispatch(
     );
     
     if (work_id < 0) {
-        NUMA_THREAD_LOG_DEBUG_AUTO("MUL_MAT", "dispatch: failed to submit work to coordinator\n");
+        NUMA_THREAD_LOG_DEBUG_TENSOR(operation, "dispatch: failed to submit work to coordinator\n");
         ggml_numa_dispatcher_free_work_context(work_context);
         NUMA_ASSERT(work_id < 0);
     }
 
-    NUMA_THREAD_LOG_DEBUG_AUTO("MUL_MAT", "dispatch: submitted work (ID: %d) to coordinator\n", work_id);
+    NUMA_THREAD_LOG_DEBUG_TENSOR(operation, "dispatch: submitted work (ID: %d) to coordinator\n", work_id);
     
     // Wait for work completion
-    NUMA_THREAD_LOG_DEBUG_AUTO("MUL_MAT", "dispatch: waiting for work completion\n");
+    NUMA_THREAD_LOG_DEBUG_TENSOR(operation, "dispatch: waiting for work completion\n");
     enum ggml_status wait_status = GGML_STATUS_FAILED;
     wait_status = ggml_numa_coordinator_manager_wait_for_completion(manager);
     NUMA_ASSERT(wait_status == GGML_STATUS_SUCCESS);
@@ -497,7 +512,7 @@ enum ggml_status ggml_numa_mul_mat_dispatch(
     // Memory barrier to ensure all coordinator work is visible
     __sync_synchronize();
 
-    NUMA_THREAD_LOG_DEBUG_AUTO("MUL_MAT", "dispatch: completed successfully\n");
+    NUMA_THREAD_LOG_DEBUG_TENSOR(operation, "dispatch: completed successfully\n");
     
     return GGML_STATUS_SUCCESS;
 }

@@ -2473,7 +2473,6 @@ extern "C" {
         bool                warn_on_numa_override;       // warn when NUMA overrides user settings
         
         // Multi-socket testing support
-        bool                force_multi_socket;          // force multi-socket mode for testing
         int                 max_numa_nodes;              // maximum NUMA nodes to use (0 = auto-detect all available)
     };
 

@@ -33,11 +33,10 @@ extern "C" {
     // numa strategies
     enum ggml_numa_strategy {
         GGML_NUMA_STRATEGY_DISABLED   = 0,
-        GGML_NUMA_STRATEGY_DISTRIBUTE = 1,
+        // GGML_NUMA_STRATEGY_DISTRIBUTE = 1, // REMOVED: redundant with default behavior
         GGML_NUMA_STRATEGY_ISOLATE    = 2,
         GGML_NUMA_STRATEGY_NUMACTL    = 3,
         GGML_NUMA_STRATEGY_MIRROR     = 4,
-        GGML_NUMA_STRATEGY_MIRROR_FORCE = 5,  // Force NUMA mirroring even on single-node systems
         GGML_NUMA_STRATEGY_COUNT
     };
 

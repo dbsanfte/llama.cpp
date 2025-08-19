@@ -39,8 +39,8 @@ static enum ggml_status test_work_function_with_delay(void* context, struct ggml
 bool test_parallel_execution_timing() {
     printf("🕰️ Testing NUMA parallel execution timing...\n");
     
-    // Force multi-socket mode for testing
-    setenv("GGML_NUMA_FORCE_MULTI_SOCKET", "1", 1);
+    // Initialize NUMA with MIRROR strategy
+    ggml_numa_init(GGML_NUMA_STRATEGY_MIRROR);
     
     // Initialize GGML
     struct ggml_init_params init_params = {

@@ -582,8 +582,6 @@ static enum ggml_numa_memory_strategy ggml_numa_strategy_to_coordinator_strategy
     switch (strategy) {
         case GGML_NUMA_STRATEGY_DISABLED:
             return GGML_NUMA_STRATEGY_AUTO;  // Use default if not disabled
-        case GGML_NUMA_STRATEGY_DISTRIBUTE:
-            return GGML_NUMA_STRATEGY_CHUNKED_PROCESSING;  // Better for distributed data access patterns
         case GGML_NUMA_STRATEGY_ISOLATE:
             return GGML_NUMA_STRATEGY_MATRIX_REDUCTION;  // Better for isolation
         case GGML_NUMA_STRATEGY_NUMACTL:
@@ -620,9 +618,7 @@ static void ggml_numa_init_coordinator(enum ggml_numa_strategy numa_strategy, co
             case GGML_NUMA_STRATEGY_ISOLATE:
                 g_numa_state.numa_nodes = 1;  // Always 1 node when isolating
                 break;
-            case GGML_NUMA_STRATEGY_DISTRIBUTE:
             case GGML_NUMA_STRATEGY_MIRROR:
-            case GGML_NUMA_STRATEGY_MIRROR_FORCE:
             case GGML_NUMA_STRATEGY_NUMACTL:
             default:
                 // For these strategies, use actual system NUMA node count
@@ -710,12 +706,10 @@ bool ggml_numa_should_mirror(void) {
 }
 
 bool ggml_numa_should_dispatch(void) {
-    // Enable dispatcher for both real NUMA and virtual NUMA testing
-    // This allows coordinator/dispatcher to work in force_multi_socket mode
+    // Enable dispatcher for NUMA mirror strategy on multi-node systems
     return g_numa_state.initialized && 
            g_numa_state.numa_enabled &&
-           (g_numa_state.strategy == GGML_NUMA_STRATEGY_MIRROR ||
-            g_numa_state.strategy == GGML_NUMA_STRATEGY_MIRROR_FORCE);
+           g_numa_state.strategy == GGML_NUMA_STRATEGY_MIRROR;
 }
 #endif
 

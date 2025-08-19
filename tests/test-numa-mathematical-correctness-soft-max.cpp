@@ -25,7 +25,7 @@ private:
     
     // Test a single SOFT_MAX case with specific dimensions and thread count
     bool test_single_soft_max_case(int rows, int cols, int num_threads, const char* size_label) {
-        printf("    🧮 Testing %s: %dx%d tensor (rows=%d, cols=%d, threads=%d) [FORCE_MULTI_SOCKET]\n", 
+        printf("    🧮 Testing %s: %dx%d tensor (rows=%d, cols=%d, threads=%d) [NUMA MIRROR]\n", 
                size_label, rows, cols, rows, cols, num_threads);
         
         // Create test context with sufficient memory for the tensor
@@ -311,6 +311,9 @@ private:
 };
 
 int main(int argc, char** argv) {
+    // Initialize NUMA with MIRROR strategy for testing
+    ggml_numa_init(GGML_NUMA_STRATEGY_MIRROR);
+    
     // Check for --summary-only flag
     bool summary_only = false;
     for (int i = 1; i < argc; i++) {
@@ -332,10 +335,10 @@ int main(int argc, char** argv) {
     }
     
     printf("🌟 Initializing NUMA system for mathematical correctness testing...\n");
-    printf("🚨 CRITICAL: Using FORCE_MULTI_SOCKET mode to test real data slicing on single-NUMA hardware\n");
+    printf("� Using MIRROR mode to test real NUMA data slicing on multi-NUMA hardware\n");
     
-    // Initialize the NUMA coordinator system with force_multi_socket=true for testing
-    struct ggml_numa_coordinator_manager* manager = ggml_numa_coordinator_manager_get_global(8, true);  // <- FORCE MULTI-SOCKET
+    // Initialize the NUMA coordinator system using MIRROR strategy
+    struct ggml_numa_coordinator_manager* manager = ggml_numa_coordinator_manager_get_global(8);
     if (!manager) {
         fprintf(stderr, "❌ Failed to initialize NUMA coordinator manager\n");
         return 1;

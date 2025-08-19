@@ -90,7 +90,6 @@ static bool test_single_work_item_wait() {
     params.poll = 50;
     params.strict_cpu = false;
     params.paused = false;
-    params.force_multi_socket = true;
     
     printf("🔧 Initializing coordinator with MIRROR mode...\n");
     ggml_numa_init_with_threadpool_params(GGML_NUMA_STRATEGY_MIRROR, &params);
@@ -552,8 +551,8 @@ bool test_execution_strategy_single_single() {
     execution_tracking_context tracking;
     
     // Get global coordinator manager with 2 NUMA nodes, 4 threads each
-    extern struct ggml_numa_coordinator_manager * ggml_numa_coordinator_manager_get_global(int n_threads, bool force_multi_socket);
-    struct ggml_numa_coordinator_manager * mgr = ggml_numa_coordinator_manager_get_global(8, true);
+    extern struct ggml_numa_coordinator_manager * ggml_numa_coordinator_manager_get_global(int n_threads);
+    struct ggml_numa_coordinator_manager * mgr = ggml_numa_coordinator_manager_get_global(8);
     
     if (!mgr) {
         printf("  ❌ Failed to get coordinator manager\n");
@@ -632,8 +631,8 @@ bool test_execution_strategy_single_multi() {
     
     execution_tracking_context tracking;
     
-    extern struct ggml_numa_coordinator_manager * ggml_numa_coordinator_manager_get_global(int n_threads, bool force_multi_socket);
-    struct ggml_numa_coordinator_manager * mgr = ggml_numa_coordinator_manager_get_global(8, true);
+    extern struct ggml_numa_coordinator_manager * ggml_numa_coordinator_manager_get_global(int n_threads);
+    struct ggml_numa_coordinator_manager * mgr = ggml_numa_coordinator_manager_get_global(8);
     
     if (!mgr) {
         printf("  ❌ Failed to get coordinator manager\n");
@@ -712,8 +711,8 @@ bool test_execution_strategy_data_parallel_single() {
     
     execution_tracking_context tracking;
     
-    extern struct ggml_numa_coordinator_manager * ggml_numa_coordinator_manager_get_global(int n_threads, bool force_multi_socket);
-    struct ggml_numa_coordinator_manager * mgr = ggml_numa_coordinator_manager_get_global(8, true);
+    extern struct ggml_numa_coordinator_manager * ggml_numa_coordinator_manager_get_global(int n_threads);
+    struct ggml_numa_coordinator_manager * mgr = ggml_numa_coordinator_manager_get_global(8);
     
     if (!mgr) {
         printf("  ❌ Failed to get coordinator manager\n");
@@ -800,8 +799,8 @@ bool test_execution_strategy_data_parallel_multi() {
     
     execution_tracking_context tracking;
     
-    extern struct ggml_numa_coordinator_manager * ggml_numa_coordinator_manager_get_global(int n_threads, bool force_multi_socket);
-    struct ggml_numa_coordinator_manager * mgr = ggml_numa_coordinator_manager_get_global(8, true);
+    extern struct ggml_numa_coordinator_manager * ggml_numa_coordinator_manager_get_global(int n_threads);
+    struct ggml_numa_coordinator_manager * mgr = ggml_numa_coordinator_manager_get_global(8);
     
     if (!mgr) {
         printf("  ❌ Failed to get coordinator manager\n");
@@ -891,8 +890,8 @@ bool test_execution_strategy_mixed_workload() {
     struct execution_tracking_context tracking_single;
     struct execution_tracking_context tracking_data_parallel;
     
-    extern struct ggml_numa_coordinator_manager * ggml_numa_coordinator_manager_get_global(int n_threads, bool force_multi_socket);
-    struct ggml_numa_coordinator_manager * mgr = ggml_numa_coordinator_manager_get_global(8, true);
+    extern struct ggml_numa_coordinator_manager * ggml_numa_coordinator_manager_get_global(int n_threads);
+    struct ggml_numa_coordinator_manager * mgr = ggml_numa_coordinator_manager_get_global(8);
     
     if (!mgr) {
         printf("  ❌ Failed to get coordinator manager\n");

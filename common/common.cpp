@@ -25,6 +25,7 @@
 #include <mutex>
 #include <regex>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -1443,15 +1444,15 @@ void ggml_threadpool_params_configure_numa_isolation(struct ggml_threadpool_para
 #ifdef GGML_NUMA_MIRROR
     // Check if NUMA is available and node exists
     if (numa_available() == -1) {
-        LOG_WRN("NUMA not available, ignoring node isolation request for node %d\n", isolate_node);
-        return;
+        LOG_ERR("NUMA not available, cannot isolate to node %d\n", isolate_node);
+        throw std::runtime_error("NUMA not available on this system, cannot use --numa isolate");
     }
     
     int max_nodes = numa_max_node() + 1;
     if (isolate_node >= max_nodes) {
-        LOG_WRN("NUMA node %d not available (max: %d), falling back to default configuration\n", 
-                isolate_node, max_nodes - 1);
-        return;
+        LOG_ERR("NUMA node %d not available (max node: %d)\n", isolate_node, max_nodes - 1);
+        throw std::runtime_error("Invalid NUMA node " + std::to_string(isolate_node) + 
+                                ", available nodes: 0-" + std::to_string(max_nodes - 1));
     }
     
     // Clear existing CPU mask
@@ -1459,39 +1460,48 @@ void ggml_threadpool_params_configure_numa_isolation(struct ggml_threadpool_para
     
     // Get CPUs for the specified NUMA node
     struct bitmask* node_cpus = numa_allocate_cpumask();
-    if (node_cpus) {
-        int result = numa_node_to_cpus(isolate_node, node_cpus);
-        if (result == 0) {
-            int cpu_count = 0;
-            for (int cpu = 0; cpu < numa_num_possible_cpus() && cpu < GGML_MAX_N_THREADS; cpu++) {
-                if (numa_bitmask_isbitset(node_cpus, cpu)) {
-                    tpp->cpumask[cpu] = true;
-                    cpu_count++;
-                }
-            }
-            
-            // If user didn't specify thread count or requested more than available,
-            // limit to CPUs available on this node
-            if (tpp->n_threads <= 0 || tpp->n_threads > cpu_count) {
-                tpp->n_threads = cpu_count;
-            }
-            
-            // Enable strict CPU placement for isolation
-            tpp->strict_cpu = true;
-            tpp->numa_aware = true;
-            
-            LOG_INF("Configured threadpool for NUMA node %d: %d threads on %d CPUs\n", 
-                    isolate_node, tpp->n_threads, cpu_count);
-        } else {
-            LOG_WRN("Failed to get CPUs for NUMA node %d\n", isolate_node);
-        }
-        numa_free_cpumask(node_cpus);
-    } else {
-        LOG_WRN("Failed to allocate CPU mask for NUMA node %d\n", isolate_node);
+    if (!node_cpus) {
+        LOG_ERR("Failed to allocate CPU mask for NUMA node %d\n", isolate_node);
+        throw std::runtime_error("Failed to allocate CPU mask for NUMA node " + std::to_string(isolate_node));
     }
+    
+    int result = numa_node_to_cpus(isolate_node, node_cpus);
+    if (result != 0) {
+        numa_free_cpumask(node_cpus);
+        LOG_ERR("Failed to get CPUs for NUMA node %d\n", isolate_node);
+        throw std::runtime_error("Failed to get CPU list for NUMA node " + std::to_string(isolate_node));
+    }
+    
+    int cpu_count = 0;
+    for (int cpu = 0; cpu < numa_num_possible_cpus() && cpu < GGML_MAX_N_THREADS; cpu++) {
+        if (numa_bitmask_isbitset(node_cpus, cpu)) {
+            tpp->cpumask[cpu] = true;
+            cpu_count++;
+        }
+    }
+    numa_free_cpumask(node_cpus);
+    
+    if (cpu_count == 0) {
+        LOG_ERR("No CPUs found for NUMA node %d\n", isolate_node);
+        throw std::runtime_error("No CPUs available on NUMA node " + std::to_string(isolate_node));
+    }
+    
+    // If user didn't specify thread count or requested more than available,
+    // limit to CPUs available on this node
+    if (tpp->n_threads <= 0 || tpp->n_threads > cpu_count) {
+        tpp->n_threads = cpu_count;
+    }
+    
+    // Enable strict CPU placement for isolation
+    tpp->strict_cpu = true;
+    tpp->numa_aware = true;
+    
+    LOG_INF("Configured threadpool for NUMA node %d: %d threads on %d CPUs\n", 
+            isolate_node, tpp->n_threads, cpu_count);
 #else
     (void)isolate_node;
-    LOG_WRN("NUMA support not compiled in, ignoring node isolation request\n");
+    LOG_ERR("NUMA support not compiled in, cannot use --numa isolate\n");
+    throw std::runtime_error("NUMA support not compiled in, cannot use --numa isolate");
 #endif
 }
 
@@ -2349,9 +2359,7 @@ void cpu_print_comprehensive_topology(const cpu_params & params, const common_pa
         case GGML_NUMA_STRATEGY_ISOLATE:
             effective_numa_nodes = 1;  // Always 1 when isolating to a specific node
             break;
-        case GGML_NUMA_STRATEGY_DISTRIBUTE:
         case GGML_NUMA_STRATEGY_MIRROR:
-        case GGML_NUMA_STRATEGY_MIRROR_FORCE:
         case GGML_NUMA_STRATEGY_NUMACTL:
         default:
             effective_numa_nodes = numa_available ? numa_nodes : 1;
@@ -2364,7 +2372,6 @@ void cpu_print_comprehensive_topology(const cpu_params & params, const common_pa
     const char* numa_strategy_name;
     switch (full_params.numa) {
         case GGML_NUMA_STRATEGY_DISABLED:   numa_strategy_name = "disabled"; break;
-        case GGML_NUMA_STRATEGY_DISTRIBUTE: numa_strategy_name = "distribute"; break;
         case GGML_NUMA_STRATEGY_ISOLATE:    
             if (full_params.numa_isolate_node >= 0) {
                 static char isolate_name[64];
@@ -2376,7 +2383,6 @@ void cpu_print_comprehensive_topology(const cpu_params & params, const common_pa
             break;
         case GGML_NUMA_STRATEGY_NUMACTL:    numa_strategy_name = "numactl"; break;
         case GGML_NUMA_STRATEGY_MIRROR:     numa_strategy_name = "mirror"; break;
-        case GGML_NUMA_STRATEGY_MIRROR_FORCE: numa_strategy_name = "mirror-force"; break;
         default:                           numa_strategy_name = "unknown"; break;
     }
     
@@ -2450,14 +2456,8 @@ void cpu_print_comprehensive_topology(const cpu_params & params, const common_pa
         
         const char* distribution_desc;
         switch (full_params.numa) {
-            case GGML_NUMA_STRATEGY_DISTRIBUTE:
-                distribution_desc = "Round-robin across NUMA nodes"; 
-                break;
             case GGML_NUMA_STRATEGY_MIRROR:
                 distribution_desc = "NUMA-aware data parallelism with mirroring";
-                break;
-            case GGML_NUMA_STRATEGY_MIRROR_FORCE:
-                distribution_desc = "Forced NUMA mirroring (virtual NUMA for testing)";
                 break;
             case GGML_NUMA_STRATEGY_NUMACTL:
                 distribution_desc = "Using numactl CPU map";

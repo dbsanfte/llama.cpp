@@ -315,6 +315,9 @@ private:
 
 // Main function - entry point for the test
 int main(int argc, char** argv) {
+    // Initialize NUMA with MIRROR strategy for testing
+    ggml_numa_init(GGML_NUMA_STRATEGY_MIRROR);
+    
     // Check for --summary-only flag
     bool summary_only = false;
     for (int i = 1; i < argc; i++) {
@@ -338,7 +341,7 @@ int main(int argc, char** argv) {
     printf("🌟 Initializing NUMA system for mathematical correctness testing...\n");
     
     // Initialize the NUMA coordinator system
-    struct ggml_numa_coordinator_manager* mgr = ggml_numa_coordinator_manager_get_global(8, true); // true = force_multi_socket
+    struct ggml_numa_coordinator_manager* mgr = ggml_numa_coordinator_manager_get_global(8); // Enable NUMA MIRROR mode
     if (!mgr) {
         if (summary_only) {
             fclose(stdout);

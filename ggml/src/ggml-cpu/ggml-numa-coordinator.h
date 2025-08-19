@@ -108,10 +108,9 @@ struct ggml_numa_workload_info {
  * Create NUMA coordinator manager with 3-tier architecture
  * 
  * @param n_threads Total number of threads to distribute across NUMA nodes
- * @param force_multi_socket Force multi-socket mode even without NUMA
- * @return Manager instance or NULL on failure
+ * @return Pointer to new coordinator manager, or NULL on failure
  */
-struct ggml_numa_coordinator_manager * ggml_numa_coordinator_manager_new(int n_threads, bool force_multi_socket);
+struct ggml_numa_coordinator_manager * ggml_numa_coordinator_manager_new(int n_threads);
 
 /**
  * Create NUMA coordinator manager with threadpool parameters (supports CPU/NUMA masks)
@@ -125,10 +124,9 @@ struct ggml_numa_coordinator_manager * ggml_numa_coordinator_manager_new_with_pa
  * Get or create global NUMA coordinator manager (singleton pattern)
  * 
  * @param n_threads Total number of threads to distribute across NUMA nodes
- * @param force_multi_socket Force multi-socket mode even without NUMA
  * @return Manager instance or NULL on failure
  */
-struct ggml_numa_coordinator_manager * ggml_numa_coordinator_manager_get_global(int n_threads, bool force_multi_socket);
+struct ggml_numa_coordinator_manager * ggml_numa_coordinator_manager_get_global(int n_threads);
 
 /**
  * Get or create global NUMA coordinator manager with parameters (singleton pattern)

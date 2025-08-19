@@ -2340,23 +2340,23 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     add_opt(common_arg(
         {"--numa"}, "TYPE",
         "attempt optimizations that help on some NUMA systems\n"
-        "- distribute: spread execution evenly over all nodes\n"
         "- isolate: only spawn threads on CPUs on the node that execution started on\n"
-        "- isolate N: only spawn threads on CPUs on NUMA node N (if valid)\n"
+        "- isolate=N: only spawn threads on CPUs on NUMA node N (if valid)\n"
         "- numactl: use the CPU map provided by numactl\n"
         "- mirror: enable coordinator data parallelism with NUMA-aware KV cache\n"
-        "- mirror-force: enable virtual NUMA coordinator even on single-node systems\n"
         "if run without this previously, it is recommended to drop the system page cache before using this\n"
         "see https://github.com/ggml-org/llama.cpp/issues/1437",
         [](common_params & params, const std::string & value) {
-            /**/ if (value == "distribute" || value == "") { 
-                params.numa = GGML_NUMA_STRATEGY_DISTRIBUTE; 
+            /**/ if (value == "") { 
+                // Default to isolate mode when --numa is specified without arguments
+                params.numa = GGML_NUMA_STRATEGY_ISOLATE; 
+                params.numa_isolate_node = -1; // Use current node
             }
             else if (value == "isolate") { 
                 params.numa = GGML_NUMA_STRATEGY_ISOLATE; 
                 params.numa_isolate_node = -1; // Use current node
             }
-            else if (value.substr(0, 8) == "isolate ") {
+            else if (value.substr(0, 8) == "isolate=") {
                 params.numa = GGML_NUMA_STRATEGY_ISOLATE;
                 try {
                     int node = std::stoi(value.substr(8));
@@ -2370,13 +2370,12 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
             else if (value == "numactl") { params.numa = GGML_NUMA_STRATEGY_NUMACTL; }
             else if (value == "mirror") { params.numa = GGML_NUMA_STRATEGY_MIRROR; }
-            else if (value == "mirror-force") { params.numa = GGML_NUMA_STRATEGY_MIRROR_FORCE; }
             else { throw std::invalid_argument("invalid value"); }
         }
     ).set_env("LLAMA_ARG_NUMA"));
     add_opt(common_arg(
         {"--numa-cache-strategy"}, "STRATEGY",
-        "cache replication strategy for NUMA distribute mode\n"
+        "cache replication strategy for NUMA mirror mode\n"
         "- disabled: no cache replication (default)\n"
         "- eager: immediate replication across all nodes\n"
         "- lazy: on-demand replication when accessed\n"

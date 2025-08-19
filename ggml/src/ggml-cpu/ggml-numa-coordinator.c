@@ -233,7 +233,6 @@ struct ggml_coordinator_thread {
 // NUMA Multi-Socket Threadpool Manager (3-tier: main → coordinator → NUMA)
 struct ggml_numa_coordinator_manager {
     int num_numa_nodes;                                   // Number of NUMA nodes
-    bool force_multi_socket;                              // Whether we're in test mode with simulated NUMA nodes
     struct ggml_coordinator_thread * coordinators;        // Array of coordinator threads (one per NUMA node)
     struct ggml_work_queue global_work_queue;             // Global work queue from main thread
     
@@ -343,7 +342,7 @@ static void ggml_work_group_pool_print_stats(struct ggml_work_group_pool * pool)
 int ggml_numa_coordinator_manager_check_work_group_completion(struct ggml_numa_coordinator_manager * mgr, int work_group_id);
 
 // Global coordinator management functions
-static struct ggml_numa_coordinator_manager * ggml_get_global_coordinator_manager(int n_threads, bool force_multi_socket);
+static struct ggml_numa_coordinator_manager * ggml_get_global_coordinator_manager(int n_threads);
 static struct ggml_numa_coordinator_manager * ggml_get_global_coordinator_manager_with_params(const struct ggml_threadpool_params * tpp);
 static void ggml_register_program_exit_cleanup(void);
 
@@ -375,7 +374,7 @@ static bool ggml_numa_should_coordinate(
 );
 
 // Operation-level NUMA parallelization using proper GGML compute functions
-static struct ggml_numa_coordinator_manager * ggml_get_global_coordinator_manager(int n_threads, bool force_multi_socket);
+static struct ggml_numa_coordinator_manager * ggml_get_global_coordinator_manager(int n_threads);
 static struct ggml_numa_coordinator_manager * ggml_get_global_coordinator_manager_with_params(const struct ggml_threadpool_params * tpp);
 static void ggml_register_program_exit_cleanup(void);
 
@@ -1400,13 +1399,13 @@ static void * ggml_integration_thread_func(void * arg) {
 }
 
 // Get or create the global singleton coordinator manager
-static struct ggml_numa_coordinator_manager * ggml_get_global_coordinator_manager(int n_threads, bool force_multi_socket) {
+static struct ggml_numa_coordinator_manager * ggml_get_global_coordinator_manager(int n_threads) {
     // Thread-safe singleton initialization
     ggml_mutex_lock(&g_coordinator_init_mutex);
     
     if (g_global_coordinator_manager == NULL) {
         GGML_LOG_INFO("Creating global singleton NUMA coordinator manager\n");
-        g_global_coordinator_manager = ggml_numa_coordinator_manager_new(n_threads, force_multi_socket);
+        g_global_coordinator_manager = ggml_numa_coordinator_manager_new(n_threads);
         
         if (g_global_coordinator_manager) {
             // Initialize intelligent operation dispatcher
@@ -1663,11 +1662,10 @@ static void create_optimal_cpu_masks(struct ggml_threadpool_params *tpp, int num
 }
 
 // Create NUMA coordinator manager
-struct ggml_numa_coordinator_manager * ggml_numa_coordinator_manager_new(int n_threads, bool force_multi_socket) {
+struct ggml_numa_coordinator_manager * ggml_numa_coordinator_manager_new(int n_threads) {
     // Create basic threadpool parameters and delegate to new function
     struct ggml_threadpool_params tpp;
     ggml_threadpool_params_init(&tpp, n_threads);
-    tpp.force_multi_socket = force_multi_socket;
     
     return ggml_numa_coordinator_manager_new_with_params(&tpp);
 }
@@ -1689,16 +1687,6 @@ struct ggml_numa_coordinator_manager * ggml_numa_coordinator_manager_new_with_pa
         numa_is_available = true;
     }
 #endif
-    
-    if (tpp->force_multi_socket && !numa_is_available) {
-        num_numa_nodes = 2; // Simulate 2 NUMA nodes for testing
-        GGML_LOG_INFO("Forcing multi-socket mode with %d simulated NUMA nodes\n", num_numa_nodes);
-    }
-    
-    // DEBUG: Show force_multi_socket status
-    GGML_LOG_INFO("🔧 DEBUG: force_multi_socket=%s, numa_is_available=%s\n", 
-                  tpp->force_multi_socket ? "TRUE" : "FALSE",
-                  numa_is_available ? "TRUE" : "FALSE");
     
     // === COMPREHENSIVE COORDINATOR SETUP LOGGING ===
     GGML_LOG_INFO("================================================================================\n");
@@ -1734,7 +1722,6 @@ struct ggml_numa_coordinator_manager * ggml_numa_coordinator_manager_new_with_pa
     
     memset(mgr, 0, sizeof(struct ggml_numa_coordinator_manager));
     mgr->num_numa_nodes = num_numa_nodes;
-    mgr->force_multi_socket = tpp->force_multi_socket;
     atomic_init(&mgr->total_work_items, 0);
     atomic_init(&mgr->completed_work_items, 0);
     atomic_init(&mgr->manager_active, true);
@@ -1844,7 +1831,6 @@ struct ggml_numa_coordinator_manager * ggml_numa_coordinator_manager_new_with_pa
         struct ggml_threadpool_params numa_tpp = optimized_tpp; // Use optimized parameters
         numa_tpp.n_threads = threads_per_numa;
         numa_tpp.numa_aware = false; // CRITICAL: Disable coordinator recursion - we ARE the coordinator
-        numa_tpp.force_multi_socket = false; // Don't create nested coordinators
         
         // Step 5: Apply NUMA-specific CPU mask filtering
         int real_numa_nodes = 1;
@@ -2130,8 +2116,8 @@ struct ggml_numa_coordinator_manager * ggml_numa_coordinator_manager_new_with_pa
 }
 
 // Get the global singleton coordinator manager (create if needed)
-struct ggml_numa_coordinator_manager * ggml_numa_coordinator_manager_get_global(int n_threads, bool force_multi_socket) {
-    return ggml_get_global_coordinator_manager(n_threads, force_multi_socket);
+struct ggml_numa_coordinator_manager * ggml_numa_coordinator_manager_get_global(int n_threads) {
+    return ggml_get_global_coordinator_manager(n_threads);
 }
 
 // Get the global singleton coordinator manager with parameters (create if needed)
