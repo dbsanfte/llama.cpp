@@ -237,3 +237,10 @@ llama_build_and_test(test-numa-coordinator-wait.cpp)
 target_link_libraries(${LLAMA_TEST_NAME} PRIVATE ggml ggml-cpu common)
 # Prioritize ggml/src/ggml-cpu/ to get the full implementation headers
 target_include_directories(${LLAMA_TEST_NAME} PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src/ggml-cpu ${CMAKE_SOURCE_DIR}/ggml/include)
+
+# test-numa-performance-benchmark-add
+set(LLAMA_TEST_NAME test-numa-performance-benchmark-add)
+llama_build_and_test(test-numa-performance-benchmark-add.cpp)
+target_link_libraries(${LLAMA_TEST_NAME} PRIVATE ggml ggml-cpu common)
+# Prioritize ggml/src/ggml-cpu/ to get the full implementation headers and add ggml/src for ggml-impl.h
+target_include_directories(${LLAMA_TEST_NAME} PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src/ggml-cpu ${CMAKE_SOURCE_DIR}/ggml/src ${CMAKE_SOURCE_DIR}/ggml/include)

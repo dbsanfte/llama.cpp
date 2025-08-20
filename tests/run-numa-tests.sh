@@ -6,21 +6,28 @@
 
 # Parse command line arguments
 VERBOSE_MODE=false
+RUN_PERFORMANCE_TESTS=false
 for arg in "$@"; do
     case $arg in
         --verbose)
             VERBOSE_MODE=true
             shift
             ;;
+        --performance)
+            RUN_PERFORMANCE_TESTS=true
+            shift
+            ;;
         --help|-h)
-            echo "Usage: $0 [--verbose] [--help]"
+            echo "Usage: $0 [--verbose] [--performance] [--help]"
             echo ""
             echo "Options:"
-            echo "  --verbose    Show full test output (default: summary only)"
-            echo "  --help, -h   Show this help message"
+            echo "  --verbose      Show full test output (default: summary only)"
+            echo "  --performance  Also run performance benchmark tests"
+            echo "  --help, -h     Show this help message"
             echo ""
             echo "By default, tests run in summary-only mode for cleaner output."
             echo "Use --verbose to see full test execution details."
+            echo "Use --performance to include comprehensive performance benchmarks."
             exit 0
             ;;
         *)
@@ -53,8 +60,16 @@ NUMA_TESTS=(
     "test-numa-mathematical-correctness-add"
 )
 
+# Performance benchmark tests (separate category)
+NUMA_PERFORMANCE_TESTS=(
+    "test-numa-performance-benchmark-add"
+)
+
 # Statistics
 TOTAL_TESTS=${#NUMA_TESTS[@]}
+if [ "$RUN_PERFORMANCE_TESTS" = true ]; then
+    TOTAL_TESTS=$((TOTAL_TESTS + ${#NUMA_PERFORMANCE_TESTS[@]}))
+fi
 PASSED_TESTS=0
 FAILED_TESTS=0
 TEST_RESULTS=()
@@ -64,6 +79,11 @@ echo "========================================"
 echo "Project: llama.cpp NUMA improvements"
 echo "Build directory: $BUILD_DIR"
 echo "Total tests: $TOTAL_TESTS"
+if [ "$RUN_PERFORMANCE_TESTS" = true ]; then
+    echo "Performance tests: Enabled (${#NUMA_PERFORMANCE_TESTS[@]} tests)"
+else
+    echo "Performance tests: Disabled (use --performance to enable)"
+fi
 if [ "$VERBOSE_MODE" = true ]; then
     echo "Output mode: Full verbose output"
 else
@@ -424,6 +444,17 @@ main() {
         # Continue running even if individual tests fail
         run_test "$test_name" || true
     done
+    
+    # Run performance benchmark tests if requested
+    if [ "$RUN_PERFORMANCE_TESTS" = true ]; then
+        echo ""
+        echo -e "${BLUE}🚀 Running Performance Benchmark Tests${NC}"
+        echo "======================================"
+        for test_name in "${NUMA_PERFORMANCE_TESTS[@]}"; do
+            # Continue running even if individual tests fail
+            run_test "$test_name" || true
+        done
+    fi
     
     # Print final summary
     print_summary

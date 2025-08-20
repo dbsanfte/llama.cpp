@@ -27,6 +27,10 @@
 // Thread-local variable to prevent infinite recursion during fallback
 _Thread_local bool in_numa_fallback = false;
 
+// Static variables for performance testing dispatch control
+static bool numa_dispatch_override_enabled = false;
+static bool numa_dispatch_override_value = true;
+
 #endif
 
 // Global NUMA state for compatibility
@@ -697,6 +701,11 @@ bool ggml_numa_should_dispatch(void) {
         return false;  // Disable NUMA dispatch during fallback to prevent infinite recursion
     }
     
+    // Check for performance testing override
+    if (numa_dispatch_override_enabled) {
+        return numa_dispatch_override_value && g_numa_state.initialized;
+    }
+    
     // Enable dispatcher for NUMA mirror strategy on multi-node systems
     return g_numa_state.initialized && 
            g_numa_state.numa_enabled &&
@@ -710,6 +719,23 @@ void ggml_numa_set_fallback_flag(bool value) {
 
 bool ggml_numa_is_fallback_active(void) {
     return in_numa_fallback;
+}
+
+// Functions to control NUMA dispatch for performance testing
+void ggml_numa_set_dispatch_enabled(bool enabled) {
+    numa_dispatch_override_enabled = true;
+    numa_dispatch_override_value = enabled;
+}
+
+bool ggml_numa_get_dispatch_enabled(void) {
+    if (numa_dispatch_override_enabled) {
+        return numa_dispatch_override_value;
+    }
+    return g_numa_state.numa_enabled;
+}
+
+void ggml_numa_clear_dispatch_override(void) {
+    numa_dispatch_override_enabled = false;
 }
 #endif
 

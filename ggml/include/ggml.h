@@ -655,6 +655,11 @@ extern "C" {
     extern bool ggml_numa_should_mirror(void);
     // Function to check if NUMA dispatch/coordinator should be active at runtime
     extern bool ggml_numa_should_dispatch(void);
+    
+    // Functions for performance testing: control NUMA dispatch behavior
+    extern void ggml_numa_set_dispatch_enabled(bool enabled);
+    extern bool ggml_numa_get_dispatch_enabled(void);
+    extern void ggml_numa_clear_dispatch_override(void);
 #endif
 
     static inline void * tensor_data(const struct ggml_tensor * tensor) {
