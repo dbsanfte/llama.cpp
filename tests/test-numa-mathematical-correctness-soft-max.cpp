@@ -29,7 +29,10 @@ private:
                size_label, rows, cols, rows, cols, num_threads);
         
         // Create test context with sufficient memory for the tensor
-        struct ggml_init_params params = {0};
+        struct ggml_init_params params;
+        params.mem_size = 0;
+        params.mem_buffer = nullptr;
+        params.no_alloc = false;
         params.mem_size = std::max((size_t)(512 * 1024 * 1024), (size_t)(rows * cols) * sizeof(float) * 8); // Scale memory with tensor size
         params.mem_buffer = nullptr;
         params.no_alloc = false;

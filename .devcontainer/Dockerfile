@@ -26,6 +26,7 @@ RUN apt-get update && \
         git \
         curl \
         wget \
+        jq \
         pkg-config \
         python3 \
         python3-pip \

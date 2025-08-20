@@ -106,10 +106,9 @@ static bool test_single_work_item_wait() {
     printf("📤 Submitting single work item...\n");
     
     // Set up execution strategy
-    ggml_numa_execution_strategy_t strategy = {
-        .node_strategy = NUMA_NODE_STRATEGY_SINGLE,
-        .on_node_strategy = NUMA_ON_NODE_STRATEGY_MULTI_THREAD
-    };
+    ggml_numa_execution_strategy_t strategy;
+    strategy.node_strategy = NUMA_NODE_STRATEGY_SINGLE;
+    strategy.on_node_strategy = NUMA_ON_NODE_STRATEGY_MULTI_THREAD;
     
     int work_id = ggml_numa_coordinator_manager_submit_work_function(
         mgr,
@@ -148,7 +147,7 @@ static bool test_single_work_item_wait() {
 static bool test_multiple_work_items_wait() {
     print_test_header("Multiple Work Items Wait");
     
-    struct ggml_numa_coordinator_manager* mgr = ggml_numa_coordinator_manager_get_global(-1, true);
+    struct ggml_numa_coordinator_manager* mgr = ggml_numa_coordinator_manager_get_global(-1);
     if (!mgr) {
         printf("❌ Failed to get coordinator manager\n");
         return false;
@@ -164,10 +163,9 @@ static bool test_multiple_work_items_wait() {
     int work_ids[3];
     
     // Set up execution strategy
-    ggml_numa_execution_strategy_t strategy = {
-        .node_strategy = NUMA_NODE_STRATEGY_SINGLE,
-        .on_node_strategy = NUMA_ON_NODE_STRATEGY_MULTI_THREAD
-    };
+    ggml_numa_execution_strategy_t strategy;
+    strategy.node_strategy = NUMA_NODE_STRATEGY_SINGLE;
+    strategy.on_node_strategy = NUMA_ON_NODE_STRATEGY_MULTI_THREAD;
     
     // Submit different duration work items
     work_ids[0] = ggml_numa_coordinator_manager_submit_work_function(
@@ -221,7 +219,7 @@ static bool test_multiple_work_items_wait() {
 static bool test_rapid_succession_wait() {
     print_test_header("Rapid Succession Wait");
     
-    struct ggml_numa_coordinator_manager* mgr = ggml_numa_coordinator_manager_get_global(-1, true);
+    struct ggml_numa_coordinator_manager* mgr = ggml_numa_coordinator_manager_get_global(-1);
     if (!mgr) {
         printf("❌ Failed to get coordinator manager\n");
         return false;
@@ -231,10 +229,9 @@ static bool test_rapid_succession_wait() {
     bool all_success = true;
     
     // Set up execution strategy
-    ggml_numa_execution_strategy_t strategy = {
-        .node_strategy = NUMA_NODE_STRATEGY_SINGLE,
-        .on_node_strategy = NUMA_ON_NODE_STRATEGY_MULTI_THREAD
-    };
+    ggml_numa_execution_strategy_t strategy;
+    strategy.node_strategy = NUMA_NODE_STRATEGY_SINGLE;
+    strategy.on_node_strategy = NUMA_ON_NODE_STRATEGY_MULTI_THREAD;
     
     for (int cycle = 0; cycle < 5; cycle++) {
         printf("📋 Cycle %d: Submit -> Wait -> Verify\n", cycle + 1);
@@ -278,7 +275,7 @@ static bool test_rapid_succession_wait() {
 static bool test_wait_timeout_behavior() {
     print_test_header("Wait Timeout Behavior");
     
-    struct ggml_numa_coordinator_manager* mgr = ggml_numa_coordinator_manager_get_global(-1, true);
+    struct ggml_numa_coordinator_manager* mgr = ggml_numa_coordinator_manager_get_global(-1);
     if (!mgr) {
         printf("❌ Failed to get coordinator manager\n");
         return false;
@@ -288,10 +285,9 @@ static bool test_wait_timeout_behavior() {
     struct test_work_context context = { 20, "timeout_test" };
     
     // Set up execution strategy
-    ggml_numa_execution_strategy_t strategy = {
-        .node_strategy = NUMA_NODE_STRATEGY_SINGLE,
-        .on_node_strategy = NUMA_ON_NODE_STRATEGY_MULTI_THREAD
-    };
+    ggml_numa_execution_strategy_t strategy;
+    strategy.node_strategy = NUMA_NODE_STRATEGY_SINGLE;
+    strategy.on_node_strategy = NUMA_ON_NODE_STRATEGY_MULTI_THREAD;
     
     int work_id = ggml_numa_coordinator_manager_submit_work_function(
         mgr, test_work_function_very_slow, &context,
@@ -327,7 +323,7 @@ static bool test_wait_timeout_behavior() {
 static bool test_immediate_wait_no_work() {
     print_test_header("Immediate Wait (No Work)");
     
-    struct ggml_numa_coordinator_manager* mgr = ggml_numa_coordinator_manager_get_global(-1, true);
+    struct ggml_numa_coordinator_manager* mgr = ggml_numa_coordinator_manager_get_global(-1);
     if (!mgr) {
         printf("❌ Failed to get coordinator manager\n");
         return false;
@@ -386,7 +382,7 @@ static void* concurrent_wait_thread(void* arg) {
 static bool test_concurrent_waits() {
     print_test_header("Concurrent Waits from Multiple Threads");
     
-    concurrent_test_data.mgr = ggml_numa_coordinator_manager_get_global(-1, true);
+    concurrent_test_data.mgr = ggml_numa_coordinator_manager_get_global(-1);
     if (!concurrent_test_data.mgr) {
         printf("❌ Failed to get coordinator manager\n");
         return false;
@@ -418,10 +414,9 @@ static bool test_concurrent_waits() {
     struct test_work_context context = { 30, "concurrent_wait" };
     
     // Set up execution strategy
-    ggml_numa_execution_strategy_t strategy = {
-        .node_strategy = NUMA_NODE_STRATEGY_SINGLE,
-        .on_node_strategy = NUMA_ON_NODE_STRATEGY_MULTI_THREAD
-    };
+    ggml_numa_execution_strategy_t strategy;
+    strategy.node_strategy = NUMA_NODE_STRATEGY_SINGLE;
+    strategy.on_node_strategy = NUMA_ON_NODE_STRATEGY_MULTI_THREAD;
     
     int work_id = ggml_numa_coordinator_manager_submit_work_function(
         concurrent_test_data.mgr, test_work_function_medium, &context,
@@ -560,10 +555,9 @@ bool test_execution_strategy_single_single() {
     }
     
     // Submit work with single node + single thread strategy
-    ggml_numa_execution_strategy_t strategy = {
-        .node_strategy = NUMA_NODE_STRATEGY_SINGLE,
-        .on_node_strategy = NUMA_ON_NODE_STRATEGY_SINGLE_THREAD
-    };
+    ggml_numa_execution_strategy_t strategy;
+    strategy.node_strategy = NUMA_NODE_STRATEGY_SINGLE;
+    strategy.on_node_strategy = NUMA_ON_NODE_STRATEGY_SINGLE_THREAD;
     
     int work_id = ggml_numa_coordinator_manager_submit_work_function(
         mgr,
@@ -640,10 +634,9 @@ bool test_execution_strategy_single_multi() {
     }
     
     // Submit work with single node + multi thread strategy
-    ggml_numa_execution_strategy_t strategy = {
-        .node_strategy = NUMA_NODE_STRATEGY_SINGLE,
-        .on_node_strategy = NUMA_ON_NODE_STRATEGY_MULTI_THREAD
-    };
+    ggml_numa_execution_strategy_t strategy;
+    strategy.node_strategy = NUMA_NODE_STRATEGY_SINGLE;
+    strategy.on_node_strategy = NUMA_ON_NODE_STRATEGY_MULTI_THREAD;
     
     int work_id = ggml_numa_coordinator_manager_submit_work_function(
         mgr,
@@ -720,10 +713,9 @@ bool test_execution_strategy_data_parallel_single() {
     }
     
     // Submit work with data parallel + single thread strategy
-    ggml_numa_execution_strategy_t strategy = {
-        .node_strategy = NUMA_NODE_STRATEGY_DATA_PARALLEL,
-        .on_node_strategy = NUMA_ON_NODE_STRATEGY_SINGLE_THREAD
-    };
+    ggml_numa_execution_strategy_t strategy;
+    strategy.node_strategy = NUMA_NODE_STRATEGY_DATA_PARALLEL;
+    strategy.on_node_strategy = NUMA_ON_NODE_STRATEGY_SINGLE_THREAD;
     
     int work_id = ggml_numa_coordinator_manager_submit_work_function(
         mgr,
@@ -808,10 +800,9 @@ bool test_execution_strategy_data_parallel_multi() {
     }
     
     // Submit work with data parallel + multi thread strategy (most complex)
-    ggml_numa_execution_strategy_t strategy = {
-        .node_strategy = NUMA_NODE_STRATEGY_DATA_PARALLEL,
-        .on_node_strategy = NUMA_ON_NODE_STRATEGY_MULTI_THREAD
-    };
+    ggml_numa_execution_strategy_t strategy;
+    strategy.node_strategy = NUMA_NODE_STRATEGY_DATA_PARALLEL;
+    strategy.on_node_strategy = NUMA_ON_NODE_STRATEGY_MULTI_THREAD;
     
     int work_id = ggml_numa_coordinator_manager_submit_work_function(
         mgr,
@@ -899,15 +890,13 @@ bool test_execution_strategy_mixed_workload() {
     }
     
     // Submit work with different strategies simultaneously
-    ggml_numa_execution_strategy_t single_strategy = {
-        .node_strategy = NUMA_NODE_STRATEGY_SINGLE,
-        .on_node_strategy = NUMA_ON_NODE_STRATEGY_MULTI_THREAD
-    };
+    ggml_numa_execution_strategy_t single_strategy;
+    single_strategy.node_strategy = NUMA_NODE_STRATEGY_SINGLE;
+    single_strategy.on_node_strategy = NUMA_ON_NODE_STRATEGY_MULTI_THREAD;
     
-    ggml_numa_execution_strategy_t data_parallel_strategy = {
-        .node_strategy = NUMA_NODE_STRATEGY_DATA_PARALLEL,
-        .on_node_strategy = NUMA_ON_NODE_STRATEGY_SINGLE_THREAD
-    };
+    ggml_numa_execution_strategy_t data_parallel_strategy;
+    data_parallel_strategy.node_strategy = NUMA_NODE_STRATEGY_DATA_PARALLEL;
+    data_parallel_strategy.on_node_strategy = NUMA_ON_NODE_STRATEGY_SINGLE_THREAD;
     
     // Submit first work item
     int work_id1 = ggml_numa_coordinator_manager_submit_work_function(

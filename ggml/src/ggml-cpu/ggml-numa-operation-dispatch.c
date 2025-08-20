@@ -152,8 +152,8 @@ static enum ggml_status ggml_numa_execute_mul_mat_chunk_range(
     (void)manager;
     (void)context;
     
-    GGML_LOG_DEBUG("Executing MUL_MAT chunk range: rows[%ld:%ld] cols[%ld:%ld]\n",
-                   row_start, row_end, col_start, col_end);
+    NUMA_DISPATCH_LOG_DEBUG(operation, "Executing chunk range: rows[%ld:%ld] cols[%ld:%ld]",
+                           row_start, row_end, col_start, col_end);
 
     const struct ggml_tensor * src0 = operation->src[0];
     
@@ -161,7 +161,7 @@ static enum ggml_status ggml_numa_execute_mul_mat_chunk_range(
     void * work_buffer = NULL;
     if (work_size > 0) {
         if (!ggml_numa_dispatch_ensure_work_buffer(0, work_size)) {
-            GGML_LOG_ERROR("Failed to ensure work buffer of size %zu for chunk range\n", work_size);
+            NUMA_DISPATCH_LOG_ERROR(operation, "Failed to ensure work buffer of size %zu for chunk range", work_size);
             return GGML_STATUS_FAILED;
         }
         
@@ -202,7 +202,7 @@ static enum ggml_status ggml_numa_execute_mul_mat_chunk_range(
         col_start, col_end              // column range
     );
     
-    GGML_LOG_DEBUG("MUL_MAT chunk range execution completed successfully\n");
+    NUMA_DISPATCH_LOG_DEBUG(operation, "Chunk range execution completed successfully");
     return GGML_STATUS_SUCCESS;
 }
 
@@ -297,7 +297,7 @@ static enum ggml_status ggml_numa_mul_mat_execute_direct(
     const struct ggml_tensor * operation,
     const ggml_numa_work_context_t * context) {
     
-    GGML_LOG_DEBUG("Direct MUL_MAT execution: analyzing strategy\n");
+    NUMA_DISPATCH_LOG_DEBUG(operation, "Direct execution: analyzing strategy");
     
     GGML_ASSERT(operation);
     GGML_ASSERT(context);
@@ -312,11 +312,11 @@ static enum ggml_status ggml_numa_mul_mat_execute_direct(
         operation, context, &strategy, &work_function, &work_buffer_size);
     
     if (analysis_result != GGML_STATUS_SUCCESS) {
-        GGML_LOG_ERROR("Failed to analyze MUL_MAT strategy\n");
+        NUMA_DISPATCH_LOG_ERROR(operation, "Failed to analyze strategy");
         return GGML_STATUS_FAILED;
     }
     
-    GGML_LOG_DEBUG("Direct MUL_MAT: strategy=%s, buffer_size=%zu\n",
+    NUMA_DISPATCH_LOG_DEBUG(operation, "Direct execution: strategy=%s, buffer_size=%zu",
                    (strategy.node_strategy == NUMA_NODE_STRATEGY_SINGLE) ? "single" : "parallel",
                    work_buffer_size);
     
@@ -329,7 +329,7 @@ static enum ggml_status ggml_numa_mul_mat_execute_direct(
     );
     
     if (!work_context) {
-        GGML_LOG_ERROR("Failed to create work context for direct MUL_MAT\n");
+        NUMA_DISPATCH_LOG_ERROR(operation, "Failed to create work context for direct execution");
         return GGML_STATUS_FAILED;
     }
     
@@ -338,11 +338,11 @@ static enum ggml_status ggml_numa_mul_mat_execute_direct(
     if (work_buffer_size > 0) {
         work_buffer = malloc(work_buffer_size);
         if (!work_buffer) {
-            GGML_LOG_ERROR("Failed to allocate work buffer (%zu bytes) for direct MUL_MAT\n", work_buffer_size);
+            NUMA_DISPATCH_LOG_ERROR(operation, "Failed to allocate work buffer (%zu bytes) for direct execution", work_buffer_size);
             ggml_numa_dispatcher_free_work_context(work_context);
             return GGML_STATUS_FAILED;
         }
-        GGML_LOG_DEBUG("Allocated work buffer: %p (%zu bytes)\n", work_buffer, work_buffer_size);
+        NUMA_DISPATCH_LOG_DEBUG(operation, "Allocated work buffer: %p (%zu bytes)", work_buffer, work_buffer_size);
     }
     
     // Set up compute params for the work function
@@ -354,20 +354,20 @@ static enum ggml_status ggml_numa_mul_mat_execute_direct(
     };
     
     // Execute the work function directly
-    GGML_LOG_DEBUG("Executing MUL_MAT work function directly\n");
+    NUMA_DISPATCH_LOG_DEBUG(operation, "Executing work function directly");
     enum ggml_status result = work_function(work_context, &params);
     
     // Cleanup
     if (work_buffer) {
         free(work_buffer);
-        GGML_LOG_DEBUG("Freed work buffer: %p\n", work_buffer);
+        NUMA_DISPATCH_LOG_DEBUG(operation, "Freed work buffer: %p", work_buffer);
     }
     ggml_numa_dispatcher_free_work_context(work_context);
     
     if (result == GGML_STATUS_SUCCESS) {
-        GGML_LOG_DEBUG("Direct MUL_MAT execution completed successfully\n");
+        NUMA_DISPATCH_LOG_DEBUG(operation, "Direct execution completed successfully");
     } else {
-        GGML_LOG_ERROR("Direct MUL_MAT execution failed\n");
+        NUMA_DISPATCH_LOG_ERROR(operation, "Direct execution failed");
     }
     
     return result;
@@ -388,50 +388,41 @@ void ggml_numa_dispatch_init(void) {
     
     // Initialize dispatcher work buffer system
     ggml_numa_dispatch_work_buffers_init_internal();
+
+    // Count active handlers
+    int handlers = 0;
     
     // Register built-in handlers
-    ggml_numa_dispatch_register_handler(&ggml_numa_handler_elementwise);
-    ggml_numa_dispatch_register_handler(&ggml_numa_handler_mul_mat_enhanced);  // Use enhanced MUL_MAT handler
-    ggml_numa_dispatch_register_handler(&ggml_numa_handler_soft_max);         // NUMA-aware SOFT_MAX handler
-    ggml_numa_dispatch_register_handler(&ggml_numa_handler_glu);              // NUMA-aware GLU handler
-    ggml_numa_dispatch_register_handler(&ggml_numa_handler_rms_norm);         // NUMA-aware RMS_NORM handler
-    ggml_numa_dispatch_register_handler(&ggml_numa_handler_complex);
-    
-    // Skip atexit registration to avoid segfaults during program termination
-    // The OS will clean up memory and resources when the process exits
-    // atexit(ggml_numa_dispatch_cleanup_work_buffers);
-    // atexit(ggml_numa_dispatch_cleanup_operation_handlers);
-    
+    // All handlers commented out for complete fallback testing
+    /*
+        ggml_numa_dispatch_register_handler(&ggml_numa_handler_elementwise); handlers++;
+        ggml_numa_dispatch_register_handler(&ggml_numa_handler_mul_mat_enhanced); handlers++;  // Use enhanced MUL_MAT handler
+        ggml_numa_dispatch_register_handler(&ggml_numa_handler_soft_max); handlers++;          // NUMA-aware SOFT_MAX handler
+        ggml_numa_dispatch_register_handler(&ggml_numa_handler_glu); handlers++;               // NUMA-aware GLU handler
+        ggml_numa_dispatch_register_handler(&ggml_numa_handler_rms_norm); handlers++;          // NUMA-aware RMS_NORM handler
+        ggml_numa_dispatch_register_handler(&ggml_numa_handler_complex); handlers++;
+    */
+
     g_dispatch_initialized = true;
-    GGML_LOG_INFO("NUMA operation dispatch system initialized with enhanced handlers\n");
 }
 
 void ggml_numa_dispatch_register_handler(const ggml_numa_operation_handler_t * handler) {
     if (!handler || handler->operation_type >= GGML_OP_COUNT) {
-        GGML_LOG_ERROR("Invalid operation handler for registration\n");
+        NUMA_DISPATCH_LOG_ERROR(NULL, "Invalid operation handler for registration");
         return;
     }
     
     // Allocate and copy handler using NUMA-aware allocation
-#ifdef __linux__
     ggml_numa_operation_handler_t * registered_handler = numa_alloc_onnode(sizeof(ggml_numa_operation_handler_t), 0);
     if (!registered_handler) {
-        // Fallback to regular malloc if NUMA allocation fails
-        registered_handler = malloc(sizeof(ggml_numa_operation_handler_t));
-    }
-#else
-    ggml_numa_operation_handler_t * registered_handler = malloc(sizeof(ggml_numa_operation_handler_t));
-#endif
-    
-    if (!registered_handler) {
-        GGML_LOG_ERROR("Failed to allocate memory for operation handler\n");
+        NUMA_DISPATCH_LOG_ERROR(NULL, "Failed to allocate NUMA memory for operation handler");
         return;
     }
-    
+        
     memcpy(registered_handler, handler, sizeof(ggml_numa_operation_handler_t));
     g_operation_handlers[handler->operation_type] = registered_handler;
     
-    GGML_LOG_DEBUG("Registered handler for operation %s\n", ggml_op_name(handler->operation_type));
+    NUMA_DISPATCH_LOG_DEBUG(NULL, "Registered handler for operation %s", ggml_op_name(handler->operation_type));
 }
 
 const ggml_numa_operation_handler_t * ggml_numa_dispatch_get_handler(enum ggml_op operation_type) {
@@ -451,30 +442,9 @@ enum ggml_status ggml_numa_dispatch_operation(
     const struct ggml_tensor * operation,
     const ggml_numa_work_context_t * context) {
     
-    if (!manager || !operation || !context) {
-        GGML_LOG_ERROR("Invalid parameters for operation dispatch\n");
-        return GGML_STATUS_FAILED;
-    }
-    
-    // CRITICAL DEBUGGING: Capture tensor types at entry point to catch corruption
-    if (operation->op == GGML_OP_MUL_MAT) {
-        const struct ggml_tensor * src0 = operation->src[0];
-        const struct ggml_tensor * src1 = operation->src[1];
-        
-        fprintf(stderr, "🔍 DISPATCH ENTRY: MUL_MAT operation entry point\n");
-        fprintf(stderr, "    📊 operation=%p, src[0]=%p, src[1]=%p\n", 
-               (const void*)operation, (const void*)src0, (const void*)src1);
-        
-        if (src0) {
-            fprintf(stderr, "    📊 src[0]: type=%d (%s), dims=(%ld,%ld,%ld,%ld)\n", 
-                   src0->type, ggml_type_name(src0->type), src0->ne[0], src0->ne[1], src0->ne[2], src0->ne[3]);
-        }
-        if (src1) {
-            fprintf(stderr, "    📊 src[1]: type=%d (%s), dims=(%ld,%ld,%ld,%ld)\n", 
-                   src1->type, ggml_type_name(src1->type), src1->ne[0], src1->ne[1], src1->ne[2], src1->ne[3]);
-        }
-        fflush(stderr);
-    }
+    NUMA_ASSERT(manager);
+    NUMA_ASSERT(operation);
+    NUMA_ASSERT(context);
     
     // Update statistics
     g_dispatch_stats.total_operations++;
@@ -485,191 +455,17 @@ enum ggml_status ggml_numa_dispatch_operation(
     int64_t start_time = ggml_time_us();
     enum ggml_status result = GGML_STATUS_SUCCESS;
     
-    // Get handler for this operation type
-    const ggml_numa_operation_handler_t * handler = ggml_numa_dispatch_get_handler(operation->op);
-    
-    // Debug logging for MUL_MAT specifically
-    if (operation->op == GGML_OP_MUL_MAT) {
-        GGML_LOG_INFO("MUL_MAT dispatch: handler=%p, initialized=%d\n", (const void*)handler, g_dispatch_initialized);
-    }
-    
-    // TEMPORARY FIX: Bypass NUMA optimization for F16 operations due to precision issues
-    // But NOT for MUL_MAT which has its own handling
-    bool has_f16_tensor = false;
-    if (operation->src[0] && operation->src[0]->type == GGML_TYPE_F16) {
-        has_f16_tensor = true;
-    }
-    if (operation->src[1] && operation->src[1]->type == GGML_TYPE_F16) {
-        has_f16_tensor = true;
-    }
-    
-    // Exclude MUL_MAT from F16 bypass since it has special handling
-    bool should_bypass_for_f16 = has_f16_tensor && (operation->op != GGML_OP_MUL_MAT);
-    
-    if (should_bypass_for_f16) {
-        GGML_LOG_DEBUG("F16 operation detected (%s), bypassing NUMA optimization and using fallback\n", 
-                       ggml_op_name(operation->op));
-        
-        // Check if this operation needs work buffers (excluding MUL_MAT)
-        bool needs_work_buffer = (operation->op == GGML_OP_SOFT_MAX || 
-                                  operation->op == GGML_OP_ROPE ||
-                                  operation->op == GGML_OP_NORM ||
-                                  operation->op == GGML_OP_RMS_NORM ||
-                                  operation->op == GGML_OP_GROUP_NORM ||
-                                  operation->op == GGML_OP_FLASH_ATTN_EXT);
-        
-        if (needs_work_buffer) {
-            GGML_LOG_DEBUG("Operation %s needs work buffers, setting up cplan for fallback\n", ggml_op_name(operation->op));
-            
-            // Calculate work buffer size for this operation
-            size_t buffer_size = ggml_numa_dispatcher_calculate_work_buffer_size(operation);
-            
-            // Allocate actual work buffer if needed
-            void * work_data = NULL;
-            if (buffer_size > 0) {
-                work_data = malloc(buffer_size);
-                if (!work_data) {
-                    GGML_LOG_ERROR("Failed to allocate %zu bytes for F16 work buffer\n", buffer_size);
-                    return GGML_STATUS_FAILED;
-                }
-                GGML_LOG_DEBUG("F16 %s allocated work buffer: %p size=%zu\n", 
-                              ggml_op_name(operation->op), work_data, buffer_size);
-            }
-            
-            // Create a simple cplan with work buffer
-            struct ggml_cplan cplan = {
-                .n_threads = 1,
-                .work_size = buffer_size,
-                .work_data = work_data,
-                .threadpool = NULL
-            };
-            
-            GGML_LOG_DEBUG("F16 %s fallback with work_size=%zu work_data=%p\n", 
-                          ggml_op_name(operation->op), buffer_size, work_data);
-            result = ggml_numa_fallback_execute((struct ggml_tensor *)operation, &cplan);
-            
-            // Free the work buffer after execution
-            if (work_data) {
-                free(work_data);
-                GGML_LOG_DEBUG("F16 %s freed work buffer %p\n", ggml_op_name(operation->op), work_data);
-            }
-        } else {
-            GGML_LOG_DEBUG("Operation %s doesn't need work buffers, using direct fallback\n", ggml_op_name(operation->op));
-            result = ggml_numa_fallback_execute((struct ggml_tensor *)operation, NULL);
-        }
-        
-        // Update timing and return
-        int64_t end_time = ggml_time_us();
-        g_dispatch_stats.total_execution_time_us += (end_time - start_time);
-        
-        return result;
-    }
-    
-    if (handler) {
-        // Special case: MUL_MAT operations use direct execution with our mathematical kernels
-        if (operation->op == GGML_OP_MUL_MAT) {
-            GGML_LOG_DEBUG("Using direct MUL_MAT execution with NUMA mathematical kernels\n");
-            result = ggml_numa_mul_mat_execute_direct(operation, context);
-        } else {
-            // Use registered handler to analyze and execute for other operations
-            ggml_numa_execution_strategy_t strategy;
-            int recommended_chunks;
-            
-            // Analyze operation to determine optimal strategy
-            if (handler->analyze) {
-                enum ggml_status analysis_result = handler->analyze(operation, context, &strategy, &recommended_chunks);
-                if (analysis_result != GGML_STATUS_SUCCESS) {
-                    GGML_LOG_WARN("Operation analysis failed for %s, falling back to single node\n", 
-                                 ggml_op_name(operation->op));
-                    strategy = (ggml_numa_execution_strategy_t){
-                        .node_strategy = NUMA_NODE_STRATEGY_SINGLE,
-                        .on_node_strategy = NUMA_ON_NODE_STRATEGY_MULTI_THREAD
-                    };
-                }
-            } else {
-                // Use default strategy from handler
-                strategy = handler->default_strategy;
-                recommended_chunks = context->numa_nodes;
-                
-                // SIMPLIFIED: Only override data parallel if coordinator reports single NUMA node
-                // The coordinator already handles force_multi_socket and real NUMA detection,
-                // so we trust its NUMA node count directly
-                
-                if (context->numa_nodes <= 1 && strategy.node_strategy == NUMA_NODE_STRATEGY_DATA_PARALLEL) {
-                    GGML_LOG_INFO("Overriding data parallel strategy to single node for %s (coordinator reports %d NUMA nodes)\n",
-                                 ggml_op_name(operation->op), context->numa_nodes);
-                    strategy.node_strategy = NUMA_NODE_STRATEGY_SINGLE;
-                } else {
-                    GGML_LOG_INFO("Using data parallel strategy for %s (coordinator reports %d NUMA nodes)\n",
-                                 ggml_op_name(operation->op), context->numa_nodes);
-                }
-            }
-            
-            // Execute based on determined strategy
-            switch (strategy.node_strategy) {
-                case NUMA_NODE_STRATEGY_SINGLE:
-                    result = ggml_numa_execute_single_node(manager, operation, context);
-                    break;
-                    
-                case NUMA_NODE_STRATEGY_DATA_PARALLEL:
-                    result = ggml_numa_execute_data_parallel(manager, operation, context);
-                    g_dispatch_stats.parallelized_operations++;
-                    break;
-                
-                if (result == GGML_STATUS_SUCCESS) {
-                    g_dispatch_stats.parallelized_operations++;
-                }
-                break;
-                
-            default:
-                GGML_LOG_WARN("Unknown node strategy %d for operation %s, using single node fallback\n", 
-                             (int)strategy.node_strategy, ggml_op_name(operation->op));
-                result = ggml_numa_execute_single_node(manager, operation, context);
-                break;
-            }
-        }
-        
+    // SIMPLE APPROACH: Only handle supported operations, let everything else fall through
+    // For now, only ADD operation is properly implemented for NUMA
+    if (operation->op == GGML_OP_ADD) {
+        // Route ADD to the proper NUMA system
+        result = ggml_numa_execute_single_node(manager, operation, context);
     } else {
-        // No handler registered - use single-threaded fallback system
-        GGML_LOG_DEBUG("No handler registered for operation %s, using fallback execution\n", 
-                      ggml_op_name(operation->op));
-        
-        // Check if this operation needs work buffers
-        // If so, route through coordinator for proper buffer setup
-        // Otherwise use direct fallback
-        bool needs_work_buffer = (operation->op == GGML_OP_SOFT_MAX || 
-                                  operation->op == GGML_OP_ROPE ||
-                                  operation->op == GGML_OP_NORM ||
-                                  operation->op == GGML_OP_RMS_NORM ||
-                                  operation->op == GGML_OP_GROUP_NORM ||
-                                  operation->op == GGML_OP_GLU ||
-                                  operation->op == GGML_OP_FLASH_ATTN_EXT);
-        
-        if (needs_work_buffer) {
-            GGML_LOG_DEBUG("Operation %s needs work buffers, routing through coordinator\n", 
-                          ggml_op_name(operation->op));
-            // Use coordinator for operations that need work buffers
-            result = ggml_numa_execute_single_node(manager, operation, context);
-        } else {
-            GGML_LOG_DEBUG("Operation %s doesn't need work buffers, using direct fallback\n", 
-                          ggml_op_name(operation->op));
-            // Route to fallback system for safe single-threaded execution
-            struct ggml_tensor * operation_tensor = (struct ggml_tensor *)operation;
-            result = ggml_numa_execute_operation_fallback(operation_tensor, NULL);
-        }
-        
-        if (result != GGML_STATUS_SUCCESS) {
-            GGML_LOG_ERROR("Fallback execution failed for operation %s\n", ggml_op_name(operation->op));
-        }
+        // For all other operations, return FAILED to let the standard path handle them
+        GGML_LOG_DEBUG("Operation %s not implemented in NUMA system, using standard execution\n", ggml_op_name(operation->op));
+        return GGML_STATUS_FAILED;  // This will cause normal execution path to be used
     }
-    
-    // Update timing statistics
-    int64_t execution_time = ggml_time_us() - start_time;
-    g_dispatch_stats.total_execution_time_us += execution_time;
-    if (operation->op < GGML_OP_COUNT) {
-        g_dispatch_stats.op_times_us[operation->op] += execution_time;
-    }
-    
+
     return result;
 }
 
@@ -684,7 +480,7 @@ static enum ggml_status ggml_numa_execute_single_node(
     
     (void)context; // Suppress unused parameter warning
     
-    GGML_LOG_DEBUG("Dispatching %s to single node (NUMA node 0) using function pointer approach\n", ggml_op_name(operation->op));
+    NUMA_DISPATCH_LOG_DEBUG(operation, "Dispatching to single node (NUMA node 0) using function pointer approach");
     
     // Reset status for this new work submission
     ggml_numa_coordinator_manager_reset_status(manager);
@@ -698,7 +494,7 @@ static enum ggml_status ggml_numa_execute_single_node(
     );
     
     if (!work_context) {
-        GGML_LOG_ERROR("Failed to create work context for operation %s\n", ggml_op_name(operation->op));
+        NUMA_DISPATCH_LOG_ERROR(operation, "Failed to create work context");
         return GGML_STATUS_FAILED;
     }
     
@@ -715,16 +511,18 @@ static enum ggml_status ggml_numa_execute_single_node(
     ggml_numa_work_function_t work_function;
     if (operation->op == GGML_OP_MUL_MAT) {
         work_function = ggml_numa_work_function_mul_mat_single;
-        GGML_LOG_DEBUG("Using specialized MUL_MAT single work function\n");
+        NUMA_DISPATCH_LOG_DEBUG(operation, "Using specialized MUL_MAT single work function");
     } else if (operation->op == GGML_OP_ADD) {
         work_function = ggml_numa_work_function_add_single;
-        GGML_LOG_DEBUG("Using specialized ADD single work function for single node\n");
+        NUMA_DISPATCH_LOG_DEBUG(operation, "Using specialized ADD single work function for single node");
     } else if (operation->op == GGML_OP_GLU) {
-        work_function = ggml_numa_work_function_glu_chunk;
-        GGML_LOG_DEBUG("Using specialized GLU chunk work function for single node\n");
+        // TEMPORARY: Disable GLU NUMA optimization due to NaN corruption
+        // Force fallback to original ggml implementation for debugging
+        NUMA_DISPATCH_LOG_DEBUG(operation, "GLU NUMA disabled - forcing fallback");
+        return GGML_STATUS_FAILED;
     } else if (operation->op == GGML_OP_RMS_NORM) {
         work_function = ggml_numa_work_function_rms_norm_chunk;
-        GGML_LOG_DEBUG("Using specialized RMS_NORM chunk work function for single node\n");
+        NUMA_DISPATCH_LOG_DEBUG(operation, "Using specialized RMS_NORM chunk work function for single node");
     } else if (operation->op == GGML_OP_FLASH_ATTN_EXT) {
         work_function = ggml_numa_work_function_flash_attn_ext_chunk;
         GGML_LOG_DEBUG("Using specialized FLASH_ATTN_EXT chunk work function for single node\n");
@@ -853,9 +651,10 @@ static enum ggml_status ggml_numa_execute_data_parallel(
         GGML_LOG_DEBUG("🔧 DEBUG: Selected ADD chunk work function %p\n", (void*)work_function);
         GGML_LOG_DEBUG("Using specialized ADD chunk work function for data parallelism\n");
     } else if (operation->op == GGML_OP_GLU) {
-        work_function = ggml_numa_work_function_glu_chunk;
-        GGML_LOG_DEBUG("🔧 DEBUG: Selected GLU chunk work function %p\n", (void*)work_function);
-        GGML_LOG_DEBUG("Using specialized GLU chunk work function for data parallelism\n");
+        // TEMPORARY: Disable GLU NUMA optimization due to NaN corruption  
+        // Force fallback to original ggml implementation for debugging
+        GGML_LOG_DEBUG("GLU NUMA disabled - forcing fallback\n");
+        return GGML_STATUS_FAILED;
     } else if (operation->op == GGML_OP_RMS_NORM) {
         work_function = ggml_numa_work_function_rms_norm_chunk;
         GGML_LOG_DEBUG("🔧 DEBUG: Selected RMS_NORM chunk work function %p\n", (void*)work_function);
@@ -1302,7 +1101,6 @@ enum ggml_status ggml_numa_graph_compute(struct ggml_cgraph * cgraph, int n_thre
     
     // Determine if NUMA coordination would be beneficial
     if (!ggml_numa_should_coordinate(cgraph, n_threads)) {
-        GGML_LOG_DEBUG("NUMA coordination not beneficial - using single-threaded fallback computation\n");
         
         // Use single-threaded fallback for each operation in the graph
         for (int i = 0; i < cgraph->n_nodes; i++) {
@@ -1311,23 +1109,16 @@ enum ggml_status ggml_numa_graph_compute(struct ggml_cgraph * cgraph, int n_thre
             
             enum ggml_status result = ggml_numa_execute_operation_fallback(operation, NULL);
             if (result != GGML_STATUS_SUCCESS) {
-                GGML_LOG_ERROR("Fallback execution failed for operation %d (%s)\n", 
-                              i, ggml_op_name(operation->op));
                 return GGML_STATUS_FAILED;
             }
         }
         
-        GGML_LOG_DEBUG("Single-threaded fallback computation completed successfully\n");
         return GGML_STATUS_SUCCESS;
     }
-    
-    GGML_LOG_INFO("Using NUMA-aware graph computation via dispatcher for %d operations with %d threads\n", 
-                  cgraph->n_nodes, n_threads);
     
     // Get or create the global NUMA coordinator manager  
     struct ggml_numa_coordinator_manager * mgr = ggml_numa_coordinator_manager_get_global(n_threads);
     if (!mgr) {
-        GGML_LOG_ERROR("Failed to create NUMA coordinator manager\n");
         return GGML_STATUS_FAILED;
     }
     
@@ -1336,18 +1127,30 @@ enum ggml_status ggml_numa_graph_compute(struct ggml_cgraph * cgraph, int n_thre
         struct ggml_tensor * operation = cgraph->nodes[i];
         if (!operation) continue;
 
+        // Create work context for this operation
+        ggml_numa_work_context_t context = {
+            .total_elements = ggml_nelements(operation),
+            .element_size = ggml_element_size(operation),
+            .numa_nodes = ggml_numa_coordinator_get_num_nodes(),
+            .threads_per_node = n_threads / ggml_numa_coordinator_get_num_nodes(),
+            .l3_cache_size = 8ULL * 1024 * 1024,  // 8MB default
+            .memory_bandwidth = 100ULL * 1024 * 1024 * 1024  // 100GB/s default
+        };
+        
+        // Copy tensor dimensions
+        for (int j = 0; j < GGML_MAX_DIMS && j < 4; j++) {
+            context.ne[j] = operation->ne[j];
+        }
+        context.n_dims = ggml_n_dims(operation);
+
         // Use proper dispatch which includes direct MUL_MAT execution
-        enum ggml_status result = ggml_numa_dispatch_operation(mgr, operation, NULL);
+        enum ggml_status result = ggml_numa_dispatch_operation(mgr, operation, &context);
         
         if (result != GGML_STATUS_SUCCESS) {
-            GGML_LOG_ERROR("NUMA dispatch failed for operation %d (%s)\n", 
-                          i, ggml_op_name(operation->op));
             return GGML_STATUS_FAILED;
         }
-        
-        GGML_LOG_DEBUG("Successfully executed operation %d (%s) via NUMA dispatch\n", 
-                      i, ggml_op_name(operation->op));
-    }    GGML_LOG_INFO("NUMA graph computation completed successfully via dispatcher\n");
+    }
+    
     return GGML_STATUS_SUCCESS;
 }
 
@@ -1408,26 +1211,21 @@ static bool ggml_numa_should_coordinate(struct ggml_cgraph * cgraph, int n_threa
     
     // SIMPLIFIED: Trust coordinator's availability - if it's active, NUMA coordination is worthwhile
     // The coordinator will only be initialized if NUMA is available and beneficial
-    GGML_LOG_DEBUG("NUMA coordinator-based decision: coordination should proceed\n");
 
     // Minimum requirements for NUMA coordination
     int min_operations_for_numa = 10;  // Need enough operations to distribute
     int min_threads_for_numa = 4;      // Need enough threads to make coordination worthwhile
 
     if (cgraph->n_nodes < min_operations_for_numa) {
-        GGML_LOG_DEBUG("Too few operations (%d < %d) for NUMA coordination\n", 
-                      cgraph->n_nodes, min_operations_for_numa);
         return false;
     }
 
     if (n_threads < min_threads_for_numa) {
-        GGML_LOG_DEBUG("Too few threads (%d < %d) for NUMA coordination\n", 
-                      n_threads, min_threads_for_numa);
         return false;
     }
 
     // SIMPLIFIED: Trust coordinator's NUMA configuration - no independent detection
-    GGML_LOG_DEBUG("Coordinator-centric: proceeding with NUMA coordination\n");    // Estimate if the computational load is large enough to justify NUMA coordination overhead
+    // Estimate if the computational load is large enough to justify NUMA coordination overhead
     int64_t total_elements = 0;
     for (int i = 0; i < cgraph->n_nodes; i++) {
         if (cgraph->nodes[i]) {
@@ -1437,13 +1235,8 @@ static bool ggml_numa_should_coordinate(struct ggml_cgraph * cgraph, int n_threa
     
     int64_t min_elements_for_numa = 100000; // Minimum computational load
     if (total_elements < min_elements_for_numa) {
-        GGML_LOG_DEBUG("Computational load too small (%ld < %ld) for NUMA coordination\n", 
-                      total_elements, min_elements_for_numa);
         return false;
     }
-    
-    GGML_LOG_INFO("NUMA coordination beneficial: %d operations, %d threads, %ld total elements\n",
-                  cgraph->n_nodes, n_threads, total_elements);
     
     return true;
 }
@@ -1893,11 +1686,7 @@ void ggml_numa_dispatch_cleanup_operation_handlers(void) {
     for (int i = 0; i < GGML_OP_COUNT; i++) {
         if (g_operation_handlers[i]) {
             GGML_LOG_DEBUG("Freeing operation handler for %s\n", ggml_op_name(i));
-#ifdef __linux__
             numa_free((void*)g_operation_handlers[i], sizeof(ggml_numa_operation_handler_t));
-#else
-            free((void*)g_operation_handlers[i]);
-#endif
             g_operation_handlers[i] = NULL;
         }
     }
@@ -1964,71 +1753,293 @@ enum ggml_status ggml_numa_intercept_operation(struct ggml_tensor * tensor, stru
     return result;
 }
 
+// ============================================================================
+// Direct Operation Execution Using ggml Building Blocks
+// ============================================================================
+
+/**
+ * Execute MUL_MAT operation using ggml building blocks without recursion
+ */
+static enum ggml_status ggml_numa_execute_mulmat_direct(
+    struct ggml_tensor * dst,
+    struct ggml_numa_coordinator_manager * coordinator,
+    int n_threads) {
+    
+    struct ggml_tensor * src0 = dst->src[0];
+    struct ggml_tensor * src1 = dst->src[1];
+    
+    if (!src0 || !src1) {
+        GGML_LOG_ERROR("MUL_MAT missing source tensors\n");
+        return GGML_STATUS_FAILED;
+    }
+    
+    // Get type information using ggml's type system
+    const struct ggml_type_traits_cpu * traits = ggml_get_type_traits_cpu(src0->type);
+    enum ggml_type vec_dot_type = traits->vec_dot_type;
+    ggml_vec_dot_t vec_dot = traits->vec_dot;
+    ggml_from_float_t from_float = ggml_get_type_traits_cpu(vec_dot_type)->from_float;
+    
+    // Tensor dimensions (equivalent to GGML_TENSOR_BINARY_OP_LOCALS)
+    const int64_t ne00 = src0->ne[0]; const int64_t ne01 = src0->ne[1];
+    const int64_t ne10 = src1->ne[0]; const int64_t ne11 = src1->ne[1];
+    const int64_t ne0 = dst->ne[0];   const int64_t ne1 = dst->ne[1];
+    
+    const size_t nb00 = src0->nb[0];  const size_t nb01 = src0->nb[1];
+    const size_t nb10 = src1->nb[0];  const size_t nb11 = src1->nb[1];
+    const size_t nb0 = dst->nb[0];    const size_t nb1 = dst->nb[1];
+    
+    GGML_ASSERT(ne00 == ne10);  // Matrix multiplication compatibility
+    GGML_ASSERT(ne0 == ne01);
+    GGML_ASSERT(ne1 == ne11);
+    
+    int64_t total_elements = ggml_nelements(dst);
+    bool use_numa = (total_elements > 32768) && coordinator;
+    
+    GGML_LOG_DEBUG("Executing MUL_MAT: %ldx%ld * %ldx%ld -> %ldx%ld (%s)\n",
+                  ne01, ne00, ne10, ne11, ne0, ne1, 
+                  use_numa ? "NUMA" : "single-threaded");
+    
+    if (use_numa) {
+        // NUMA-distributed execution
+        int num_numa_nodes = ggml_numa_coordinator_manager_get_numa_nodes(coordinator);
+        
+        GGML_LOG_DEBUG("Executing MUL_MAT with NUMA distribution across %d nodes\n", num_numa_nodes);
+        
+        // Distribute rows across NUMA nodes
+        for (int numa_node = 0; numa_node < num_numa_nodes; numa_node++) {
+            int64_t rows_per_node = ne01 / num_numa_nodes;
+            int64_t row_start = numa_node * rows_per_node;
+            int64_t row_end = (numa_node == num_numa_nodes - 1) ? ne01 : row_start + rows_per_node;
+            
+            if (row_start >= row_end) continue; // No work for this node
+            
+            // Get NUMA-local resources
+            struct ggml_threadpool * threadpool = ggml_numa_coordinator_get_threadpool(coordinator, numa_node);
+            void * work_buffer = ggml_numa_coordinator_get_work_buffer(coordinator, numa_node);
+            
+            if (!threadpool) {
+                GGML_LOG_WARN("No threadpool for NUMA node %d, using single-threaded\n", numa_node);
+            }
+            
+            // Type conversion if needed
+            void * src1_data = (void*)((char*)tensor_data(src1));
+            if (src1->type != vec_dot_type && work_buffer) {
+                GGML_LOG_DEBUG("Converting src1 from %s to %s on NUMA node %d\n",
+                              ggml_type_name(src1->type), ggml_type_name(vec_dot_type), numa_node);
+                
+                // Convert src1 using ggml's conversion function
+                for (int64_t i11 = 0; i11 < ne11; i11++) {
+                    from_float((float*)((char*)tensor_data(src1) + i11 * nb11),
+                              (void*)((char*)work_buffer + i11 * ggml_row_size(vec_dot_type, ne10)), 
+                              ne10);
+                }
+                src1_data = work_buffer;
+            }
+            
+            // Execute matrix multiplication for this NUMA node's rows
+            for (int64_t ir0 = row_start; ir0 < row_end; ir0++) {
+                for (int64_t ir1 = 0; ir1 < ne11; ir1++) {
+                    const void * src0_row = (void*)((char*)tensor_data(src0) + ir0 * nb01);
+                    const void * src1_col = (void*)((char*)src1_data + ir1 * nb11);
+                    float * dst_element = (float*)((char*)tensor_data(dst) + ir0 * nb1 + ir1 * nb0);
+                    
+                    // Use ggml's optimized vector dot product
+                    vec_dot(ne00, dst_element, 0, src0_row, 0, src1_col, 0, 1);
+                }
+            }
+            
+            GGML_LOG_DEBUG("NUMA node %d completed rows %ld to %ld\n", numa_node, row_start, row_end - 1);
+        }
+        
+    } else {
+        // Single-threaded execution
+        GGML_LOG_DEBUG("Executing MUL_MAT single-threaded\n");
+        
+        // Type conversion if needed
+        void * src1_data = tensor_data(src1);
+        void * conversion_buffer = NULL;
+        
+        if (src1->type != vec_dot_type) {
+            // Allocate temporary conversion buffer
+            size_t conversion_size = ggml_row_size(vec_dot_type, ne10) * ne11;
+            conversion_buffer = malloc(conversion_size);
+            if (!conversion_buffer) {
+                GGML_LOG_ERROR("Failed to allocate conversion buffer (%zu bytes)\n", conversion_size);
+                return GGML_STATUS_FAILED;
+            }
+            
+            // Convert using ggml's type conversion
+            for (int64_t i11 = 0; i11 < ne11; i11++) {
+                from_float((float*)((char*)tensor_data(src1) + i11 * nb11),
+                          (void*)((char*)conversion_buffer + i11 * ggml_row_size(vec_dot_type, ne10)),
+                          ne10);
+            }
+            src1_data = conversion_buffer;
+        }
+        
+        // Execute matrix multiplication
+        for (int64_t ir0 = 0; ir0 < ne01; ir0++) {
+            for (int64_t ir1 = 0; ir1 < ne11; ir1++) {
+                const void * src0_row = (void*)((char*)tensor_data(src0) + ir0 * nb01);
+                const void * src1_col = (void*)((char*)src1_data + ir1 * nb11);
+                float * dst_element = (float*)((char*)tensor_data(dst) + ir0 * nb1 + ir1 * nb0);
+                
+                // Use ggml's optimized vector dot product
+                vec_dot(ne00, dst_element, 0, src0_row, 0, src1_col, 0, 1);
+            }
+        }
+        
+        // Cleanup
+        if (conversion_buffer) {
+            free(conversion_buffer);
+        }
+    }
+    
+    GGML_LOG_DEBUG("MUL_MAT operation completed successfully\n");
+    return GGML_STATUS_SUCCESS;
+}
+
 // Graph-level processing function - primary interface for llama-context.cpp
-// Routes graph through dispatcher instead of coordinator directly
+// Complete graph executor using ggml building blocks to avoid recursion
 int ggml_numa_dispatch_compute_graph(struct ggml_cgraph * cgraph, int n_threads) {
     if (!cgraph) {
-        GGML_LOG_ERROR("Invalid graph provided to dispatcher\n");
+        GGML_LOG_ERROR("Invalid graph provided to NUMA graph executor\n");
         return -1;
     }
     
     if (!ggml_numa_should_dispatch()) {
-        GGML_LOG_DEBUG("NUMA dispatch disabled, skipping dispatcher\n");
-        return -1;  // Let caller use standard processing
+        GGML_LOG_DEBUG("NUMA dispatch disabled\n");
+        return -1;  // Let llama-context use backend scheduler
     }
     
-    GGML_LOG_INFO("Processing computation graph with %d nodes through NUMA dispatcher\n", cgraph->n_nodes);
+    GGML_LOG_INFO("🚀 NUMA Graph Executor: Processing graph with %d nodes\n", cgraph->n_nodes);
     
     // Initialize dispatcher if needed
     ggml_numa_dispatch_init();
     
     // Get coordinator manager (should already be initialized by llama-context.cpp)
     extern struct ggml_numa_coordinator_manager * ggml_numa_coordinator_manager_get_global(int n_threads);
-    struct ggml_numa_coordinator_manager * manager = ggml_numa_coordinator_manager_get_global(n_threads);  // Use existing coordinator settings
+    struct ggml_numa_coordinator_manager * manager = ggml_numa_coordinator_manager_get_global(n_threads);
     if (!manager) {
-        GGML_LOG_ERROR("No NUMA coordinator available for dispatcher\n");
-        return -1;
+        GGML_LOG_WARN("No NUMA coordinator available, checking for NUMA-eligible operations\n");
     }
     
-    // Process each node through the dispatcher handlers directly
+    // Quick scan for NUMA-eligible operations
+    bool has_numa_operations = false;
     for (int i = 0; i < cgraph->n_nodes; i++) {
         struct ggml_tensor * node = cgraph->nodes[i];
         if (!node) continue;
         
-        GGML_LOG_DEBUG("Dispatching node %d: %s\n", i, ggml_op_name(node->op));
-        
-        // Create work context for this operation
-        ggml_numa_work_context_t context = {
-            .total_elements = ggml_nelements(node),
-            .element_size = ggml_element_size(node),
-            .numa_nodes = 2,  // Default
-            .threads_per_node = n_threads,
-            .l3_cache_size = 32 * 1024 * 1024,  // 32MB default
-            .memory_bandwidth = 100ULL * 1024 * 1024 * 1024  // 100GB/s default
-        };
-        
-        // Copy tensor dimensions
-        for (int dim = 0; dim < GGML_MAX_DIMS && dim < 4; dim++) {
-            context.ne[dim] = node->ne[dim];
+        // Check if operation is NUMA-eligible
+        switch (node->op) {
+            case GGML_OP_MUL_MAT: {
+                int64_t total_elements = ggml_nelements(node);
+                if (total_elements > 32768) {  // Large tensor threshold
+                    has_numa_operations = true;
+                    GGML_LOG_DEBUG("Found NUMA-eligible MUL_MAT with %ld elements\n", total_elements);
+                }
+                break;
+            }
+            case GGML_OP_ADD:
+            case GGML_OP_RMS_NORM:
+            case GGML_OP_SOFT_MAX: {
+                int64_t total_elements = ggml_nelements(node);
+                if (total_elements > 65536) {  // Higher threshold for simpler operations
+                    has_numa_operations = true;
+                    GGML_LOG_DEBUG("Found NUMA-eligible %s with %ld elements\n", 
+                                  ggml_op_name(node->op), total_elements);
+                }
+                break;
+            }
+            default:
+                break;
         }
-        context.n_dims = ggml_n_dims(node);
         
-        // Call dispatcher directly without going through intercept system
-        enum ggml_status result = ggml_numa_dispatch_operation(manager, node, &context);
+        if (has_numa_operations) break;
+    }
+    
+    if (!has_numa_operations) {
+        GGML_LOG_INFO("No NUMA-eligible operations found, using fallback\n");
+        return -1;  // Let backend scheduler handle it
+    }
+    
+    // Execute operations using direct ggml building blocks
+    for (int i = 0; i < cgraph->n_nodes; i++) {
+        struct ggml_tensor * node = cgraph->nodes[i];
+        if (!node) continue;
+        
+        GGML_LOG_DEBUG("Executing operation %d: %s\n", i, ggml_op_name(node->op));
+        
+        // Execute using appropriate method
+        enum ggml_status result = GGML_STATUS_FAILED;
+        
+        switch (node->op) {
+            case GGML_OP_MUL_MAT: {
+                // Use our optimized MUL_MAT implementation
+                result = ggml_numa_execute_mulmat_direct(node, manager, n_threads);
+                break;
+            }
+            
+            default: {
+                // For non-NUMA operations, call ggml compute functions directly
+                // This avoids infinite recursion through the dispatcher
+                
+                // Set up compute params for direct ggml function call
+                struct ggml_compute_params params = {
+                    .ith = 0,
+                    .nth = n_threads,
+                    .wsize = 0,
+                    .wdata = NULL,
+                    .threadpool = NULL  // Single-threaded execution for now
+                };
+                
+                // Call appropriate ggml compute function directly
+                switch (node->op) {
+                    case GGML_OP_GET_ROWS:
+                        ggml_compute_forward_get_rows(&params, node);
+                        result = GGML_STATUS_SUCCESS;
+                        break;
+                    case GGML_OP_ADD:
+                        ggml_compute_forward_add(&params, node);
+                        result = GGML_STATUS_SUCCESS;
+                        break;
+                    case GGML_OP_RMS_NORM:
+                        ggml_compute_forward_rms_norm(&params, node);
+                        result = GGML_STATUS_SUCCESS;
+                        break;
+                    case GGML_OP_SOFT_MAX:
+                        ggml_compute_forward_soft_max(&params, node);
+                        result = GGML_STATUS_SUCCESS;
+                        break;
+                    case GGML_OP_ROPE:
+                        ggml_compute_forward_rope(&params, node);
+                        result = GGML_STATUS_SUCCESS;
+                        break;
+                    case GGML_OP_CPY:
+                        ggml_compute_forward_cpy(&params, node);
+                        result = GGML_STATUS_SUCCESS;
+                        break;
+                    default:
+                        // For unhandled operations, log and fail - backend will handle
+                        GGML_LOG_DEBUG("Operation %s not handled by NUMA system, letting backend handle\n", 
+                                      ggml_op_name(node->op));
+                        result = GGML_STATUS_FAILED;
+                        break;
+                }
+                break;
+            }
+        }
         
         if (result != GGML_STATUS_SUCCESS) {
-            GGML_LOG_ERROR("Node %d (%s) failed in dispatcher, aborting graph\n", i, ggml_op_name(node->op));
+            GGML_LOG_ERROR("Operation %d (%s) failed, aborting graph\n", i, ggml_op_name(node->op));
             return -1;
         }
         
-        GGML_LOG_DEBUG("Node %d (%s) completed successfully\n", i, ggml_op_name(node->op));
+        GGML_LOG_DEBUG("Operation %d (%s) completed successfully\n", i, ggml_op_name(node->op));
     }
     
-    // Graph processing complete - coordinator handles individual operation synchronization
-    // No need for additional waiting as operations are already synchronized
-    
-    GGML_LOG_INFO("Graph computation completed successfully through dispatcher\n");
-    return 0;
+    GGML_LOG_INFO("✅ NUMA Graph Executor: All %d operations completed successfully\n", cgraph->n_nodes);
+    return 0;  // Success - llama-context will not use backend scheduler
 }
 
 //

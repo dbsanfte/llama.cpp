@@ -46,6 +46,32 @@ bool ggml_numa_fallback_is_supported(enum ggml_op op);
  */
 void ggml_numa_fallback_get_stats(int64_t * fallback_count);
 
+/**
+ * Initialize the fallback system to use original ggml threadpools
+ * 
+ * This sets up the fallback system to use the original ggml threadpools
+ * instead of creating isolated threadpools, ensuring compatibility with
+ * quantized operations.
+ *
+ * @return GGML_STATUS_SUCCESS on success, GGML_STATUS_FAILED on error
+ */
+enum ggml_status ggml_numa_fallback_init(void);
+
+/**
+ * Cleanup the fallback system
+ * 
+ * This should be called during coordinator shutdown to properly
+ * cleanup the fallback system and release resources.
+ */
+void ggml_numa_fallback_cleanup(void);
+
+/**
+ * Check if the fallback system is properly initialized
+ * 
+ * @return true if fallback system has been initialized, false otherwise
+ */
+bool ggml_numa_fallback_is_initialized(void);
+
 #ifdef __cplusplus
 }
 #endif

@@ -94,7 +94,10 @@ private:
                size_label, dim1, dim2, dim3, num_threads);
         
         // Create test context with sufficient memory for larger tensors
-        struct ggml_init_params params = {0};
+        struct ggml_init_params params;
+        params.mem_size = 0;
+        params.mem_buffer = nullptr;
+        params.no_alloc = false;
         params.mem_size = std::max((size_t)(512 * 1024 * 1024), (size_t)(dim1 * dim2 * dim3) * sizeof(float) * 8); // Scale memory with tensor size
         params.mem_buffer = nullptr;
         params.no_alloc = false;
@@ -301,7 +304,7 @@ int main() {
     printf("🌟 Initializing NUMA system for mathematical correctness testing...\n");
     
     // Initialize the NUMA coordinator system
-    struct ggml_numa_coordinator_manager* mgr = ggml_numa_coordinator_manager_get_global(8, true); // true = force_multi_socket
+    struct ggml_numa_coordinator_manager* mgr = ggml_numa_coordinator_manager_get_global(8); // true = force_multi_socket
     if (!mgr) {
         printf("❌ Failed to initialize NUMA coordinator manager\n");
         return 1;

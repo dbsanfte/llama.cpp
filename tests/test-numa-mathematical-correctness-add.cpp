@@ -94,7 +94,10 @@ private:
                size_label, dim1, dim2, dim3, num_threads);
         
         // Create test context with sufficient memory for larger tensors
-        struct ggml_init_params params = {0};
+        struct ggml_init_params params;
+        params.mem_size = 0;
+        params.mem_buffer = nullptr;
+        params.no_alloc = false;
         params.mem_size = std::max((size_t)(512 * 1024 * 1024), (size_t)(dim1 * dim2 * dim3) * sizeof(float) * 8); // Scale memory with tensor size
         params.mem_buffer = nullptr;
         params.no_alloc = false;
@@ -137,7 +140,12 @@ private:
         }
         
         // Execute via NUMA intercept
-        struct ggml_compute_params numa_params = {0, num_threads, 0, nullptr};
+        struct ggml_compute_params numa_params;
+        numa_params.ith = 0;
+        numa_params.nth = num_threads;
+        numa_params.wsize = 0;
+        numa_params.wdata = nullptr;
+        numa_params.threadpool = nullptr;
         enum ggml_status dispatch_result = ggml_numa_intercept_operation(numa_result, &numa_params);
         
         if (dispatch_result != GGML_STATUS_SUCCESS) {
@@ -148,7 +156,12 @@ private:
         
         // Create reference computation using serial execution
         struct ggml_tensor* ref_result = ggml_add(test_ctx, input_a, input_b);
-        struct ggml_compute_params ref_params = {0, 1, 0, nullptr}; // Single thread
+        struct ggml_compute_params ref_params;
+        ref_params.ith = 0;
+        ref_params.nth = 1;
+        ref_params.wsize = 0;
+        ref_params.wdata = nullptr;
+        ref_params.threadpool = nullptr;
         ggml_compute_forward_add_non_quantized(&ref_params, ref_result);
         
         // Compare results

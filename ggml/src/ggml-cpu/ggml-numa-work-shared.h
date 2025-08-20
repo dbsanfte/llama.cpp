@@ -118,3 +118,52 @@ extern void ggml_compute_forward_mul_mat_one_chunk(
     const int64_t ir0_end,
     const int64_t ir1_start,
     const int64_t ir1_end);
+
+//
+// Systematic NUMA Component Logging Macros
+//
+
+// Dispatch system logging - for operation routing and dispatch decisions
+#define NUMA_DISPATCH_LOG_DEBUG(operation, fmt, ...) \
+    do { \
+        int current_numa = ggml_numa_get_current_node(); \
+        const char* op_name = operation ? ggml_numa_get_operation_name(operation) : "UNKNOWN"; \
+        GGML_LOG_DEBUG("🔄[NUMA%d][DISPATCH:%s] " fmt "\n", current_numa, op_name, ##__VA_ARGS__); \
+    } while(0)
+
+#define NUMA_DISPATCH_LOG_ERROR(operation, fmt, ...) \
+    do { \
+        int current_numa = ggml_numa_get_current_node(); \
+        const char* op_name = operation ? ggml_numa_get_operation_name(operation) : "UNKNOWN"; \
+        GGML_LOG_ERROR("🔄[NUMA%d][DISPATCH:%s] " fmt "\n", current_numa, op_name, ##__VA_ARGS__); \
+    } while(0)
+
+#define NUMA_DISPATCH_LOG_INFO(operation, fmt, ...) \
+    do { \
+        int current_numa = ggml_numa_get_current_node(); \
+        const char* op_name = operation ? ggml_numa_get_operation_name(operation) : "UNKNOWN"; \
+        GGML_LOG_INFO("🔄[NUMA%d][DISPATCH:%s] " fmt "\n", current_numa, op_name, ##__VA_ARGS__); \
+    } while(0)
+
+// Coordinator system logging - for work coordination and execution
+#define NUMA_COORD_LOG_DEBUG(numa_node, fmt, ...) \
+    GGML_LOG_DEBUG("⚙️[NUMA%d][COORD] " fmt "\n", numa_node, ##__VA_ARGS__)
+
+#define NUMA_COORD_LOG_ERROR(numa_node, fmt, ...) \
+    GGML_LOG_ERROR("⚙️[NUMA%d][COORD] " fmt "\n", numa_node, ##__VA_ARGS__)
+
+#define NUMA_COORD_LOG_INFO(numa_node, fmt, ...) \
+    GGML_LOG_INFO("⚙️[NUMA%d][COORD] " fmt "\n", numa_node, ##__VA_ARGS__)
+
+// Coordinator operation-specific logging (when we know the operation)
+#define NUMA_COORD_OP_LOG_DEBUG(numa_node, operation, fmt, ...) \
+    do { \
+        const char* op_name = operation ? ggml_numa_get_operation_name(operation) : "UNKNOWN"; \
+        GGML_LOG_DEBUG("⚙️[NUMA%d][COORD:%s] " fmt "\n", numa_node, op_name, ##__VA_ARGS__); \
+    } while(0)
+
+#define NUMA_COORD_OP_LOG_ERROR(numa_node, operation, fmt, ...) \
+    do { \
+        const char* op_name = operation ? ggml_numa_get_operation_name(operation) : "UNKNOWN"; \
+        GGML_LOG_ERROR("⚙️[NUMA%d][COORD:%s] " fmt "\n", numa_node, op_name, ##__VA_ARGS__); \
+    } while(0)

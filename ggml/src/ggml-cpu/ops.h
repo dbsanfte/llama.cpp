@@ -27,6 +27,12 @@ static const size_t CACHE_LINE_SIZE_F32 = CACHE_LINE_SIZE/sizeof(float);
 extern "C" {
 #endif
 
+// Universal compute function for all operations - used by NUMA executor fallback
+void ggml_compute_forward(struct ggml_compute_params * params, struct ggml_tensor * tensor);
+
+// NUMA fallback recursion prevention
+void ggml_numa_set_fallback_flag(bool value);
+
 void ggml_compute_forward_dup(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_add(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_add1(const struct ggml_compute_params * params, struct ggml_tensor * dst);

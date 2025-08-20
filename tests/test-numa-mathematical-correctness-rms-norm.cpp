@@ -81,7 +81,10 @@ private:
                size_label, rows, cols, batch_size, num_threads);
         
         // Create test context with sufficient memory for tensors
-        struct ggml_init_params params = {0};
+        struct ggml_init_params params;
+        params.mem_size = 0;
+        params.mem_buffer = nullptr;
+        params.no_alloc = false;
         params.mem_size = std::max((size_t)(512 * 1024 * 1024), (size_t)(rows * cols * batch_size) * sizeof(float) * 8);
         params.mem_buffer = nullptr;
         params.no_alloc = false;
@@ -120,7 +123,12 @@ private:
             }
             
             // Execute via NUMA dispatch system
-            struct ggml_compute_params numa_params = {0};
+            struct ggml_compute_params numa_params;
+            numa_params.ith = 0;
+            numa_params.nth = num_threads;
+            numa_params.wsize = 0;
+            numa_params.wdata = nullptr;
+            numa_params.threadpool = nullptr;
             numa_params.ith = 0;
             numa_params.nth = num_threads;
             numa_params.wsize = 0;
@@ -153,7 +161,12 @@ private:
             memcpy(ref_result->op_params, &epsilon, sizeof(float));
             
             // Execute reference computation with single thread to avoid NUMA effects
-            struct ggml_compute_params ref_params = {0};
+            struct ggml_compute_params ref_params;
+            ref_params.ith = 0;
+            ref_params.nth = 1;
+            ref_params.wsize = 0;
+            ref_params.wdata = nullptr;
+            ref_params.threadpool = nullptr;
             ref_params.ith = 0;
             ref_params.nth = 1;
             ref_params.wsize = 0;

@@ -261,9 +261,12 @@ public:
                 struct ggml_tensor * result = ggml_add(exec_ctx, a, b);
                 if (result) {
                     // Test via NUMA intercept (this should route to function pointer)
-                    struct ggml_compute_params params = {
-                        0, 1, 0, nullptr
-                    };
+                    struct ggml_compute_params params;
+                    params.ith = 0;
+                    params.nth = 1;
+                    params.wsize = 0;
+                    params.wdata = nullptr;
+                    params.threadpool = nullptr;
                     
                     enum ggml_status status = ggml_numa_intercept_operation(result, &params);
                     if (status == GGML_STATUS_SUCCESS || status == GGML_STATUS_FAILED) {
@@ -300,9 +303,12 @@ public:
                 struct ggml_tensor * result = ggml_mul_mat(exec_ctx, a, b);
                 if (result) {
                     // Test via NUMA intercept
-                    struct ggml_compute_params params = {
-                        0, 4, 0, nullptr
-                    };
+                    struct ggml_compute_params params;
+                    params.ith = 0;
+                    params.nth = 4;
+                    params.wsize = 0;
+                    params.wdata = nullptr;
+                    params.threadpool = nullptr;
                     
                     enum ggml_status status = ggml_numa_intercept_operation(result, &params);
                     if (status == GGML_STATUS_SUCCESS || status == GGML_STATUS_FAILED) {

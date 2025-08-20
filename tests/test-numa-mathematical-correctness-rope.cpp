@@ -101,7 +101,10 @@ public:
         
         try {
             // Initialize GGML context with sufficient memory
-            struct ggml_init_params params = {0};
+            struct ggml_init_params params;
+        params.mem_size = 0;
+        params.mem_buffer = nullptr;
+        params.no_alloc = false;
             params.mem_size = std::max((size_t)(128 * 1024 * 1024), (size_t)(seq_len * n_embd * batch_size) * sizeof(float) * 8);
             params.mem_buffer = nullptr;
             params.no_alloc = false;

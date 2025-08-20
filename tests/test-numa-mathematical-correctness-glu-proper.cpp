@@ -79,9 +79,9 @@ private:
         printf("    🧮 Testing %s: %s with dimensions [%d,%d,%d] (threads=%d)\n", 
                size_label, glu_names[glu_variant], dim1, dim2, dim3, num_threads);
         
-        // Create test context with sufficient memory for GLU operations
-        struct ggml_init_params params = {0};
-        params.mem_size = std::max((size_t)(512 * 1024 * 1024), (size_t)(dim1 * dim2 * dim3) * sizeof(float) * 8);
+                // Create test context with sufficient memory for larger tensors
+        struct ggml_init_params params;
+        params.mem_size = std::max((size_t)(512 * 1024 * 1024), (size_t)(dim1 * dim2 * dim3) * sizeof(float) * 8); // Scale memory with tensor size
         params.mem_buffer = nullptr;
         params.no_alloc = false;
         
@@ -137,7 +137,12 @@ private:
                 printf("      ❌ Failed to create GLU operations for %s\n", size_label);
             } else {
                 // Execute via NUMA intercept
-                struct ggml_compute_params numa_params = {0};
+                struct ggml_compute_params numa_params;
+                numa_params.ith = 0;
+                numa_params.nth = num_threads;
+                numa_params.wsize = 0;
+                numa_params.wdata = nullptr;
+                numa_params.threadpool = nullptr;
                 numa_params.ith = 0;
                 numa_params.nth = num_threads;
                 numa_params.wsize = 0;
@@ -151,8 +156,12 @@ private:
                            size_label, dispatch_result, num_threads);
                 } else {
                     // Execute reference computation (serial)
-                    struct ggml_compute_params ref_params = {0};
+                    struct ggml_compute_params ref_params;
                     ref_params.ith = 0;
+                    ref_params.nth = 1;
+                    ref_params.wsize = 0;
+                    ref_params.wdata = nullptr;
+                    ref_params.threadpool = nullptr;
                     ref_params.nth = 1;
                     ref_params.wsize = 0;
                     ref_params.wdata = nullptr;
@@ -341,7 +350,7 @@ int main() {
     printf("🌟 Initializing NUMA system for mathematical correctness testing...\n");
     
     // Initialize the NUMA coordinator system
-    struct ggml_numa_coordinator_manager* mgr = ggml_numa_coordinator_manager_get_global(8, false);
+    struct ggml_numa_coordinator_manager* mgr = ggml_numa_coordinator_manager_get_global(8);
     if (!mgr) {
         printf("❌ Failed to initialize NUMA coordinator manager\n");
         return 1;

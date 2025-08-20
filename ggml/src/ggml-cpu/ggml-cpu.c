@@ -18,10 +18,15 @@
 #ifdef GGML_NUMA_MIRROR
 #include "ggml-numa-coordinator.h"
 #include "ggml-numa-operation-dispatch.h"
+#include "ggml-numa-executor.h"
 #ifdef __linux__
 #include <numa.h>
 #include <sched.h>
 #endif
+
+// Thread-local variable to prevent infinite recursion during fallback
+_Thread_local bool in_numa_fallback = false;
+
 #endif
 
 // Global NUMA state for compatibility
@@ -578,6 +583,7 @@ int ggml_threadpool_chunk_add(struct ggml_threadpool * tp, int value) {
 // NUMA Management Functions
 //
 
+#ifdef GGML_NUMA_MIRROR
 static enum ggml_numa_memory_strategy ggml_numa_strategy_to_coordinator_strategy(enum ggml_numa_strategy strategy) {
     switch (strategy) {
         case GGML_NUMA_STRATEGY_DISABLED:
@@ -592,6 +598,7 @@ static enum ggml_numa_memory_strategy ggml_numa_strategy_to_coordinator_strategy
             return GGML_NUMA_STRATEGY_AUTO;
     }
 }
+#endif // GGML_NUMA_MIRROR
 
 static void ggml_numa_init_coordinator(enum ggml_numa_strategy numa_strategy, const struct ggml_threadpool_params * tpp) {
 #ifdef GGML_NUMA_MIRROR
@@ -706,10 +713,20 @@ bool ggml_numa_should_mirror(void) {
 }
 
 bool ggml_numa_should_dispatch(void) {
+    // Check for fallback recursion prevention flag
+    if (in_numa_fallback) {
+        return false;  // Disable NUMA dispatch during fallback to prevent infinite recursion
+    }
+    
     // Enable dispatcher for NUMA mirror strategy on multi-node systems
     return g_numa_state.initialized && 
            g_numa_state.numa_enabled &&
            g_numa_state.strategy == GGML_NUMA_STRATEGY_MIRROR;
+}
+
+// Functions to control fallback recursion prevention
+void ggml_numa_set_fallback_flag(bool value) {
+    in_numa_fallback = value;
 }
 #endif
 
@@ -1513,6 +1530,11 @@ UseGgmlGemm1:;
     if (ith == 0) {
         // Every thread starts at ith, so the first unprocessed chunk is nth.  This save a bit of coordination right at the start.
         atomic_store_explicit(&params->threadpool->current_chunk, nth, memory_order_relaxed);
+        
+        // Debug logging for barrier mismatch investigation
+        int threadpool_threads = atomic_load_explicit(&params->threadpool->n_threads_cur, memory_order_relaxed);
+        GGML_LOG_DEBUG("🔍 MUL_MAT barrier debug: params->nth=%d, threadpool->n_threads_cur=%d, ith=%d\n", 
+                       nth, threadpool_threads, ith);
     }
 
     ggml_barrier(params->threadpool);
@@ -1867,7 +1889,8 @@ static void ggml_compute_forward_mul_mat_id(
 
 /////////////////////////////////
 
-static void ggml_compute_forward(struct ggml_compute_params * params, struct ggml_tensor * tensor) {
+// Main compute function - made public for NUMA executor fallback
+void ggml_compute_forward(struct ggml_compute_params * params, struct ggml_tensor * tensor) {
     GGML_ASSERT(params);
 
     if (tensor->op == GGML_OP_NONE || ggml_is_empty(tensor)) {

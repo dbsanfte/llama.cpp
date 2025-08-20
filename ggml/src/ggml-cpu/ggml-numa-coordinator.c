@@ -11,8 +11,8 @@
  */
 
 #include "ggml-numa-coordinator.h"
-#include "ggml-numa-operation-dispatch.h"  // New intelligent dispatcher
-#include "ggml-numa-fallback.h"            // Centralized fallback system
+#include "ggml-numa-executor.h"           // New NUMA executor
+#include "ggml-numa-work-shared.h"         // Shared logging macros and utilities
 #include "ggml-impl.h"
 #include "ggml-cpu.h"
 #include "ggml-cpu-impl.h"  // For ggml_compute_params structure
@@ -43,13 +43,6 @@ void ggml_numa_set_virtual_node(int node) {
 }
 
 int ggml_numa_get_current_node(void) {
-    // If we have a virtual node set (test mode), return it
-    if (g_virtual_numa_node >= 0) {
-        return g_virtual_numa_node;
-    }
-    
-    // Otherwise, detect real NUMA node in production environment
-#ifdef __linux__
     if (numa_available() >= 0) {
         // Get current CPU and determine its NUMA node
         int current_cpu = sched_getcpu();
@@ -60,8 +53,7 @@ int ggml_numa_get_current_node(void) {
             }
         }
     }
-#endif
-    
+
     // Fallback: return node 0 if detection fails
     return 0;
 }
@@ -221,10 +213,6 @@ struct ggml_coordinator_thread {
     atomic_bool thread_created;                     // Whether thread was actually created
     struct ggml_numa_coordinator_manager * manager; // Reference to parent manager for callbacks
     
-    // Persistent work buffer for compute operations (NUMA-local)
-    void * work_buffer;                             // NUMA-local work buffer
-    size_t work_buffer_size;                        // Current work buffer size
-    
     // Performance tracking
     int64_t total_work_items;          // Total work items processed
     int64_t total_processing_time_us;  // Total processing time
@@ -272,6 +260,10 @@ struct ggml_numa_coordinator_manager {
     atomic_int last_work_status;                          // Last work execution status (ggml_status)
     ggml_mutex_t status_mutex;                           // Mutex for status updates
     ggml_mutex_t strategy_mutex;                          // Mutex for strategy changes
+    
+    // Fallback threadpool for simple CPU operations
+    struct ggml_threadpool * fallback_threadpool;         // Simple threadpool for CPU fallbacks (NUMA node 0)
+    int fallback_thread_count;                           // Number of threads in fallback pool
 };
 
 // Global singleton coordinator manager - persists for program lifetime
@@ -381,131 +373,76 @@ static void ggml_register_program_exit_cleanup(void);
 // Operation-specific NUMA parallelization using proper GGML compute functions
 // Execute complete operations on NUMA nodes using GGML's optimized functions
 
-// Work buffer management functions
-static bool ggml_numa_ensure_work_buffer(struct ggml_coordinator_thread * coordinator, size_t required_size);
+// Per-thread work buffer management functions
+static void * ggml_numa_get_partitioned_work_buffer(size_t required_size_per_thread, int numa_node, int n_threads);
+static void ggml_numa_free_thread_work_buffers(void);
 
 static enum ggml_status ggml_numa_node_execute_operation(
     struct ggml_coordinator_thread * coordinator,
     const struct ggml_work_item * work_item
 ) {
-    if (!coordinator || !work_item) return GGML_STATUS_FAILED;
+    NUMA_ASSERT(coordinator);
+    NUMA_ASSERT(work_item);
+    NUMA_ASSERT(work_item->work_function);
+
+    NUMA_COORD_LOG_DEBUG(coordinator->numa_node, "executing generic work function with node_strategy=%d, on_node_strategy=%d", 
+                    (int)work_item->execution_strategy.node_strategy,
+                    (int)work_item->execution_strategy.on_node_strategy);
+        
+    // Set up compute parameters with partitioned work buffer 
+    // Allocate buffer large enough for all threads, each thread gets its own partition
+    int n_threads = (work_item->execution_strategy.on_node_strategy == NUMA_ON_NODE_STRATEGY_SINGLE_THREAD) ? 1 : coordinator->n_threads;
+    void * work_buffer = NULL;
+    if (work_item->required_work_buffer_size > 0) {
+        work_buffer = ggml_numa_get_partitioned_work_buffer(work_item->required_work_buffer_size, coordinator->numa_node, n_threads);
+        if (!work_buffer) {
+            NUMA_COORD_LOG_ERROR(coordinator->numa_node, "Failed to allocate partitioned work buffer (%zu bytes per thread, %d threads)", 
+                            work_item->required_work_buffer_size, n_threads);
+            return GGML_STATUS_FAILED;
+        }
+    }
     
-    // Check if we have a function pointer (new approach) or legacy operation
-    if (work_item->work_function) {
-        // NEW APPROACH: Generic function pointer execution
-        GGML_LOG_DEBUG("NUMA%d: executing generic work function with node_strategy=%d, on_node_strategy=%d\n", 
-                       coordinator->numa_node, 
-                       (int)work_item->execution_strategy.node_strategy,
-                       (int)work_item->execution_strategy.on_node_strategy);
-        
-        // Ensure work buffer meets dispatcher requirements
-        if (work_item->required_work_buffer_size > 0) {
-            if (!ggml_numa_ensure_work_buffer(coordinator, work_item->required_work_buffer_size)) {
-                GGML_LOG_ERROR("NUMA%d: Failed to ensure work buffer (%zu bytes)\n", 
-                              coordinator->numa_node, work_item->required_work_buffer_size);
-                return GGML_STATUS_FAILED;
-            }
-        }
-        
-        // Set up compute parameters as specified by dispatcher
-        struct ggml_compute_params params = {
-            .ith = 0,
-            .nth = (work_item->execution_strategy.on_node_strategy == NUMA_ON_NODE_STRATEGY_SINGLE_THREAD) ? 1 : coordinator->n_threads,
-            .wsize = work_item->required_work_buffer_size,
-            .wdata = coordinator->work_buffer,
-            .threadpool = (work_item->execution_strategy.on_node_strategy == NUMA_ON_NODE_STRATEGY_SINGLE_THREAD) ? NULL : coordinator->numa_pool
-        };
-        
-        // Execute the work function provided by the dispatcher
-        // The coordinator has no knowledge of what this function does - it's completely generic
-        GGML_LOG_ERROR("� EXECUTE: About to execute work item %p with context %p\n", 
-                       (void*)work_item, work_item->work_context);
-        GGML_LOG_ERROR("�🚀 NUMA%d: About to call work_function %p with context %p\n", 
-                       coordinator->numa_node, (void*)work_item->work_function, work_item->work_context);
-        
-        // DEBUGGING: Validate function pointer and context before calling
-        GGML_LOG_ERROR("🔍 PRE-CALL: work_function=%p, work_context=%p, params=%p\n", 
-                       (void*)work_item->work_function, work_item->work_context, (void*)&params);
-        GGML_LOG_ERROR("🔍 PRE-CALL: params.ith=%d, params.nth=%d, params.wsize=%zu\n", 
-                       params.ith, params.nth, params.wsize);
-        fprintf(stderr, "🔍 FPRINTF: About to call work function %p with context %p\n", 
-                (void*)work_item->work_function, work_item->work_context);
-        fflush(stderr);
-        
-        // Set virtual NUMA node for testing purposes (thread-local storage)
-        ggml_numa_set_virtual_node(coordinator->numa_node);
-        
-        enum ggml_status status = work_item->work_function(work_item->work_context, &params);
-        
-        // This should never be reached if function crashes
-        GGML_LOG_ERROR("🚀 NUMA%d: Work function returned status %d\n", coordinator->numa_node, (int)status);
-        fprintf(stderr, "🚀 FPRINTF: Work function returned status %d\n", (int)status);
-        fflush(stderr);
-        
-        // Store work status for critical error handling
-        if (status != GGML_STATUS_SUCCESS) {
-            ggml_mutex_lock(&coordinator->manager->status_mutex);
-            atomic_store(&coordinator->manager->last_work_status, (int)status);
-            ggml_mutex_unlock(&coordinator->manager->status_mutex);
-        }
-        
-        if (status == GGML_STATUS_SUCCESS) {
-            GGML_LOG_DEBUG("NUMA%d: Successfully executed work function\n", coordinator->numa_node);
-        } else {
-            GGML_LOG_ERROR("NUMA%d: Work function failed with status %d\n", coordinator->numa_node, (int)status);
-        }
-        
-        return status;
+    struct ggml_compute_params params = {
+        .ith = 0,
+        .nth = n_threads,
+        .wsize = work_item->required_work_buffer_size,
+        .wdata = work_buffer,
+        .threadpool = (work_item->execution_strategy.on_node_strategy == NUMA_ON_NODE_STRATEGY_SINGLE_THREAD) ? NULL : coordinator->numa_pool
+    };
+    
+    // Execute the work function provided by the dispatcher
+    // The coordinator has no knowledge of what this function does - it's completely generic
+    NUMA_COORD_LOG_DEBUG(coordinator->numa_node, "About to execute work item %p with context %p", 
+                    (void*)work_item, work_item->work_context);
+    NUMA_COORD_LOG_DEBUG(coordinator->numa_node, "About to call work_function %p with context %p", 
+                    (void*)work_item->work_function, work_item->work_context);
+    
+    // DEBUGGING: Validate function pointer and context before calling
+    NUMA_COORD_LOG_DEBUG(coordinator->numa_node, "PRE-CALL: work_function=%p, work_context=%p, params=%p", 
+                    (void*)work_item->work_function, work_item->work_context, (void*)&params);
+    NUMA_COORD_LOG_DEBUG(coordinator->numa_node, "PRE-CALL: params.ith=%d, params.nth=%d, params.wsize=%zu", 
+                    params.ith, params.nth, params.wsize);
+    
+    // Set virtual NUMA node for testing purposes (thread-local storage)
+    ggml_numa_set_virtual_node(coordinator->numa_node);
+    
+    enum ggml_status status = work_item->work_function(work_item->work_context, &params);
+    
+    // This should never be reached if function crashes
+    NUMA_COORD_LOG_DEBUG(coordinator->numa_node, "Work function returned status %d", (int)status);
+    
+    // Store work status for all results to ensure latest status is preserved
+    ggml_mutex_lock(&coordinator->manager->status_mutex);
+    atomic_store(&coordinator->manager->last_work_status, (int)status);
+    ggml_mutex_unlock(&coordinator->manager->status_mutex);
+    
+    if (status == GGML_STATUS_SUCCESS) {
+        GGML_LOG_DEBUG("NUMA%d: Successfully executed work function\n", coordinator->numa_node);
+    } else {
+        GGML_LOG_ERROR("NUMA%d: Work function failed with status %d\n", coordinator->numa_node, (int)status);
     }
-    else if (work_item->operation) {
-        // LEGACY APPROACH: Operation-specific fallback (to be removed)
-        struct ggml_tensor * operation = work_item->operation;
-        
-        GGML_LOG_DEBUG("NUMA%d: executing legacy operation %s with node_strategy=%d, on_node_strategy=%d\n", 
-                       coordinator->numa_node, ggml_op_name(operation->op), 
-                       (int)work_item->execution_strategy.node_strategy,
-                       (int)work_item->execution_strategy.on_node_strategy);
-        
-        // Ensure work buffer meets dispatcher requirements
-        if (work_item->required_work_buffer_size > 0) {
-            if (!ggml_numa_ensure_work_buffer(coordinator, work_item->required_work_buffer_size)) {
-                GGML_LOG_ERROR("NUMA%d: Failed to ensure work buffer (%zu bytes) for %s\n", 
-                              coordinator->numa_node, work_item->required_work_buffer_size, ggml_op_name(operation->op));
-                return GGML_STATUS_FAILED;
-            }
-        }
-        
-        // Legacy execution using fallback system
-        struct ggml_cplan cplan = {
-            .work_size = work_item->required_work_buffer_size,
-            .work_data = coordinator->work_buffer,
-            .n_threads = work_item->execution_strategy.on_node_strategy == NUMA_ON_NODE_STRATEGY_SINGLE_THREAD ? 1 : coordinator->n_threads,
-            .threadpool = work_item->execution_strategy.on_node_strategy == NUMA_ON_NODE_STRATEGY_SINGLE_THREAD ? NULL : coordinator->numa_pool
-        };
-        
-        enum ggml_status status = ggml_numa_fallback_execute(operation, work_item->required_work_buffer_size > 0 ? &cplan : NULL);
-        
-        // Store work status for critical error handling
-        if (status != GGML_STATUS_SUCCESS) {
-            ggml_mutex_lock(&coordinator->manager->status_mutex);
-            atomic_store(&coordinator->manager->last_work_status, (int)status);
-            ggml_mutex_unlock(&coordinator->manager->status_mutex);
-        }
-        
-        if (status == GGML_STATUS_SUCCESS) {
-            GGML_LOG_DEBUG("NUMA%d: Successfully executed %s operation\n", 
-                           coordinator->numa_node, ggml_op_name(operation->op));
-        } else {
-            GGML_LOG_ERROR("NUMA%d: Failed to execute %s operation\n", 
-                           coordinator->numa_node, ggml_op_name(operation->op));
-        }
-        
-        return status;
-    }
-    else {
-        GGML_LOG_ERROR("NUMA%d: Work item has neither function pointer nor operation\n", coordinator->numa_node);
-        return GGML_STATUS_FAILED;
-    }
+    
+    return status;
 }
 
 // NOTE: Work buffer size calculation removed from coordinator.
@@ -513,39 +450,60 @@ static enum ggml_status ggml_numa_node_execute_operation(
 // The coordinator's job is purely to execute work, not to calculate requirements.
 
 // Work buffer management - ensure coordinator has sufficient NUMA-local work buffer
-static bool ggml_numa_ensure_work_buffer(struct ggml_coordinator_thread * coordinator, size_t required_size) {
-    if (!coordinator) return false;
+// Per-thread work buffer management using thread-local storage
+__thread void * ggml_thread_work_buffer = NULL;
+__thread size_t ggml_thread_work_buffer_size = 0;
+__thread int ggml_thread_work_buffer_numa_node = -1;
+
+// Partitioned work buffer management - allocate large buffer and partition per thread
+static void * ggml_numa_get_partitioned_work_buffer(size_t required_size_per_thread, int numa_node, int n_threads) {
+    size_t total_required_size = required_size_per_thread * n_threads;
     
-    // If we already have a sufficient buffer, reuse it
-    if (coordinator->work_buffer && coordinator->work_buffer_size >= required_size) {
-        return true;
+    // Check if current thread buffer is sufficient for all threads
+    if (ggml_thread_work_buffer && 
+        ggml_thread_work_buffer_size >= total_required_size && 
+        ggml_thread_work_buffer_numa_node == numa_node) {
+        return ggml_thread_work_buffer;
     }
     
-    // Free existing buffer if it's too small
-    if (coordinator->work_buffer) {
-        GGML_LOG_DEBUG("NUMA%d: Growing work buffer from %zu to %zu bytes\n", 
-                       coordinator->numa_node, coordinator->work_buffer_size, required_size);
-        numa_free(coordinator->work_buffer, coordinator->work_buffer_size);
-        coordinator->work_buffer = NULL;
-        coordinator->work_buffer_size = 0;
+    // Free existing buffer if it exists
+    if (ggml_thread_work_buffer) {
+        GGML_LOG_DEBUG("NUMA%d: Growing partitioned work buffer from %zu to %zu bytes (%d threads)\n", 
+                       numa_node, ggml_thread_work_buffer_size, total_required_size, n_threads);
+        numa_free(ggml_thread_work_buffer, ggml_thread_work_buffer_size);
+        ggml_thread_work_buffer = NULL;
+        ggml_thread_work_buffer_size = 0;
     } else {
-        GGML_LOG_DEBUG("NUMA%d: Allocating initial work buffer of %zu bytes\n", 
-                       coordinator->numa_node, required_size);
+        GGML_LOG_DEBUG("NUMA%d: Allocating partitioned work buffer of %zu bytes (%zu per thread, %d threads)\n", 
+                       numa_node, total_required_size, required_size_per_thread, n_threads);
     }
     
-    // Allocate new NUMA-local buffer
-    coordinator->work_buffer = numa_alloc_onnode(required_size, coordinator->numa_node);
-    if (!coordinator->work_buffer) {
-        GGML_LOG_ERROR("NUMA%d: Failed to allocate NUMA-local work buffer of size %zu\n", 
-                       coordinator->numa_node, required_size);
-        coordinator->work_buffer_size = 0;
-        return false;
+    // Allocate new NUMA-local buffer for all threads
+    ggml_thread_work_buffer = numa_alloc_onnode(total_required_size, numa_node);
+    if (!ggml_thread_work_buffer) {
+        GGML_LOG_ERROR("NUMA%d: Failed to allocate NUMA-local partitioned work buffer of size %zu\n", 
+                       numa_node, total_required_size);
+        ggml_thread_work_buffer_size = 0;
+        ggml_thread_work_buffer_numa_node = -1;
+        return NULL;
     }
     
-    coordinator->work_buffer_size = required_size;
-    GGML_LOG_DEBUG("NUMA%d: Successfully allocated %zu bytes NUMA-local work buffer\n", 
-                   coordinator->numa_node, required_size);
-    return true;
+    ggml_thread_work_buffer_size = total_required_size;
+    ggml_thread_work_buffer_numa_node = numa_node;
+    GGML_LOG_DEBUG("NUMA%d: Successfully allocated %zu bytes partitioned NUMA-local work buffer\n", 
+                   numa_node, total_required_size);
+    return ggml_thread_work_buffer;
+}
+
+static void ggml_numa_free_thread_work_buffers(void) {
+    if (ggml_thread_work_buffer) {
+        GGML_LOG_DEBUG("NUMA%d: Freeing thread work buffer (%zu bytes)\n", 
+                       ggml_thread_work_buffer_numa_node, ggml_thread_work_buffer_size);
+        numa_free(ggml_thread_work_buffer, ggml_thread_work_buffer_size);
+        ggml_thread_work_buffer = NULL;
+        ggml_thread_work_buffer_size = 0;
+        ggml_thread_work_buffer_numa_node = -1;
+    }
 }
 
 // Initialize work queue
@@ -1288,20 +1246,9 @@ static void * ggml_coordinator_thread_func(void * arg) {
         const char * op_name = "unknown";
         if (work_item->operation) {
             op_name = ggml_op_name(work_item->operation->op);
-        } else if (work_item->work_context) {
-            // Extract operation name from dispatcher work context
-            typedef struct {
-                struct ggml_tensor * operation;
-                struct ggml_cplan * cplan;
-                const char * operation_name;
-                void * additional_context;
-                size_t additional_context_size;
-            } ggml_numa_dispatcher_work_context_t;
-            
-            ggml_numa_dispatcher_work_context_t * ctx = (ggml_numa_dispatcher_work_context_t *)work_item->work_context;
-            if (ctx && ctx->operation_name) {
-                op_name = ctx->operation_name;
-            }
+        } else if (work_item->work_function) {
+            // For work functions submitted directly, just use a generic name
+            op_name = "function";
         }
         
         if (status != GGML_STATUS_SUCCESS) {
@@ -1408,9 +1355,6 @@ static struct ggml_numa_coordinator_manager * ggml_get_global_coordinator_manage
         g_global_coordinator_manager = ggml_numa_coordinator_manager_new(n_threads);
         
         if (g_global_coordinator_manager) {
-            // Initialize intelligent operation dispatcher
-            ggml_numa_dispatch_init();
-            
             // Register cleanup function to run at program exit
             ggml_register_program_exit_cleanup();
             GGML_LOG_INFO("Global coordinator manager created and registered for program exit cleanup\n");
@@ -1432,8 +1376,6 @@ static struct ggml_numa_coordinator_manager * ggml_get_global_coordinator_manage
         
         if (g_global_coordinator_manager) {
             // Initialize intelligent operation dispatcher
-            ggml_numa_dispatch_init();
-            
             // Register cleanup function to run at program exit
             ggml_register_program_exit_cleanup();
             GGML_LOG_INFO("Global coordinator manager created with parameters and registered for program exit cleanup\n");
@@ -1495,15 +1437,8 @@ static void create_optimal_cpu_masks(struct ggml_threadpool_params *tpp, int num
         int target_threads = tpp->n_threads;
         if (target_threads <= 0) {
             // Auto-detect: use all available logical CPUs
-#ifdef __linux__
             target_threads = numa_num_configured_cpus();
-#else
-            // Fallback for non-Linux systems using POSIX sysconf
-            target_threads = (int)sysconf(_SC_NPROCESSORS_ONLN);
-            if (target_threads <= 0) {
-                target_threads = 4; // Safe fallback
-            }
-#endif
+
             GGML_LOG_INFO("   Auto-detected %d threads (was %d)\n", target_threads, tpp->n_threads);
             tpp->n_threads = target_threads; // Update the threadpool params
         }
@@ -1514,14 +1449,13 @@ static void create_optimal_cpu_masks(struct ggml_threadpool_params *tpp, int num
         memset(tpp->cpumask, false, sizeof(tpp->cpumask));
         cpu_count = 0;
         
-#ifdef __linux__
         // Use real NUMA topology instead of hardcoded assumptions
         int total_cpus = numa_num_configured_cpus();
         
         // For systems with gaps in CPU numbering, we need to scan higher
         int cpu_scan_limit = GGML_MAX_N_THREADS;
         
-#ifdef __linux__
+
         // Find the actual highest CPU number on the system
         int max_cpu_found = 0;
         for (int node = 0; node < num_numa_nodes; node++) {
@@ -1536,7 +1470,6 @@ static void create_optimal_cpu_masks(struct ggml_threadpool_params *tpp, int num
             numa_free_cpumask(test_cpus);
         }
         cpu_scan_limit = max_cpu_found + 1;
-#endif
         
         GGML_LOG_INFO("   CPU scanning range: 0 to %d (total CPUs: %d, max CPU number: %d)\n", 
                      cpu_scan_limit - 1, total_cpus, max_cpu_found);
@@ -1635,14 +1568,6 @@ static void create_optimal_cpu_masks(struct ggml_threadpool_params *tpp, int num
             }
             numa_free_cpumask(node_cpus);
         }
-#else
-        // Fallback for non-Linux systems
-        GGML_LOG_WARN("Non-Linux system: using simple round-robin CPU assignment\n");
-        for (int i = 0; i < target_threads && i < GGML_MAX_N_THREADS; i++) {
-            tpp->cpumask[i] = true;
-            available_cpus[cpu_count++] = i;
-        }
-#endif
         
         GGML_LOG_INFO("    Created NUMA-aware CPU mask with %d CPUs total across %d nodes\n", cpu_count, num_numa_nodes);
         
@@ -1681,12 +1606,10 @@ struct ggml_numa_coordinator_manager * ggml_numa_coordinator_manager_new_with_pa
     int num_numa_nodes = 1;
     bool numa_is_available = false;
     
-#ifdef __linux__
     if (numa_available() != -1) {
         num_numa_nodes = numa_max_node() + 1;
         numa_is_available = true;
     }
-#endif
     
     // === COMPREHENSIVE COORDINATOR SETUP LOGGING ===
     GGML_LOG_INFO("================================================================================\n");
@@ -1763,6 +1686,39 @@ struct ggml_numa_coordinator_manager * ggml_numa_coordinator_manager_new_with_pa
     // Initialize work group tracker for data parallelism
     ggml_work_group_tracker_init(&mgr->work_groups);
     
+    // Step 2.5: Create dedicated fallback threadpool for CPU operations
+    // This is a simple threadpool on NUMA node 0 for fallback operations
+    mgr->fallback_thread_count = 1;  // Start with single thread
+    GGML_LOG_INFO("🔧 Creating fallback threadpool with %d thread(s) on NUMA node 0\n", mgr->fallback_thread_count);
+    
+    struct ggml_threadpool_params fallback_params = ggml_threadpool_params_default(mgr->fallback_thread_count);
+    // Set CPU mask to NUMA node 0 CPUs if available
+    if (numa_available() >= 0) {
+        // Clear the CPU mask first
+        for (int i = 0; i < GGML_MAX_N_THREADS; i++) {
+            fallback_params.cpumask[i] = false;
+        }
+        // Set only NUMA node 0 CPUs
+        struct bitmask * node0_mask = numa_allocate_cpumask();
+        if (numa_node_to_cpus(0, node0_mask) >= 0) {
+            for (int cpu = 0; cpu < numa_num_possible_cpus() && cpu < GGML_MAX_N_THREADS; cpu++) {
+                if (numa_bitmask_isbitset(node0_mask, cpu)) {
+                    fallback_params.cpumask[cpu] = true;
+                }
+            }
+        }
+        numa_free_cpumask(node0_mask);
+    }
+    fallback_params.strict_cpu = false;  // Allow OS to manage scheduling
+    
+    mgr->fallback_threadpool = ggml_threadpool_new(&fallback_params);
+    if (!mgr->fallback_threadpool) {
+        GGML_LOG_WARN("Failed to create fallback threadpool, fallback operations will be single-threaded\n");
+        mgr->fallback_thread_count = 0;
+    } else {
+        GGML_LOG_INFO("✅ Fallback threadpool created successfully\n");
+    }
+    
     // Step 3: Create coordinator threads (one per NUMA node)
     mgr->coordinators = malloc(sizeof(struct ggml_coordinator_thread) * num_numa_nodes);
     if (!mgr->coordinators) {
@@ -1833,170 +1789,82 @@ struct ggml_numa_coordinator_manager * ggml_numa_coordinator_manager_new_with_pa
         numa_tpp.numa_aware = false; // CRITICAL: Disable coordinator recursion - we ARE the coordinator
         
         // Step 5: Apply NUMA-specific CPU mask filtering
-        int real_numa_nodes = 1;
-#ifdef __linux__
-        if (numa_is_available) {
-            real_numa_nodes = numa_max_node() + 1;
-        }
-#endif
+        GGML_LOG_INFO("   Processing NUMA node %d in REAL NUMA mode (hardware node exists)\n", i);
+
+        // Real NUMA: Filter the optimized CPU mask to only include CPUs from this NUMA node
+        GGML_LOG_INFO("Filtering CPU mask for NUMA node %d (real NUMA mode)\n", i);
         
-        if (numa_is_available && i < real_numa_nodes) {
-            GGML_LOG_INFO("   Processing NUMA node %d in REAL NUMA mode (hardware node exists)\n", i);
-#ifdef __linux__
-            // Real NUMA: Filter the optimized CPU mask to only include CPUs from this NUMA node
-            GGML_LOG_INFO("Filtering CPU mask for NUMA node %d (real NUMA mode)\n", i);
-            
-            struct bitmask* node_cpus = numa_allocate_cpumask();
-            if (numa_node_to_cpus(i, node_cpus) == 0) {
-                // Debug: Show optimized mask before filtering
-                char opt_mask_str[1024] = {0};  // Increased size for more CPUs
-                int opt_pos = 0;
-                for (int cpu = 0; cpu < GGML_MAX_N_THREADS && opt_pos < 1000; cpu++) {
-                    if (optimized_tpp.cpumask[cpu]) {
-                        opt_pos += snprintf(opt_mask_str + opt_pos, sizeof(opt_mask_str) - opt_pos, 
-                                           "%s%d", opt_pos > 0 ? "," : "", cpu);
-                    }
-                }
-                GGML_LOG_INFO("   Optimized mask before filtering: [%s]\n", opt_mask_str);
-                
-                // Debug: Show what CPUs belong to this NUMA node  
-                char node_mask_str[1024] = {0};  // Increased size for more CPUs
-                int node_pos = 0;
-                for (int cpu = 0; cpu < GGML_MAX_N_THREADS && node_pos < 1000; cpu++) {
-                    if (numa_bitmask_isbitset(node_cpus, cpu)) {
-                        node_pos += snprintf(node_mask_str + node_pos, sizeof(node_mask_str) - node_pos, 
-                                            "%s%d", node_pos > 0 ? "," : "", cpu);
-                    }
-                }
-                GGML_LOG_INFO("   CPUs belonging to NUMA node %d: [%s]\n", i, node_mask_str);
-                
-                // Create NUMA-filtered CPU mask
-                memset(numa_tpp.cpumask, false, sizeof(numa_tpp.cpumask));
-                bool has_numa_cpus = false;
-                
-                for (int cpu = 0; cpu < GGML_MAX_N_THREADS; cpu++) {
-                    // Include CPU if it's both in the optimized mask AND on this NUMA node
-                    if (optimized_tpp.cpumask[cpu] && numa_bitmask_isbitset(node_cpus, cpu)) {
-                        numa_tpp.cpumask[cpu] = true;
-                        has_numa_cpus = true;
-                    }
-                }
-                
-                if (!has_numa_cpus) {
-                    // Debug: Show what filtering failed to find
-                    char filtered_mask_str[1024] = {0};  // Increased size for more CPUs
-                    int filtered_pos = 0;
-                    for (int cpu = 0; cpu < GGML_MAX_N_THREADS && filtered_pos < 1000; cpu++) {
-                        if (numa_tpp.cpumask[cpu]) {
-                            filtered_pos += snprintf(filtered_mask_str + filtered_pos, sizeof(filtered_mask_str) - filtered_pos, 
-                                                    "%s%d", filtered_pos > 0 ? "," : "", cpu);
-                        }
-                    }
-                    GGML_LOG_WARN("   ❌ NUMA node %d: no intersection found between optimized mask and node CPUs\n", i);
-                    GGML_LOG_WARN("   ❌ Filtered result would be: [%s] (empty)\n", filtered_mask_str);
-                    GGML_LOG_WARN("NUMA node %d: no NUMA-local CPUs found in optimized mask, using original mask\n", i);
-                    memcpy(numa_tpp.cpumask, optimized_tpp.cpumask, sizeof(numa_tpp.cpumask));
-                } else {
-                    // Debug: Show successful filtering result
-                    char filtered_mask_str[1024] = {0};  // Increased size for more CPUs
-                    int filtered_pos = 0;
-                    int filtered_count = 0;
-                    for (int cpu = 0; cpu < GGML_MAX_N_THREADS && filtered_pos < 1000; cpu++) {
-                        if (numa_tpp.cpumask[cpu]) {
-                            filtered_pos += snprintf(filtered_mask_str + filtered_pos, sizeof(filtered_mask_str) - filtered_pos, 
-                                                    "%s%d", filtered_pos > 0 ? "," : "", cpu);
-                            filtered_count++;
-                        }
-                    }
-                    GGML_LOG_INFO("   ✅ NUMA node %d: successfully filtered to %d CPUs: [%s]\n", i, filtered_count, filtered_mask_str);
-                    GGML_LOG_INFO("NUMA node %d: filtered optimized CPU mask to NUMA-local CPUs\n", i);
-                }
-            } else {
-                GGML_LOG_WARN("NUMA node %d: failed to get node CPUs, using optimized mask\n", i);
-                memcpy(numa_tpp.cpumask, optimized_tpp.cpumask, sizeof(numa_tpp.cpumask));
-            }
-            numa_free_cpumask(node_cpus);
-#endif
-        } else {
-            // Simulated NUMA (when i >= real_numa_nodes) or no NUMA: distribute CPUs evenly
-            GGML_LOG_INFO("   Processing NUMA node %d in SIMULATED NUMA mode (real nodes: %d)\n", i, real_numa_nodes);
-            bool has_cpu_mask = false;
-            for (int cpu = 0; cpu < GGML_MAX_N_THREADS; cpu++) {
+        struct bitmask* node_cpus = numa_allocate_cpumask();
+        if (numa_node_to_cpus(i, node_cpus) == 0) {
+            // Debug: Show optimized mask before filtering
+            char opt_mask_str[1024] = {0};  // Increased size for more CPUs
+            int opt_pos = 0;
+            for (int cpu = 0; cpu < GGML_MAX_N_THREADS && opt_pos < 1000; cpu++) {
                 if (optimized_tpp.cpumask[cpu]) {
-                    has_cpu_mask = true;
-                    break;
+                    opt_pos += snprintf(opt_mask_str + opt_pos, sizeof(opt_mask_str) - opt_pos, 
+                                        "%s%d", opt_pos > 0 ? "," : "", cpu);
+                }
+            }
+            GGML_LOG_INFO("   Optimized mask before filtering: [%s]\n", opt_mask_str);
+            
+            // Debug: Show what CPUs belong to this NUMA node  
+            char node_mask_str[1024] = {0};  // Increased size for more CPUs
+            int node_pos = 0;
+            for (int cpu = 0; cpu < GGML_MAX_N_THREADS && node_pos < 1000; cpu++) {
+                if (numa_bitmask_isbitset(node_cpus, cpu)) {
+                    node_pos += snprintf(node_mask_str + node_pos, sizeof(node_mask_str) - node_pos, 
+                                        "%s%d", node_pos > 0 ? "," : "", cpu);
+                }
+            }
+            GGML_LOG_INFO("   CPUs belonging to NUMA node %d: [%s]\n", i, node_mask_str);
+            
+            // Create NUMA-filtered CPU mask
+            memset(numa_tpp.cpumask, false, sizeof(numa_tpp.cpumask));
+            bool has_numa_cpus = false;
+            
+            for (int cpu = 0; cpu < GGML_MAX_N_THREADS; cpu++) {
+                // Include CPU if it's both in the optimized mask AND on this NUMA node
+                if (optimized_tpp.cpumask[cpu] && numa_bitmask_isbitset(node_cpus, cpu)) {
+                    numa_tpp.cpumask[cpu] = true;
+                    has_numa_cpus = true;
                 }
             }
             
-            if (has_cpu_mask) {
-                // Count available CPUs in optimized mask
-                int available_cpus[GGML_MAX_N_THREADS];
-                int cpu_count = 0;
-                
-                for (int cpu = 0; cpu < GGML_MAX_N_THREADS; cpu++) {
-                    if (optimized_tpp.cpumask[cpu]) {
-                        available_cpus[cpu_count++] = cpu;
+            if (!has_numa_cpus) {
+                // Debug: Show what filtering failed to find
+                char filtered_mask_str[1024] = {0};  // Increased size for more CPUs
+                int filtered_pos = 0;
+                for (int cpu = 0; cpu < GGML_MAX_N_THREADS && filtered_pos < 1000; cpu++) {
+                    if (numa_tpp.cpumask[cpu]) {
+                        filtered_pos += snprintf(filtered_mask_str + filtered_pos, sizeof(filtered_mask_str) - filtered_pos, 
+                                                "%s%d", filtered_pos > 0 ? "," : "", cpu);
                     }
                 }
-                
-                // Distribute CPUs round-robin across NUMA nodes
-                memset(numa_tpp.cpumask, false, sizeof(numa_tpp.cpumask));
-                bool has_assigned_cpus = false;
-                int assigned_cpu_list[GGML_MAX_N_THREADS];
-                int assigned_count = 0;
-                
-                for (int j = 0; j < cpu_count; j++) {
-                    if ((j % num_numa_nodes) == i) {
-                        numa_tpp.cpumask[available_cpus[j]] = true;
-                        assigned_cpu_list[assigned_count++] = available_cpus[j];
-                        has_assigned_cpus = true;
+                GGML_LOG_WARN("   ❌ NUMA node %d: no intersection found between optimized mask and node CPUs\n", i);
+                GGML_LOG_WARN("   ❌ Filtered result would be: [%s] (empty)\n", filtered_mask_str);
+                GGML_LOG_WARN("NUMA node %d: no NUMA-local CPUs found in optimized mask, using original mask\n", i);
+                memcpy(numa_tpp.cpumask, optimized_tpp.cpumask, sizeof(numa_tpp.cpumask));
+            } else {
+                // Debug: Show successful filtering result
+                char filtered_mask_str[1024] = {0};  // Increased size for more CPUs
+                int filtered_pos = 0;
+                int filtered_count = 0;
+                for (int cpu = 0; cpu < GGML_MAX_N_THREADS && filtered_pos < 1000; cpu++) {
+                    if (numa_tpp.cpumask[cpu]) {
+                        filtered_pos += snprintf(filtered_mask_str + filtered_pos, sizeof(filtered_mask_str) - filtered_pos, 
+                                                "%s%d", filtered_pos > 0 ? "," : "", cpu);
+                        filtered_count++;
                     }
                 }
-                
-                // Enhanced CPU assignment logging
-                if (has_assigned_cpus) {
-                    char cpu_list_str[512] = {0};
-                    char hyperthreading_analysis[512] = {0};
-                    int pos = 0;
-                    int ht_conflicts = 0;
-                    GGML_UNUSED(hyperthreading_analysis); // May not be used in all debug builds
-                    
-                    // Build CPU list string and analyze hyperthreading
-                    for (int k = 0; k < assigned_count; k++) {
-                        int cpu = assigned_cpu_list[k];
-                        int physical_core = cpu / 2;  // Intel HT pattern: CPU 0,1->Core 0, CPU 2,3->Core 1
-                        bool is_ht_sibling = (cpu % 2 == 1);
-                        
-                        pos += snprintf(cpu_list_str + pos, sizeof(cpu_list_str) - pos, 
-                                       "%sCPU%d(Core%d%s)", 
-                                       k > 0 ? "," : "", cpu, physical_core, 
-                                       is_ht_sibling ? "-HT" : "");
-                        
-                        // Check for hyperthreading conflicts with other assigned CPUs
-                        for (int l = k + 1; l < assigned_count; l++) {
-                            int other_cpu = assigned_cpu_list[l];
-                            if (cpu / 2 == other_cpu / 2) {  // Same physical core
-                                ht_conflicts++;
-                                break;
-                            }
-                        }
-                    }
-                    
-                    GGML_LOG_INFO("NUMA node %d: assigned %d CPUs [%s] via round-robin\n", 
-                                  i, assigned_count, cpu_list_str);
-                    
-                    if (ht_conflicts > 0) {
-                        GGML_LOG_WARN("    NUMA node %d: WARNING - %d hyperthreading conflicts detected - may reduce performance\n", 
-                                      i, ht_conflicts);
-                    } else {
-                        GGML_LOG_INFO("    NUMA node %d: OK - No hyperthreading conflicts - optimal CPU assignment\n", i);
-                    }
-                } else {
-                    GGML_LOG_INFO("NUMA node %d: no specific CPUs assigned - using default affinity\n", i);
-                }
+                GGML_LOG_INFO("   ✅ NUMA node %d: successfully filtered to %d CPUs: [%s]\n", i, filtered_count, filtered_mask_str);
+                GGML_LOG_INFO("NUMA node %d: filtered optimized CPU mask to NUMA-local CPUs\n", i);
             }
+        } else {
+            GGML_LOG_WARN("NUMA node %d: failed to get node CPUs, using optimized mask\n", i);
+            memcpy(numa_tpp.cpumask, optimized_tpp.cpumask, sizeof(numa_tpp.cpumask));
         }
-        
+        numa_free_cpumask(node_cpus);
+
         // Step 6: Create NUMA threadpool with cache optimization
         coord->numa_pool = ggml_threadpool_cache_get(numa_tpp.n_threads, i);
         if (!coord->numa_pool) {
@@ -2023,10 +1891,8 @@ struct ggml_numa_coordinator_manager * ggml_numa_coordinator_manager_new_with_pa
         // Step 7: Initialize work queue for this coordinator
         ggml_work_queue_init(&coord->work_queue);
         
-        // Step 8: Initialize persistent work buffer (NUMA-local)
-        coord->work_buffer = NULL;
-        coord->work_buffer_size = 0;
-        GGML_LOG_INFO("    NUMA node %d: initialized persistent work buffer system\n", i);
+        // Step 8: Per-thread work buffers are now handled automatically
+        GGML_LOG_INFO("    NUMA node %d: initialized per-thread work buffer system\n", i);
         
         // Enhanced logging with complete CPU assignment details
         char final_cpu_summary[256] = {0};
@@ -2123,6 +1989,11 @@ struct ggml_numa_coordinator_manager * ggml_numa_coordinator_manager_get_global(
 // Get the global singleton coordinator manager with parameters (create if needed)
 struct ggml_numa_coordinator_manager * ggml_numa_coordinator_manager_get_global_with_params(const struct ggml_threadpool_params * tpp) {
     return ggml_get_global_coordinator_manager_with_params(tpp);
+}
+
+// Get existing global singleton coordinator manager (no creation)
+struct ggml_numa_coordinator_manager * ggml_numa_coordinator_manager_get_existing(void) {
+    return g_global_coordinator_manager;
 }
 
 // Free NUMA coordinator manager (hierarchical cleanup)
@@ -2240,13 +2111,8 @@ void ggml_numa_coordinator_manager_free(struct ggml_numa_coordinator_manager * m
         ggml_cond_destroy(&coord->work_queue.work_available);
         ggml_mutex_destroy(&coord->work_queue.queue_mutex);
         
-        // Clean up persistent work buffer
-        if (coord->work_buffer) {
-            GGML_LOG_DEBUG("Freeing persistent work buffer for NUMA node %d (%zu bytes)\n", i, coord->work_buffer_size);
-            numa_free(coord->work_buffer, coord->work_buffer_size);
-            coord->work_buffer = NULL;
-            coord->work_buffer_size = 0;
-        }
+        // Per-thread work buffers are automatically cleaned up when threads exit
+        GGML_LOG_DEBUG("Per-thread work buffers for NUMA node %d will be cleaned automatically\n", i);
         
         // Step 11: Coordinator workers return NUMA threadpools to cache for reuse
         if (coord->numa_pool) {
@@ -2274,6 +2140,15 @@ void ggml_numa_coordinator_manager_free(struct ggml_numa_coordinator_manager * m
     }    
     
     // Step 12: Main thread cleans up the coordinator threadpool and frees any remaining objects
+    
+    // Clean up fallback threadpool
+    if (mgr->fallback_threadpool) {
+        GGML_LOG_INFO("🔧 Cleaning up fallback threadpool\n");
+        ggml_threadpool_free(mgr->fallback_threadpool);
+        mgr->fallback_threadpool = NULL;
+        mgr->fallback_thread_count = 0;
+    }
+    
     ggml_work_group_tracker_destroy(&mgr->work_groups);
     ggml_work_queue_destroy(&mgr->global_work_queue);
     ggml_cond_destroy(&mgr->main_sync_cond);
@@ -2405,8 +2280,33 @@ int ggml_numa_coordinator_manager_start(struct ggml_numa_coordinator_manager * m
         GGML_LOG_INFO("Coordinator thread started for NUMA node %d\n", i);
     }
     
+    // RACE CONDITION FIX: Wait for all coordinator threads to become active
+    // This prevents work submission before threads are ready to process
+    GGML_LOG_DEBUG("Waiting for all coordinator threads to become active...\n");
+    for (int i = 0; i < mgr->num_numa_nodes; i++) {
+        struct ggml_coordinator_thread * coord = &mgr->coordinators[i];
+        
+        // Polling wait with short delays to avoid hanging
+        int wait_attempts = 0;
+        const int max_wait_attempts = 1000; // 1 second total
+        
+        while (!atomic_load(&coord->active) && wait_attempts < max_wait_attempts) {
+            usleep(1000); // 1ms delay
+            wait_attempts++;
+        }
+        
+        if (!atomic_load(&coord->active)) {
+            GGML_LOG_ERROR("Coordinator thread %d failed to become active after 1 second\n", i);
+            return -1;
+        }
+        
+        GGML_LOG_DEBUG("Coordinator thread %d is now active\n", i);
+    }
+    
     // Mark threads as started
     atomic_store(&mgr->threads_started, true);
+    
+    GGML_LOG_INFO("All %d coordinator threads are active and ready\n", mgr->num_numa_nodes);
     
     return 0;
 }
@@ -2482,6 +2382,11 @@ int ggml_numa_coordinator_manager_submit_work_function(struct ggml_numa_coordina
                                                        ggml_numa_execution_strategy_t execution_strategy,
                                                        size_t required_buffer_size) {
     if (!mgr || !work_function) return -1;
+    
+    // Reset work status to success before submitting new work
+    ggml_mutex_lock(&mgr->status_mutex);
+    atomic_store(&mgr->last_work_status, GGML_STATUS_SUCCESS);
+    ggml_mutex_unlock(&mgr->status_mutex);
     
     // Ensure coordinator threads are started before submitting work
     int start_result = ggml_numa_coordinator_manager_start(mgr);
@@ -2699,101 +2604,44 @@ int ggml_numa_coordinator_manager_compute_graph(struct ggml_numa_coordinator_man
     }
     
     // Process each node in the computation graph
-    // Use data parallelism for suitable operations when multiple NUMA nodes are available
+    // Delegate all operation-specific logic to the dispatcher
     for (int i = 0; i < cgraph->n_nodes; i++) {
         struct ggml_tensor * node = cgraph->nodes[i];
         if (!node) continue;
         
-        // Analyze the operation to determine if data parallelism is beneficial
-        bool use_data_parallel = false;
-        if (mgr->num_numa_nodes > 1) {
-            // Check if this operation can benefit from data parallelism
-            switch (node->op) {
-                case GGML_OP_MUL_MAT:
-                case GGML_OP_MUL_MAT_ID:
-                    // Matrix multiplication - excellent candidate for row-wise splitting
-                    if (ggml_nelements(node) > 50000) { // Only for large matrices
-                        use_data_parallel = true;
-                        GGML_LOG_DEBUG("Node %d: Matrix operation (%s) using data parallelism (%ld elements)\n", 
-                                       i, ggml_op_name(node->op), ggml_nelements(node));
-                    }
-                    break;
-                    
-                case GGML_OP_ADD:
-                case GGML_OP_MUL:
-                case GGML_OP_DIV:
-                case GGML_OP_SUB:
-                    // Element-wise operations - good for parallelism on large tensors
-                    if (ggml_nelements(node) > 100000) {
-                        use_data_parallel = true;
-                        GGML_LOG_DEBUG("Node %d: Element-wise operation (%s) using data parallelism (%ld elements)\n", 
-                                       i, ggml_op_name(node->op), ggml_nelements(node));
-                    }
-                    break;
-                    
-                case GGML_OP_UNARY:
-                    // Unary operations (GELU, SILU, RELU, etc.) - good for parallelism on large tensors
-                    if (ggml_nelements(node) > 50000) {
-                        use_data_parallel = true;
-                        GGML_LOG_DEBUG("Node %d: Unary operation (%s) using data parallelism (%ld elements)\n", 
-                                       i, ggml_op_name(node->op), ggml_nelements(node));
-                    }
-                    break;
-                    
-                default: {
-                    // For other operations, use simple size heuristic
-                    int64_t tensor_elements = ggml_nelements(node);
-                    int64_t tensor_bytes = ggml_nbytes(node);
-                    int64_t min_elements_per_numa = 10000;
-                    int64_t min_bytes_per_numa = 1024 * 1024; // 1MB
-                    
-                    if (tensor_elements > (min_elements_per_numa * mgr->num_numa_nodes) ||
-                        tensor_bytes > (min_bytes_per_numa * mgr->num_numa_nodes)) {
-                        use_data_parallel = true;
-                        GGML_LOG_DEBUG("Node %d: Large tensor operation (%s) using data parallelism (%ld elements, %ld bytes)\n", 
-                                       i, ggml_op_name(node->op), tensor_elements, tensor_bytes);
-                    } else {
-                        GGML_LOG_DEBUG("Node %d: Small operation (%s) using single-node processing (%ld elements, %ld bytes)\n", 
-                                       i, ggml_op_name(node->op), tensor_elements, tensor_bytes);
-                    }
-                    break;
-                }
-            }
+        GGML_LOG_DEBUG("Node %d: Processing operation %s (%ld elements) via dispatcher\n", 
+                       i, ggml_op_name(node->op), ggml_nelements(node));
+        
+        // Create context for the dispatcher - use same approach as existing dispatcher code
+        ggml_numa_work_context_t context = {
+            .total_elements = ggml_nelements(node),
+            .element_size = ggml_element_size(node),
+            .numa_nodes = mgr->num_numa_nodes,
+            .threads_per_node = mgr->num_numa_nodes > 0 ? mgr->coordinators[0].n_threads : 1,
+            .l3_cache_size = 8ULL * 1024 * 1024,  // 8MB default
+            .memory_bandwidth = 100ULL * 1024 * 1024 * 1024  // 100GB/s default
+        };
+        
+        // Copy tensor dimensions
+        for (int j = 0; j < GGML_MAX_DIMS && j < 4; j++) {
+            context.ne[j] = node->ne[j];
+        }
+        context.n_dims = ggml_n_dims(node);
+        
+        // Delegate to dispatcher - it will handle all operation-specific decisions:
+        // - Operation type analysis
+        // - Data parallelism vs single-node decision  
+        // - Work function selection
+        // - Execution strategy optimization
+        enum ggml_status dispatch_result = ggml_numa_dispatch_operation(mgr, node, &context);
+        
+        if (dispatch_result != GGML_STATUS_SUCCESS) {
+            GGML_LOG_ERROR("Failed to dispatch operation %s for cgraph node %d (status: %d)\n", 
+                           ggml_op_name(node->op), i, dispatch_result);
+            return -1;
         }
         
-        if (use_data_parallel) {
-            // Submit with data parallelism - ASYNC, no blocking
-            int work_group_id = ggml_numa_coordinator_manager_submit_data_parallel_work(mgr, node);
-            if (work_group_id < 0) {
-                GGML_LOG_WARN("Failed to submit data parallel work for cgraph node %d, falling back to single-node\n", i);
-                // Fallback to single-node processing
-                ggml_numa_execution_strategy_t single_node_strategy = {
-                    .node_strategy = NUMA_NODE_STRATEGY_SINGLE,
-                    .on_node_strategy = NUMA_ON_NODE_STRATEGY_MULTI_THREAD
-                };
-                size_t buffer_size = 0; // No buffer size info available - let fallback handle it
-                int work_id = ggml_numa_coordinator_manager_submit_work(mgr, node, -1, single_node_strategy, buffer_size);
-                if (work_id < 0) {
-                    GGML_LOG_ERROR("Failed to submit work for cgraph node %d\n", i);
-                    return -1;
-                }
-            }
-            // NO BLOCKING - let work execute asynchronously
-            GGML_LOG_DEBUG("Submitted data parallel work group %d asynchronously for cgraph node %d\n", work_group_id, i);
-        } else {
-            // Submit to single NUMA node - ASYNC, no blocking
-            ggml_numa_execution_strategy_t single_node_strategy = {
-                .node_strategy = NUMA_NODE_STRATEGY_SINGLE,
-                .on_node_strategy = NUMA_ON_NODE_STRATEGY_MULTI_THREAD
-            };
-            size_t buffer_size = 0; // No buffer size info available - let fallback handle it
-            int work_id = ggml_numa_coordinator_manager_submit_work(mgr, node, -1, single_node_strategy, buffer_size);
-            if (work_id < 0) {
-                GGML_LOG_WARN("Failed to submit work for cgraph node %d\n", i);
-                return -1;
-            }
-            GGML_LOG_DEBUG("Submitted single-node work %d asynchronously for cgraph node %d\n", work_id, i);
-        }
+        GGML_LOG_DEBUG("Node %d: Successfully dispatched operation %s\n", i, ggml_op_name(node->op));
     }
     
     // Wait for any remaining single-node work to complete
@@ -2833,9 +2681,16 @@ enum ggml_status ggml_numa_coordinator_manager_wait_for_completion(struct ggml_n
             break;
         }
         
+        // RACE CONDITION FIX: Double-check condition before waiting to avoid lost signals
+        // This prevents the classic race where work completes between checking and waiting
+        GGML_LOG_DEBUG("Work still pending, entering wait...\n");
+        
         // Wait on condition variable instead of sleeping
         // The coordinator threads will signal this condition when they complete work
         ggml_cond_wait(&mgr->main_sync_cond, &mgr->main_sync_mutex);
+        
+        // After being signaled, we'll loop back and check the condition again
+        GGML_LOG_DEBUG("Received signal, re-checking work completion...\n");
     }
     
     ggml_mutex_unlock(&mgr->main_sync_mutex);
@@ -3675,21 +3530,26 @@ bool ggml_numa_coordinator_ensure_work_buffer(struct ggml_numa_coordinator_manag
     if (!manager || numa_node < 0 || numa_node >= manager->num_numa_nodes) {
         return false;
     }
-    return ggml_numa_ensure_work_buffer(&manager->coordinators[numa_node], required_size);
+    // With per-thread work buffers, this function always succeeds
+    // Individual threads will allocate their own partitioned buffers as needed
+    return true;
 }
 
 void * ggml_numa_coordinator_get_work_buffer(struct ggml_numa_coordinator_manager * manager, int numa_node) {
     if (!manager || numa_node < 0 || numa_node >= manager->num_numa_nodes) {
         return NULL;
     }
-    return manager->coordinators[numa_node].work_buffer;
+    // With per-thread work buffers, return the current thread's buffer
+    // This is mainly for legacy compatibility
+    return ggml_numa_get_partitioned_work_buffer(0, numa_node, 1);
 }
 
 size_t ggml_numa_coordinator_get_work_buffer_size(struct ggml_numa_coordinator_manager * manager, int numa_node) {
     if (!manager || numa_node < 0 || numa_node >= manager->num_numa_nodes) {
         return 0;
     }
-    return manager->coordinators[numa_node].work_buffer_size;
+    // With per-thread work buffers, return the current thread's buffer size
+    return ggml_thread_work_buffer_size;
 }
 
 enum ggml_status ggml_numa_coordinator_execute_graph_operation(
@@ -3730,14 +3590,15 @@ enum ggml_status ggml_numa_coordinator_execute_graph_operation(
     
     // Ensure adequate work buffer if needed
     if (cplan.work_size > 0) {
-        if (!ggml_numa_ensure_work_buffer(coordinator, cplan.work_size)) {
-            GGML_LOG_ERROR("NUMA%d: Failed to ensure adequate work buffer of size %zu for operation %s\n", 
+        void* work_buffer = ggml_numa_get_partitioned_work_buffer(cplan.work_size, numa_node, 1);
+        if (!work_buffer) {
+            GGML_LOG_ERROR("NUMA%d: Failed to get partitioned work buffer of size %zu for operation %s\n", 
                           numa_node, cplan.work_size, ggml_op_name(operation->op));
             status = GGML_STATUS_FAILED;
         } else {
-            cplan.work_data = coordinator->work_buffer;
-            GGML_LOG_DEBUG("NUMA%d: Using persistent work buffer (%zu bytes available, %zu needed) for %s\n", 
-                           numa_node, coordinator->work_buffer_size, cplan.work_size, ggml_op_name(operation->op));
+            cplan.work_data = work_buffer;
+            GGML_LOG_DEBUG("NUMA%d: Using per-thread work buffer (%zu bytes) for %s\n", 
+                           numa_node, cplan.work_size, ggml_op_name(operation->op));
         }
     }
     
@@ -3767,5 +3628,35 @@ void ggml_numa_coordinator_manager_reset_status(struct ggml_numa_coordinator_man
     ggml_mutex_lock(&mgr->status_mutex);
     atomic_store(&mgr->last_work_status, GGML_STATUS_SUCCESS);
     ggml_mutex_unlock(&mgr->status_mutex);
+}
+
+// ============================================================================
+// Fallback Threadpool Implementation
+// ============================================================================
+
+struct ggml_threadpool * ggml_numa_coordinator_get_fallback_threadpool(struct ggml_numa_coordinator_manager * mgr) {
+    if (!mgr) {
+        // Use global singleton if no manager provided
+        mgr = ggml_numa_coordinator_manager_get_existing();
+        if (!mgr) {
+            GGML_LOG_WARN("No NUMA coordinator manager available for fallback threadpool\n");
+            return NULL;
+        }
+    }
+    
+    return mgr->fallback_threadpool;
+}
+
+int ggml_numa_coordinator_get_fallback_thread_count(struct ggml_numa_coordinator_manager * mgr) {
+    if (!mgr) {
+        // Use global singleton if no manager provided
+        mgr = ggml_numa_coordinator_manager_get_existing();
+        if (!mgr) {
+            GGML_LOG_WARN("No NUMA coordinator manager available for fallback thread count\n");
+            return 1;  // Default to single thread
+        }
+    }
+    
+    return mgr->fallback_thread_count > 0 ? mgr->fallback_thread_count : 1;
 }
 

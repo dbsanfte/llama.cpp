@@ -24,25 +24,43 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
     list (APPEND GGML_CPU_SOURCES
         ggml-cpu/ggml-cpu.c
         ggml-cpu/ggml-cpu.cpp
+        # New NUMA Architecture
         ggml-cpu/ggml-numa-coordinator.c
-        ggml-cpu/ggml-numa-operation-dispatch.c
-        ggml-cpu/ggml-numa-operation-dispatch.h
-        ggml-cpu/ggml-numa-fallback.c
+        ggml-cpu/ggml-numa-cpu-backend.c
+        ggml-cpu/ggml-numa-cpu-backend.h
+        ggml-cpu/ggml-numa-executor.c
+        ggml-cpu/ggml-numa-executor.h
         ggml-cpu/ggml-numa-work-shared.h
-        ggml-cpu/numa-work/ggml-numa-add.c
-        ggml-cpu/numa-work/ggml-numa-add.h
-        ggml-cpu/numa-work/ggml-numa-mulmat.c
-        ggml-cpu/numa-work/ggml-numa-mulmat.h
-        ggml-cpu/numa-work/ggml-numa-softmax.c
-        ggml-cpu/numa-work/ggml-numa-softmax.h
-        ggml-cpu/numa-work/ggml-numa-rope.c
-        ggml-cpu/numa-work/ggml-numa-rope.h
-        ggml-cpu/numa-work/ggml-numa-glu.c
-        ggml-cpu/numa-work/ggml-numa-glu.h
-        ggml-cpu/numa-work/ggml-numa-rms-norm.c
-        ggml-cpu/numa-work/ggml-numa-rms-norm.h
-        ggml-cpu/numa-work/ggml-numa-flash-attn-ext.c
-        ggml-cpu/numa-work/ggml-numa-flash-attn-ext.h
+        # NUMA Kernels
+        ggml-cpu/numa-kernels/mul_mat.c
+        ggml-cpu/numa-kernels/mul_mat.h
+        ggml-cpu/numa-kernels/add.c
+        ggml-cpu/numa-kernels/add.h
+        ggml-cpu/numa-kernels/kernel_stubs.c
+        ggml-cpu/numa-kernels/rms_norm.h
+        ggml-cpu/numa-kernels/soft_max.h
+        ggml-cpu/numa-kernels/rope.h
+        ggml-cpu/numa-kernels/cpy.h
+        ggml-cpu/numa-kernels/get_rows.h
+        # Transition stubs for old dispatcher functions
+        ggml-cpu/ggml-numa-dispatch-stubs.c
+        # Legacy NUMA files (to be phased out) - temporarily disabled during architecture transition
+        # ggml-cpu/ggml-numa-operation-dispatch.c
+        # ggml-cpu/ggml-numa-operation-dispatch.h
+        # ggml-cpu/numa-work/ggml-numa-add.c
+        # ggml-cpu/numa-work/ggml-numa-add.h
+        # ggml-cpu/numa-work/ggml-numa-mulmat.c
+        # ggml-cpu/numa-work/ggml-numa-mulmat.h
+        # ggml-cpu/numa-work/ggml-numa-softmax.c
+        # ggml-cpu/numa-work/ggml-numa-softmax.h
+        # ggml-cpu/numa-work/ggml-numa-rope.c
+        # ggml-cpu/numa-work/ggml-numa-rope.h
+        # ggml-cpu/numa-work/ggml-numa-glu.c
+        # ggml-cpu/numa-work/ggml-numa-glu.h
+        # ggml-cpu/numa-work/ggml-numa-rms-norm.c
+        # ggml-cpu/numa-work/ggml-numa-rms-norm.h
+        # ggml-cpu/numa-work/ggml-numa-flash-attn-ext.c
+        # ggml-cpu/numa-work/ggml-numa-flash-attn-ext.h
         ggml-work-item.c
         ggml-cpu/repack.cpp
         ggml-cpu/repack.h
@@ -613,5 +631,18 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
     if (CMAKE_CXX_COMPILER_ID STREQUAL "IntelLLVM")
         # The compiler automatically enables "-ffast-math" which can cause NaNs in tests due to "-fassociative-math"
         target_compile_options(${GGML_CPU_NAME} PRIVATE "-fno-associative-math")
+    endif()
+
+    # NUMA support for ggml-cpu backend
+    if (GGML_NUMA_MIRROR)
+        find_library(NUMA_LIBRARY NAMES numa)
+        if (NUMA_LIBRARY)
+            message(STATUS "Adding NUMA support to ${GGML_CPU_NAME}")
+            target_compile_definitions(${GGML_CPU_NAME} PRIVATE GGML_NUMA_MIRROR)
+            target_compile_definitions(${GGML_CPU_NAME} PRIVATE GGML_NUMA)
+            target_link_libraries(${GGML_CPU_NAME} PRIVATE ${NUMA_LIBRARY})
+        else()
+            message(WARNING "NUMA library not found for ${GGML_CPU_NAME}")
+        endif()
     endif()
 endfunction()

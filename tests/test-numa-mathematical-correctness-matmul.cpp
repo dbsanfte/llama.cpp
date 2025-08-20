@@ -30,7 +30,10 @@ private:
                size_label, M, K, K, N, M, N, M, K, N, num_threads);
         
         // Create test context with sufficient memory for larger matrices
-        struct ggml_init_params params = {0};
+        struct ggml_init_params params;
+        params.mem_size = 0;
+        params.mem_buffer = nullptr;
+        params.no_alloc = false;
         params.mem_size = std::max((size_t)(512 * 1024 * 1024), (size_t)(M * K + K * N + M * N) * sizeof(float) * 4); // Scale memory with matrix size
         params.mem_buffer = nullptr;
         params.no_alloc = false;
@@ -198,7 +201,10 @@ public:
                ggml_type_name(quantized_type), size_label, M, K, K, N, M, N, M, K, N, num_threads);
         
         // Initialize test context with adequate memory for quantized and F32 tensors
-        struct ggml_init_params params = {0};
+        struct ggml_init_params params;
+        params.mem_size = 0;
+        params.mem_buffer = nullptr;
+        params.no_alloc = false;
         params.mem_size = std::max((size_t)(512 * 1024 * 1024), (size_t)(M * K + K * N + M * N) * sizeof(float) * 4);
         params.mem_buffer = nullptr;
         params.no_alloc = false;
@@ -283,57 +289,79 @@ public:
                     printf("      ❌ %s×F32 NUMA execution failed for %s (status=%d, threads=%d)\n", 
                            ggml_type_name(quantized_type), size_label, dispatch_result, num_threads);
                 } else {
-                    // Create F32×F32 reference for comparison
-                    struct ggml_tensor* ref_result = ggml_mul_mat(test_ctx, a_f32, b);
+                    // Create F32×F32 reference using direct chunk kernel (same approach as F32×F32 test)
+                    struct ggml_tensor* ref_result = ggml_new_tensor_2d(test_ctx, GGML_TYPE_F32, M, N);
                     if (!ref_result) {
-                        printf("      ❌ Failed to create F32×F32 reference for %s\n", size_label);
+                        printf("      ❌ Failed to create F32×F32 reference result tensor for %s\n", size_label);
                     } else {
-                        // Create F32×F32 reference using ggml computation graph (safer than direct function call)
-                        struct ggml_cgraph* ref_graph = ggml_new_graph(test_ctx);
-                        if (!ref_graph) {
-                            printf("      ❌ Failed to create reference computation graph for %s\n", size_label);
+                        // Set up the reference result tensor for chunk kernel computation
+                        ref_result->src[0] = a_f32;  // F32 version of matrix A
+                        ref_result->src[1] = b;      // F32 matrix B (same as NUMA test)
+                        ref_result->op = GGML_OP_MUL_MAT;
+                        
+                        // Set up compute params for single-threaded F32×F32 reference computation
+                        struct ggml_compute_params ref_params = {
+                            0,       // ith
+                            1,       // nth - Single thread for reference (baseline)
+                            0,       // wsize
+                            nullptr, // wdata
+                            nullptr  // threadpool
+                        };
+                        
+                        // Get matrix dimensions for chunk parameters
+                        const int64_t ne00 = a_f32->ne[0]; // K dimension
+                        const int64_t ne01 = a_f32->ne[1]; // M dimension  
+                        const int64_t ne11 = b->ne[1];     // N dimension
+                        
+                        // F32×F32 multiplication always uses 1 row per vec_dot
+                        const int64_t num_rows_per_vec_dot = 1;
+                        
+                        // Call the underlying chunk kernel directly for F32×F32 reference
+                        ggml_compute_forward_mul_mat_one_chunk(
+                            &ref_params,
+                            ref_result,           // dst
+                            a_f32->type,         // type (GGML_TYPE_F32)
+                            num_rows_per_vec_dot, // num_rows_per_vec_dot
+                            0,                   // ir0_start (all rows)
+                            ne01,                // ir0_end (all rows)
+                            0,                   // ir1_start (all cols)  
+                            ne11                 // ir1_end (all cols)
+                        );
+                        
+                        // Compare quantized×F32 NUMA result with F32×F32 reference
+                        float* numa_data = (float*)ggml_get_data(numa_result);
+                        float* ref_data = (float*)ggml_get_data(ref_result);
+                        int total_elements = ggml_nelements(numa_result);
+                        
+                        // Check for corruption in quantized×F32 NUMA result
+                        printf("        🔍 Checking %s×F32 NUMA result for corruption...\n", ggml_type_name(quantized_type));
+                        auto numa_analysis = NumaTestUtils::analyze_tensor_corruption(numa_data, total_elements, "quantized×F32_NUMA_result", false);
+                        
+                        if (numa_analysis.has_corruption) {
+                            printf("        🚨 CRITICAL: %s×F32 NUMA result contains corruption! BUG DETECTED!\n", ggml_type_name(quantized_type));
+                            NumaTestUtils::print_corruption_report(numa_analysis, "quantized×F32_NUMA_result");
+                            case_passed = false;
                         } else {
-                            // Add the F32×F32 reference operation to the graph
-                            ggml_build_forward_expand(ref_graph, ref_result);
+                            printf("        ✅ %s×F32 NUMA result is clean (no NaN/inf detected)\n", ggml_type_name(quantized_type));
                             
-                            // Execute the reference computation graph (this handles threadpool properly)
-                            ggml_graph_compute_with_ctx(test_ctx, ref_graph, 1); // single thread
+                            // Compare with F32×F32 reference (allowing for quantization error)
+                            printf("        🧮 Comparing %s×F32 NUMA vs F32×F32 reference...\n", ggml_type_name(quantized_type));
                             
-                            // Compare quantized×F32 NUMA result with F32×F32 reference
-                            float* numa_data = (float*)ggml_get_data(numa_result);
-                            float* ref_data = (float*)ggml_get_data(ref_result);
-                            int total_elements = ggml_nelements(numa_result);
+                            // Use higher tolerance for quantized types (based on test-quantize-fns.cpp patterns)
+                            float tolerance = (quantized_type == GGML_TYPE_Q2_K || quantized_type == GGML_TYPE_IQ2_S) ? 0.1f :
+                                            (quantized_type == GGML_TYPE_Q3_K || quantized_type == GGML_TYPE_IQ3_S) ? 0.05f :
+                                            (quantized_type == GGML_TYPE_Q4_0 || quantized_type == GGML_TYPE_Q4_1) ? 0.02f :
+                                            (quantized_type == GGML_TYPE_Q5_0 || quantized_type == GGML_TYPE_Q5_1) ? 0.01f :
+                                            0.5f;  // Default for Q8_0, Q8_1 (higher tolerance for 8-bit quantization)
                             
-                            // Check for corruption in quantized×F32 NUMA result
-                            printf("        🔍 Checking %s×F32 NUMA result for corruption...\n", ggml_type_name(quantized_type));
-                            auto numa_analysis = NumaTestUtils::analyze_tensor_corruption(numa_data, total_elements, "quantized×F32_NUMA_result", false);
+                            case_passed = NumaTestUtils::tensors_equal(numa_data, ref_data, total_elements, tolerance, tolerance, true);
                             
-                            if (numa_analysis.has_corruption) {
-                                printf("        🚨 CRITICAL: %s×F32 NUMA result contains corruption! BUG DETECTED!\n", ggml_type_name(quantized_type));
-                                NumaTestUtils::print_corruption_report(numa_analysis, "quantized×F32_NUMA_result");
-                                case_passed = false;
+                            if (case_passed) {
+                                printf("      ✅ %s×F32 %s (%d threads): MATHEMATICALLY EQUIVALENT AND CORRUPTION-FREE\n",
+                                        ggml_type_name(quantized_type), size_label, num_threads);
                             } else {
-                                printf("        ✅ %s×F32 NUMA result is clean (no NaN/inf detected)\n", ggml_type_name(quantized_type));
-                                
-                                // Compare with F32×F32 reference (allowing for quantization error)
-                                printf("        🧮 Comparing %s×F32 NUMA vs F32×F32 reference...\n", ggml_type_name(quantized_type));
-                                
-                                // Use higher tolerance for quantized types (based on test-quantize-fns.cpp patterns)
-                                float tolerance = (quantized_type == GGML_TYPE_Q2_K || quantized_type == GGML_TYPE_IQ2_S) ? 0.1f :
-                                                (quantized_type == GGML_TYPE_Q3_K || quantized_type == GGML_TYPE_IQ3_S) ? 0.05f :
-                                                (quantized_type == GGML_TYPE_Q4_0 || quantized_type == GGML_TYPE_Q4_1) ? 0.02f :
-                                                (quantized_type == GGML_TYPE_Q5_0 || quantized_type == GGML_TYPE_Q5_1) ? 0.01f :
-                                                0.5f;  // Default for Q8_0, Q8_1 (higher tolerance for 8-bit quantization)
-                                
-                                case_passed = NumaTestUtils::tensors_equal(numa_data, ref_data, total_elements, tolerance, tolerance, true);
-                                
-                                if (case_passed) {
-                                    printf("      ✅ %s×F32 %s (%d threads): MATHEMATICALLY EQUIVALENT AND CORRUPTION-FREE\n",
-                                            ggml_type_name(quantized_type), size_label, num_threads);
-                                } else {
-                                    printf("      ❌ %s×F32 %s (%d threads): MATHEMATICAL MISMATCH (tolerance=%.4f)\n",
-                                            ggml_type_name(quantized_type), size_label, num_threads, tolerance);
-                                }
+                                printf("      ❌ %s×F32 %s (%d threads): MATHEMATICAL MISMATCH (tolerance=%.4f)\n",
+                                        ggml_type_name(quantized_type), size_label, num_threads, tolerance);
                             }
                         }
                     }
@@ -695,7 +723,10 @@ private:
                 int num_threads = data_parallel_thread_counts[thread_idx];
                 
                 // Test with larger memory context to handle type conversion buffers
-                struct ggml_init_params params = {0};
+                struct ggml_init_params params;
+        params.mem_size = 0;
+        params.mem_buffer = nullptr;
+        params.no_alloc = false;
                 params.mem_size = std::max((size_t)(1024 * 1024 * 1024), // At least 1GB
                                          (size_t)(test_case.M * test_case.K + test_case.K * test_case.N + test_case.M * test_case.N) * sizeof(float) * 8);
                 params.mem_buffer = nullptr;

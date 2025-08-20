@@ -83,7 +83,7 @@ public:
         
         // Test: Basic coordinator manager creation
         printf("  Creating basic coordinator manager...\n");
-        struct ggml_numa_coordinator_manager* basic_mgr = ggml_numa_coordinator_manager_new(4, false);
+        struct ggml_numa_coordinator_manager* basic_mgr = ggml_numa_coordinator_manager_new(4);
         if (basic_mgr) {
             printf("  ✅ Basic coordinator manager created successfully\n");
             ggml_numa_coordinator_manager_free(basic_mgr);
@@ -94,7 +94,7 @@ public:
         
         // Test: Force multi-socket coordinator manager creation
         printf("  Creating force multi-socket coordinator manager...\n");
-        struct ggml_numa_coordinator_manager* multi_mgr = ggml_numa_coordinator_manager_new(8, true);
+        struct ggml_numa_coordinator_manager* multi_mgr = ggml_numa_coordinator_manager_new(8);
         if (multi_mgr) {
             printf("  ✅ Multi-socket coordinator manager created successfully\n");
             ggml_numa_coordinator_manager_free(multi_mgr);
@@ -105,7 +105,7 @@ public:
         
         // Test: Global coordinator access
         printf("  Testing global coordinator access...\n");
-        struct ggml_numa_coordinator_manager* global_mgr = ggml_numa_coordinator_manager_get_global(4, false);
+        struct ggml_numa_coordinator_manager* global_mgr = ggml_numa_coordinator_manager_get_global(4);
         if (global_mgr) {
             printf("  ✅ Global coordinator manager accessible\n");
             // Don't free global manager - it's managed globally
@@ -196,7 +196,7 @@ public:  // Ensure all test functions are public
         bool all_tests_passed = true;
         
         // Get global coordinator for testing
-        struct ggml_numa_coordinator_manager* mgr = ggml_numa_coordinator_manager_get_global(4, false);
+        struct ggml_numa_coordinator_manager* mgr = ggml_numa_coordinator_manager_get_global(4);
         if (!mgr) {
             add_test_result("function_pointer_submission", false, "Failed to get coordinator manager");
             return;
@@ -285,7 +285,7 @@ public:  // Ensure all test functions are public
         printf("Testing different execution strategies...\n");
         
         bool all_passed = true;
-        struct ggml_numa_coordinator_manager* mgr = ggml_numa_coordinator_manager_get_global(8, false);
+        struct ggml_numa_coordinator_manager* mgr = ggml_numa_coordinator_manager_get_global(8);
         
         if (!mgr) {
             add_test_result("execution_strategy_validation", false, "Failed to get coordinator manager");
@@ -348,7 +348,7 @@ public:  // Ensure all test functions are public
         printf("Testing NUMA node assignment and buffer allocation...\n");
         
         bool all_passed = true;
-        struct ggml_numa_coordinator_manager* mgr = ggml_numa_coordinator_manager_get_global(8, true); // Force multi-socket
+        struct ggml_numa_coordinator_manager* mgr = ggml_numa_coordinator_manager_get_global(8); // Force multi-socket
         
         if (!mgr) {
             add_test_result("numa_node_assignment", false, "Failed to get coordinator manager");
@@ -402,7 +402,7 @@ public:  // Ensure all test functions are public
         printf("Testing error handling for function pointer submission...\n");
         
         bool all_passed = true;
-        struct ggml_numa_coordinator_manager* mgr = ggml_numa_coordinator_manager_get_global(4, false);
+        struct ggml_numa_coordinator_manager* mgr = ggml_numa_coordinator_manager_get_global(4);
         
         if (!mgr) {
             add_test_result("function_pointer_error_handling", false, "Failed to get coordinator manager");
@@ -504,7 +504,7 @@ public:  // Ensure all test functions are public
         bool all_tests_passed = true;
         
         // Get global coordinator for testing
-        struct ggml_numa_coordinator_manager* mgr = ggml_numa_coordinator_manager_get_global(4, false);
+        struct ggml_numa_coordinator_manager* mgr = ggml_numa_coordinator_manager_get_global(4);
         if (!mgr) {
             add_test_result("work_function_execution_verification", false, "Failed to get coordinator manager");
             return;
@@ -618,7 +618,7 @@ public:  // Ensure all test functions are public
         bool all_tests_passed = true;
         
         // Get global coordinator for testing
-        struct ggml_numa_coordinator_manager* mgr = ggml_numa_coordinator_manager_get_global(4, false);
+        struct ggml_numa_coordinator_manager* mgr = ggml_numa_coordinator_manager_get_global(4);
         if (!mgr) {
             add_test_result("work_completion_tracking", false, "Failed to get coordinator manager");
             return;
@@ -689,7 +689,7 @@ public:  // Ensure all test functions are public
         bool all_tests_passed = true;
         
         // Get global coordinator for testing
-        struct ggml_numa_coordinator_manager* mgr = ggml_numa_coordinator_manager_get_global(4, false);
+        struct ggml_numa_coordinator_manager* mgr = ggml_numa_coordinator_manager_get_global(4);
         if (!mgr) {
             add_test_result("coordinator_thread_status", false, "Failed to get coordinator manager");
             return;
@@ -754,7 +754,7 @@ public:  // Ensure all test functions are public
         bool all_tests_passed = true;
         
         // Get global coordinator for testing
-        struct ggml_numa_coordinator_manager* mgr = ggml_numa_coordinator_manager_get_global(4, false);
+        struct ggml_numa_coordinator_manager* mgr = ggml_numa_coordinator_manager_get_global(4);
         if (!mgr) {
             add_test_result("context_pointer_correctness", false, "Failed to get coordinator manager");
             return;
@@ -1010,7 +1010,7 @@ public:  // Ensure all test functions are public
         
         bool all_tests_passed = true;
         
-        struct ggml_numa_coordinator_manager* mgr = ggml_numa_coordinator_manager_get_global(2, false);
+        struct ggml_numa_coordinator_manager* mgr = ggml_numa_coordinator_manager_get_global(2);
         if (!mgr) {
             add_test_result("rapid_work_submission_race", false, "Failed to get coordinator manager");
             return;
@@ -1083,7 +1083,7 @@ public:  // Ensure all test functions are public
         
         bool all_tests_passed = true;
         
-        struct ggml_numa_coordinator_manager* mgr = ggml_numa_coordinator_manager_get_global(1, false);
+        struct ggml_numa_coordinator_manager* mgr = ggml_numa_coordinator_manager_get_global(1);
         if (!mgr) {
             add_test_result("completion_signal_race", false, "Failed to get coordinator manager");
             return;
@@ -1164,7 +1164,7 @@ public:  // Ensure all test functions are public
             NUMA_ON_NODE_STRATEGY_SINGLE_THREAD
         };
         
-        struct ggml_numa_coordinator_manager* mgr = ggml_numa_coordinator_manager_get_global(1, false);
+        struct ggml_numa_coordinator_manager* mgr = ggml_numa_coordinator_manager_get_global(1);
         if (!mgr) {
             add_test_result("single_thread_rope_race", false, "Failed to get coordinator manager");
             return;

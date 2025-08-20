@@ -137,6 +137,13 @@ struct ggml_numa_coordinator_manager * ggml_numa_coordinator_manager_get_global(
 struct ggml_numa_coordinator_manager * ggml_numa_coordinator_manager_get_global_with_params(const struct ggml_threadpool_params * tpp);
 
 /**
+ * Get existing global NUMA coordinator manager (no creation)
+ * 
+ * @return Manager instance or NULL if not yet created
+ */
+struct ggml_numa_coordinator_manager * ggml_numa_coordinator_manager_get_existing(void);
+
+/**
  * Free NUMA coordinator manager (hierarchical cleanup)
  * 
  * @param mgr Manager to free
@@ -286,17 +293,6 @@ struct ggml_numa_perf_stats {
 };
 
 struct ggml_numa_perf_stats ggml_numa_coordinator_manager_get_stats(struct ggml_numa_coordinator_manager * mgr, int numa_node);
-
-/**
- * Main NUMA-aware graph computation function
- * This is the primary integration point that replaces standard ggml_graph_compute
- * when NUMA coordination is beneficial
- * 
- * @param cgraph Computation graph to execute
- * @param n_threads Number of threads for computation
- * @return GGML_STATUS_SUCCESS on success, GGML_STATUS_FAILED on failure
- */
-enum ggml_status ggml_numa_graph_compute(struct ggml_cgraph * cgraph, int n_threads);
 
 /**
  * NUMA-aware graph computation with virtual NUMA support for testing
@@ -484,6 +480,28 @@ int ggml_numa_get_current_node(void);
  * @param mgr Manager instance
  */
 void ggml_numa_coordinator_manager_reset_status(struct ggml_numa_coordinator_manager * mgr);
+
+// ============================================================================
+// Fallback Threadpool Interface
+// ============================================================================
+
+/**
+ * Get the dedicated fallback threadpool for CPU operations
+ * This is a simple, single-threaded (expandable) threadpool on NUMA node 0
+ * specifically for fallback operations that can't use the coordinator system.
+ * 
+ * @param mgr Manager instance (NULL for global singleton)
+ * @return Threadpool instance for fallback operations, or NULL if not available
+ */
+struct ggml_threadpool * ggml_numa_coordinator_get_fallback_threadpool(struct ggml_numa_coordinator_manager * mgr);
+
+/**
+ * Get the number of threads in the fallback threadpool
+ * 
+ * @param mgr Manager instance (NULL for global singleton)
+ * @return Number of threads in fallback threadpool, or 1 if not available
+ */
+int ggml_numa_coordinator_get_fallback_thread_count(struct ggml_numa_coordinator_manager * mgr);
 
 #ifdef __cplusplus
 }

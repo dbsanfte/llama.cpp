@@ -46,6 +46,7 @@ tags
 .build/
 build*
 core.*
+vgcore*
 release
 debug
 !build-info.cmake
