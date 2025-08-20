@@ -19,6 +19,9 @@
 #include <numaif.h>
 #endif
 
+#include <stdatomic.h>
+#include <stdbool.h>
+
 // Kernel headers - each operation has its own file
 #include "numa-kernels/mul_mat.h"
 #include "numa-kernels/add.h"
@@ -162,7 +165,7 @@ enum ggml_status ggml_numa_executor_compute_graph(struct ggml_cgraph * cgraph, s
         return GGML_STATUS_FAILED;  // Let standard ggml handle the computation
     }
     
-    GGML_LOG_INFO("🎯 NUMA Executor: Processing graph with %d nodes using %d threads\n", 
+    GGML_LOG_INFO("🎯 NUMA Executor: Processing graph with %d nodes (original plan: %d threads, fallback will use NUMA node 0 threads)\n", 
                   cgraph->n_nodes, cplan->n_threads);
     
     // Process each operation in the graph
@@ -244,6 +247,7 @@ float ggml_numa_executor_get_efficiency(enum ggml_op op, size_t tensor_size) {
 
 // Forward declaration of function to control fallback flag in ggml-cpu.c
 extern void ggml_numa_set_fallback_flag(bool value);
+extern enum ggml_status ggml_graph_compute_impl(struct ggml_cgraph * cgraph, struct ggml_cplan * cplan);
 
 // Calculate work buffer size needed for a specific operation (from ggml-cpu.c logic)
 static size_t ggml_numa_calculate_work_size(struct ggml_tensor * tensor, int n_threads) {
@@ -375,7 +379,7 @@ enum ggml_status ggml_numa_executor_fallback_to_cpu(struct ggml_tensor * tensor,
         GGML_LOG_DEBUG("NUMA Fallback: No coordinator available, using single-threaded execution\n");
     }
     
-    // Set up compute params for fallback execution
+    // Set up compute params for fallback execution  
     struct ggml_compute_params params = {
         .ith = 0,
         .nth = fallback_thread_count,
@@ -384,14 +388,50 @@ enum ggml_status ggml_numa_executor_fallback_to_cpu(struct ggml_tensor * tensor,
         .threadpool = fallback_threadpool  // Use dedicated fallback threadpool
     };
     
-    GGML_LOG_DEBUG("NUMA Fallback: Executing operation %s (work_size=%zu, threads=%d)\n", 
-                   ggml_op_name(tensor->op), needed_work_size, fallback_thread_count);
+    GGML_LOG_INFO("🔧 NUMA Fallback: Executing operation %s (work_size=%zu, fallback_threads=%d, params.nth=%d, threadpool=%p)\n", 
+                   ggml_op_name(tensor->op), needed_work_size, fallback_thread_count, params.nth, (void*)fallback_threadpool);
     
-    // Call the original CPU implementation with the fallback threadpool
-    ggml_compute_forward(&params, tensor);
+    // CRITICAL FIX: Use ggml_graph_compute instead of ggml_compute_forward to properly activate all worker threads
+    // Create a temporary single-node graph for this operation
+    struct ggml_cgraph temp_graph = {0};
+    temp_graph.nodes = &tensor;
+    temp_graph.n_nodes = 1;
+    temp_graph.size = 1;
+    
+    // Create a temporary compute plan for the fallback threadpool
+    struct ggml_cplan temp_cplan = {
+        .n_threads = fallback_thread_count,
+        .threadpool = fallback_threadpool,
+        .work_size = needed_work_size,
+        .work_data = work_data,
+        .abort_callback = NULL,
+        .abort_callback_data = NULL
+    };
+    
+    // Execute using the internal implementation that bypasses NUMA dispatcher
+    enum ggml_status result = ggml_graph_compute_impl(&temp_graph, &temp_cplan);
     
     // Clear flag after computation
     ggml_numa_set_fallback_flag(false);
+    
+    // Check result
+    if (result != GGML_STATUS_SUCCESS) {
+        GGML_LOG_ERROR("NUMA Fallback: Graph computation failed with status %d\n", result);
+        // Clean up allocated work buffer
+        if (allocated_work_buffer && work_data) {
+            #ifdef __linux__
+            if (numa_available() >= 0) {
+                numa_free(work_data, needed_work_size);
+                GGML_LOG_DEBUG("NUMA Fallback: Freed NUMA work buffer\n");
+            } else
+            #endif
+            {
+                free(work_data);
+                GGML_LOG_DEBUG("NUMA Fallback: Freed malloc work buffer\n");
+            }
+        }
+        return GGML_STATUS_FAILED;
+    }
     
     // Clean up allocated work buffer
     if (allocated_work_buffer && work_data) {

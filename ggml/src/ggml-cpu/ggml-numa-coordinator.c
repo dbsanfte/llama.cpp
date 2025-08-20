@@ -1686,39 +1686,6 @@ struct ggml_numa_coordinator_manager * ggml_numa_coordinator_manager_new_with_pa
     // Initialize work group tracker for data parallelism
     ggml_work_group_tracker_init(&mgr->work_groups);
     
-    // Step 2.5: Create dedicated fallback threadpool for CPU operations
-    // This is a simple threadpool on NUMA node 0 for fallback operations
-    mgr->fallback_thread_count = 1;  // Start with single thread
-    GGML_LOG_INFO("🔧 Creating fallback threadpool with %d thread(s) on NUMA node 0\n", mgr->fallback_thread_count);
-    
-    struct ggml_threadpool_params fallback_params = ggml_threadpool_params_default(mgr->fallback_thread_count);
-    // Set CPU mask to NUMA node 0 CPUs if available
-    if (numa_available() >= 0) {
-        // Clear the CPU mask first
-        for (int i = 0; i < GGML_MAX_N_THREADS; i++) {
-            fallback_params.cpumask[i] = false;
-        }
-        // Set only NUMA node 0 CPUs
-        struct bitmask * node0_mask = numa_allocate_cpumask();
-        if (numa_node_to_cpus(0, node0_mask) >= 0) {
-            for (int cpu = 0; cpu < numa_num_possible_cpus() && cpu < GGML_MAX_N_THREADS; cpu++) {
-                if (numa_bitmask_isbitset(node0_mask, cpu)) {
-                    fallback_params.cpumask[cpu] = true;
-                }
-            }
-        }
-        numa_free_cpumask(node0_mask);
-    }
-    fallback_params.strict_cpu = false;  // Allow OS to manage scheduling
-    
-    mgr->fallback_threadpool = ggml_threadpool_new(&fallback_params);
-    if (!mgr->fallback_threadpool) {
-        GGML_LOG_WARN("Failed to create fallback threadpool, fallback operations will be single-threaded\n");
-        mgr->fallback_thread_count = 0;
-    } else {
-        GGML_LOG_INFO("✅ Fallback threadpool created successfully\n");
-    }
-    
     // Step 3: Create coordinator threads (one per NUMA node)
     mgr->coordinators = malloc(sizeof(struct ggml_coordinator_thread) * num_numa_nodes);
     if (!mgr->coordinators) {
@@ -1976,6 +1943,39 @@ struct ggml_numa_coordinator_manager * ggml_numa_coordinator_manager_new_with_pa
         // Integration thread failure is not critical - manager can still work synchronously
     } else {
         GGML_LOG_INFO("✅ Async integration thread started successfully\n");
+    }
+    
+    // Create dedicated fallback threadpool for CPU operations AFTER coordinators are set up
+    // Use the same thread count as NUMA node 0 coordinator for full multithreading
+    mgr->fallback_thread_count = mgr->num_numa_nodes > 0 ? mgr->coordinators[0].n_threads : 1;
+    GGML_LOG_INFO("🔧 Creating fallback threadpool with %d thread(s) (matching NUMA node 0)\n", mgr->fallback_thread_count);
+    
+    struct ggml_threadpool_params fallback_params = ggml_threadpool_params_default(mgr->fallback_thread_count);
+    // Set CPU mask to NUMA node 0 CPUs if available
+    if (numa_available() >= 0) {
+        // Clear the CPU mask first
+        for (int i = 0; i < GGML_MAX_N_THREADS; i++) {
+            fallback_params.cpumask[i] = false;
+        }
+        // Set only NUMA node 0 CPUs
+        struct bitmask * node0_mask = numa_allocate_cpumask();
+        if (numa_node_to_cpus(0, node0_mask) >= 0) {
+            for (int cpu = 0; cpu < numa_num_possible_cpus() && cpu < GGML_MAX_N_THREADS; cpu++) {
+                if (numa_bitmask_isbitset(node0_mask, cpu)) {
+                    fallback_params.cpumask[cpu] = true;
+                }
+            }
+        }
+        numa_free_cpumask(node0_mask);
+    }
+    fallback_params.strict_cpu = false;  // Allow OS to manage scheduling
+    
+    mgr->fallback_threadpool = ggml_threadpool_new(&fallback_params);
+    if (!mgr->fallback_threadpool) {
+        GGML_LOG_WARN("Failed to create fallback threadpool, fallback operations will be single-threaded\n");
+        mgr->fallback_thread_count = 0;
+    } else {
+        GGML_LOG_INFO("✅ Fallback threadpool created successfully with %d threads\n", mgr->fallback_thread_count);
     }
     
     return mgr;

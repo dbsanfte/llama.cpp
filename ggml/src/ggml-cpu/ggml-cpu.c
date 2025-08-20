@@ -728,6 +728,10 @@ bool ggml_numa_should_dispatch(void) {
 void ggml_numa_set_fallback_flag(bool value) {
     in_numa_fallback = value;
 }
+
+bool ggml_numa_is_fallback_active(void) {
+    return in_numa_fallback;
+}
 #endif
 
 enum ggml_numa_strategy ggml_get_numa_strategy(void) {
@@ -1530,11 +1534,6 @@ UseGgmlGemm1:;
     if (ith == 0) {
         // Every thread starts at ith, so the first unprocessed chunk is nth.  This save a bit of coordination right at the start.
         atomic_store_explicit(&params->threadpool->current_chunk, nth, memory_order_relaxed);
-        
-        // Debug logging for barrier mismatch investigation
-        int threadpool_threads = atomic_load_explicit(&params->threadpool->n_threads_cur, memory_order_relaxed);
-        GGML_LOG_DEBUG("🔍 MUL_MAT barrier debug: params->nth=%d, threadpool->n_threads_cur=%d, ith=%d\n", 
-                       nth, threadpool_threads, ith);
     }
 
     ggml_barrier(params->threadpool);
@@ -2545,6 +2544,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
 }
 
 static thread_ret_t ggml_graph_compute_secondary_thread(void* data);
+enum ggml_status ggml_graph_compute_impl(struct ggml_cgraph * cgraph, struct ggml_cplan * cplan);
 
 #if defined(_WIN32)
 #include "windows.h"
@@ -3290,12 +3290,22 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
     GGML_ASSERT(cplan->work_size == 0 || cplan->work_data != NULL);
 
 #ifdef GGML_NUMA_MIRROR
+    // Check if we're inside a fallback operation to prevent infinite recursion
+    extern bool ggml_numa_is_fallback_active(void);
+    
     // NUMA intercept: Check if NUMA system should handle this graph computation
-    if (g_numa_state.numa_enabled && g_numa_state.coordinator) {
+    if (g_numa_state.numa_enabled && g_numa_state.coordinator && !ggml_numa_is_fallback_active()) {
         GGML_LOG_INFO("Processing computation graph with %d nodes through NUMA dispatcher\n", cgraph->n_nodes);
         return ggml_numa_graph_compute(cgraph, cplan->n_threads);
     }
 #endif
+
+    // Continue with non-NUMA execution
+    return ggml_graph_compute_impl(cgraph, cplan);
+}
+
+// Internal implementation without NUMA interception
+enum ggml_status ggml_graph_compute_impl(struct ggml_cgraph * cgraph, struct ggml_cplan * cplan) {
 
     int n_threads                               = cplan->n_threads;
     struct ggml_threadpool * threadpool = cplan->threadpool;
