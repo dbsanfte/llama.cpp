@@ -71,16 +71,6 @@ struct ggml_work_queue;
 struct ggml_coordinator_thread;
 
 /**
- * Memory management strategy for the NUMA coordinator
- */
-enum ggml_numa_memory_strategy {
-    GGML_NUMA_STRATEGY_AUTO,        // Adaptive strategy selection based on workload (default)
-    GGML_NUMA_STRATEGY_MATRIX_REDUCTION,  // Reduce matrix dimensions to fit memory (better scaling measurement)
-    GGML_NUMA_STRATEGY_CHUNKED_PROCESSING, // Process in chunks with full matrices (better throughput)
-    GGML_NUMA_STRATEGY_HYBRID       // Dynamic switching based on runtime conditions
-};
-
-/**
  * CPU cache hierarchy information
  */
 struct ggml_numa_cache_info {
@@ -100,7 +90,6 @@ struct ggml_numa_workload_info {
     int batch_size;                  // Batch size being processed
     int64_t available_memory_gb;     // Available system memory in GB
     bool prioritize_scaling_accuracy; // Whether to prioritize batch scaling measurement over throughput
-    enum ggml_numa_memory_strategy user_override; // User-specified strategy override
     struct ggml_numa_cache_info cache_info; // CPU cache hierarchy information
 };
 
@@ -229,17 +218,6 @@ int ggml_numa_coordinator_manager_submit_data_parallel_work(struct ggml_numa_coo
                                                             struct ggml_tensor * tensor);
 
 /**
- * Submit computation graph with data parallelism
- * This function analyzes the graph and applies data parallelism where beneficial
- * 
- * @param mgr Manager instance
- * @param cgraph Computation graph to process
- * @return 0 on success, -1 on failure
- */
-int ggml_numa_coordinator_manager_compute_graph(struct ggml_numa_coordinator_manager * mgr,
-                                               struct ggml_cgraph * cgraph);
-
-/**
  * Wait for all work to complete
  * 
  * @param mgr Manager instance
@@ -303,23 +281,6 @@ struct ggml_numa_perf_stats ggml_numa_coordinator_manager_get_stats(struct ggml_
  * @return GGML_STATUS_SUCCESS on success, GGML_STATUS_FAILED on failure
  */
 enum ggml_status ggml_numa_graph_compute_with_virtual(struct ggml_cgraph * cgraph, int n_threads, bool force_virtual_numa);
-
-/**
- * Set memory management strategy for the coordinator
- * 
- * @param mgr Manager instance
- * @param strategy Strategy to use (AUTO for adaptive selection)
- * @return 0 on success, -1 on failure
- */
-int ggml_numa_coordinator_manager_set_strategy(struct ggml_numa_coordinator_manager * mgr, enum ggml_numa_memory_strategy strategy);
-
-/**
- * Get current memory management strategy
- * 
- * @param mgr Manager instance
- * @return Current strategy
- */
-enum ggml_numa_memory_strategy ggml_numa_coordinator_manager_get_strategy(struct ggml_numa_coordinator_manager * mgr);
 
 /**
  * Get the number of NUMA nodes that the coordinator is managing
@@ -390,15 +351,6 @@ enum ggml_status ggml_numa_coordinator_execute_graph_operation(
     int numa_node
 );
 int ggml_numa_coordinator_manager_get_num_nodes(struct ggml_numa_coordinator_manager * mgr);
-
-/**
- * Choose optimal memory management strategy based on workload characteristics
- * This function implements the adaptive strategy selection logic based on A/B test results
- * 
- * @param workload Workload characteristics
- * @return Recommended strategy
- */
-enum ggml_numa_memory_strategy ggml_numa_choose_strategy(const struct ggml_numa_workload_info * workload);
 
 /**
  * Submit tensor with adaptive strategy selection

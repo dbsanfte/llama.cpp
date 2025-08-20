@@ -22,7 +22,7 @@
 #include "ggml.h"
 #include "ggml-cpu.h" 
 #include "ggml-cpu-impl.h"
-#include "ggml-numa-operation-dispatch.h"
+#include "ggml-numa-executor.h"
 #include "ggml-numa-coordinator.h"
 
 // Test work function that simulates different execution times

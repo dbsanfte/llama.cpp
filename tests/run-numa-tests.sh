@@ -50,16 +50,7 @@ BIN_DIR="$BUILD_DIR/bin"
 NUMA_TESTS=(
     "test-numa-coordinator"
     "test-numa-coordinator-wait"
-    "test-numa-dispatcher"
-    "test-numa-mathematical-correctness"
-    "test-numa-mathematical-correctness-soft-max"
-    "test-numa-mathematical-correctness-rope"
     "test-numa-mathematical-correctness-add"
-    "test-numa-mathematical-correctness-glu-proper"
-    "test-numa-mathematical-correctness-rms-norm"
-    "test-numa-mathematical-correctness-flash-attn-ext"
-    "test-numa-mathematical-correctness-matmul"
-    "test-numa-reference-correctness"
 )
 
 # Statistics

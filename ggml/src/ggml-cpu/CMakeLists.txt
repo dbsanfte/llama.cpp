@@ -25,42 +25,17 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
         ggml-cpu/ggml-cpu.c
         ggml-cpu/ggml-cpu.cpp
         # New NUMA Architecture
+        ggml-cpu/ggml-numa-shared.h
         ggml-cpu/ggml-numa-coordinator.c
         ggml-cpu/ggml-numa-cpu-backend.c
         ggml-cpu/ggml-numa-cpu-backend.h
         ggml-cpu/ggml-numa-executor.c
         ggml-cpu/ggml-numa-executor.h
-        ggml-cpu/ggml-numa-work-shared.h
-        # NUMA Kernels
-        ggml-cpu/numa-kernels/mul_mat.c
-        ggml-cpu/numa-kernels/mul_mat.h
+        # NUMA Kernels - Real implementations for data-parallel execution
+        ggml-cpu/numa-kernels/numa-kernels.c
+        ggml-cpu/numa-kernels/numa-kernels.h
         ggml-cpu/numa-kernels/add.c
         ggml-cpu/numa-kernels/add.h
-        ggml-cpu/numa-kernels/kernel_stubs.c
-        ggml-cpu/numa-kernels/rms_norm.h
-        ggml-cpu/numa-kernels/soft_max.h
-        ggml-cpu/numa-kernels/rope.h
-        ggml-cpu/numa-kernels/cpy.h
-        ggml-cpu/numa-kernels/get_rows.h
-        # Transition stubs for old dispatcher functions
-        ggml-cpu/ggml-numa-dispatch-stubs.c
-        # Legacy NUMA files (to be phased out) - temporarily disabled during architecture transition
-        # ggml-cpu/ggml-numa-operation-dispatch.c
-        # ggml-cpu/ggml-numa-operation-dispatch.h
-        # ggml-cpu/numa-work/ggml-numa-add.c
-        # ggml-cpu/numa-work/ggml-numa-add.h
-        # ggml-cpu/numa-work/ggml-numa-mulmat.c
-        # ggml-cpu/numa-work/ggml-numa-mulmat.h
-        # ggml-cpu/numa-work/ggml-numa-softmax.c
-        # ggml-cpu/numa-work/ggml-numa-softmax.h
-        # ggml-cpu/numa-work/ggml-numa-rope.c
-        # ggml-cpu/numa-work/ggml-numa-rope.h
-        # ggml-cpu/numa-work/ggml-numa-glu.c
-        # ggml-cpu/numa-work/ggml-numa-glu.h
-        # ggml-cpu/numa-work/ggml-numa-rms-norm.c
-        # ggml-cpu/numa-work/ggml-numa-rms-norm.h
-        # ggml-cpu/numa-work/ggml-numa-flash-attn-ext.c
-        # ggml-cpu/numa-work/ggml-numa-flash-attn-ext.h
         ggml-work-item.c
         ggml-cpu/repack.cpp
         ggml-cpu/repack.h

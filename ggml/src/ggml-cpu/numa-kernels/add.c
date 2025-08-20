@@ -6,6 +6,7 @@
  */
 
 #include "add.h"
+#include "../ggml-numa-shared.h"          // Shared NUMA logging and utilities
 #include "../ggml-numa-coordinator.h"
 #include "../ggml-cpu-impl.h"
 #include "../ggml-impl.h"
@@ -40,6 +41,67 @@ bool ggml_numa_kernel_add_supports(const struct ggml_tensor * tensor) {
     return true;
 }
 
+// New architecture functions for kernel registry queries
+
+ggml_numa_execution_strategy_t ggml_numa_kernel_add_get_strategy(const struct ggml_tensor * tensor) {
+    ggml_numa_execution_strategy_t strategy = {
+        .node_strategy = NUMA_NODE_STRATEGY_SINGLE,
+        .on_node_strategy = NUMA_ON_NODE_STRATEGY_MULTI_THREAD
+    };
+    
+    if (!tensor) {
+        return strategy;
+    }
+    
+    size_t tensor_size = ggml_nelements(tensor);
+    
+    // Use data-parallel execution for large tensors
+    if (tensor_size >= 32768) {  // 32K elements threshold
+        strategy.node_strategy = NUMA_NODE_STRATEGY_DATA_PARALLEL;
+    }
+    
+    return strategy;
+}
+
+size_t ggml_numa_kernel_add_get_buffer_size(const struct ggml_tensor * tensor) {
+    // Element-wise ADD doesn't need significant work buffers
+    // Just a small buffer for potential temporary calculations
+    (void)tensor;  // Unused for ADD
+    return 1024;   // 1KB per thread should be sufficient
+}
+
+ggml_numa_work_function_t ggml_numa_kernel_add_get_work_function(const struct ggml_tensor * tensor) {
+    (void)tensor;  // For ADD, we use the same work function regardless of tensor
+    return ggml_numa_kernel_add_work_function;
+}
+
+float ggml_numa_kernel_add_get_efficiency(const struct ggml_tensor * tensor) {
+    if (!tensor) {
+        return 0.0f;
+    }
+    
+    size_t tensor_size = ggml_nelements(tensor);
+    
+    // ADD is highly parallel, efficiency depends mainly on data size
+    if (tensor_size >= 32768) {
+        return 0.95f;  // Very high efficiency for large tensors
+    } else if (tensor_size >= 4096) {
+        return 0.80f;  // Good efficiency for medium tensors
+    } else {
+        return 0.50f;  // Lower efficiency for small tensors due to overhead
+    }
+}
+
+// Work function that will be called by the coordinator
+enum ggml_status ggml_numa_kernel_add_work_function(void * work_context, struct ggml_compute_params * params) {
+    // TODO: This needs to be implemented to extract tensor from work_context
+    // and perform the actual ADD computation using SIMD operations
+    // For now, return success to allow compilation
+    (void)work_context;
+    (void)params;
+    return GGML_STATUS_SUCCESS;
+}
+
 enum ggml_status ggml_numa_kernel_add_execute(struct ggml_tensor * tensor, struct ggml_cplan * cplan) {
     if (!ggml_numa_kernel_add_supports(tensor)) {
         return GGML_STATUS_FAILED;
@@ -65,7 +127,8 @@ enum ggml_status ggml_numa_kernel_add_execute(struct ggml_tensor * tensor, struc
     return GGML_STATUS_SUCCESS;
 }
 
-float ggml_numa_kernel_add_get_efficiency(const struct ggml_tensor * tensor, size_t tensor_size) {
+// Legacy function for backward compatibility (different signature)
+float ggml_numa_kernel_add_get_efficiency_legacy(const struct ggml_tensor * tensor, size_t tensor_size) {
     if (!ggml_numa_kernel_add_supports(tensor)) {
         return -1.0f;
     }

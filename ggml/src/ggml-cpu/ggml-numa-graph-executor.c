@@ -6,7 +6,7 @@
  * any calls back into ggml_graph_compute().
  */
 
-#include "ggml-numa-operation-dispatch.h"
+#include "ggml-numa-executor.h"
 #include "ggml-numa-coordinator.h"
 #include "ggml-cpu.h"
 #include "ggml-cpu-impl.h"

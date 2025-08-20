@@ -8,7 +8,7 @@
 #pragma once
 
 #include "ggml.h"
-#include "ggml-impl.h"
+#include "../ggml-impl.h"
 #include "ggml-cpu.h"  // For complete ggml_cplan definition
 
 #ifdef __cplusplus
@@ -18,6 +18,19 @@ extern "C" {
 // Forward declarations
 struct ggml_numa_coordinator_manager;
 struct ggml_cplan;
+
+/**
+ * Initialize the NUMA executor and kernel registry
+ * This must be called before using any executor functions
+ * 
+ * @return GGML_STATUS_SUCCESS on success, error code on failure
+ */
+enum ggml_status ggml_numa_executor_init(void);
+
+/**
+ * Cleanup the NUMA executor and kernel registry
+ */
+void ggml_numa_executor_cleanup(void);
 
 /**
  * Execute a compute graph using NUMA-aware strategies
@@ -44,21 +57,14 @@ enum ggml_status ggml_numa_executor_execute_tensor(
     struct ggml_cplan * cplan);
 
 /**
- * Check if executor supports a specific operation
+ * Execute compute graph using NUMA-aware executor
+ * Main entry point for compute graph execution with NUMA optimization
  * 
- * @param op The operation type to check
- * @return true if supported, false otherwise
+ * @param cgraph The compute graph to execute
+ * @param cplan The compute plan
+ * @return GGML_STATUS_SUCCESS on success, error code on failure
  */
-bool ggml_numa_executor_supports_op(enum ggml_op op);
-
-/**
- * Get estimated efficiency for an operation
- * 
- * @param op The operation type
- * @param tensor_size Size in elements
- * @return Efficiency estimate (0.0-1.0) or -1.0 if unsupported
- */
-float ggml_numa_executor_get_efficiency(enum ggml_op op, size_t tensor_size);
+enum ggml_status ggml_numa_executor_execute_graph(struct ggml_cgraph * cgraph, struct ggml_cplan * cplan);
 
 /**
  * Fallback to standard CPU implementation for unsupported operations

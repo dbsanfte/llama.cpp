@@ -17,7 +17,7 @@
 
 #ifdef GGML_NUMA_MIRROR
 #include "ggml-numa-coordinator.h"
-#include "ggml-numa-operation-dispatch.h"
+#include "ggml-numa-executor.h"
 #include "ggml-numa-executor.h"
 #ifdef __linux__
 #include <numa.h>
@@ -583,23 +583,6 @@ int ggml_threadpool_chunk_add(struct ggml_threadpool * tp, int value) {
 // NUMA Management Functions
 //
 
-#ifdef GGML_NUMA_MIRROR
-static enum ggml_numa_memory_strategy ggml_numa_strategy_to_coordinator_strategy(enum ggml_numa_strategy strategy) {
-    switch (strategy) {
-        case GGML_NUMA_STRATEGY_DISABLED:
-            return GGML_NUMA_STRATEGY_AUTO;  // Use default if not disabled
-        case GGML_NUMA_STRATEGY_ISOLATE:
-            return GGML_NUMA_STRATEGY_MATRIX_REDUCTION;  // Better for isolation
-        case GGML_NUMA_STRATEGY_NUMACTL:
-            return GGML_NUMA_STRATEGY_HYBRID;  // Respect numactl settings with hybrid approach
-        case GGML_NUMA_STRATEGY_MIRROR:
-            return GGML_NUMA_STRATEGY_AUTO;  // Mirror uses auto-selection with coordinator data parallelism
-        default:
-            return GGML_NUMA_STRATEGY_AUTO;
-    }
-}
-#endif // GGML_NUMA_MIRROR
-
 static void ggml_numa_init_coordinator(enum ggml_numa_strategy numa_strategy, const struct ggml_threadpool_params * tpp) {
 #ifdef GGML_NUMA_MIRROR
     if (numa_strategy == GGML_NUMA_STRATEGY_DISABLED) {
@@ -610,10 +593,6 @@ static void ggml_numa_init_coordinator(enum ggml_numa_strategy numa_strategy, co
     g_numa_state.coordinator = ggml_numa_coordinator_manager_get_global_with_params(tpp);
     
     if (g_numa_state.coordinator) {
-        // Set the appropriate memory strategy
-        enum ggml_numa_memory_strategy coord_strategy = ggml_numa_strategy_to_coordinator_strategy(numa_strategy);
-        ggml_numa_coordinator_manager_set_strategy(g_numa_state.coordinator, coord_strategy);
-        
         // Query actual NUMA capabilities from coordinator
         g_numa_state.numa_enabled = true;
         
@@ -1902,19 +1881,10 @@ void ggml_compute_forward(struct ggml_compute_params * params, struct ggml_tenso
     }
 
 #ifdef GGML_NUMA_MIRROR
-    // NUMA dispatch intercept - route operations to NUMA coordinator when NUMA dispatch is enabled
-    if (ggml_numa_should_dispatch() && params->ith == 0) {
-        extern enum ggml_status ggml_numa_intercept_operation(struct ggml_tensor * tensor, struct ggml_compute_params * params);
-        enum ggml_status numa_result = ggml_numa_intercept_operation(tensor, params);
-        
-        if (numa_result == GGML_STATUS_SUCCESS) {
-            // Operation was successfully handled by NUMA system
-            return;
-        }
-        
-        // If NUMA dispatch failed, continue with standard execution
-        GGML_LOG_DEBUG("NUMA dispatch failed for %s, using standard execution\n", ggml_op_name(tensor->op));
-    }
+    // NOTE: NUMA dispatch is now handled by the executor at the graph level
+    // Individual tensor operations no longer intercept here - they use the 
+    // executor for optimal NUMA-aware execution
+    GGML_LOG_DEBUG("Tensor operation %s executed via standard CPU path (NUMA handled at graph level)\n", ggml_op_name(tensor->op));
 #endif
 
     switch (tensor->op) {
@@ -3295,8 +3265,8 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
     
     // NUMA intercept: Check if NUMA system should handle this graph computation
     if (g_numa_state.numa_enabled && g_numa_state.coordinator && !ggml_numa_is_fallback_active()) {
-        GGML_LOG_INFO("Processing computation graph with %d nodes through NUMA dispatcher\n", cgraph->n_nodes);
-        return ggml_numa_graph_compute(cgraph, cplan->n_threads);
+        GGML_LOG_INFO("Processing computation graph with %d nodes through NUMA executor\n", cgraph->n_nodes);
+        return ggml_numa_executor_compute_graph(cgraph, cplan);
     }
 #endif
 
@@ -3389,22 +3359,19 @@ enum ggml_status ggml_graph_compute_with_ctx(struct ggml_context * ctx, struct g
             }
         }
         
-        // Try to use persistent dispatcher work buffer for NUMA optimization
-        extern bool ggml_numa_dispatch_ensure_work_buffer(int numa_node, size_t required_size);
-        extern void* ggml_numa_dispatch_get_work_buffer(int numa_node, size_t* buffer_size);
-        
-        if (ggml_numa_dispatch_ensure_work_buffer(numa_node, cplan.work_size)) {
-            size_t buffer_size = 0;
-            void* persistent_buffer = ggml_numa_dispatch_get_work_buffer(numa_node, &buffer_size);
+        // Try to use persistent coordinator work buffer for NUMA optimization
+        struct ggml_numa_coordinator_manager * manager = ggml_numa_coordinator_manager_get_existing();
+        if (manager && ggml_numa_coordinator_ensure_work_buffer(manager, numa_node, cplan.work_size)) {
+            void * persistent_buffer = ggml_numa_coordinator_get_work_buffer(manager, numa_node);
             
-            if (persistent_buffer && buffer_size >= cplan.work_size) {
+            if (persistent_buffer) {
                 cplan.work_data = (uint8_t *)persistent_buffer;
                 GGML_LOG_DEBUG("Using NUMA-aware persistent work buffer: %zu bytes on node %d (replaces ggml_new_buffer)\n", 
-                               buffer_size, numa_node);
+                               cplan.work_size, numa_node);
             } else {
                 // Fallback to original context allocation
                 cplan.work_data = (uint8_t *)ggml_new_buffer(ctx, cplan.work_size);
-                GGML_LOG_DEBUG("Fallback to context work buffer: %zu bytes (NUMA dispatcher unavailable)\n", cplan.work_size);
+                GGML_LOG_DEBUG("Fallback to context work buffer: %zu bytes (NUMA coordinator unavailable)\n", cplan.work_size);
             }
         } else {
             // Fallback to original context allocation

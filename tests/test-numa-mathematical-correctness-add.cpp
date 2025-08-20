@@ -38,7 +38,7 @@
 // GGML includes
 #include "ggml.h"
 #include "ggml-cpu.h"
-#include "ggml-numa-operation-dispatch.h"
+#include "ggml-numa-executor.h"
 #include "ggml-numa-coordinator.h"
 #include "ggml-cpu/binary-ops.h"
 
@@ -146,7 +146,17 @@ private:
         numa_params.wsize = 0;
         numa_params.wdata = nullptr;
         numa_params.threadpool = nullptr;
-        enum ggml_status dispatch_result = ggml_numa_intercept_operation(numa_result, &numa_params);
+        // Create minimal compute plan for single tensor execution
+        struct ggml_cplan cplan = {};
+        cplan.work_size = 0;
+        cplan.work_data = nullptr;
+        cplan.n_threads = num_threads;
+        cplan.threadpool = nullptr;
+        cplan.abort_callback = nullptr;
+        cplan.abort_callback_data = nullptr;
+        
+        // Execute with new executor architecture
+        enum ggml_status dispatch_result = ggml_numa_executor_execute_tensor(numa_result, &cplan);
         
         if (dispatch_result != GGML_STATUS_SUCCESS) {
             printf("      ❌ NUMA dispatch failed for %s: %d\n", size_label, dispatch_result);

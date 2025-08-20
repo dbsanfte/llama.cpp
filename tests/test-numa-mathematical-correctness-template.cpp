@@ -38,7 +38,7 @@
 // GGML includes
 #include "ggml.h"
 #include "ggml-cpu.h"
-#include "ggml-numa-operation-dispatch.h"
+#include "ggml-numa-executor.h"
 #include "ggml-numa-coordinator.h"
 
 // Test result structure

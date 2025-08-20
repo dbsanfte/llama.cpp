@@ -4,20 +4,19 @@
  * Flow: Main Thread → Coordinator Threads → NUMA Node Threadpools
  * 
  * Design Principles:
- * 1. Main thread creates coordinator threads (one per NUMA node)
- * 2. Each coordinator thread manages one NUMA node with its own threadpool
- * 3. Work flows: main → global queue → coordinator → NUMA pool → coordinator → main
- * 4. Cleanup flows: main → coordinator → NUMA pool (hierarchical)
+ *  - Main thread creates coordinator threads (one per NUMA node)
+ *  - Each coordinator thread manages one NUMA node with its own threadpool
+ *  - Work is dispatched to nodes/threads based on execution strategy
  */
 
 #include "ggml-numa-coordinator.h"
-#include "ggml-numa-executor.h"           // New NUMA executor
-#include "ggml-numa-work-shared.h"         // Shared logging macros and utilities
+#include "ggml-numa-executor.h"           // NUMA executor
+#include "ggml-numa-shared.h"             // Shared logging macros and utilities
 #include "ggml-impl.h"
 #include "ggml-cpu.h"
-#include "ggml-cpu-impl.h"  // For ggml_compute_params structure
-#include "ops.h"  // For ggml_compute_forward_* functions
-#include "binary-ops.h"  // For binary operation functions
+#include "ggml-cpu-impl.h"                // For ggml_compute_params structure
+#include "ops.h"                          // For ggml_compute_forward_* functions
+#include "binary-ops.h"                   // For binary operation functions
 
 #ifdef __linux__
 #include <sched.h>
@@ -253,13 +252,9 @@ struct ggml_numa_coordinator_manager {
     int64_t numa_times_us[GGML_NUMA_MAX_NODES];           // Individual NUMA node computation times
     int64_t last_computation_elements;                    // Elements in last computation (for throughput)
     
-    // Memory management strategy
-    enum ggml_numa_memory_strategy memory_strategy;       // Current memory management strategy
-    
     // Work status tracking for critical error handling
     atomic_int last_work_status;                          // Last work execution status (ggml_status)
     ggml_mutex_t status_mutex;                           // Mutex for status updates
-    ggml_mutex_t strategy_mutex;                          // Mutex for strategy changes
     
     // Fallback threadpool for simple CPU operations
     struct ggml_threadpool * fallback_threadpool;         // Simple threadpool for CPU fallbacks (NUMA node 0)
@@ -1660,24 +1655,11 @@ struct ggml_numa_coordinator_manager * ggml_numa_coordinator_manager_new_with_pa
     mgr->progress_callback = NULL;
     mgr->progress_callback_user_data = NULL;
     
-    // Initialize memory management strategy
-    mgr->memory_strategy = GGML_NUMA_STRATEGY_AUTO;  // Default to adaptive strategy
-    ggml_mutex_init(&mgr->strategy_mutex);
-    
     // Initialize work status tracking
     atomic_init(&mgr->last_work_status, GGML_STATUS_SUCCESS);
     ggml_mutex_init(&mgr->status_mutex);
     
-    // Log memory strategy information
-    const char* strategy_name = "UNKNOWN";
-    switch(mgr->memory_strategy) {
-        case GGML_NUMA_STRATEGY_AUTO: strategy_name = "AUTO"; break;
-        case GGML_NUMA_STRATEGY_MATRIX_REDUCTION: strategy_name = "MATRIX_REDUCTION"; break;
-        case GGML_NUMA_STRATEGY_CHUNKED_PROCESSING: strategy_name = "CHUNKED_PROCESSING"; break;
-        case GGML_NUMA_STRATEGY_HYBRID: strategy_name = "HYBRID"; break;
-        default: strategy_name = "UNKNOWN"; break;
-    }
-    GGML_LOG_INFO("    Memory strategy: %s\n", strategy_name);
+    GGML_LOG_INFO("    Coordinator initialized for executor-based dispatch\n");
     
     ggml_mutex_init(&mgr->main_sync_mutex);
     ggml_cond_init(&mgr->main_sync_cond);
@@ -1906,17 +1888,7 @@ struct ggml_numa_coordinator_manager * ggml_numa_coordinator_manager_new_with_pa
     GGML_LOG_INFO("    Total threads distributed: %d (avg %d per node)\n", 
                   total_distributed_threads, avg_threads_per_node);
     
-    // Get current strategy name for final summary
-    const char* final_strategy_name = "UNKNOWN";
-    switch(mgr->memory_strategy) {
-        case GGML_NUMA_STRATEGY_AUTO: final_strategy_name = "AUTO"; break;
-        case GGML_NUMA_STRATEGY_MATRIX_REDUCTION: final_strategy_name = "MATRIX_REDUCTION"; break;
-        case GGML_NUMA_STRATEGY_CHUNKED_PROCESSING: final_strategy_name = "CHUNKED_PROCESSING"; break;
-        case GGML_NUMA_STRATEGY_HYBRID: final_strategy_name = "HYBRID"; break;
-        default: final_strategy_name = "UNKNOWN"; break;
-    }
-    
-    GGML_LOG_INFO("    Memory strategy: %s\n", final_strategy_name);
+    GGML_LOG_INFO("    Architecture: Executor-driven dispatch with NUMA-aware coordination\n");
     GGML_LOG_INFO("    Thread binding: %s\n", 
                   tpp->cpumask[0] ? "CPU affinity enforced" : "Default OS scheduling");
     GGML_LOG_INFO("    Manager state: ACTIVE and ready for work distribution\n");
@@ -2153,7 +2125,6 @@ void ggml_numa_coordinator_manager_free(struct ggml_numa_coordinator_manager * m
     ggml_work_queue_destroy(&mgr->global_work_queue);
     ggml_cond_destroy(&mgr->main_sync_cond);
     ggml_mutex_destroy(&mgr->main_sync_mutex);
-    ggml_mutex_destroy(&mgr->strategy_mutex);
     
     // Clean up async integration system
     ggml_cond_destroy(&mgr->integration_work_available);
@@ -2579,80 +2550,6 @@ int ggml_numa_coordinator_manager_submit_data_parallel_work(struct ggml_numa_coo
     
     GGML_LOG_DEBUG("Created data parallel work group %d with %d chunks\n", group->group_id, num_chunks);
     return group->group_id;
-}
-
-// Submit computation graph to coordinator manager
-int ggml_numa_coordinator_manager_compute_graph(struct ggml_numa_coordinator_manager * mgr,
-                                               struct ggml_cgraph * cgraph) {
-    if (!mgr || !cgraph) return -1;
-    
-    GGML_LOG_INFO("Submitting computation graph with %d nodes to coordinator manager (%d NUMA nodes)\n", 
-                  cgraph->n_nodes, mgr->num_numa_nodes);
-    
-    // Set the cgraph for all coordinators (they will use their own copies)
-    int result = ggml_numa_coordinator_manager_set_cgraph(mgr, cgraph);
-    if (result != 0) {
-        GGML_LOG_ERROR("Failed to set cgraph for coordinators\n");
-        return -1;
-    }
-    
-    // Start coordinator threads if not already started
-    result = ggml_numa_coordinator_manager_start(mgr);
-    if (result != 0) {
-        GGML_LOG_ERROR("Failed to start coordinator threads\n");
-        return -1;
-    }
-    
-    // Process each node in the computation graph
-    // Delegate all operation-specific logic to the dispatcher
-    for (int i = 0; i < cgraph->n_nodes; i++) {
-        struct ggml_tensor * node = cgraph->nodes[i];
-        if (!node) continue;
-        
-        GGML_LOG_DEBUG("Node %d: Processing operation %s (%ld elements) via dispatcher\n", 
-                       i, ggml_op_name(node->op), ggml_nelements(node));
-        
-        // Create context for the dispatcher - use same approach as existing dispatcher code
-        ggml_numa_work_context_t context = {
-            .total_elements = ggml_nelements(node),
-            .element_size = ggml_element_size(node),
-            .numa_nodes = mgr->num_numa_nodes,
-            .threads_per_node = mgr->num_numa_nodes > 0 ? mgr->coordinators[0].n_threads : 1,
-            .l3_cache_size = 8ULL * 1024 * 1024,  // 8MB default
-            .memory_bandwidth = 100ULL * 1024 * 1024 * 1024  // 100GB/s default
-        };
-        
-        // Copy tensor dimensions
-        for (int j = 0; j < GGML_MAX_DIMS && j < 4; j++) {
-            context.ne[j] = node->ne[j];
-        }
-        context.n_dims = ggml_n_dims(node);
-        
-        // Delegate to dispatcher - it will handle all operation-specific decisions:
-        // - Operation type analysis
-        // - Data parallelism vs single-node decision  
-        // - Work function selection
-        // - Execution strategy optimization
-        enum ggml_status dispatch_result = ggml_numa_dispatch_operation(mgr, node, &context);
-        
-        if (dispatch_result != GGML_STATUS_SUCCESS) {
-            GGML_LOG_ERROR("Failed to dispatch operation %s for cgraph node %d (status: %d)\n", 
-                           ggml_op_name(node->op), i, dispatch_result);
-            return -1;
-        }
-        
-        GGML_LOG_DEBUG("Node %d: Successfully dispatched operation %s\n", i, ggml_op_name(node->op));
-    }
-    
-    // Wait for any remaining single-node work to complete
-    result = ggml_numa_coordinator_manager_wait_for_completion(mgr);
-    if (result != 0) {
-        GGML_LOG_ERROR("Failed to wait for computation completion\n");
-        return -1;
-    }
-    
-    GGML_LOG_INFO("Computation graph completed successfully with data parallelism\n");
-    return 0;
 }
 
 // Wait for all work to complete (Step 7: Main thread waits with condition variables)
@@ -3096,33 +2993,8 @@ static enum ggml_status ggml_numa_execute_assigned_operations(
 }
 
 // ================================================================================================
-// Memory Management Strategy Implementation
+// NUMA Node Management
 // ================================================================================================
-
-int ggml_numa_coordinator_manager_set_strategy(struct ggml_numa_coordinator_manager * mgr, enum ggml_numa_memory_strategy strategy) {
-    if (!mgr) {
-        return -1;
-    }
-    
-    ggml_mutex_lock(&mgr->strategy_mutex);
-    mgr->memory_strategy = strategy;
-    ggml_mutex_unlock(&mgr->strategy_mutex);
-    
-    GGML_LOG_DEBUG("NUMA coordinator strategy set to %d\n", strategy);
-    return 0;
-}
-
-enum ggml_numa_memory_strategy ggml_numa_coordinator_manager_get_strategy(struct ggml_numa_coordinator_manager * mgr) {
-    if (!mgr) {
-        return GGML_NUMA_STRATEGY_AUTO;
-    }
-    
-    ggml_mutex_lock(&mgr->strategy_mutex);
-    enum ggml_numa_memory_strategy strategy = mgr->memory_strategy;
-    ggml_mutex_unlock(&mgr->strategy_mutex);
-    
-    return strategy;
-}
 
 int ggml_numa_coordinator_manager_get_num_nodes(struct ggml_numa_coordinator_manager * mgr) {
     if (!mgr) {
@@ -3132,98 +3004,6 @@ int ggml_numa_coordinator_manager_get_num_nodes(struct ggml_numa_coordinator_man
     return mgr->num_numa_nodes;
 }
 
-enum ggml_numa_memory_strategy ggml_numa_choose_strategy(const struct ggml_numa_workload_info * workload) {
-    if (!workload) {
-        return GGML_NUMA_STRATEGY_MATRIX_REDUCTION; // Safe default
-    }
-    
-    // Honor user override if specified
-    if (workload->user_override != GGML_NUMA_STRATEGY_AUTO) {
-        return workload->user_override;
-    }
-    
-    // Get cache information for cache-aware optimization
-    struct ggml_numa_cache_info cache_info = {0};
-    ggml_numa_detect_cache_info(&cache_info);
-    
-    // Adaptive strategy selection based on A/B test results and cache characteristics
-    // Key findings from testing:
-    // - Small matrices (≤512): Chunked processing wins by ~4%  
-    // - Large matrices (≥768): Matrix reduction wins by ~4%
-    // - Memory efficiency: Matrix reduction uses ~50% less memory
-    // - Cache awareness: Consider L3 cache size for optimal chunk boundaries
-    
-    // If prioritizing scaling accuracy, always use matrix reduction
-    if (workload->prioritize_scaling_accuracy) {
-        return GGML_NUMA_STRATEGY_MATRIX_REDUCTION;
-    }
-    
-    // Memory-constrained environments: prefer matrix reduction
-    if (workload->available_memory_gb < 16) {
-        return GGML_NUMA_STRATEGY_MATRIX_REDUCTION;
-    }
-    
-    // Cache-aware strategy selection
-    const size_t matrix_bytes = workload->matrix_dim * workload->matrix_dim * sizeof(float);
-    const bool fits_in_l3 = cache_info.l3_cache_size > 0 && matrix_bytes <= (size_t)cache_info.l3_cache_size;
-    const bool fits_in_l2 = cache_info.l2_cache_size > 0 && matrix_bytes <= (size_t)cache_info.l2_cache_size;
-    
-    // Very small matrices that fit in L2 cache: optimize for cache locality
-    if (fits_in_l2 && workload->matrix_dim <= 256) {
-        return GGML_NUMA_STRATEGY_CHUNKED_PROCESSING; // Better cache utilization
-    }
-    
-    // Medium matrices that fit in L3 cache: consider cache sharing
-    if (fits_in_l3) {
-        if (cache_info.l3_sharing_cores > 1) {
-            // Multiple cores share L3: matrix reduction minimizes cache conflicts
-            return GGML_NUMA_STRATEGY_MATRIX_REDUCTION;
-        } else {
-            // Dedicated L3 per core: chunked processing can leverage full cache
-            return GGML_NUMA_STRATEGY_CHUNKED_PROCESSING;
-        }
-    }
-    
-    // Large matrices exceeding L3 cache: fall back to empirical results
-    if (workload->matrix_dim <= 512) {
-        // Small matrices: chunked processing for better throughput
-        return GGML_NUMA_STRATEGY_CHUNKED_PROCESSING;
-    } else if (workload->matrix_dim >= 768) {
-        // Large matrices: matrix reduction for better performance and memory efficiency
-        return GGML_NUMA_STRATEGY_MATRIX_REDUCTION;
-    } else {
-        // Medium matrices: consider batch size and cache characteristics
-        if (workload->batch_size >= 128 || (cache_info.l3_sharing_cores > 4)) {
-            // Large batches or high cache contention: prefer matrix reduction for memory efficiency
-            return GGML_NUMA_STRATEGY_MATRIX_REDUCTION;
-        } else {
-            // Small batches with good cache characteristics: chunked processing may be better
-            return GGML_NUMA_STRATEGY_CHUNKED_PROCESSING;
-        }
-    }
-}
-
-static int64_t estimate_memory_usage_gb(const struct ggml_tensor * tensor, enum ggml_numa_memory_strategy strategy) {
-    if (!tensor) return 0;
-    
-    int64_t elements = ggml_nelements(tensor);
-    int64_t element_size = ggml_element_size(tensor);
-    int64_t base_memory = elements * element_size;
-    
-    switch (strategy) {
-        case GGML_NUMA_STRATEGY_MATRIX_REDUCTION:
-            // Matrix reduction uses less memory due to smaller matrices
-            return (base_memory * 3) / (1024 * 1024 * 1024); // 3x for intermediate results, convert to GB
-            
-        case GGML_NUMA_STRATEGY_CHUNKED_PROCESSING:
-            // Chunked processing uses more memory for full-size matrices
-            return (base_memory * 6) / (1024 * 1024 * 1024); // 6x for chunks and intermediates
-            
-        default:
-            return (base_memory * 4) / (1024 * 1024 * 1024); // Conservative estimate
-    }
-}
-
 int ggml_numa_coordinator_manager_submit_adaptive_work(struct ggml_numa_coordinator_manager * mgr,
                                                        struct ggml_tensor * tensor,
                                                        const struct ggml_numa_workload_info * workload) {
@@ -3231,26 +3011,8 @@ int ggml_numa_coordinator_manager_submit_adaptive_work(struct ggml_numa_coordina
         return -1;
     }
     
-    // Get current strategy
-    enum ggml_numa_memory_strategy current_strategy = ggml_numa_coordinator_manager_get_strategy(mgr);
-    enum ggml_numa_memory_strategy chosen_strategy;
-    
-    if (current_strategy == GGML_NUMA_STRATEGY_AUTO) {
-        // Use adaptive selection
-        chosen_strategy = ggml_numa_choose_strategy(workload);
-        GGML_LOG_DEBUG("Adaptive strategy selection chose: %d\n", chosen_strategy);
-    } else {
-        // Use fixed user-specified strategy
-        chosen_strategy = current_strategy;
-        GGML_LOG_DEBUG("Using fixed strategy: %d\n", chosen_strategy);
-    }
-    
-    // Estimate memory usage for logging/monitoring
-    int64_t estimated_memory = estimate_memory_usage_gb(tensor, chosen_strategy);
-    GGML_LOG_DEBUG("Estimated memory usage: %ldGB for strategy %d\n", estimated_memory, chosen_strategy);
-    
     // For now, delegate to the existing data parallel work submission
-    // TODO: In future, implement strategy-specific processing logic here
+    // TODO: In future, implement workload-specific processing logic here
     return ggml_numa_coordinator_manager_submit_data_parallel_work(mgr, tensor);
 }
 

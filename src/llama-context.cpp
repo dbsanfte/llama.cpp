@@ -11,7 +11,7 @@
 
 #ifdef GGML_NUMA_MIRROR
 #include "ggml-numa-coordinator.h"
-#include "ggml-numa-operation-dispatch.h"
+#include "ggml-numa-executor.h"
 #endif
 
 #include <cinttypes>
@@ -1442,17 +1442,28 @@ ggml_status llama_context::graph_compute(
     ggml_threadpool_t tp = batched ? threadpool_batch        : threadpool;
 
 #ifdef GGML_NUMA_MIRROR
-    // Try to use NUMA dispatcher only if NUMA is actually enabled
+    // Try to use NUMA executor only if NUMA is actually enabled
     if (numa_coordinator && ggml_get_numa_strategy() != GGML_NUMA_STRATEGY_DISABLED) {
-        LLAMA_LOG_DEBUG("%s: using NUMA dispatcher for graph computation\n", __func__);
+        LLAMA_LOG_DEBUG("%s: using NUMA executor for graph computation\n", __func__);
         
-        // Route through dispatcher instead of coordinator directly
-        int result = ggml_numa_dispatch_compute_graph(gf, n_threads);
-        if (result == 0) {
-            LLAMA_LOG_DEBUG("%s: NUMA dispatcher completed successfully\n", __func__);
+        // Create a basic compute plan for the executor
+        struct ggml_cplan cplan = ggml_graph_plan(gf, n_threads, tp);
+        
+        // Route through executor
+        enum ggml_status result = ggml_numa_executor_compute_graph(gf, &cplan);
+        if (result == GGML_STATUS_SUCCESS) {
+            LLAMA_LOG_DEBUG("%s: NUMA executor completed successfully\n", __func__);
+            // Clean up plan work data if allocated
+            if (cplan.work_data) {
+                free(cplan.work_data);
+            }
             return GGML_STATUS_SUCCESS;
         } else {
-            LLAMA_LOG_WARN("%s: NUMA dispatcher failed, falling back to backend scheduler\n", __func__);
+            LLAMA_LOG_WARN("%s: NUMA executor failed, falling back to backend scheduler\n", __func__);
+            // Clean up plan work data if allocated
+            if (cplan.work_data) {
+                free(cplan.work_data);
+            }
         }
     }
 #endif

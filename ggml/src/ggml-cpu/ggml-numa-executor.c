@@ -22,14 +22,8 @@
 #include <stdatomic.h>
 #include <stdbool.h>
 
-// Kernel headers - each operation has its own file
-#include "numa-kernels/mul_mat.h"
-#include "numa-kernels/add.h"
-#include "numa-kernels/rms_norm.h"
-#include "numa-kernels/soft_max.h"
-#include "numa-kernels/rope.h"
-#include "numa-kernels/cpy.h"
-#include "numa-kernels/get_rows.h"
+// Kernel headers - using the new query interface
+#include "numa-kernels/numa-kernels.h"  // New centralized query interface
 
 // Missing struct definition for MUL_MAT_ID work buffer calculation
 struct mmid_row_mapping {
@@ -38,114 +32,36 @@ struct mmid_row_mapping {
 };
 
 // ============================================================================
-// Operation Registry - Maps operations to their kernel implementations
+// Core Executor Implementation  
 // ============================================================================
 
-typedef struct {
-    enum ggml_op op_type;
-    bool supported;
-    float base_efficiency;          // Base parallel efficiency estimate
-    size_t min_elements_for_numa;   // Minimum tensor size for NUMA benefit
+// Compute graph execution - analyze nodes and dispatch to NUMA kernels or fallback
+enum ggml_status ggml_numa_executor_execute_graph(struct ggml_cgraph * cgraph, struct ggml_cplan * cplan) {
+    if (!cgraph || !cplan) {
+        return GGML_STATUS_FAILED;
+    }
     
-    // Kernel interface functions
-    bool (*supports_operation)(const struct ggml_tensor * tensor);
-    enum ggml_status (*execute_operation)(struct ggml_tensor * tensor, struct ggml_cplan * cplan);
-    float (*get_efficiency)(const struct ggml_tensor * tensor, size_t tensor_size);
-} ggml_numa_kernel_registry_entry_t;
-
-static const ggml_numa_kernel_registry_entry_t numa_kernel_registry[] = {
-    // Matrix multiplication - complex but high payoff (NOT IMPLEMENTED YET)
-    {
-        .op_type = GGML_OP_MUL_MAT,
-        .supported = false,  // Mark as unsupported until implementation is complete
-        .base_efficiency = 0.85f,
-        .min_elements_for_numa = 8192,
-        .supports_operation = NULL,  // Will fall back to CPU
-        .execute_operation = NULL,
-        .get_efficiency = NULL
-    },
+    GGML_LOG_DEBUG("NUMA Executor: Processing compute graph with %d nodes\n", cgraph->n_nodes);
     
-    // Element-wise operations - simple and highly parallel
-    {
-        .op_type = GGML_OP_ADD,
-        .supported = true,
-        .base_efficiency = 0.95f,
-        .min_elements_for_numa = 4096,
-        .supports_operation = ggml_numa_kernel_add_supports,
-        .execute_operation = ggml_numa_kernel_add_execute,
-        .get_efficiency = ggml_numa_kernel_add_get_efficiency
-    },
+    // Initialize kernel registry if not already done
+    if (!ggml_numa_kernels_init()) {
+        GGML_LOG_ERROR("NUMA Executor: Failed to initialize kernel registry\n");
+        return GGML_STATUS_FAILED;
+    }
     
-    // Normalization operations - moderate complexity (NOT IMPLEMENTED YET)
-    {
-        .op_type = GGML_OP_RMS_NORM,
-        .supported = false,  // Mark as unsupported until implementation is complete
-        .base_efficiency = 0.8f,
-        .min_elements_for_numa = 2048,
-        .supports_operation = NULL,
-        .execute_operation = NULL,
-        .get_efficiency = NULL
-    },
-    
-    // Attention operations - complex synchronization (NOT IMPLEMENTED YET)
-    {
-        .op_type = GGML_OP_SOFT_MAX,
-        .supported = false,  // Mark as unsupported until implementation is complete
-        .base_efficiency = 0.7f,
-        .min_elements_for_numa = 1024,
-        .supports_operation = NULL,
-        .execute_operation = NULL,
-        .get_efficiency = NULL
-    },
-    
-    // Position embedding operations (NOT IMPLEMENTED YET)
-    {
-        .op_type = GGML_OP_ROPE,
-        .supported = false,  // Mark as unsupported until implementation is complete
-        .base_efficiency = 0.9f,
-        .min_elements_for_numa = 2048,
-        .supports_operation = NULL,
-        .execute_operation = NULL,
-        .get_efficiency = NULL
-    },
-    
-    // Memory operations - bandwidth limited but simple (NOT IMPLEMENTED YET)
-    {
-        .op_type = GGML_OP_CPY,
-        .supported = false,  // Mark as unsupported until implementation is complete
-        .base_efficiency = 0.95f,
-        .min_elements_for_numa = 4096,
-        .supports_operation = NULL,
-        .execute_operation = NULL,
-        .get_efficiency = NULL
-    },
-    
-    // Row extraction operations (NOT IMPLEMENTED YET)
-    {
-        .op_type = GGML_OP_GET_ROWS,
-        .supported = false,  // Mark as unsupported until implementation is complete
-        .base_efficiency = 0.9f,
-        .min_elements_for_numa = 1024,
-        .supports_operation = NULL,
-        .execute_operation = NULL,
-        .get_efficiency = NULL
-    },
-    
-    // Terminator
-    { .op_type = GGML_OP_COUNT, .supported = false }
-};
-
-// ============================================================================
-// Registry Lookup Functions
-// ============================================================================
-
-static const ggml_numa_kernel_registry_entry_t * find_kernel_entry(enum ggml_op op) {
-    for (int i = 0; numa_kernel_registry[i].op_type != GGML_OP_COUNT; i++) {
-        if (numa_kernel_registry[i].op_type == op) {
-            return &numa_kernel_registry[i];
+    // Process each node in the graph
+    for (int i = 0; i < cgraph->n_nodes; i++) {
+        struct ggml_tensor * node = cgraph->nodes[i];
+        
+        enum ggml_status result = ggml_numa_executor_execute_tensor(node, cplan);
+        if (result != GGML_STATUS_SUCCESS) {
+            GGML_LOG_ERROR("NUMA Executor: Failed to execute node %d (%s)\n", i, ggml_op_name(node->op));
+            return result;
         }
     }
-    return NULL;
+    
+    GGML_LOG_DEBUG("NUMA Executor: Successfully completed graph execution\n");
+    return GGML_STATUS_SUCCESS;
 }
 
 // ============================================================================
@@ -191,54 +107,93 @@ enum ggml_status ggml_numa_executor_execute_tensor(struct ggml_tensor * tensor, 
         return GGML_STATUS_FAILED;
     }
     
-    // Find the kernel for this operation
-    const ggml_numa_kernel_registry_entry_t * kernel = find_kernel_entry(tensor->op);
-    if (!kernel || !kernel->supported || !kernel->execute_operation) {
-        GGML_LOG_DEBUG("NUMA Executor: Operation %s not implemented, falling back to standard CPU\n", ggml_op_name(tensor->op));
-        return ggml_numa_executor_fallback_to_cpu(tensor, cplan);
-    }
+    // Query the kernel registry for execution information
+    ggml_numa_kernel_query_result_t query_result = ggml_numa_kernels_query(tensor);
     
-    // Check if the specific tensor variant is supported
-    if (!kernel->supports_operation || !kernel->supports_operation(tensor)) {
-        GGML_LOG_DEBUG("NUMA Executor: Operation %s not supported for this tensor config, falling back to standard CPU\n", 
+    if (!query_result.supported) {
+        GGML_LOG_DEBUG("NUMA Executor: Operation %s not supported by NUMA kernels, falling back to CPU\n", 
                       ggml_op_name(tensor->op));
         return ggml_numa_executor_fallback_to_cpu(tensor, cplan);
     }
     
-    // Calculate efficiency to decide if NUMA is worthwhile
-    size_t tensor_size = ggml_nelements(tensor);
-    float efficiency = kernel->get_efficiency(tensor, tensor_size);
+    GGML_LOG_DEBUG("NUMA Executor: %s kernel selected for %s (efficiency=%.2f, strategy=%s, buffer=%zu bytes/thread)\n",
+                   query_result.kernel_name,
+                   ggml_op_name(tensor->op),
+                   query_result.efficiency_score,
+                   (query_result.strategy.node_strategy == NUMA_NODE_STRATEGY_DATA_PARALLEL) ? "data-parallel" : "single-node",
+                   query_result.work_buffer_size_per_thread);
     
-    if (tensor_size < kernel->min_elements_for_numa || efficiency < 0.5f) {
-        GGML_LOG_DEBUG("NUMA Executor: Using single-node execution for %s (size=%zu, efficiency=%.2f)\n",
-                      ggml_op_name(tensor->op), tensor_size, efficiency);
+    // Get or create coordinator manager for dispatch
+    struct ggml_numa_coordinator_manager * mgr = ggml_numa_coordinator_manager_get_existing();
+    if (!mgr) {
+        GGML_LOG_DEBUG("NUMA Executor: No coordinator available, falling back to CPU for %s\n", 
+                       ggml_op_name(tensor->op));
+        return ggml_numa_executor_fallback_to_cpu(tensor, cplan);
+    }
+    
+    // Dispatch work to coordinator based on strategy
+    enum ggml_status result = GGML_STATUS_SUCCESS;
+    
+    int num_numa_nodes = ggml_numa_coordinator_manager_get_num_nodes(mgr);
+    if (query_result.strategy.node_strategy == NUMA_NODE_STRATEGY_DATA_PARALLEL && num_numa_nodes > 1) {
+        // Multi-node data-parallel execution
+        GGML_LOG_DEBUG("NUMA Executor: Dispatching %s to coordinator for data-parallel execution across %d nodes\n", 
+                       ggml_op_name(tensor->op), num_numa_nodes);
+        
+        // Submit data-parallel work (coordinator will handle work function dispatch)
+        int work_group_id = ggml_numa_coordinator_manager_submit_data_parallel_work(mgr, tensor);
+        if (work_group_id < 0) {
+            GGML_LOG_ERROR("NUMA Executor: Failed to submit data-parallel work for %s\n", ggml_op_name(tensor->op));
+            return ggml_numa_executor_fallback_to_cpu(tensor, cplan);
+        }
+        
+        // Wait for completion
+        if (ggml_numa_coordinator_manager_wait_for_work_group(mgr, work_group_id) != 0) {
+            GGML_LOG_ERROR("NUMA Executor: Data-parallel work group failed for %s\n", ggml_op_name(tensor->op));
+            return GGML_STATUS_FAILED;
+        }
+        
+        result = ggml_numa_coordinator_manager_wait_for_completion(mgr);
+        
     } else {
-        GGML_LOG_DEBUG("NUMA Executor: Using NUMA execution for %s (size=%zu, efficiency=%.2f)\n",
-                      ggml_op_name(tensor->op), tensor_size, efficiency);
+        // Single-node execution - choose optimal node (for now, use node 0)
+        int target_node = 0;
+        
+        GGML_LOG_DEBUG("NUMA Executor: Dispatching %s to coordinator for single-node execution on node %d\n", 
+                       ggml_op_name(tensor->op), target_node);
+        
+        // Create work context that includes the tensor and compute plan
+        // TODO: This needs to be a proper context structure that the work function can use
+        void * work_context = tensor;  // Simplified for now
+        
+        // Submit work function to coordinator
+        int work_group_id = ggml_numa_coordinator_manager_submit_work_function(
+            mgr, query_result.work_function, work_context, target_node, 
+            query_result.strategy, query_result.work_buffer_size_per_thread);
+        
+        if (work_group_id < 0) {
+            GGML_LOG_ERROR("NUMA Executor: Failed to submit single-node work for %s\n", ggml_op_name(tensor->op));
+            return ggml_numa_executor_fallback_to_cpu(tensor, cplan);
+        }
+        
+        // Wait for completion
+        if (ggml_numa_coordinator_manager_wait_for_work_group(mgr, work_group_id) != 0) {
+            GGML_LOG_ERROR("NUMA Executor: Single-node work group failed for %s\n", ggml_op_name(tensor->op));
+            return GGML_STATUS_FAILED;
+        }
+        
+        result = ggml_numa_coordinator_manager_wait_for_completion(mgr);
     }
     
-    // Execute using the kernel
-    return kernel->execute_operation(tensor, cplan);
-}
-
-bool ggml_numa_executor_supports_op(enum ggml_op op) {
-    const ggml_numa_kernel_registry_entry_t * kernel = find_kernel_entry(op);
-    return kernel && kernel->supported;
-}
-
-float ggml_numa_executor_get_efficiency(enum ggml_op op, size_t tensor_size) {
-    const ggml_numa_kernel_registry_entry_t * kernel = find_kernel_entry(op);
-    if (!kernel || !kernel->supported) {
-        return -1.0f;
-    }
-    
-    // Return base efficiency scaled by tensor size appropriateness
-    if (tensor_size >= kernel->min_elements_for_numa) {
-        return kernel->base_efficiency;
+    if (result == GGML_STATUS_SUCCESS) {
+        GGML_LOG_DEBUG("NUMA Executor: Successfully completed %s using %s\n", 
+                       ggml_op_name(tensor->op), query_result.kernel_name);
     } else {
-        // Reduced efficiency for small tensors
-        return kernel->base_efficiency * 0.3f;
+        GGML_LOG_ERROR("NUMA Executor: Failed to execute %s using %s (status=%d)\n", 
+                       ggml_op_name(tensor->op), query_result.kernel_name, (int)result);
     }
+    
+    return result;
 }
 
 // ============================================================================
