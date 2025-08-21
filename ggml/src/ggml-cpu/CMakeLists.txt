@@ -26,11 +26,14 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
         ggml-cpu/ggml-cpu.cpp
         # New NUMA Architecture
         ggml-cpu/ggml-numa-shared.h
-        ggml-cpu/ggml-numa-coordinator.c
+        ggml-cpu/ggml-numa-simple-coordinator.c
+        ggml-cpu/ggml-numa-simple-coordinator.h
         ggml-cpu/ggml-numa-cpu-backend.c
         ggml-cpu/ggml-numa-cpu-backend.h
         ggml-cpu/ggml-numa-executor.c
         ggml-cpu/ggml-numa-executor.h
+        ggml-cpu/ggml-numa-perf.c
+        ggml-cpu/ggml-numa-perf.h
         # NUMA Kernels - Real implementations for data-parallel execution
         ggml-cpu/numa-kernels/numa-kernels.c
         ggml-cpu/numa-kernels/numa-kernels.h

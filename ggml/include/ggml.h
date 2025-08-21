@@ -2489,6 +2489,11 @@ extern "C" {
     GGML_API bool ggml_is_numa(void);
     GGML_API int  ggml_numa_node_count(void);
 
+    // NUMA-aware memory allocation functions  
+    GGML_API void * ggml_numa_alloc_context_memory(size_t size, void * numa_ctx);
+    GGML_API void   ggml_numa_free(void * ptr);
+    GGML_API bool   ggml_numa_is_numa_allocated(void * ptr);
+
     GGML_API struct ggml_threadpool_params ggml_threadpool_params_default(int n_threads);
     GGML_API void                          ggml_threadpool_params_init   (struct ggml_threadpool_params * p, int n_threads);
     GGML_API bool                          ggml_threadpool_params_match  (const struct ggml_threadpool_params * p0, const struct ggml_threadpool_params * p1);

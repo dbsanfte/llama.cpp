@@ -8,15 +8,17 @@
  */
 
 #include "ggml-numa-executor.h"
-#include "ggml-numa-coordinator.h"
+#include "ggml-numa-simple-coordinator.h"
 #include "ggml-cpu-impl.h"
 #include "ggml-impl.h"
 #include "ggml-cpu.h"  // For ggml_compute_forward_* function declarations
 #include "ops.h"       // For actual ggml_compute_forward_* declarations
+#include "ggml-numa-perf.h"  // Performance instrumentation
 
 #ifdef __linux__
 #include <numa.h>
 #include <numaif.h>
+#include <sched.h>
 #endif
 
 #include <stdatomic.h>
@@ -78,7 +80,9 @@ enum ggml_status ggml_numa_executor_compute_graph(struct ggml_cgraph * cgraph, s
     extern bool ggml_numa_should_dispatch(void);
     if (!ggml_numa_should_dispatch()) {
         GGML_LOG_DEBUG("NUMA Executor: NUMA dispatch disabled, using standard ggml computation\n");
-        return GGML_STATUS_FAILED;  // Let standard ggml handle the computation
+        // Call standard ggml computation instead of failing
+        extern enum ggml_status ggml_graph_compute_impl(struct ggml_cgraph * cgraph, struct ggml_cplan * cplan);
+        return ggml_graph_compute_impl(cgraph, cplan);
     }
     
     GGML_LOG_INFO("🎯 NUMA Executor: Processing graph with %d nodes (original plan: %d threads, fallback will use NUMA node 0 threads)\n", 
@@ -104,95 +108,128 @@ enum ggml_status ggml_numa_executor_compute_graph(struct ggml_cgraph * cgraph, s
 
 enum ggml_status ggml_numa_executor_execute_tensor(struct ggml_tensor * tensor, struct ggml_cplan * cplan) {
     if (!tensor || !cplan) {
+        printf("DEBUG: NUMA Executor: NULL tensor=%p or cplan=%p, returning FAILED\n", tensor, cplan);
         return GGML_STATUS_FAILED;
     }
     
+    const char* op_name = ggml_op_name(tensor->op);
+    size_t tensor_size = ggml_nbytes(tensor);
+    
+    NUMA_PERF_START(NUMA_PERF_OPERATION_TOTAL, op_name, "numa_executor", -1, tensor_size, cplan->n_threads);
+    
+    printf("DEBUG: NUMA Executor: Starting execution for %s, threads=%d\n", op_name, cplan->n_threads);
+    
+    // Check NUMA environment
+    #ifdef __linux__
+    int current_cpu = sched_getcpu();
+    int current_node = numa_node_of_cpu(current_cpu);
+    int numa_nodes = numa_max_node() + 1;
+    printf("DEBUG: NUMA Executor: Running on CPU %d (NUMA node %d), %d nodes available\n", 
+           current_cpu, current_node, numa_nodes);
+    #else
+    printf("DEBUG: NUMA Executor: NUMA info not available (not Linux)\n");
+    #endif
+    
     // Query the kernel registry for execution information
+    NUMA_PERF_START(NUMA_PERF_EXECUTOR_QUERY, op_name, "kernel_registry", -1, 0, 0);
     ggml_numa_kernel_query_result_t query_result = ggml_numa_kernels_query(tensor);
+    NUMA_PERF_END();
+    
+    printf("DEBUG: NUMA Executor: Query result - supported=%s, kernel=%s\n", 
+           query_result.supported ? "true" : "false", 
+           query_result.supported ? query_result.kernel_name : "N/A");
     
     if (!query_result.supported) {
         GGML_LOG_DEBUG("NUMA Executor: Operation %s not supported by NUMA kernels, falling back to CPU\n", 
-                      ggml_op_name(tensor->op));
-        return ggml_numa_executor_fallback_to_cpu(tensor, cplan);
+                      op_name);
+        enum ggml_status result = ggml_numa_executor_fallback_to_cpu(tensor, cplan);
+        NUMA_PERF_END();
+        return result;
     }
     
     GGML_LOG_DEBUG("NUMA Executor: %s kernel selected for %s (efficiency=%.2f, strategy=%s, buffer=%zu bytes/thread)\n",
                    query_result.kernel_name,
-                   ggml_op_name(tensor->op),
+                   op_name,
                    query_result.efficiency_score,
                    (query_result.strategy.node_strategy == NUMA_NODE_STRATEGY_DATA_PARALLEL) ? "data-parallel" : "single-node",
                    query_result.work_buffer_size_per_thread);
     
-    // Get or create coordinator manager for dispatch
-    struct ggml_numa_coordinator_manager * mgr = ggml_numa_coordinator_manager_get_existing();
-    if (!mgr) {
-        GGML_LOG_DEBUG("NUMA Executor: No coordinator available, falling back to CPU for %s\n", 
-                       ggml_op_name(tensor->op));
-        return ggml_numa_executor_fallback_to_cpu(tensor, cplan);
+    // Initialize simple coordinator if needed
+    NUMA_PERF_START(NUMA_PERF_COORDINATOR_INIT, op_name, query_result.kernel_name, -1, 0, cplan->n_threads);
+    if (!ggml_numa_simple_coordinator_is_initialized()) {
+        // Create threadpool parameters based on cplan
+        struct ggml_threadpool_params tpp = {
+            .n_threads = cplan->n_threads,
+            .prio = GGML_SCHED_PRIO_NORMAL,
+            .poll = 50,
+            .strict_cpu = true,
+            .paused = false,
+            .numa_aware = false  // We ARE the NUMA coordinator
+        };
+        
+        // Clear CPU mask - let the simple coordinator create optimal masks
+        memset(tpp.cpumask, false, sizeof(tpp.cpumask));
+        
+        if (!ggml_numa_simple_coordinator_init(&tpp)) {
+            NUMA_PERF_END();
+            GGML_LOG_DEBUG("NUMA Executor: Failed to initialize simple coordinator, falling back to CPU for %s\n", 
+                           op_name);
+            enum ggml_status result = ggml_numa_executor_fallback_to_cpu(tensor, cplan);
+            NUMA_PERF_END();
+            return result;
+        }
+        NUMA_PERF_END();
     }
     
-    // Dispatch work to coordinator based on strategy
+    // Execute using simple coordinator - no work groups, no complex synchronization
     enum ggml_status result = GGML_STATUS_SUCCESS;
     
-    int num_numa_nodes = ggml_numa_coordinator_manager_get_num_nodes(mgr);
+    int num_numa_nodes = ggml_numa_simple_coordinator_get_num_nodes();
+    printf("DEBUG: NUMA Executor: num_numa_nodes=%d, strategy=%s\n", 
+           num_numa_nodes,
+           (query_result.strategy.node_strategy == NUMA_NODE_STRATEGY_DATA_PARALLEL) ? "data-parallel" : "single-node");
+           
     if (query_result.strategy.node_strategy == NUMA_NODE_STRATEGY_DATA_PARALLEL && num_numa_nodes > 1) {
         // Multi-node data-parallel execution
-        GGML_LOG_DEBUG("NUMA Executor: Dispatching %s to coordinator for data-parallel execution across %d nodes\n", 
-                       ggml_op_name(tensor->op), num_numa_nodes);
+        NUMA_PERF_START(NUMA_PERF_EXECUTOR_KERNEL_EXEC, op_name, query_result.kernel_name, -1, tensor_size, num_numa_nodes);
+        printf("DEBUG: NUMA Executor: Taking DATA_PARALLEL path with %d nodes\n", num_numa_nodes);
+        GGML_LOG_DEBUG("NUMA Executor: Dispatching %s for data-parallel execution across %d nodes\n", 
+                       op_name, num_numa_nodes);
         
-        // Submit data-parallel work (coordinator will handle work function dispatch)
-        int work_group_id = ggml_numa_coordinator_manager_submit_data_parallel_work(mgr, tensor);
-        if (work_group_id < 0) {
-            GGML_LOG_ERROR("NUMA Executor: Failed to submit data-parallel work for %s\n", ggml_op_name(tensor->op));
-            return ggml_numa_executor_fallback_to_cpu(tensor, cplan);
-        }
-        
-        // Wait for completion
-        if (ggml_numa_coordinator_manager_wait_for_work_group(mgr, work_group_id) != 0) {
-            GGML_LOG_ERROR("NUMA Executor: Data-parallel work group failed for %s\n", ggml_op_name(tensor->op));
-            return GGML_STATUS_FAILED;
-        }
-        
-        result = ggml_numa_coordinator_manager_wait_for_completion(mgr);
+        result = ggml_numa_simple_coordinator_execute_data_parallel(
+            query_result.work_function, tensor, query_result.work_buffer_size_per_thread);
+            
+        printf("DEBUG: NUMA Executor: Data-parallel execution result=%d\n", result);
+        NUMA_PERF_END();
         
     } else {
         // Single-node execution - choose optimal node (for now, use node 0)
+        NUMA_PERF_START(NUMA_PERF_EXECUTOR_KERNEL_EXEC, op_name, query_result.kernel_name, 0, tensor_size, 1);
         int target_node = 0;
         
-        GGML_LOG_DEBUG("NUMA Executor: Dispatching %s to coordinator for single-node execution on node %d\n", 
+        printf("DEBUG: NUMA Executor: Taking SINGLE_NODE path, target_node=%d\n", target_node);
+        GGML_LOG_DEBUG("NUMA Executor: Dispatching %s for single-node execution on node %d\n", 
                        ggml_op_name(tensor->op), target_node);
         
-        // Create work context that includes the tensor and compute plan
-        // TODO: This needs to be a proper context structure that the work function can use
-        void * work_context = tensor;  // Simplified for now
+        result = ggml_numa_simple_coordinator_execute_single_node(
+            query_result.work_function, tensor, target_node, query_result.work_buffer_size_per_thread);
         
-        // Submit work function to coordinator
-        int work_group_id = ggml_numa_coordinator_manager_submit_work_function(
-            mgr, query_result.work_function, work_context, target_node, 
-            query_result.strategy, query_result.work_buffer_size_per_thread);
-        
-        if (work_group_id < 0) {
-            GGML_LOG_ERROR("NUMA Executor: Failed to submit single-node work for %s\n", ggml_op_name(tensor->op));
-            return ggml_numa_executor_fallback_to_cpu(tensor, cplan);
-        }
-        
-        // Wait for completion
-        if (ggml_numa_coordinator_manager_wait_for_work_group(mgr, work_group_id) != 0) {
-            GGML_LOG_ERROR("NUMA Executor: Single-node work group failed for %s\n", ggml_op_name(tensor->op));
-            return GGML_STATUS_FAILED;
-        }
-        
-        result = ggml_numa_coordinator_manager_wait_for_completion(mgr);
+        printf("DEBUG: NUMA Executor: Single-node execution result=%d\n", result);
+        NUMA_PERF_END();
     }
     
+    printf("DEBUG: NUMA Executor: Final result=%d for %s\n", result, op_name);
     if (result == GGML_STATUS_SUCCESS) {
+        printf("DEBUG: NUMA Executor: SUCCESS - returning GGML_STATUS_SUCCESS\n");
         GGML_LOG_DEBUG("NUMA Executor: Successfully completed %s using %s\n", 
-                       ggml_op_name(tensor->op), query_result.kernel_name);
+                       op_name, query_result.kernel_name);
     } else {
+        printf("DEBUG: NUMA Executor: FAILURE - returning status %d\n", result);
         GGML_LOG_ERROR("NUMA Executor: Failed to execute %s using %s (status=%d)\n", 
-                       ggml_op_name(tensor->op), query_result.kernel_name, (int)result);
+                       op_name, query_result.kernel_name, (int)result);
     }
     
+    NUMA_PERF_END();
     return result;
 }
 
@@ -277,7 +314,12 @@ enum ggml_status ggml_numa_executor_fallback_to_cpu(struct ggml_tensor * tensor,
         return GGML_STATUS_FAILED;
     }
     
-    GGML_LOG_DEBUG("NUMA Fallback: Starting fallback for operation %s\n", ggml_op_name(tensor->op));
+    const char* op_name = ggml_op_name(tensor->op);
+    size_t tensor_size = ggml_nbytes(tensor);
+    
+    NUMA_PERF_START(NUMA_PERF_EXECUTOR_FALLBACK, op_name, "cpu_fallback", -1, tensor_size, cplan->n_threads);
+    
+    GGML_LOG_DEBUG("NUMA Fallback: Starting fallback for operation %s\n", op_name);
     
     // Set flag to disable NUMA dispatch during this call (prevents infinite recursion)
     ggml_numa_set_fallback_flag(true);
@@ -321,17 +363,16 @@ enum ggml_status ggml_numa_executor_fallback_to_cpu(struct ggml_tensor * tensor,
         }
     }
 
-    // Get the dedicated fallback threadpool from the coordinator
-    struct ggml_numa_coordinator_manager * coordinator = ggml_numa_coordinator_manager_get_existing();
+    // Get fallback threadpool - use simple approach without complex coordinator
     struct ggml_threadpool * fallback_threadpool = NULL;
-    int fallback_thread_count = 1;
+    int fallback_thread_count = cplan->n_threads; // Use original plan's thread count
     
-    if (coordinator) {
-        fallback_threadpool = ggml_numa_coordinator_get_fallback_threadpool(coordinator);
-        fallback_thread_count = ggml_numa_coordinator_get_fallback_thread_count(coordinator);
-        GGML_LOG_DEBUG("NUMA Fallback: Using dedicated fallback threadpool with %d thread(s)\n", fallback_thread_count);
+    if (cplan->threadpool) {
+        fallback_threadpool = cplan->threadpool;
+        GGML_LOG_DEBUG("NUMA Fallback: Using existing threadpool with %d thread(s)\n", fallback_thread_count);
     } else {
-        GGML_LOG_DEBUG("NUMA Fallback: No coordinator available, using single-threaded execution\n");
+        GGML_LOG_DEBUG("NUMA Fallback: No threadpool available, using single-threaded execution\n");
+        fallback_thread_count = 1;
     }
     
     // Set up compute params for fallback execution  
@@ -385,6 +426,7 @@ enum ggml_status ggml_numa_executor_fallback_to_cpu(struct ggml_tensor * tensor,
                 GGML_LOG_DEBUG("NUMA Fallback: Freed malloc work buffer\n");
             }
         }
+        NUMA_PERF_END();
         return GGML_STATUS_FAILED;
     }
     
@@ -402,6 +444,7 @@ enum ggml_status ggml_numa_executor_fallback_to_cpu(struct ggml_tensor * tensor,
         }
     }
     
-    GGML_LOG_DEBUG("NUMA Fallback: Operation %s completed successfully\n", ggml_op_name(tensor->op));
+    GGML_LOG_DEBUG("NUMA Fallback: Operation %s completed successfully\n", op_name);
+    NUMA_PERF_END();
     return GGML_STATUS_SUCCESS;
 }

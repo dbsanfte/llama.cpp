@@ -10,7 +10,7 @@
 #include "ggml-cpu.h"
 
 #ifdef GGML_NUMA_MIRROR
-#include "ggml-numa-coordinator.h"
+#include "ggml-numa-simple-coordinator.h"
 #include "ggml-numa-executor.h"
 #endif
 
@@ -368,22 +368,14 @@ llama_context::llama_context(
     }
 
 #ifdef GGML_NUMA_MIRROR
-    // Initialize NUMA coordinator if NUMA mirroring is enabled
-    struct ggml_threadpool_params tpp = ggml_threadpool_params_default(cparams.n_threads);
-    numa_coordinator = ggml_numa_coordinator_manager_get_global_with_params(&tpp);
-    if (numa_coordinator) {
-        LLAMA_LOG_INFO("%s: initialized NUMA coordinator with %d threads\n", __func__, cparams.n_threads);
-    } else {
-        LLAMA_LOG_WARN("%s: failed to initialize NUMA coordinator, falling back to standard backend\n", __func__);
-    }
+    // NUMA system is initialized globally when needed
+    LLAMA_LOG_INFO("%s: NUMA system ready for accelerated execution\n", __func__);
 #endif
 }
 
 llama_context::~llama_context() {
 #ifdef GGML_NUMA_MIRROR
-    // Note: We don't need to explicitly free the NUMA coordinator as it's a global singleton
-    // managed by ggml_numa_coordinator_manager. Setting to nullptr for clarity.
-    numa_coordinator = nullptr;
+    // NUMA system cleanup is handled globally
 #endif
     ggml_opt_free(opt_ctx);
 }
@@ -1443,7 +1435,7 @@ ggml_status llama_context::graph_compute(
 
 #ifdef GGML_NUMA_MIRROR
     // Try to use NUMA executor only if NUMA is actually enabled
-    if (numa_coordinator && ggml_get_numa_strategy() != GGML_NUMA_STRATEGY_DISABLED) {
+    if (ggml_get_numa_strategy() != GGML_NUMA_STRATEGY_DISABLED) {
         LLAMA_LOG_DEBUG("%s: using NUMA executor for graph computation\n", __func__);
         
         // Create a basic compute plan for the executor

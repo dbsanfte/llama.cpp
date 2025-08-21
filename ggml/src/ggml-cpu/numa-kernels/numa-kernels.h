@@ -19,6 +19,32 @@ extern "C" {
 struct ggml_cplan;
 
 /**
+ * Complexity classes for kernel performance optimization
+ * Used to select optimal execution strategies based on tensor size
+ */
+typedef enum {
+    COMPLEXITY_TINY = 0,    // < 1K elements
+    COMPLEXITY_SMALL,       // 1K - 16K elements  
+    COMPLEXITY_MEDIUM,      // 16K - 256K elements
+    COMPLEXITY_LARGE,       // 256K - 4M elements
+    COMPLEXITY_HUGE,        // > 4M elements
+    COMPLEXITY_COUNT
+} ggml_numa_complexity_class_t;
+
+/**
+ * Pre-computed cache entry for ultra-fast lookups
+ * All decisions made at init time, zero overhead during execution
+ */
+typedef struct {
+    bool valid;                                    // Cache entry is valid
+    ggml_numa_execution_strategy_t strategy;      // Pre-computed strategy
+    size_t work_buffer_size_per_thread;          // Pre-computed buffer size
+    ggml_numa_work_function_t work_function;     // Pre-selected work function
+    float efficiency_score;                       // Pre-computed efficiency
+    const char * kernel_name;                     // Kernel identifier
+} ggml_numa_cache_entry_t;
+
+/**
  * Kernel execution information returned by registry queries
  * Contains all information needed for the executor to dispatch work to coordinator
  */

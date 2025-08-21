@@ -22,28 +22,6 @@
  * Quick complexity categorization for cache keys
  * This avoids expensive runtime calculations during graph execution
  */
-typedef enum {
-    COMPLEXITY_TINY = 0,    // < 1K elements
-    COMPLEXITY_SMALL,       // 1K - 16K elements  
-    COMPLEXITY_MEDIUM,      // 16K - 256K elements
-    COMPLEXITY_LARGE,       // 256K - 4M elements
-    COMPLEXITY_HUGE,        // > 4M elements
-    COMPLEXITY_COUNT
-} ggml_numa_complexity_class_t;
-
-/**
- * Pre-computed cache entry for ultra-fast lookups
- * All decisions made at init time, zero overhead during execution
- */
-typedef struct {
-    bool valid;                                    // Cache entry is valid
-    ggml_numa_execution_strategy_t strategy;      // Pre-computed strategy
-    size_t work_buffer_size_per_thread;          // Pre-computed buffer size
-    ggml_numa_work_function_t work_function;     // Pre-selected work function
-    float efficiency_score;                       // Pre-computed efficiency
-    const char * kernel_name;                     // Kernel identifier
-} ggml_numa_cache_entry_t;
-
 /**
  * High-speed lookup cache
  * [operation_type][complexity_class] -> cache_entry
@@ -73,47 +51,6 @@ static inline size_t get_tensor_complexity_score(const struct ggml_tensor * tens
 // Cache Population at Init Time
 // ============================================================================
 
-static void populate_add_cache_entries(void) {
-    // Pre-compute all ADD operation strategies across complexity classes
-    for (int complexity = 0; complexity < COMPLEXITY_COUNT; complexity++) {
-        ggml_numa_cache_entry_t * entry = &g_numa_cache[GGML_OP_ADD][complexity];
-        
-        entry->valid = true;
-        entry->kernel_name = "NUMA Add";
-        entry->work_function = ggml_numa_kernel_add_work_function;
-        entry->work_buffer_size_per_thread = 1024; // Minimal for element-wise ops
-        
-        // Strategy selection based on complexity class
-        switch (complexity) {
-            case COMPLEXITY_TINY:
-            case COMPLEXITY_SMALL:
-                // Small tensors: single-node execution
-                entry->strategy.node_strategy = NUMA_NODE_STRATEGY_SINGLE;
-                entry->strategy.on_node_strategy = NUMA_ON_NODE_STRATEGY_MULTI_THREAD;
-                entry->efficiency_score = 0.60f; // Lower due to overhead
-                break;
-                
-            case COMPLEXITY_MEDIUM:
-            case COMPLEXITY_LARGE:
-            case COMPLEXITY_HUGE:
-                // Large tensors: data-parallel across nodes
-                entry->strategy.node_strategy = NUMA_NODE_STRATEGY_DATA_PARALLEL;
-                entry->strategy.on_node_strategy = NUMA_ON_NODE_STRATEGY_MULTI_THREAD;
-                entry->efficiency_score = 0.95f; // Excellent for large parallel work
-                break;
-                
-            default:
-                entry->valid = false;
-                break;
-        }
-        
-        GGML_LOG_DEBUG("NUMA Cache: Populated ADD[%d] -> strategy=%s, efficiency=%.2f\n",
-                       complexity,
-                       (entry->strategy.node_strategy == NUMA_NODE_STRATEGY_DATA_PARALLEL) ? "data-parallel" : "single-node",
-                       entry->efficiency_score);
-    }
-}
-
 static void populate_unsupported_operation(enum ggml_op op) {
     // Mark all complexity classes as unsupported for this operation
     for (int complexity = 0; complexity < COMPLEXITY_COUNT; complexity++) {
@@ -124,6 +61,7 @@ static void populate_unsupported_operation(enum ggml_op op) {
 }
 
 static bool build_kernel_cache(void) {
+    printf("DEBUG: NUMA Cache: Building high-speed operation cache...\n");
     GGML_LOG_INFO("🔧 NUMA Cache: Building high-speed operation cache...\n");
     
     // Initialize all entries as invalid
@@ -133,8 +71,21 @@ static bool build_kernel_cache(void) {
         }
     }
     
-    // Populate supported operations
-    populate_add_cache_entries();
+    // Populate supported operations - each kernel provides its own cache entries
+    printf("DEBUG: NUMA Cache: Populating ADD cache entries\n");
+    GGML_LOG_DEBUG("NUMA Cache: Populating ADD cache entries\n");
+    ggml_numa_kernel_add_populate_cache(g_numa_cache[GGML_OP_ADD]);
+    
+    // Verify ADD cache entries were populated
+    for (int complexity = 0; complexity < COMPLEXITY_COUNT; complexity++) {
+        ggml_numa_cache_entry_t * entry = &g_numa_cache[GGML_OP_ADD][complexity];
+        printf("DEBUG: NUMA Cache: ADD[%d] valid=%s, kernel=%s\n", 
+               complexity, entry->valid ? "true" : "false", 
+               entry->valid ? entry->kernel_name : "N/A");
+        GGML_LOG_DEBUG("NUMA Cache: ADD[%d] valid=%s, kernel=%s\n", 
+                       complexity, entry->valid ? "true" : "false", 
+                       entry->valid ? entry->kernel_name : "N/A");
+    }
     
     // Mark unsupported operations (can be extended as kernels are added)
     for (int op = 0; op < GGML_OP_COUNT; op++) {
@@ -143,6 +94,7 @@ static bool build_kernel_cache(void) {
         }
     }
     
+    printf("DEBUG: NUMA Cache: Cache built successfully with %d operations cached\n", GGML_OP_COUNT);
     GGML_LOG_INFO("✅ NUMA Cache: Cache built successfully with %d operations cached\n", GGML_OP_COUNT);
     return true;
 }
@@ -182,19 +134,42 @@ ggml_numa_kernel_query_result_t ggml_numa_kernels_query(const struct ggml_tensor
         .kernel_name = "None"
     };
     
-    if (!tensor || !g_numa_cache_initialized) {
+    if (!tensor) {
+        GGML_LOG_DEBUG("NUMA Query: Tensor is NULL\n");
         return result;
+    }
+    
+    if (!g_numa_cache_initialized) {
+        GGML_LOG_DEBUG("NUMA Query: Cache not initialized, initializing for op %s\n", ggml_op_name(tensor->op));
+        if (!ggml_numa_kernels_init()) {
+            GGML_LOG_DEBUG("NUMA Query: Failed to initialize kernel cache for op %s\n", ggml_op_name(tensor->op));
+            return result;
+        }
     }
     
     // Lightning-fast complexity scoring and cache lookup
     size_t complexity_score = get_tensor_complexity_score(tensor);
     ggml_numa_complexity_class_t complexity_class = get_complexity_class(complexity_score);
     
+    printf("DEBUG: NUMA Query: op=%s, complexity_score=%zu, complexity_class=%d\n", 
+           ggml_op_name(tensor->op), complexity_score, complexity_class);
+    GGML_LOG_DEBUG("NUMA Query: op=%s, complexity_score=%zu, complexity_class=%d\n", 
+                   ggml_op_name(tensor->op), complexity_score, complexity_class);
+    
     // O(1) cache lookup - zero runtime overhead
     const ggml_numa_cache_entry_t * entry = &g_numa_cache[tensor->op][complexity_class];
     
+    printf("DEBUG: NUMA Query: Cache entry valid=%s for op=%s[%d]\n", 
+           entry->valid ? "true" : "false", ggml_op_name(tensor->op), complexity_class);
+    GGML_LOG_DEBUG("NUMA Query: Cache entry valid=%s for op=%s[%d]\n", 
+                   entry->valid ? "true" : "false", ggml_op_name(tensor->op), complexity_class);
+    
     if (!entry->valid) {
         // Cache miss - operation not supported
+        printf("DEBUG: NUMA Query: Cache miss for op %s complexity %d\n", 
+               ggml_op_name(tensor->op), complexity_class);
+        GGML_LOG_DEBUG("NUMA Query: Cache miss for op %s complexity %d\n", 
+                       ggml_op_name(tensor->op), complexity_class);
         return result;
     }
     
@@ -205,6 +180,11 @@ ggml_numa_kernel_query_result_t ggml_numa_kernels_query(const struct ggml_tensor
     result.work_function = entry->work_function;
     result.efficiency_score = entry->efficiency_score;
     result.kernel_name = entry->kernel_name;
+    
+    printf("DEBUG: NUMA Query: Cache hit for op %s - kernel=%s, efficiency=%.2f, work_function=%p\n", 
+           ggml_op_name(tensor->op), entry->kernel_name, entry->efficiency_score, entry->work_function);
+    GGML_LOG_DEBUG("NUMA Query: Cache hit for op %s - kernel=%s, efficiency=%.2f\n", 
+                   ggml_op_name(tensor->op), entry->kernel_name, entry->efficiency_score);
     
     return result;
 }

@@ -10,7 +10,7 @@
 #include "ggml.h"
 #include "ggml-impl.h"
 #include "ggml-cpu.h"  // For complete ggml_cplan definition
-#include "../ggml-numa-coordinator.h"  // For execution strategy and work function types
+#include "../ggml-numa-simple-coordinator.h"  // For execution strategy and work function types
 
 #ifdef __cplusplus
 extern "C" {
@@ -25,6 +25,9 @@ ggml_numa_execution_strategy_t ggml_numa_kernel_add_get_strategy(const struct gg
 size_t ggml_numa_kernel_add_get_buffer_size(const struct ggml_tensor * tensor);
 ggml_numa_work_function_t ggml_numa_kernel_add_get_work_function(const struct ggml_tensor * tensor);
 float ggml_numa_kernel_add_get_efficiency(const struct ggml_tensor * tensor);
+
+// Cache registration interface - kernel provides its own cache entries
+void ggml_numa_kernel_add_populate_cache(void * cache_array);
 
 // Work function that coordinator will execute
 enum ggml_status ggml_numa_kernel_add_work_function(void * work_context, struct ggml_compute_params * params);

@@ -203,6 +203,8 @@ add_library(ggml-base
             ggml-threading.h
             ggml-quants.c
             ggml-quants.h
+            ggml-numa-allocator.c
+            ggml-numa-allocator.h
             gguf.cpp)
 
 target_include_directories(ggml-base PRIVATE .)

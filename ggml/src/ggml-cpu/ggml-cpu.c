@@ -16,8 +16,7 @@
 #include "ggml.h"
 
 #ifdef GGML_NUMA_MIRROR
-#include "ggml-numa-coordinator.h"
-#include "ggml-numa-executor.h"
+#include "ggml-numa-simple-coordinator.h"
 #include "ggml-numa-executor.h"
 #ifdef __linux__
 #include <numa.h>
@@ -39,7 +38,6 @@ static struct {
     enum ggml_numa_strategy strategy;
     int numa_nodes;
     bool numa_enabled;
-    struct ggml_numa_coordinator_manager * coordinator;  // Coordinator manager instance
     struct ggml_threadpool_params threadpool_params;     // Stored threadpool params
     bool threadpool_params_valid;                        // Whether params are valid
     
@@ -50,7 +48,6 @@ static struct {
     .strategy = GGML_NUMA_STRATEGY_DISABLED, 
     .numa_nodes = 1, 
     .numa_enabled = false,
-    .coordinator = NULL,
     .threadpool_params = {{0}},  // Proper nested braces for struct initialization
     .threadpool_params_valid = false,
     .cache_strategy = 0  // DISABLED by default
@@ -593,35 +590,14 @@ static void ggml_numa_init_coordinator(enum ggml_numa_strategy numa_strategy, co
         return;  // Don't create coordinator for disabled NUMA
     }
 
-    // Create coordinator with threadpool parameters
-    g_numa_state.coordinator = ggml_numa_coordinator_manager_get_global_with_params(tpp);
-    
-    if (g_numa_state.coordinator) {
-        // Query actual NUMA capabilities from coordinator
+    // Initialize simple coordinator with threadpool parameters
+    if (ggml_numa_simple_coordinator_init((struct ggml_threadpool_params *)tpp)) {
         g_numa_state.numa_enabled = true;
         
-        // Determine number of NUMA nodes based on strategy
-        switch (numa_strategy) {
-            case GGML_NUMA_STRATEGY_DISABLED:
-                g_numa_state.numa_nodes = 1;
-                break;
-            case GGML_NUMA_STRATEGY_ISOLATE:
-                g_numa_state.numa_nodes = 1;  // Always 1 node when isolating
-                break;
-            case GGML_NUMA_STRATEGY_MIRROR:
-            case GGML_NUMA_STRATEGY_NUMACTL:
-            default:
-                // For these strategies, use actual system NUMA node count
-#ifdef __linux__
-                if (numa_available() != -1) {
-                    g_numa_state.numa_nodes = numa_max_node() + 1;
-                } else {
-                    g_numa_state.numa_nodes = 1;
-                }
-#else
-                g_numa_state.numa_nodes = 1;  // Non-Linux fallback
-#endif
-                break;
+        // Get number of NUMA nodes from simple coordinator
+        g_numa_state.numa_nodes = ggml_numa_simple_coordinator_get_num_nodes();
+        if (g_numa_state.numa_nodes <= 0) {
+            g_numa_state.numa_nodes = 1;
         }
     } else {
         // Coordinator creation failed, fall back to no NUMA
@@ -666,20 +642,10 @@ void ggml_numa_init(enum ggml_numa_strategy numa_flag) {
 }
 
 bool ggml_is_numa(void) {
-#ifdef GGML_NUMA_MIRROR
-    if (g_numa_state.coordinator) {
-        return g_numa_state.numa_enabled;
-    }
-#endif
     return g_numa_state.numa_enabled;
 }
 
 int ggml_numa_node_count(void) {
-#ifdef GGML_NUMA_MIRROR
-    if (g_numa_state.coordinator) {
-        return g_numa_state.numa_nodes;
-    }
-#endif
     return g_numa_state.numa_nodes;
 }
 
@@ -1907,10 +1873,37 @@ void ggml_compute_forward(struct ggml_compute_params * params, struct ggml_tenso
     }
 
 #ifdef GGML_NUMA_MIRROR
-    // NOTE: NUMA dispatch is now handled by the executor at the graph level
-    // Individual tensor operations no longer intercept here - they use the 
-    // executor for optimal NUMA-aware execution
-    GGML_LOG_DEBUG("Tensor operation %s executed via standard CPU path (NUMA handled at graph level)\n", ggml_op_name(tensor->op));
+    // Direct NUMA execution via simple coordinator and executor
+    // Check if we should use NUMA dispatch for large operations
+    if (params->ith == 0 && ggml_numa_should_dispatch()) { // Only for main thread AND when dispatch enabled
+        GGML_LOG_DEBUG("💡 Direct NUMA check: op=%s, ith=%d, nelements=%zu, threshold=10000\n", 
+                      ggml_op_name(tensor->op), params->ith, ggml_nelements(tensor));
+        
+        if (ggml_nelements(tensor) >= 10000) { // Lowered threshold for testing
+            // Create minimal compute plan for executor
+            struct ggml_cplan cplan = {0};
+            cplan.work_size = 0;
+            cplan.work_data = NULL;
+            cplan.n_threads = params->nth;
+            cplan.threadpool = params->threadpool;
+            cplan.abort_callback = NULL;
+            cplan.abort_callback_data = NULL;
+            
+            enum ggml_status numa_result = ggml_numa_executor_execute_tensor(tensor, &cplan);
+            if (numa_result == GGML_STATUS_SUCCESS) {
+                GGML_LOG_DEBUG("Tensor operation %s successfully executed via NUMA executor\n", ggml_op_name(tensor->op));
+                return; // Successfully handled by NUMA executor
+            }
+            // If NUMA failed, fall through to standard execution
+            GGML_LOG_DEBUG("Tensor operation %s falling back to standard CPU path\n", ggml_op_name(tensor->op));
+        } else {
+            GGML_LOG_DEBUG("Tensor operation %s skipped direct NUMA (too small: %zu elements)\n", 
+                          ggml_op_name(tensor->op), ggml_nelements(tensor));
+        }
+    } else {
+        GGML_LOG_DEBUG("Tensor operation %s skipped direct NUMA (thread %d, not main)\n", 
+                      ggml_op_name(tensor->op), params->ith);
+    }
 #endif
 
     switch (tensor->op) {
@@ -3290,9 +3283,19 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
     extern bool ggml_numa_is_fallback_active(void);
     
     // NUMA intercept: Check if NUMA system should handle this graph computation
-    if (g_numa_state.numa_enabled && g_numa_state.coordinator && !ggml_numa_is_fallback_active()) {
-        GGML_LOG_INFO("Processing computation graph with %d nodes through NUMA executor\n", cgraph->n_nodes);
+    bool should_dispatch = ggml_numa_should_dispatch();
+    bool coord_init = ggml_numa_simple_coordinator_is_initialized();
+    bool not_in_fallback = !ggml_numa_is_fallback_active();
+    
+    GGML_LOG_DEBUG("NUMA Dispatch Decision: should_dispatch=%d, coord_init=%d, not_in_fallback=%d\n", 
+                   should_dispatch, coord_init, not_in_fallback);
+    
+    if (should_dispatch && coord_init && not_in_fallback) {
+        GGML_LOG_INFO("🎯 NUMA Path: Processing computation graph with %d nodes through NUMA executor\n", cgraph->n_nodes);
         return ggml_numa_executor_compute_graph(cgraph, cplan);
+    } else {
+        GGML_LOG_INFO("🔄 Fallback Path: Processing computation graph with %d nodes, %d threads, threadpool=%p\n", 
+                      cgraph->n_nodes, cplan->n_threads, cplan->threadpool);
     }
 #endif
 
@@ -3306,14 +3309,38 @@ enum ggml_status ggml_graph_compute_impl(struct ggml_cgraph * cgraph, struct ggm
     int n_threads                               = cplan->n_threads;
     struct ggml_threadpool * threadpool = cplan->threadpool;
 
+    GGML_LOG_INFO("📊 Fallback Execution: threads=%d, threadpool=%p (disposable=%s)\n", 
+                  n_threads, threadpool, threadpool ? "false" : "true");
+
     bool disposable_threadpool = false;
 
     if (threadpool == NULL) {
-        //GGML_PRINT_DEBUG("Threadpool is not specified. Will create a disposable threadpool : n_threads %d\n", n_threads);
+#ifdef GGML_NUMA_MIRROR
+        // Use dedicated fallback threadpool instead of creating disposable one
+        threadpool = ggml_numa_simple_coordinator_get_fallback_threadpool();
+        if (threadpool) {
+            GGML_LOG_INFO("🔧 Using dedicated fallback threadpool: %p (bound to NUMA node 0)\n", threadpool);
+            disposable_threadpool = false; // Don't free the dedicated threadpool
+            
+            // Reset the fallback threadpool parameters for this computation
+            threadpool->cgraph           = cgraph;
+            threadpool->cplan            = cplan;
+            threadpool->current_chunk    = 0;
+            threadpool->abort            = -1;
+            threadpool->ec               = GGML_STATUS_SUCCESS;
+        } else {
+            // Fallback to disposable threadpool if dedicated one not available
+            GGML_LOG_WARN("⚠️ Dedicated fallback threadpool not available, creating disposable threadpool\n");
+            disposable_threadpool = true;
+            struct ggml_threadpool_params ttp = ggml_threadpool_params_default(n_threads);
+            threadpool = ggml_threadpool_new_impl(&ttp, cgraph, cplan);
+        }
+#else
+        // Non-NUMA build: create disposable threadpool as before
         disposable_threadpool = true;
-
         struct ggml_threadpool_params ttp = ggml_threadpool_params_default(n_threads);
         threadpool = ggml_threadpool_new_impl(&ttp, cgraph, cplan);
+#endif
     } else {
         // Reset some of the parameters that need resetting
         // No worker threads should be accessing the parameters below at this stage
@@ -3347,6 +3374,12 @@ enum ggml_status ggml_graph_compute_impl(struct ggml_cgraph * cgraph, struct ggm
         n_threads = threadpool->n_threads_max;
     }
 
+    // For dedicated fallback threadpool, ensure we don't exceed the available thread count
+    if (n_threads > threadpool->n_threads_max) {
+        GGML_LOG_WARN("🔧 Limiting requested threads (%d) to threadpool maximum (%d)\n", n_threads, threadpool->n_threads_max);
+        n_threads = threadpool->n_threads_max;
+    }
+
     // Kick all threads to start the new graph
     ggml_graph_compute_kickoff(threadpool, n_threads);
 
@@ -3377,33 +3410,9 @@ enum ggml_status ggml_graph_compute_with_ctx(struct ggml_context * ctx, struct g
     if (cplan.work_size > 0) {
         // Get current CPU and NUMA node for NUMA-aware allocation
         int current_cpu = sched_getcpu();
-        int numa_node = 0;  // Default to node 0 if detection fails
-        if (current_cpu >= 0) {
-            int detected_node = numa_node_of_cpu(current_cpu);
-            if (detected_node >= 0) {
-                numa_node = detected_node;
-            }
-        }
-        
-        // Try to use persistent coordinator work buffer for NUMA optimization
-        struct ggml_numa_coordinator_manager * manager = ggml_numa_coordinator_manager_get_existing();
-        if (manager && ggml_numa_coordinator_ensure_work_buffer(manager, numa_node, cplan.work_size)) {
-            void * persistent_buffer = ggml_numa_coordinator_get_work_buffer(manager, numa_node);
-            
-            if (persistent_buffer) {
-                cplan.work_data = (uint8_t *)persistent_buffer;
-                GGML_LOG_DEBUG("Using NUMA-aware persistent work buffer: %zu bytes on node %d (replaces ggml_new_buffer)\n", 
-                               cplan.work_size, numa_node);
-            } else {
-                // Fallback to original context allocation
-                cplan.work_data = (uint8_t *)ggml_new_buffer(ctx, cplan.work_size);
-                GGML_LOG_DEBUG("Fallback to context work buffer: %zu bytes (NUMA coordinator unavailable)\n", cplan.work_size);
-            }
-        } else {
-            // Fallback to original context allocation
-            cplan.work_data = (uint8_t *)ggml_new_buffer(ctx, cplan.work_size);
-            GGML_LOG_DEBUG("Fallback to context work buffer: %zu bytes (NUMA allocation failed)\n", cplan.work_size);
-        }
+        // For NUMA builds, just use the standard buffer allocation
+        // The simple coordinator manages its own threadpool work buffers
+        cplan.work_data = (uint8_t *)ggml_new_buffer(ctx, cplan.work_size);
     }
 #else
     // Non-NUMA build: use original context allocation

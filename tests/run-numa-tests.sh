@@ -55,8 +55,6 @@ BIN_DIR="$BUILD_DIR/bin"
 
 # Test binaries to run (in order of complexity)
 NUMA_TESTS=(
-    "test-numa-coordinator"
-    "test-numa-coordinator-wait"
     "test-numa-mathematical-correctness-add"
 )
 
@@ -89,6 +87,30 @@ if [ "$VERBOSE_MODE" = true ]; then
 else
     echo "Output mode: Summary only (use --verbose for full output)"
 fi
+echo ""
+
+# Ensure fresh Debug build for testing
+echo -e "${YELLOW}🔨 Building fresh Debug configuration for testing...${NC}"
+cd "$PROJECT_ROOT" || {
+    echo -e "${RED}❌ Error: Cannot change to project root directory: $PROJECT_ROOT${NC}"
+    exit 1
+}
+
+# Configure Debug build with NUMA support
+echo "Configuring Debug build with NUMA support..."
+cmake -B build -DCMAKE_BUILD_TYPE=Debug -DCMAKE_EXPORT_COMPILE_COMMANDS=ON -DGGML_NUMA_MIRROR=ON -DGGML_OPENMP=OFF || {
+    echo -e "${RED}❌ Error: CMake configuration failed${NC}"
+    exit 1
+}
+
+# Build with maximum parallelism
+echo "Building NUMA test suite in Debug mode..."
+cmake --build build --parallel || {
+    echo -e "${RED}❌ Error: CMake build failed${NC}"
+    exit 1
+}
+
+echo -e "${GREEN}✅ Debug build completed successfully${NC}"
 echo ""
 
 # Check if build directory exists

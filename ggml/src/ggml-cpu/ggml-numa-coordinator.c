@@ -378,6 +378,9 @@ static enum ggml_status ggml_numa_node_execute_operation(
 ) {
     NUMA_ASSERT(coordinator);
     NUMA_ASSERT(work_item);
+    
+    // Debug: Check work function pointer before assertion
+    GGML_LOG_DEBUG("NUMA[%d]: work_function pointer: %p", coordinator->numa_node, (void*)work_item->work_function);
     NUMA_ASSERT(work_item->work_function);
 
     NUMA_COORD_LOG_DEBUG(coordinator->numa_node, "executing generic work function with node_strategy=%d, on_node_strategy=%d", 
@@ -398,28 +401,28 @@ static enum ggml_status ggml_numa_node_execute_operation(
     }
     
     struct ggml_compute_params params = {
-        .ith = 0,
+        .ith = 0,  // Coordinator thread starts at 0
         .nth = n_threads,
         .wsize = work_item->required_work_buffer_size,
         .wdata = work_buffer,
         .threadpool = (work_item->execution_strategy.on_node_strategy == NUMA_ON_NODE_STRATEGY_SINGLE_THREAD) ? NULL : coordinator->numa_pool
     };
     
-    // Execute the work function provided by the dispatcher
-    // The coordinator has no knowledge of what this function does - it's completely generic
-    NUMA_COORD_LOG_DEBUG(coordinator->numa_node, "About to execute work item %p with context %p", 
-                    (void*)work_item, work_item->work_context);
-    NUMA_COORD_LOG_DEBUG(coordinator->numa_node, "About to call work_function %p with context %p", 
-                    (void*)work_item->work_function, work_item->work_context);
-    
-    // DEBUGGING: Validate function pointer and context before calling
-    NUMA_COORD_LOG_DEBUG(coordinator->numa_node, "PRE-CALL: work_function=%p, work_context=%p, params=%p", 
-                    (void*)work_item->work_function, work_item->work_context, (void*)&params);
-    NUMA_COORD_LOG_DEBUG(coordinator->numa_node, "PRE-CALL: params.ith=%d, params.nth=%d, params.wsize=%zu", 
-                    params.ith, params.nth, params.wsize);
-    
     // Set virtual NUMA node for testing purposes (thread-local storage)
     ggml_numa_set_virtual_node(coordinator->numa_node);
+    
+    // Execute the work function provided by the dispatcher
+    // For multi-threaded operations, the work function should use the threadpool to spawn additional threads
+    GGML_LOG_DEBUG("NUMA[%d]: About to execute work item %p with context %p", 
+                   coordinator->numa_node, (void*)work_item, work_item->work_context);
+    GGML_LOG_DEBUG("NUMA[%d]: About to call work_function %p with context %p", 
+                   coordinator->numa_node, (void*)work_item->work_function, work_item->work_context);
+    
+    // DEBUGGING: Validate function pointer and context before calling
+    GGML_LOG_DEBUG("NUMA[%d]: PRE-CALL: work_function=%p, work_context=%p, params=%p", 
+                   coordinator->numa_node, (void*)work_item->work_function, work_item->work_context, (void*)&params);
+    GGML_LOG_DEBUG("NUMA[%d]: PRE-CALL: params.ith=%d, params.nth=%d, params.wsize=%zu, threadpool=%p", 
+                   coordinator->numa_node, params.ith, params.nth, params.wsize, (void*)params.threadpool);
     
     enum ggml_status status = work_item->work_function(work_item->work_context, &params);
     
@@ -573,7 +576,7 @@ static struct ggml_work_item * ggml_work_queue_dequeue(struct ggml_work_queue * 
         }
         // Don't decrement pending_items here - do it when work is actually completed
         
-        GGML_LOG_ERROR("🔧 DEQUEUE: Retrieved work item %p with context %p\n", 
+        GGML_LOG_DEBUG("🔧 DEQUEUE: Retrieved work item %p with context %p", 
                        (void*)item, item ? item->work_context : NULL);
     }
     
@@ -1640,7 +1643,7 @@ struct ggml_numa_coordinator_manager * ggml_numa_coordinator_manager_new_with_pa
     
     memset(mgr, 0, sizeof(struct ggml_numa_coordinator_manager));
     mgr->num_numa_nodes = num_numa_nodes;
-    atomic_init(&mgr->total_work_items, 0);
+    atomic_init(&mgr->total_work_items, 1);  // Start work IDs from 1 (not 0) to avoid wait function rejection
     atomic_init(&mgr->completed_work_items, 0);
     atomic_init(&mgr->manager_active, true);
     atomic_init(&mgr->threads_started, false);
@@ -2444,7 +2447,7 @@ int ggml_numa_coordinator_manager_submit_work_function(struct ggml_numa_coordina
         work_item->work_context = work_context;
         work_item->operation = NULL;  // Using function pointer approach
         
-        GGML_LOG_ERROR("🔧 SUBMIT: Created work item %p with context %p\n", 
+        GGML_LOG_DEBUG("🔧 SUBMIT: Created work item %p with context %p", 
                        (void*)work_item, work_context);
         
         // Work item metadata
@@ -2461,7 +2464,7 @@ int ggml_numa_coordinator_manager_submit_work_function(struct ggml_numa_coordina
         // Submit to target coordinator
         ggml_work_queue_enqueue(&mgr->coordinators[target_numa].work_queue, work_item);
         
-        GGML_LOG_ERROR("🔧 SUBMIT: Enqueued work item %p to NUMA %d\n", 
+        GGML_LOG_DEBUG("🔧 SUBMIT: Enqueued work item %p to NUMA %d", 
                        (void*)work_item, target_numa);
         
         GGML_LOG_DEBUG("Submitted generic function work (ID: %d) to NUMA node %d\n", 
@@ -3420,5 +3423,54 @@ int ggml_numa_coordinator_get_fallback_thread_count(struct ggml_numa_coordinator
     }
     
     return mgr->fallback_thread_count > 0 ? mgr->fallback_thread_count : 1;
+}
+
+//
+// Direct NUMA kernel interception (bypasses complex coordinator)
+//
+
+enum ggml_status ggml_numa_intercept_operation(struct ggml_tensor * tensor, 
+                                               const struct ggml_compute_params * params) {
+    if (!tensor || !params) {
+        return GGML_STATUS_FAILED;
+    }
+    
+    // Direct kernel dispatch based on operation type
+    switch (tensor->op) {
+        case GGML_OP_ADD:
+            {
+                // For ADD operations with sufficient size, use direct NUMA dispatch
+                if (ggml_nelements(tensor) >= 100000) {
+                    // Import the NUMA ADD kernel function
+                    extern enum ggml_status ggml_numa_kernel_add_execute(struct ggml_tensor * tensor, struct ggml_cplan * cplan);
+                    
+                    // Create a simple cplan for the kernel
+                    struct ggml_cplan cplan = {
+                        .n_threads = params->nth,
+                        .work_size = params->wsize,
+                        .work_data = params->wdata,
+                        .threadpool = params->threadpool
+                    };
+                    
+                    // Direct call to NUMA ADD kernel - this bypasses all the complex coordination
+                    enum ggml_status result = ggml_numa_kernel_add_execute(tensor, &cplan);
+                    
+                    if (result == GGML_STATUS_SUCCESS) {
+                        NUMA_COORD_LOG_INFO(-1, "🚀 Direct NUMA ADD kernel completed successfully (bypassed complex coordinator)");
+                        return GGML_STATUS_SUCCESS;
+                    } else {
+                        NUMA_COORD_LOG_DEBUG(-1, "⚠️ Direct NUMA ADD kernel failed, falling back to CPU");
+                        return GGML_STATUS_FAILED;
+                    }
+                }
+                break;
+            }
+        default:
+            // Other operations not implemented in direct coordinator yet
+            break;
+    }
+    
+    // Operation not supported by direct coordinator, let CPU backend handle it
+    return GGML_STATUS_FAILED;
 }
 

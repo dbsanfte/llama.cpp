@@ -271,8 +271,7 @@ private:
     ggml_threadpool_t threadpool_batch = nullptr;
 
 #ifdef GGML_NUMA_MIRROR
-    // NUMA coordinator for NUMA-aware computation
-    struct ggml_numa_coordinator_manager * numa_coordinator = nullptr;
+    // NUMA acceleration is handled globally through the executor
 #endif
 
     ggml_abort_callback abort_callback      = nullptr;

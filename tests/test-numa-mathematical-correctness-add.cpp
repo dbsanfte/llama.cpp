@@ -39,7 +39,7 @@
 #include "ggml.h"
 #include "ggml-cpu.h"
 #include "ggml-numa-executor.h"
-#include "ggml-numa-coordinator.h"
+#include "ggml-numa-simple-coordinator.h"  // For NUMA functions
 #include "ggml-cpu/binary-ops.h"
 
 // Test result structure
@@ -338,8 +338,8 @@ private:
 
 // Main function - entry point for the test
 int main(int argc, char** argv) {
-    // Initialize NUMA with MIRROR strategy for testing
-    ggml_numa_init(GGML_NUMA_STRATEGY_MIRROR);
+    // Note: Skip complex coordinator initialization - let simple coordinator handle NUMA
+    // ggml_numa_init(GGML_NUMA_STRATEGY_MIRROR);
     
     // Check for --summary-only flag
     bool summary_only = false;
@@ -363,14 +363,25 @@ int main(int argc, char** argv) {
     
     printf("🌟 Initializing NUMA system for mathematical correctness testing...\n");
     
-    // Initialize the NUMA coordinator system
-    struct ggml_numa_coordinator_manager* mgr = ggml_numa_coordinator_manager_get_global(8); // Enable NUMA MIRROR mode
-    if (!mgr) {
+    // Initialize the simple NUMA coordinator system
+    struct ggml_threadpool_params tpp;
+    memset(&tpp, 0, sizeof(tpp)); // Zero-initialize entire structure
+    tpp.n_threads = 8;
+    tpp.prio = GGML_SCHED_PRIO_NORMAL;
+    tpp.poll = 50;
+    tpp.strict_cpu = true;
+    tpp.paused = false;
+    tpp.numa_aware = true;
+    tpp.allow_numa_override = false;
+    tpp.warn_on_numa_override = false;
+    tpp.max_numa_nodes = 0;
+    
+    if (!ggml_numa_simple_coordinator_init(&tpp)) {
         if (summary_only) {
             fclose(stdout);
             stdout = original_stdout;
         }
-        printf("❌ Failed to initialize NUMA coordinator manager\n");
+        printf("❌ Failed to initialize simple NUMA coordinator\n");
         return 1;
     }
     
@@ -398,7 +409,7 @@ int main(int argc, char** argv) {
  * 3. ✅ Implement test_single_OPERATION_case() with:
  *    - Appropriate tensor creation for your operation
  *    - Deterministic test data generation
- *    - NUMA operation execution via ggml_numa_intercept_operation
+ *    - NUMA operation execution via ggml_numa_executor_execute_tensor
  *    - Reference implementation (serial computation or mathematical kernel)
  *    - Result comparison using compare_float_arrays()
  * 4. ✅ Update CMakeLists.txt to include your new test file

@@ -455,6 +455,18 @@ struct ggml_threadpool * ggml_numa_coordinator_get_fallback_threadpool(struct gg
  */
 int ggml_numa_coordinator_get_fallback_thread_count(struct ggml_numa_coordinator_manager * mgr);
 
+/**
+ * Direct NUMA operation interception (Simple Coordinator)
+ * 
+ * Intercepts tensor operations for direct NUMA kernel dispatch,
+ * bypassing the complex 3-tier coordination architecture.
+ * 
+ * @param tensor The tensor to process
+ * @param params Compute parameters including thread info
+ * @return GGML_STATUS_SUCCESS if handled by NUMA kernels, GGML_STATUS_FAILED for fallback to CPU
+ */
+enum ggml_status ggml_numa_intercept_operation(struct ggml_tensor * tensor, const struct ggml_compute_params * params);
+
 #ifdef __cplusplus
 }
 #endif

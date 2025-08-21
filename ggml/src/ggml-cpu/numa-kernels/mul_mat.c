@@ -6,7 +6,7 @@
  */
 
 #include "mul_mat.h"
-#include "../ggml-numa-coordinator.h"
+#include "../ggml-numa-simple-coordinator.h"
 #include "../ggml-numa-work-shared.h"
 #include "../ggml-cpu-impl.h"
 #include "../ggml-impl.h"
@@ -55,19 +55,22 @@ enum ggml_status ggml_numa_kernel_mul_mat_execute(struct ggml_tensor * tensor, s
         return GGML_STATUS_FAILED;
     }
     
-    // Get NUMA coordinator
-    struct ggml_numa_coordinator_manager * coordinator = 
-        ggml_numa_coordinator_manager_get_global(cplan->n_threads);
+    // Check if simple NUMA coordinator is available
+    if (!ggml_numa_simple_coordinator_is_initialized()) {
+        GGML_LOG_ERROR("MUL_MAT kernel: Simple NUMA coordinator not initialized\n");
+        return GGML_STATUS_FAILED;
+    }
     
-    if (!coordinator) {
-        GGML_LOG_ERROR("MUL_MAT kernel: NUMA coordinator not available\n");
+    int numa_nodes = ggml_numa_simple_coordinator_get_num_nodes();
+    if (numa_nodes <= 0) {
+        GGML_LOG_ERROR("MUL_MAT kernel: No NUMA nodes available\n");
         return GGML_STATUS_FAILED;
     }
     
     // Create work context for the operation
     ggml_numa_work_context_t context = {
-        .numa_nodes = ggml_numa_coordinator_manager_get_numa_nodes(coordinator),
-        .threads_per_node = cplan->n_threads / ggml_numa_coordinator_manager_get_numa_nodes(coordinator)
+        .numa_nodes = numa_nodes,
+        .threads_per_node = cplan->n_threads / numa_nodes
     };
     
     if (context.numa_nodes <= 0) context.numa_nodes = 1;

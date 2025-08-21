@@ -6,6 +6,7 @@
 #include "ggml-threading.h"
 #include "ggml-cpu.h"
 #include "ggml.h"
+#include "ggml-numa-allocator.h"  // NUMA-aware memory allocation
 
 // FIXME: required here for quantization functions
 #include "ggml-quants.h"
@@ -248,6 +249,9 @@ struct ggml_logger_state {
     void * log_callback_user_data;
 };
 static struct ggml_logger_state g_logger_state = {ggml_log_callback_default, NULL};
+
+// Force linking NUMA allocator symbols  
+void ggml_force_link_numa_allocator_symbols(void);
 
 static void ggml_log_internal_v(enum ggml_log_level level, const char * format, va_list args) {
     if (format == NULL) {
@@ -1479,6 +1483,9 @@ struct ggml_context * ggml_init(struct ggml_init_params params) {
         // initialize time system (required on Windows)
         ggml_time_init();
 
+        // Force linking of NUMA allocator symbols
+        ggml_force_link_numa_allocator_symbols();
+
         is_first_call = false;
     }
 
@@ -1493,9 +1500,26 @@ struct ggml_context * ggml_init(struct ggml_init_params params) {
 
     const size_t mem_size = params.mem_buffer ? params.mem_size : GGML_PAD(params.mem_size, GGML_MEM_ALIGN);
 
+    // Use NUMA-aware allocation for large context memory pools
+    void* context_memory = NULL;
+    if (params.mem_buffer) {
+        context_memory = params.mem_buffer;
+    } else {
+        // For large contexts (>64MB), use NUMA distribution
+        if (mem_size >= 64 * 1024 * 1024) {
+            printf("🗂️ Allocating NUMA-distributed context memory pool: %zu MB\n", mem_size / (1024 * 1024));
+            context_memory = ggml_numa_alloc_context_memory(mem_size, NULL);
+        }
+        
+        // Fallback to regular allocation
+        if (!context_memory) {
+            context_memory = ggml_aligned_malloc(mem_size);
+        }
+    }
+
     *ctx = (struct ggml_context) {
         /*.mem_size           =*/ mem_size,
-        /*.mem_buffer         =*/ params.mem_buffer ? params.mem_buffer : ggml_aligned_malloc(mem_size),
+        /*.mem_buffer         =*/ context_memory,
         /*.mem_buffer_owned   =*/ params.mem_buffer ? false : true,
         /*.no_alloc           =*/ params.no_alloc,
         /*.n_objects          =*/ 0,
@@ -1528,7 +1552,12 @@ void ggml_free(struct ggml_context * ctx) {
     }
 
     if (ctx->mem_buffer_owned) {
-        ggml_aligned_free(ctx->mem_buffer, ctx->mem_size);
+        // Check if this was NUMA-allocated memory
+        if (ggml_numa_is_numa_allocated(ctx->mem_buffer)) {
+            ggml_numa_free(ctx->mem_buffer);
+        } else {
+            ggml_aligned_free(ctx->mem_buffer, ctx->mem_size);
+        }
     }
 
     GGML_FREE(ctx);
@@ -6997,4 +7026,18 @@ __attribute__((weak)) bool ggml_is_numa(void) {
 
 __attribute__((weak)) int ggml_numa_node_count(void) {
     return 1;  // Default to single node
+}
+
+// Force link NUMA allocator functions to ensure they're exported
+// This function is referenced from ggml_init to force symbol inclusion
+void ggml_force_link_numa_allocator_symbols(void) {
+    // This function forces the linker to include NUMA allocator symbols
+    // It's called from ggml_init to ensure symbols are available
+    static volatile void* force_link_table[] = {
+        (void*)ggml_numa_alloc_context_memory,
+        (void*)ggml_numa_free,
+        (void*)ggml_numa_is_numa_allocated,
+        NULL
+    };
+    (void)force_link_table; // Prevent optimization
 }
