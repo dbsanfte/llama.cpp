@@ -136,6 +136,12 @@ static void* numa_dispatch_worker(void* arg) {
             };
             
             // Execute the work function
+            // CRITICAL: Set thread-local NUMA node for tensor_data() access
+            extern __thread int ggml_current_numa_node;
+            ggml_current_numa_node = numa_node;
+            printf("DEBUG: Set ggml_current_numa_node=%d before calling work function on node %d\n", 
+                   ggml_current_numa_node, numa_node);
+            
             enum ggml_status result = g_simple_coordinator.active_work_function(
                 g_simple_coordinator.active_work_context, &work_params);
             

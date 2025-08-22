@@ -8,6 +8,11 @@
 //
 //   https://github.com/ggerganov/whisper.cpp/issues/40
 //
+
+#ifdef GGML_NUMA_MIRROR
+#include <numa.h>
+#include <string.h>
+#endif
 // ## Overview
 //
 // This library implements:
@@ -681,29 +686,21 @@ extern "C" {
             max_nodes = GGML_NUMA_MAX_NODES;
         if (n >= max_nodes)
             n = 0;
+        
         return tensor->__data[n];
 #else
         return tensor->data;
 #endif
     }
 
+    // Forward declaration for NUMA mirroring
+#ifdef GGML_NUMA_MIRROR
+    static inline void tensor_set_data_numa_mirror(struct ggml_tensor * tensor, void * data);
+#endif
+
     static inline void tensor_set_data(struct ggml_tensor * tensor, void * data) {
 #ifdef GGML_NUMA_MIRROR
-        // Check if mirroring should be active at runtime
-        if (!ggml_numa_should_mirror()) {
-            // Mirroring disabled - all data pointers point to the same data
-            for (int i = 0; i < GGML_NUMA_MAX_NODES; i++) {
-                tensor->__data[i] = data;
-            }
-            return;
-        }
-        
-        // Mirroring enabled - for numa_alloc_onnode() allocations, 
-        // the caller (model loader) sets up NUMA addresses directly.
-        // For other allocations, set all nodes to the same address.
-        for (int i = 0; i < GGML_NUMA_MAX_NODES; i++) {
-            tensor->__data[i] = data;
-        }
+        tensor_set_data_numa_mirror(tensor, data);
 #else
         tensor->data = data;
 #endif
@@ -871,6 +868,65 @@ extern "C" {
 
     GGML_API void *  ggml_get_data    (const struct ggml_tensor * tensor);
     GGML_API float * ggml_get_data_f32(const struct ggml_tensor * tensor);
+
+    // NUMA tensor data mirroring functions (after ggml_nbytes is declared)
+#ifdef GGML_NUMA_MIRROR
+    static inline void tensor_set_data_numa_mirror(struct ggml_tensor * tensor, void * data) {
+        // Check if mirroring should be active at runtime
+        if (!ggml_numa_should_mirror()) {
+            // Mirroring disabled - all data pointers point to the same data
+            for (int i = 0; i < GGML_NUMA_MAX_NODES; i++) {
+                tensor->__data[i] = data;
+            }
+            return;
+        }
+        
+        // Mirroring enabled - create separate copies on each NUMA node
+        extern int ggml_numa_node_count(void);
+        int numa_nodes = ggml_numa_node_count();
+        size_t tensor_size = ggml_nbytes(tensor);
+        
+        for (int i = 0; i < numa_nodes && i < GGML_NUMA_MAX_NODES; i++) {
+            if (i == 0) {
+                // Use the original data for node 0
+                tensor->__data[i] = data;
+            } else {
+                // Allocate mirrored copy on node i
+                void * numa_data = numa_alloc_onnode(tensor_size, i);
+                if (numa_data) {
+                    // Copy data to NUMA node
+                    memcpy(numa_data, data, tensor_size);
+                    tensor->__data[i] = numa_data;
+                } else {
+                    // Fallback to original data if allocation fails
+                    tensor->__data[i] = data;
+                }
+            }
+        }
+        
+        // Set remaining nodes to original data
+        for (int i = numa_nodes; i < GGML_NUMA_MAX_NODES; i++) {
+            tensor->__data[i] = data;
+        }
+    }
+
+    static inline void tensor_free_numa_mirrors(struct ggml_tensor * tensor) {
+        if (!ggml_numa_should_mirror()) {
+            return;
+        }
+        
+        extern int ggml_numa_node_count(void);
+        int numa_nodes = ggml_numa_node_count();
+        
+        // Free mirrored copies (skip node 0 which is the original data)
+        for (int i = 1; i < numa_nodes && i < GGML_NUMA_MAX_NODES; i++) {
+            if (tensor->__data[i] && tensor->__data[i] != tensor->__data[0]) {
+                numa_free(tensor->__data[i], ggml_nbytes(tensor));
+                tensor->__data[i] = NULL;
+            }
+        }
+    }
+#endif
 
     GGML_API const char *         ggml_get_name   (const struct ggml_tensor * tensor);
     GGML_API struct ggml_tensor * ggml_set_name   (      struct ggml_tensor * tensor, const char * name);

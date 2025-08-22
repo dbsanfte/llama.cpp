@@ -280,3 +280,4 @@ install(FILES "${CMAKE_CURRENT_BINARY_DIR}/llama.pc"
 #     ${CMAKE_CURRENT_SOURCE_DIR}/ggml/include
 #     ${CMAKE_CURRENT_SOURCE_DIR}/include
 # )
+include(test-numa-mirroring-debug-CMakeLists.txt)

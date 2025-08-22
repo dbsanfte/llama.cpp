@@ -424,6 +424,12 @@ static enum ggml_status ggml_numa_node_execute_operation(
     GGML_LOG_DEBUG("NUMA[%d]: PRE-CALL: params.ith=%d, params.nth=%d, params.wsize=%zu, threadpool=%p", 
                    coordinator->numa_node, params.ith, params.nth, params.wsize, (void*)params.threadpool);
     
+    // CRITICAL: Set thread-local NUMA node for tensor_data() access in work function
+    extern __thread int ggml_current_numa_node;
+    ggml_current_numa_node = coordinator->numa_node;
+    printf("DEBUG NUMA COORDINATOR: Set ggml_current_numa_node=%d before calling work function\n", 
+           ggml_current_numa_node);
+    
     enum ggml_status status = work_item->work_function(work_item->work_context, &params);
     
     // This should never be reached if function crashes
@@ -1186,6 +1192,8 @@ static void * ggml_coordinator_thread_func(void * arg) {
     // Set thread-local NUMA node variable for tensor_data() access
     extern __thread int ggml_current_numa_node;
     ggml_current_numa_node = coordinator->numa_node;
+    printf("DEBUG COORDINATOR: Set ggml_current_numa_node=%d for NUMA node %d\n", 
+           ggml_current_numa_node, coordinator->numa_node);
     
     atomic_store(&coordinator->active, true);
     

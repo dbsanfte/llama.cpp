@@ -1565,6 +1565,20 @@ void ggml_free(struct ggml_context * ctx) {
         return;
     }
 
+#ifdef GGML_NUMA_MIRROR
+    // Clean up NUMA mirrored tensor data before freeing context
+    if (ggml_numa_should_mirror()) {
+        struct ggml_object * obj = ctx->objects_begin;
+        while (obj != NULL) {
+            if (obj->type == GGML_OBJECT_TYPE_TENSOR) {
+                struct ggml_tensor * tensor = (struct ggml_tensor *)((char *)ctx->mem_buffer + obj->offs);
+                tensor_free_numa_mirrors(tensor);
+            }
+            obj = obj->next;
+        }
+    }
+#endif
+
     if (ctx->mem_buffer_owned) {
         // Check if this was NUMA-allocated memory
         if (ggml_numa_is_numa_allocated(ctx->mem_buffer)) {

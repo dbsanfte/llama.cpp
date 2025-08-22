@@ -240,7 +240,7 @@ target_include_directories(${LLAMA_TEST_NAME} PRIVATE ${CMAKE_SOURCE_DIR}/ggml/s
 
 # test-huge-dataparallel-debug (focused debug test)
 set(LLAMA_TEST_NAME test-huge-dataparallel-debug)
-add_executable(test-huge-dataparallel-debug ../test-huge-dataparallel-debug.cpp get-model.cpp)
+add_executable(test-huge-dataparallel-debug test-huge-dataparallel-debug.cpp get-model.cpp)
 install(TARGETS test-huge-dataparallel-debug RUNTIME)
 target_link_libraries(test-huge-dataparallel-debug PRIVATE common)
 target_link_libraries(${LLAMA_TEST_NAME} PRIVATE ggml ggml-cpu common)

@@ -11,7 +11,7 @@
  */
 
 #include "numa-kernels.h"
-#include "add.h"
+#include "add-direct.h"
 #include "../ggml-impl.h"
 
 // ============================================================================
@@ -74,7 +74,7 @@ static bool build_kernel_cache(void) {
     // Populate supported operations - each kernel provides its own cache entries
     printf("DEBUG: NUMA Cache: Temporarily disabling ADD cache for debugging\n");
     GGML_LOG_DEBUG("NUMA Cache: Temporarily disabling ADD cache for debugging\n");
-    ggml_numa_kernel_add_populate_cache(g_numa_cache[GGML_OP_ADD]); // RE-ENABLED AFTER BROADCASTING FIX
+    ggml_numa_kernel_add_direct_populate_cache(g_numa_cache[GGML_OP_ADD]); // DIRECT VERSION - NO MIGRATION
     
     // Verify ADD cache entries were populated
     for (int complexity = 0; complexity < COMPLEXITY_COUNT; complexity++) {

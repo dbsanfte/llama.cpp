@@ -627,6 +627,10 @@ void ggml_numa_init_with_threadpool_params(enum ggml_numa_strategy numa_strategy
 }
 
 void ggml_numa_init(enum ggml_numa_strategy numa_flag) {
+    // Set strategy and initialization state FIRST
+    g_numa_state.strategy = numa_flag;
+    g_numa_state.initialized = true;
+    
     // Legacy initialization - use threadpool params if available, otherwise basic init
     if (g_numa_state.threadpool_params_valid) {
         ggml_numa_init_coordinator(numa_flag, &g_numa_state.threadpool_params);
@@ -636,9 +640,6 @@ void ggml_numa_init(enum ggml_numa_strategy numa_flag) {
         ggml_threadpool_params_init(&tpp, -1);  // Use default thread count
         ggml_numa_init_coordinator(numa_flag, &tpp);
     }
-    
-    g_numa_state.strategy = numa_flag;
-    g_numa_state.initialized = true;
 }
 
 bool ggml_is_numa(void) {
