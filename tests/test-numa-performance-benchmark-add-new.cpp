@@ -45,11 +45,12 @@ public:
         };
     }
     
-    double measure_fallback_performance(const TestCase& test_case) {
-        printf("    Testing %s [%dx%dx%d] (Fallback mode)...\n", 
-               test_case.name, test_case.dim1, test_case.dim2, test_case.dim3);
+    double measure_performance(const TestCase& test_case, bool use_numa) {
+        printf("    Testing %s [%dx%dx%d] (%s mode)...\n", 
+               test_case.name, test_case.dim1, test_case.dim2, test_case.dim3,
+               use_numa ? "NUMA" : "Fallback");
         
-        // Create context WITHOUT NUMA initialization
+        // Create context
         size_t tensor_size = (size_t)test_case.dim1 * test_case.dim2 * test_case.dim3 * sizeof(float);
         size_t ctx_size = tensor_size * 8 + 64*1024*1024; // Extra space
         
@@ -86,106 +87,14 @@ public:
             b_data[i] = 2.5f + (i % 100) * 0.01f;
         }
         
-        // Create computation graph and use ggml_graph_compute (no NUMA)
-        struct ggml_cgraph* cgraph = ggml_new_graph(ctx);
-        ggml_build_forward_expand(cgraph, result);
-        
-        struct ggml_cplan cplan = ggml_graph_plan(cgraph, 8, NULL);
-        
-        // Warmup
-        for (int i = 0; i < 3; i++) {
-            ggml_graph_compute(cgraph, &cplan);
+        // Set execution mode
+        if (use_numa) {
+            ggml_numa_set_dispatch_enabled(true);
+        } else {
+            ggml_numa_set_dispatch_enabled(false);
         }
         
-        // Measure performance
-        const int num_runs = 10;
-        std::vector<double> times;
-        
-        for (int run = 0; run < num_runs; run++) {
-            auto start = std::chrono::high_resolution_clock::now();
-            enum ggml_status status = ggml_graph_compute(cgraph, &cplan);
-            auto end = std::chrono::high_resolution_clock::now();
-            
-            if (status != GGML_STATUS_SUCCESS) {
-                printf("Computation failed\n");
-                ggml_free(ctx);
-                return -1.0;
-            }
-            
-            double time_ms = std::chrono::duration<double, std::milli>(end - start).count();
-            if (time_ms > 0.001) { // Filter unrealistic times
-                times.push_back(time_ms);
-            }
-        }
-        
-        ggml_free(ctx);
-        
-        if (times.empty()) {
-            return -1.0;
-        }
-        
-        // Calculate average time (remove outliers)
-        std::sort(times.begin(), times.end());
-        if (times.size() > 4) {
-            times.erase(times.begin()); // Remove fastest
-            times.pop_back(); // Remove slowest
-        }
-        
-        double avg_time = 0.0;
-        for (double time : times) {
-            avg_time += time;
-        }
-        avg_time /= times.size();
-        
-        printf("      Average time: %.3f ms\n", avg_time);
-        return avg_time;
-    }
-    
-    double measure_numa_performance(const TestCase& test_case) {
-        printf("    Testing %s [%dx%dx%d] (NUMA mode)...\n", 
-               test_case.name, test_case.dim1, test_case.dim2, test_case.dim3);
-        
-        // Create context WITH NUMA
-        size_t tensor_size = (size_t)test_case.dim1 * test_case.dim2 * test_case.dim3 * sizeof(float);
-        size_t ctx_size = tensor_size * 8 + 64*1024*1024; // Extra space
-        
-        struct ggml_init_params params = {
-            /*.mem_size   =*/ ctx_size,
-            /*.mem_buffer =*/ NULL,
-            /*.no_alloc   =*/ false,
-        };
-        
-        struct ggml_context* ctx = ggml_init(params);
-        if (!ctx) {
-            printf("Failed to create context\n");
-            return -1.0;
-        }
-        
-        // Create tensors
-        struct ggml_tensor* tensor_a = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, test_case.dim1, test_case.dim2, test_case.dim3);
-        struct ggml_tensor* tensor_b = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, test_case.dim1, test_case.dim2, test_case.dim3);
-        struct ggml_tensor* result = ggml_add(ctx, tensor_a, tensor_b);
-        
-        if (!tensor_a || !tensor_b || !result) {
-            printf("Failed to create tensors\n");
-            ggml_free(ctx);
-            return -1.0;
-        }
-        
-        // Initialize data
-        float* a_data = (float*)ggml_get_data(tensor_a);
-        float* b_data = (float*)ggml_get_data(tensor_b);
-        size_t total_elements = ggml_nelements(tensor_a);
-        
-        for (size_t i = 0; i < total_elements; i++) {
-            a_data[i] = 1.5f + (i % 100) * 0.01f;
-            b_data[i] = 2.5f + (i % 100) * 0.01f;
-        }
-        
-        // Ensure NUMA dispatch is enabled
-        ggml_numa_set_dispatch_enabled(true);
-        
-        // Create computation graph and use ggml_graph_compute_with_ctx (NUMA)
+        // Create computation graph
         struct ggml_cgraph* cgraph = ggml_new_graph(ctx);
         ggml_build_forward_expand(cgraph, result);
         
@@ -251,8 +160,8 @@ public:
         for (const auto& test_case : test_cases) {
             printf("📊 Testing %s: %s\n", test_case.name, test_case.description);
             
-            double fallback_time = measure_fallback_performance(test_case);
-            double numa_time = measure_numa_performance(test_case);
+            double fallback_time = measure_performance(test_case, false);
+            double numa_time = measure_performance(test_case, true);
             
             PerformanceResult result;
             result.test_name = test_case.name;
