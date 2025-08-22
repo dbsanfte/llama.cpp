@@ -748,3 +748,10 @@ struct ggml_threadpool * ggml_numa_simple_coordinator_get_fallback_threadpool(vo
     }
     return g_simple_coordinator.fallback_threadpool;
 }
+
+int ggml_numa_simple_coordinator_get_fallback_thread_count(void) {
+    if (!g_simple_coordinator.initialized) {
+        return 1;
+    }
+    return g_simple_coordinator.threads_per_node[0];
+}

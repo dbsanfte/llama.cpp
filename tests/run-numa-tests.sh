@@ -298,7 +298,7 @@ run_integration_test() {
     echo "    🚀 Starting llama-server with NUMA mirror mode..."
     
     # Start llama-server in background with NUMA mirror mode
-    "$BIN_DIR/llama-server" -m "$model_path" --host 0.0.0.0 --numa mirror-force --port $server_port > /tmp/llama-server.log 2>&1 &
+    "$BIN_DIR/llama-server" -m "$model_path" --host 0.0.0.0 --numa mirror --port $server_port > /tmp/llama-server.log 2>&1 &
     server_pid=$!
     
     # Function to cleanup server

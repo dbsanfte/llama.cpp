@@ -1500,19 +1500,33 @@ struct ggml_context * ggml_init(struct ggml_init_params params) {
 
     const size_t mem_size = params.mem_buffer ? params.mem_size : GGML_PAD(params.mem_size, GGML_MEM_ALIGN);
 
-    // Use NUMA-aware allocation for large context memory pools
+    // Use NUMA-aware allocation for context memory pools
     void* context_memory = NULL;
     if (params.mem_buffer) {
         context_memory = params.mem_buffer;
     } else {
-        // For large contexts (>64MB), use NUMA distribution
-        if (mem_size >= 64 * 1024 * 1024) {
+        // Check if NUMA allocator should be bypassed
+        const char* bypass_numa = getenv("GGML_BYPASS_NUMA_ALLOCATOR");
+        bool use_numa = (bypass_numa == NULL || strcmp(bypass_numa, "1") != 0);
+
+        // Only use NUMA allocation for contexts >= 16MB that benefit from distribution
+        // Small contexts should always use regular allocation to avoid complexity
+        const size_t numa_threshold = 16 * 1024 * 1024; // 16MB threshold
+        bool should_use_numa = use_numa && (mem_size >= numa_threshold);
+
+        if (should_use_numa) {
             printf("🗂️ Allocating NUMA-distributed context memory pool: %zu MB\n", mem_size / (1024 * 1024));
             context_memory = ggml_numa_alloc_context_memory(mem_size, NULL);
-        }
-        
-        // Fallback to regular allocation
+        } 
+
+        // Fallback to regular allocation (for small contexts or if NUMA failed)
         if (!context_memory) {
+            if (should_use_numa) {
+                printf("⚠️ NUMA allocation failed, falling back to regular allocation\n");
+            } else if (!use_numa) {
+                printf("⚠️ NUMA allocator bypassed via GGML_BYPASS_NUMA_ALLOCATOR=1\n");
+            }
+            // For small contexts, this is the expected path
             context_memory = ggml_aligned_malloc(mem_size);
         }
     }
@@ -7028,16 +7042,4 @@ __attribute__((weak)) int ggml_numa_node_count(void) {
     return 1;  // Default to single node
 }
 
-// Force link NUMA allocator functions to ensure they're exported
-// This function is referenced from ggml_init to force symbol inclusion
-void ggml_force_link_numa_allocator_symbols(void) {
-    // This function forces the linker to include NUMA allocator symbols
-    // It's called from ggml_init to ensure symbols are available
-    static volatile void* force_link_table[] = {
-        (void*)ggml_numa_alloc_context_memory,
-        (void*)ggml_numa_free,
-        (void*)ggml_numa_is_numa_allocated,
-        NULL
-    };
-    (void)force_link_table; // Prevent optimization
-}
+

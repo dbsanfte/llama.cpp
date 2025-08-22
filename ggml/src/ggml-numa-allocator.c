@@ -117,11 +117,15 @@ static bool is_numa_broken(void) {
 // Enhanced allocation with explicit first-touch distribution
 static void* allocate_distributed_memory(size_t total_size, ggml_numa_alloc_context_t* ctx) {
     if (ctx->num_numa_nodes <= 1) {
-        // Fallback to regular allocation
-        return aligned_alloc(64, total_size);
+        // Fallback to regular allocation - ensure it's zeroed
+        void* mem = aligned_alloc(64, total_size);
+        if (mem) {
+            memset(mem, 0, total_size); // Ensure memory is zeroed
+        }
+        return mem;
     }
     
-    // Use mmap for better control
+    // Use mmap for better control - mmap returns zeroed memory
     void* memory = mmap(NULL, total_size, PROT_READ | PROT_WRITE, 
                        MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     
@@ -136,6 +140,7 @@ static void* allocate_distributed_memory(size_t total_size, ggml_numa_alloc_cont
     }
     
     // Distribute pages across NUMA nodes using first-touch
+    // Note: mmap() already returns zeroed memory, so we only need first-touch for NUMA placement
     const size_t page_size = 4096;
     const size_t total_pages = (total_size + page_size - 1) / page_size;
     const size_t pages_per_node = total_pages / ctx->num_numa_nodes;
@@ -161,11 +166,14 @@ static void* allocate_distributed_memory(size_t total_size, ggml_numa_alloc_cont
                    node, start_page, end_page - 1, end_page - start_page);
         }
         
-        // First-touch pages for this node
+        // First-touch pages for this node (memory is already zeroed by mmap)
+        // We just need to touch each page to establish NUMA placement
         for (size_t page = start_page; page < end_page; page++) {
             size_t offset = page * page_size;
             if (offset < total_size) {
-                mem_ptr[offset] = 0x42; // First touch
+                // Just read the already-zero value to establish NUMA locality
+                volatile char temp = mem_ptr[offset];
+                (void)temp; // Prevent optimization
             }
         }
         
@@ -215,6 +223,8 @@ void* ggml_numa_aligned_malloc(size_t size, ggml_numa_alloc_context_t* numa_ctx)
             int current_node = numa_node_of_cpu(sched_getcpu());
             void* mem = numa_alloc_onnode(size, current_node);
             if (mem) {
+                // Ensure memory is zeroed (numa_alloc_onnode should do this, but be explicit)
+                memset(mem, 0, size);
                 numa_ctx->per_node_allocated[current_node] += size;
                 numa_ctx->total_allocated += size;
                 return mem;
@@ -225,6 +235,8 @@ void* ggml_numa_aligned_malloc(size_t size, ggml_numa_alloc_context_t* numa_ctx)
         case GGML_NUMA_ALLOC_STRATEGY_INTERLEAVE: {
             void* mem = numa_alloc_interleaved(size);
             if (mem) {
+                // Ensure memory is zeroed (numa_alloc_interleaved should do this, but be explicit)
+                memset(mem, 0, size);
                 numa_ctx->total_allocated += size;
                 return mem;
             }
@@ -234,13 +246,13 @@ void* ggml_numa_aligned_malloc(size_t size, ggml_numa_alloc_context_t* numa_ctx)
             break;
     }
     
-    // Fallback to regular aligned allocation
+    // Fallback to regular aligned allocation - ensure it's zeroed
     void* mem = aligned_alloc(64, size);
-    if (mem && numa_ctx->debug_enabled) {
-        printf("⚠️ Fallback allocation for %zu bytes\n", size);
-    }
-    
     if (mem) {
+        memset(mem, 0, size); // Ensure memory is zeroed
+        if (numa_ctx->debug_enabled) {
+            printf("⚠️ Fallback allocation for %zu bytes (zeroed)\n", size);
+        }
         numa_ctx->total_allocated += size;
     }
     
@@ -363,4 +375,16 @@ void ggml_numa_free(void* ptr) {
         // This was a NUMA allocation, use numa_free which handles this
         numa_free(ptr, 0); // numa_free with size 0 is handled internally
     }
+}
+
+// Force linking of NUMA allocator symbols (prevent dead code elimination)
+void ggml_force_link_numa_allocator_symbols(void) {
+    // This function ensures that NUMA allocator symbols are linked
+    // even if not directly called, preventing linker optimization
+    volatile void* symbols[] = {
+        (void*)ggml_numa_alloc_context_memory,
+        (void*)ggml_numa_is_numa_allocated,
+        (void*)ggml_numa_free
+    };
+    (void)symbols; // Suppress unused variable warning
 }

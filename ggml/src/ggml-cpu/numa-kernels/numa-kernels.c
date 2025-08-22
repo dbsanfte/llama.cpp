@@ -72,9 +72,9 @@ static bool build_kernel_cache(void) {
     }
     
     // Populate supported operations - each kernel provides its own cache entries
-    printf("DEBUG: NUMA Cache: Populating ADD cache entries\n");
-    GGML_LOG_DEBUG("NUMA Cache: Populating ADD cache entries\n");
-    ggml_numa_kernel_add_populate_cache(g_numa_cache[GGML_OP_ADD]);
+    printf("DEBUG: NUMA Cache: Temporarily disabling ADD cache for debugging\n");
+    GGML_LOG_DEBUG("NUMA Cache: Temporarily disabling ADD cache for debugging\n");
+    ggml_numa_kernel_add_populate_cache(g_numa_cache[GGML_OP_ADD]); // RE-ENABLED AFTER BROADCASTING FIX
     
     // Verify ADD cache entries were populated
     for (int complexity = 0; complexity < COMPLEXITY_COUNT; complexity++) {
@@ -89,7 +89,7 @@ static bool build_kernel_cache(void) {
     
     // Mark unsupported operations (can be extended as kernels are added)
     for (int op = 0; op < GGML_OP_COUNT; op++) {
-        if (op != GGML_OP_ADD) {
+        if (op != GGML_OP_ADD) {  // Mark all operations except ADD as unsupported 
             populate_unsupported_operation((enum ggml_op)op);
         }
     }

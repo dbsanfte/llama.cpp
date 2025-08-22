@@ -268,6 +268,175 @@ private:
         results.push_back({"ADD_mathematical_equivalence", overall_test_passed, failure_reason ? failure_reason : ""});
     }
 
+    // Test specific broadcasting scenarios that previously caused memory corruption
+    void test_ADD_broadcasting_regression() {
+        printf("--- Test: ADD Broadcasting Regression (Specific Bug Scenarios) ---\n");
+        printf("Testing specific tensor broadcasting scenarios that previously caused NUMA memory corruption...\n");
+        printf("This ensures the fix for buffer overflow in broadcasting is working correctly\n\n");
+        
+        bool overall_test_passed = true;
+        const char* failure_reason = nullptr;
+        
+        // Define specific broadcasting scenarios that were problematic
+        struct {
+            int src0_dim1, src0_dim2;  // Source tensor 0 dimensions
+            int src1_dim1, src1_dim2;  // Source tensor 1 dimensions (smaller, broadcasted)
+            const char* description;
+        } broadcasting_cases[] = {
+            {2, 1024, 2, 1, "Matrix [2x1024] + Vector [2] (row broadcast)"},
+            {1024, 2, 2, 1, "Matrix [1024x2] + Vector [2] (element broadcast)"},
+            {128, 64, 64, 1, "Matrix [128x64] + Vector [64] (column broadcast)"},
+            {256, 32, 1, 32, "Matrix [256x32] + Vector [32] (row broadcast)"},
+            {512, 8, 8, 1, "Matrix [512x8] + Vector [8] (element broadcast)"}
+        };
+        
+        int num_broadcasting_cases = sizeof(broadcasting_cases) / sizeof(broadcasting_cases[0]);
+        int thread_strategies[] = {1, 2, 4, 8};
+        int num_strategies = sizeof(thread_strategies) / sizeof(thread_strategies[0]);
+        
+        printf("  🎯 Testing %d broadcasting scenarios with %d thread strategies (%d total combinations)\n\n",
+               num_broadcasting_cases, num_strategies, num_broadcasting_cases * num_strategies);
+        
+        int total_tests = 0;
+        int passed_tests = 0;
+        
+        for (int case_idx = 0; case_idx < num_broadcasting_cases; case_idx++) {
+            printf("  📡 Broadcasting case: %s\n", broadcasting_cases[case_idx].description);
+            
+            for (int strategy_idx = 0; strategy_idx < num_strategies; strategy_idx++) {
+                int num_threads = thread_strategies[strategy_idx];
+                
+                printf("    🧮 Testing with %d threads\n", num_threads);
+                
+                // Create test context
+                struct ggml_init_params params;
+                params.mem_size = 512 * 1024 * 1024; // 512MB should be enough
+                params.mem_buffer = nullptr;
+                params.no_alloc = false;
+                
+                struct ggml_context* test_ctx = ggml_init(params);
+                if (!test_ctx) {
+                    printf("      ❌ Failed to create test context\n");
+                    overall_test_passed = false;
+                    continue;
+                }
+                
+                bool case_passed = false;
+                
+                // Create source tensors with specific broadcasting dimensions
+                struct ggml_tensor* src0 = ggml_new_tensor_2d(test_ctx, GGML_TYPE_F32, 
+                                                             broadcasting_cases[case_idx].src0_dim1,
+                                                             broadcasting_cases[case_idx].src0_dim2);
+                struct ggml_tensor* src1 = ggml_new_tensor_2d(test_ctx, GGML_TYPE_F32,
+                                                             broadcasting_cases[case_idx].src1_dim1,
+                                                             broadcasting_cases[case_idx].src1_dim2);
+                
+                if (!src0 || !src1) {
+                    printf("      ❌ Failed to create source tensors\n");
+                    ggml_free(test_ctx);
+                    overall_test_passed = false;
+                    continue;
+                }
+                
+                // Fill tensors with deterministic test data
+                float* src0_data = (float*)ggml_get_data(src0);
+                float* src1_data = (float*)ggml_get_data(src1);
+                int src0_elements = ggml_nelements(src0);
+                int src1_elements = ggml_nelements(src1);
+                
+                for (int i = 0; i < src0_elements; i++) {
+                    src0_data[i] = 1.0f + (i % 100) * 0.01f; // Pattern that reveals out-of-bounds access
+                }
+                for (int i = 0; i < src1_elements; i++) {
+                    src1_data[i] = 10.0f + i * 0.1f; // Distinct pattern for broadcasting tensor
+                }
+                
+                // Create ADD operation (this should trigger broadcasting)
+                struct ggml_tensor* numa_result = ggml_add(test_ctx, src0, src1);
+                
+                if (!numa_result) {
+                    printf("      ❌ Failed to create ADD operation\n");
+                    ggml_free(test_ctx);
+                    overall_test_passed = false;
+                    continue;
+                }
+                
+                printf("      📊 Tensors: src0[%ldx%ld]=%ld elements, src1[%ldx%ld]=%ld elements, dst[%ldx%ld]=%ld elements\n",
+                       src0->ne[0], src0->ne[1], ggml_nelements(src0),
+                       src1->ne[0], src1->ne[1], ggml_nelements(src1),
+                       numa_result->ne[0], numa_result->ne[1], ggml_nelements(numa_result));
+                
+                // Execute via NUMA (this previously caused memory corruption)
+                struct ggml_cplan cplan = {};
+                cplan.work_size = 0;
+                cplan.work_data = nullptr;
+                cplan.n_threads = num_threads;
+                cplan.threadpool = nullptr;
+                
+                enum ggml_status dispatch_result = ggml_numa_executor_execute_tensor(numa_result, &cplan);
+                
+                if (dispatch_result != GGML_STATUS_SUCCESS) {
+                    printf("      ❌ NUMA dispatch failed: %d (this suggests the broadcasting bug still exists!)\n", dispatch_result);
+                    ggml_free(test_ctx);
+                    overall_test_passed = false;
+                    continue;
+                }
+                
+                // Create reference computation using serial execution
+                struct ggml_tensor* ref_result = ggml_add(test_ctx, src0, src1);
+                struct ggml_compute_params ref_params;
+                ref_params.ith = 0;
+                ref_params.nth = 1;
+                ref_params.wsize = 0;
+                ref_params.wdata = nullptr;
+                ref_params.threadpool = nullptr;
+                ggml_compute_forward_add_non_quantized(&ref_params, ref_result);
+                
+                // Compare results (this will detect if memory corruption occurred)
+                float* numa_data = (float*)ggml_get_data(numa_result);
+                float* ref_data = (float*)ggml_get_data(ref_result);
+                int total_elements = ggml_nelements(numa_result);
+                
+                case_passed = compare_float_arrays(numa_data, ref_data, total_elements, "Broadcasting ADD");
+                
+                if (case_passed) {
+                    printf("      ✅ Broadcasting case passed (threads=%d)\n", num_threads);
+                } else {
+                    printf("      ❌ Broadcasting case failed (threads=%d) - REGRESSION DETECTED!\n", num_threads);
+                    if (!failure_reason) {
+                        failure_reason = "Broadcasting regression detected - memory corruption or incorrect results";
+                    }
+                }
+                
+                total_tests++;
+                if (case_passed) {
+                    passed_tests++;
+                } else {
+                    overall_test_passed = false;
+                }
+                
+                ggml_free(test_ctx);
+            }
+            printf("\n");
+        }
+        
+        // Print summary for broadcasting test
+        printf("  📊 Broadcasting Regression Test Summary:\n");
+        printf("    Total test combinations: %d\n", total_tests);
+        printf("    Passed: %d\n", passed_tests);
+        printf("    Failed: %d\n", total_tests - passed_tests);
+        
+        if (overall_test_passed) {
+            printf("✅ ADD broadcasting regression test: PASSED\n");
+            printf("  🎉 All broadcasting scenarios work correctly - no memory corruption detected!\n\n");
+        } else {
+            printf("❌ ADD broadcasting regression test: FAILED - %s\n", failure_reason);
+            printf("  ⚠️  Broadcasting memory corruption bug may have returned - immediate investigation required!\n\n");
+        }
+        
+        results.push_back({"ADD_broadcasting_regression", overall_test_passed, failure_reason ? failure_reason : ""});
+    }
+
 public:
     bool run_all_tests() {
         printf("🧪 NUMA Mathematical Correctness Test Suite - ADD\n");
@@ -278,6 +447,9 @@ public:
         
         // Run mathematical correctness tests
         test_ADD_mathematical_equivalence();
+        
+        // Run broadcasting regression tests
+        test_ADD_broadcasting_regression();
         
         print_summary();
         

@@ -79,6 +79,12 @@ int ggml_numa_get_current_node(void);
  */
 struct ggml_threadpool * ggml_numa_simple_coordinator_get_fallback_threadpool(void);
 
+/**
+ * Get the fallback thread count
+ * @return Number of threads in the fallback threadpool, or 1 if not initialized
+ */
+int ggml_numa_simple_coordinator_get_fallback_thread_count(void);
+
 #ifdef __cplusplus
 }
 #endif

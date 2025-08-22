@@ -241,7 +241,7 @@ enum ggml_status ggml_numa_kernel_add_work_function(void * work_context, struct 
         NUMA_ASSERT(ggml_are_same_shape(src0, src1), "Non-contiguous broadcast requires same shapes");
     }
     
-    // Process assigned NUMA slice directly on flattened tensor data
+    // Process assigned NUMA slice with proper broadcasting support
     // For element-wise operations, work with flat array for optimal performance
     const float * src0_data = (const float *)tensor_data(src0);
     const float * src1_data = (const float *)tensor_data(src1);
@@ -251,8 +251,14 @@ enum ggml_status ggml_numa_kernel_add_work_function(void * work_context, struct 
     size_t elements_in_slice = numa_end - numa_start;
     const int current_numa_node = ggml_numa_get_current_node();
     
+    // Get tensor sizes for broadcasting calculations
+    const int64_t src1_elements = ggml_nelements(src1);
+    const int64_t dst_elements = ggml_nelements(tensor);
+    
     printf("DEBUG ADD KERNEL: Processing %zu elements from %zu to %zu on NUMA node %d\n", 
            elements_in_slice, numa_start, numa_end, current_numa_node);
+    printf("DEBUG ADD KERNEL: Broadcasting: dst=%ld elements, src1=%ld elements\n", 
+           dst_elements, src1_elements);
 
     printf("DEBUG ADD KERNEL: Implementing FIRST TOUCH policy for optimal NUMA locality\n");
 
@@ -272,7 +278,7 @@ enum ggml_status ggml_numa_kernel_add_work_function(void * work_context, struct 
     // Only attempt madvise on aligned memory regions that we fully control
     float* dst_ptr = (float*)dst_data + numa_start;
     const float* src0_ptr = src0_data + numa_start;
-    const float* src1_ptr = src1_data + numa_start;
+    // NOTE: src1_ptr calculation moved to per-element loop for proper broadcasting
     
     printf("DEBUG ADD KERNEL: Smart page migration to NUMA node %d\n", current_numa_node);
     
@@ -312,17 +318,23 @@ enum ggml_status ggml_numa_kernel_add_work_function(void * work_context, struct 
     }
     
     // For source memory: always use safe first-touch (can't use MADV_DONTNEED as it would lose data)
-    printf("DEBUG ADD KERNEL: First-touch prefaulting source pages\n");
+    printf("DEBUG ADD KERNEL: First-touch prefaulting source pages with broadcasting support\n");
     volatile float prefault_sum = 0.0f;  // Prevent optimization
     
     for (size_t i = 0; i < elements_in_slice; i += page_size_floats) {
         // Touch each page to ensure it's accessible and potentially migrate if kernel allows
-        prefault_sum += src0_ptr[i] + src1_ptr[i];
+        // Apply proper broadcasting for src1 access
+        size_t dst_idx = numa_start + i;
+        size_t src1_idx = dst_idx % src1_elements;  // Proper broadcasting
+        
+        prefault_sum += src0_ptr[i] + src1_data[src1_idx];
         
         // Touch end of page too if different
         size_t page_end = (i + page_size_floats < elements_in_slice) ? i + page_size_floats : elements_in_slice;
         if (page_end - 1 > i) {
-            prefault_sum += src0_ptr[page_end - 1] + src1_ptr[page_end - 1];
+            size_t end_dst_idx = numa_start + (page_end - 1);
+            size_t end_src1_idx = end_dst_idx % src1_elements;  // Proper broadcasting
+            prefault_sum += src0_ptr[page_end - 1] + src1_data[end_src1_idx];
         }
     }
     
@@ -340,33 +352,66 @@ enum ggml_status ggml_numa_kernel_add_work_function(void * work_context, struct 
     printf("DEBUG ADD KERNEL: Memory preparation completed in %.3fms (sum=%.6f to prevent optimization)\n", 
            migration_time_ms, prefault_sum);
 
-    printf("DEBUG ADD KERNEL: Starting SIMD-optimized ADD for %zu elements on NUMA node %d\n", 
-           elements_in_slice, current_numa_node);    struct timespec time_start, time_end;
+    printf("DEBUG ADD KERNEL: Starting SIMD-optimized ADD with broadcasting for %zu elements on NUMA node %d\n", 
+           elements_in_slice, current_numa_node);    
+    struct timespec time_start, time_end;
     clock_gettime(CLOCK_MONOTONIC, &time_start);
     
-    // Optimized SIMD ADD implementation using AVX2
-    // This is similar to what the raw test uses
-    const size_t simd_width = 8; // AVX2 processes 8 floats at once
-    const size_t simd_end_idx = (elements_in_slice / simd_width) * simd_width;
+    // For proper broadcasting, we need to check if src1 is truly compatible
+    // Only use simple SIMD if no broadcasting is needed (same size tensors)
+    const bool can_use_simple_simd = (src1_elements == dst_elements);
     
+    if (can_use_simple_simd) {
+        printf("DEBUG ADD KERNEL: Using optimized SIMD path (no broadcasting)\n");
+        // Simple SIMD ADD - no broadcasting needed
+        const size_t simd_width = 8; // AVX2 processes 8 floats at once
+        const size_t simd_end_idx = (elements_in_slice / simd_width) * simd_width;
+        
+        const float* src1_ptr = src1_data + numa_start;
+        
 #if defined(__AVX2__)
-    // Process SIMD chunks using AVX2
-    for (size_t i = 0; i < simd_end_idx; i += simd_width) {
-        __m256 a = _mm256_loadu_ps(&src0_ptr[i]);
-        __m256 b = _mm256_loadu_ps(&src1_ptr[i]);
-        __m256 result = _mm256_add_ps(a, b);
-        _mm256_storeu_ps(&dst_ptr[i], result);
-    }
+        // Process SIMD chunks using AVX2
+        for (size_t i = 0; i < simd_end_idx; i += simd_width) {
+            __m256 a = _mm256_loadu_ps(&src0_ptr[i]);
+            __m256 b = _mm256_loadu_ps(&src1_ptr[i]);
+            __m256 result = _mm256_add_ps(a, b);
+            _mm256_storeu_ps(&dst_ptr[i], result);
+        }
 #else
-    // Fallback to scalar for the SIMD portion if AVX2 not available
-    for (size_t i = 0; i < simd_end_idx; i++) {
-        dst_ptr[i] = src0_ptr[i] + src1_ptr[i];
-    }
+        // Fallback to scalar for the SIMD portion if AVX2 not available
+        for (size_t i = 0; i < simd_end_idx; i++) {
+            dst_ptr[i] = src0_ptr[i] + src1_ptr[i];
+        }
 #endif
-    
-    // Handle remainder elements
-    for (size_t i = simd_end_idx; i < elements_in_slice; i++) {
-        dst_ptr[i] = src0_ptr[i] + src1_ptr[i];
+        
+        // Handle remainder elements
+        for (size_t i = simd_end_idx; i < elements_in_slice; i++) {
+            dst_ptr[i] = src0_ptr[i] + src1_ptr[i];
+        }
+    } else {
+        printf("DEBUG ADD KERNEL: Using element-wise broadcasting path\n");
+        // Element-wise path with proper 2D broadcasting semantics
+        
+        // Get tensor dimensions for proper broadcasting
+        const int64_t dst_ne0 = tensor->ne[0];  // columns
+        const int64_t dst_ne1 = tensor->ne[1];  // rows  
+        const int64_t src1_ne0 = src1->ne[0];   // columns
+        const int64_t src1_ne1 = src1->ne[1];   // rows
+        
+        for (size_t i = 0; i < elements_in_slice; i++) {
+            size_t dst_idx = numa_start + i;
+            
+            // Convert flat index to 2D coordinates
+            size_t dst_row = dst_idx / dst_ne0;
+            size_t dst_col = dst_idx % dst_ne0;
+            
+            // Apply broadcasting rules to find src1 element
+            size_t src1_row = dst_row % src1_ne1;
+            size_t src1_col = dst_col % src1_ne0;
+            size_t src1_idx = src1_row * src1_ne0 + src1_col;
+            
+            dst_ptr[i] = src0_ptr[i] + src1_data[src1_idx];
+        }
     }
     
     clock_gettime(CLOCK_MONOTONIC, &time_end);

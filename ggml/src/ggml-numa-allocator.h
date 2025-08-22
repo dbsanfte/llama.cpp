@@ -54,14 +54,17 @@ void ggml_numa_alloc_stats(const ggml_numa_alloc_context_t* ctx);
 // Enable/disable debug logging
 void ggml_numa_alloc_set_debug(ggml_numa_alloc_context_t* ctx, bool enabled);
 
-#ifdef __cplusplus
-}
-#endif
-
 // Check if memory was allocated by NUMA allocator
 bool ggml_numa_is_numa_allocated(void* ptr);
 
 // Free NUMA-allocated memory
 void ggml_numa_free(void* ptr);
+
+// Force linking of NUMA allocator symbols (internal use)
+void ggml_force_link_numa_allocator_symbols(void);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif // GGML_NUMA_ALLOCATOR_H

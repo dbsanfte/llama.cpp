@@ -9,6 +9,7 @@
 
 #include "ggml-numa-executor.h"
 #include "ggml-numa-simple-coordinator.h"
+#include "ggml-numa-simple-coordinator.h"  // For fallback threadpool functions
 #include "ggml-cpu-impl.h"
 #include "ggml-impl.h"
 #include "ggml-cpu.h"  // For ggml_compute_forward_* function declarations
@@ -363,11 +364,18 @@ enum ggml_status ggml_numa_executor_fallback_to_cpu(struct ggml_tensor * tensor,
         }
     }
 
-    // Get fallback threadpool - use simple approach without complex coordinator
+    // Get fallback threadpool - try dedicated fallback threadpool first, then cplan threadpool
     struct ggml_threadpool * fallback_threadpool = NULL;
     int fallback_thread_count = cplan->n_threads; // Use original plan's thread count
     
-    if (cplan->threadpool) {
+    // Try to get the dedicated fallback threadpool from coordinator
+    fallback_threadpool = ggml_numa_simple_coordinator_get_fallback_threadpool();
+    if (fallback_threadpool) {
+        fallback_thread_count = ggml_numa_simple_coordinator_get_fallback_thread_count();
+        GGML_LOG_DEBUG("🔧 Using dedicated fallback threadpool: %p (bound to NUMA node 0)\n", (void*)fallback_threadpool);
+        GGML_LOG_DEBUG("📊 Fallback Execution: threads=%d, threadpool=%p (disposable=true)\n", 
+                       fallback_thread_count, (void*)fallback_threadpool);
+    } else if (cplan->threadpool) {
         fallback_threadpool = cplan->threadpool;
         GGML_LOG_DEBUG("NUMA Fallback: Using existing threadpool with %d thread(s)\n", fallback_thread_count);
     } else {
