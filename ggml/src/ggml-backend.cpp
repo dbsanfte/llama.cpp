@@ -1981,6 +1981,9 @@ static ggml_backend_buffer_t ggml_backend_cpu_buffer_type_alloc_buffer(ggml_back
             // Try NUMA allocation with proper alignment
             data = numa_alloc_onnode(size, numa_node);
             if (data) {
+                // Initialize pages to ensure proper NUMA placement (critical for move_pages() verification)
+                memset(data, 0, size);
+                
                 // Verify alignment for NUMA allocated memory
                 if ((uintptr_t)data % TENSOR_ALIGNMENT != 0) {
                     // NUMA allocation not properly aligned, fall back

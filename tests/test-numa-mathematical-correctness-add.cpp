@@ -130,6 +130,12 @@ private:
             b_data[i] = 0.05f + (i % 23) * 0.015f; // Different pattern for B
         }
         
+        // CRITICAL: Re-initialize NUMA mirroring after filling data to ensure all NUMA copies have correct data
+        // The initial NUMA mirroring during tensor creation copied uninitialized memory (zeros)
+        // We need to re-mirror with the actual test data we just wrote
+        tensor_set_data_numa_mirror(input_a, a_data);
+        tensor_set_data_numa_mirror(input_b, b_data);
+        
         // Create ADD operation
         struct ggml_tensor* numa_result = ggml_add(test_ctx, input_a, input_b);
         
@@ -202,10 +208,10 @@ private:
             int dim1, dim2, dim3;
             const char* label;
         } test_cases[] = {
-            {8, 8, 4, "TINY"},           // Small tensors for basic verification
-            {32, 32, 16, "SMALL"},       // Medium tensors
-            {128, 64, 32, "MEDIUM"},     // Larger tensors
-            {256, 128, 64, "LARGE"}      // Large tensors for stress testing
+            {8, 8, 4, "TINY"},           // Small tensors for basic verification - 256 elements
+            {64, 64, 8, "SMALL"},        // Medium tensors - 32,768 elements (triggers data-parallel!)
+            {128, 64, 32, "MEDIUM"},     // Larger tensors - 262,144 elements
+            {256, 128, 64, "LARGE"}      // Large tensors for stress testing - 2,097,152 elements
         };
         
         // Define coordinator execution strategies (various thread counts)
@@ -510,8 +516,8 @@ private:
 
 // Main function - entry point for the test
 int main(int argc, char** argv) {
-    // Note: Skip complex coordinator initialization - let simple coordinator handle NUMA
-    // ggml_numa_init(GGML_NUMA_STRATEGY_MIRROR);
+    // Initialize NUMA with mirroring strategy for data locality
+    ggml_numa_init(GGML_NUMA_STRATEGY_MIRROR);
     
     // Check for --summary-only flag
     bool summary_only = false;
@@ -535,29 +541,19 @@ int main(int argc, char** argv) {
     
     printf("🌟 Initializing NUMA system for mathematical correctness testing...\n");
     
-    // Initialize the simple NUMA coordinator system
-    struct ggml_threadpool_params tpp;
-    memset(&tpp, 0, sizeof(tpp)); // Zero-initialize entire structure
-    tpp.n_threads = 8;
-    tpp.prio = GGML_SCHED_PRIO_NORMAL;
-    tpp.poll = 50;
-    tpp.strict_cpu = true;
-    tpp.paused = false;
-    tpp.numa_aware = true;
-    tpp.allow_numa_override = false;
-    tpp.warn_on_numa_override = false;
-    tpp.max_numa_nodes = 0;
+    // Initialize NUMA with automatic coordinator initialization
+    ggml_numa_init(GGML_NUMA_STRATEGY_MIRROR);
     
-    if (!ggml_numa_simple_coordinator_init(&tpp)) {
+    if (!ggml_numa_simple_coordinator_is_initialized()) {
         if (summary_only) {
             fclose(stdout);
             stdout = original_stdout;
         }
-        printf("❌ Failed to initialize simple NUMA coordinator\n");
+        printf("❌ NUMA auto-initialization failed\n");
         return 1;
     }
     
-    printf("✅ NUMA system initialized successfully\n\n");
+    printf("✅ NUMA system auto-initialized successfully\n\n");
     
     NumaMathematicalCorrectnessTestSuite test_suite;
     bool all_passed = test_suite.run_all_tests();

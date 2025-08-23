@@ -12,6 +12,7 @@
 #ifdef GGML_NUMA_MIRROR
 #include <numa.h>
 #include <string.h>
+#include "ggml-numa-allocator.h"
 #endif
 // ## Overview
 //
@@ -591,6 +592,15 @@ extern "C" {
         GGML_LOG_LEVEL_CONT  = 5, // continue previous log
     };
 
+    enum ggml_numa_strategy {
+        GGML_NUMA_STRATEGY_DISABLED   = 0,
+        // GGML_NUMA_STRATEGY_DISTRIBUTE = 1, // REMOVED: redundant with default behavior
+        GGML_NUMA_STRATEGY_ISOLATE    = 2,
+        GGML_NUMA_STRATEGY_NUMACTL    = 3,
+        GGML_NUMA_STRATEGY_MIRROR     = 4,
+        GGML_NUMA_STRATEGY_COUNT
+    };
+
     // this tensor...
     enum ggml_tensor_flag {
         GGML_TENSOR_FLAG_INPUT  =  1, // ...is an input for the GGML compute graph
@@ -871,6 +881,9 @@ extern "C" {
 
     // NUMA tensor data mirroring functions (after ggml_nbytes is declared)
 #ifdef GGML_NUMA_MIRROR
+    // Forward declaration of NUMA allocation assertion function
+    extern void ggml_numa_assert_allocation(void* ptr, int expected_node, const char* context);
+    
     static inline void tensor_set_data_numa_mirror(struct ggml_tensor * tensor, void * data) {
         // Check if mirroring should be active at runtime
         if (!ggml_numa_should_mirror()) {
@@ -881,33 +894,47 @@ extern "C" {
             return;
         }
         
-        // Mirroring enabled - create separate copies on each NUMA node
+        // SMART NUMA MIRRORING STRATEGY:
+        // 1. For model weights/constants: Use copy-on-access (lazy mirroring)
+        // 2. For intermediate computation tensors: Mirror immediately only if needed
+        // 3. Avoid unnecessary allocations during model loading
+        
         extern int ggml_numa_node_count(void);
         int numa_nodes = ggml_numa_node_count();
-        size_t tensor_size = ggml_nbytes(tensor);
         
+        // First: Check if we already have NUMA-mirrored data that needs cleanup
+        bool has_existing_numa_copies = false;
         for (int i = 0; i < numa_nodes && i < GGML_NUMA_MAX_NODES; i++) {
-            if (i == 0) {
-                // Use the original data for node 0
-                tensor->__data[i] = data;
-            } else {
-                // Allocate mirrored copy on node i
-                void * numa_data = numa_alloc_onnode(tensor_size, i);
-                if (numa_data) {
-                    // Copy data to NUMA node
-                    memcpy(numa_data, data, tensor_size);
-                    tensor->__data[i] = numa_data;
-                } else {
-                    // Fallback to original data if allocation fails
-                    tensor->__data[i] = data;
+            if (tensor->__data[i] && tensor->__data[i] != data) {
+                // Check if this looks like a NUMA allocation (different from other nodes)
+                for (int j = 0; j < numa_nodes && j < GGML_NUMA_MAX_NODES; j++) {
+                    if (j != i && tensor->__data[j] != tensor->__data[i]) {
+                        has_existing_numa_copies = true;
+                        break;
+                    }
+                }
+                if (has_existing_numa_copies) break;
+            }
+        }
+        
+        // Clean up existing NUMA copies if they exist
+        if (has_existing_numa_copies) {
+            for (int i = 0; i < numa_nodes && i < GGML_NUMA_MAX_NODES; i++) {
+                if (tensor->__data[i] && tensor->__data[i] != data) {
+                    ggml_numa_aligned_free(tensor->__data[i], NULL);
                 }
             }
         }
         
-        // Set remaining nodes to original data
-        for (int i = numa_nodes; i < GGML_NUMA_MAX_NODES; i++) {
+        // LAZY MIRRORING: Initially, all nodes point to the same data
+        // NUMA copies will be created on-demand during execution
+        for (int i = 0; i < GGML_NUMA_MAX_NODES; i++) {
             tensor->__data[i] = data;
         }
+        
+        // Set a flag to indicate this tensor supports NUMA mirroring
+        // This will be used by the executor to create copies when needed
+        // Note: We're using the existing data structure without modifications
     }
 
     static inline void tensor_free_numa_mirrors(struct ggml_tensor * tensor) {
@@ -921,7 +948,7 @@ extern "C" {
         // Free mirrored copies (skip node 0 which is the original data)
         for (int i = 1; i < numa_nodes && i < GGML_NUMA_MAX_NODES; i++) {
             if (tensor->__data[i] && tensor->__data[i] != tensor->__data[0]) {
-                numa_free(tensor->__data[i], ggml_nbytes(tensor));
+                ggml_numa_free(tensor->__data[i]);
                 tensor->__data[i] = NULL;
             }
         }
@@ -2545,14 +2572,29 @@ extern "C" {
     GGML_API bool ggml_is_numa(void);
     GGML_API int  ggml_numa_node_count(void);
 
-    // NUMA-aware memory allocation functions  
-    GGML_API void * ggml_numa_alloc_context_memory(size_t size, void * numa_ctx);
-    GGML_API void   ggml_numa_free(void * ptr);
-    GGML_API bool   ggml_numa_is_numa_allocated(void * ptr);
+    // NUMA state management  
+    GGML_API int  ggml_numa_get_strategy(void);
+    GGML_API int  ggml_numa_get_isolate_node(void);
+    GGML_API void ggml_numa_set_strategy(int strategy);
+    GGML_API void ggml_numa_set_isolate_node(int node);
 
     GGML_API struct ggml_threadpool_params ggml_threadpool_params_default(int n_threads);
     GGML_API void                          ggml_threadpool_params_init   (struct ggml_threadpool_params * p, int n_threads);
     GGML_API bool                          ggml_threadpool_params_match  (const struct ggml_threadpool_params * p0, const struct ggml_threadpool_params * p1);
+
+    // NUMA management functions
+    GGML_API void ggml_numa_init(enum ggml_numa_strategy numa_flag);
+    GGML_API void ggml_numa_init_with_threadpool_params(enum ggml_numa_strategy numa_strategy, const struct ggml_threadpool_params * tpp);
+    GGML_API void ggml_numa_init_with_node(enum ggml_numa_strategy numa_flag, int isolate_node);
+    GGML_API bool ggml_is_numa(void);
+    GGML_API int  ggml_numa_node_count(void);
+    GGML_API enum ggml_numa_strategy ggml_get_numa_strategy(void);
+    GGML_API void ggml_numa_set_cache_strategy(int cache_strategy);
+    GGML_API int  ggml_numa_get_cache_strategy(void);
+#ifdef GGML_NUMA_MIRROR
+    GGML_API void ggml_numa_set_fallback_flag(bool value);
+    GGML_API bool ggml_numa_is_fallback_active(void);
+#endif
 
 #ifdef  __cplusplus
 }

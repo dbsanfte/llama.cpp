@@ -8,6 +8,10 @@
 #include "ggml.h"
 #include "ggml-numa-allocator.h"  // NUMA-aware memory allocation
 
+#ifdef GGML_NUMA_MIRROR
+#include <numa.h>  // NUMA library functions for node isolation
+#endif
+
 // FIXME: required here for quantization functions
 #include "ggml-quants.h"
 
@@ -53,6 +57,15 @@
 #endif
 
 #define UNUSED GGML_UNUSED
+
+#ifdef GGML_NUMA_MIRROR
+// Thread-local variable to prevent infinite recursion during fallback
+_Thread_local bool in_numa_fallback = false;
+
+// Static variables for performance testing dispatch control
+static bool numa_dispatch_override_enabled = false;
+static bool numa_dispatch_override_value = true;
+#endif
 
 #if defined(_MSC_VER)
 #define m512bh(p) p
@@ -249,6 +262,285 @@ struct ggml_logger_state {
     void * log_callback_user_data;
 };
 static struct ggml_logger_state g_logger_state = {ggml_log_callback_default, NULL};
+
+//
+// NUMA Management Functions (moved from ggml-cpu.c to resolve linking dependencies)
+//
+
+static void ggml_numa_init_coordinator(enum ggml_numa_strategy numa_strategy, const struct ggml_threadpool_params * tpp);
+static void configure_threadpool_params_for_node_isolation(struct ggml_threadpool_params * tpp, int isolate_node);
+
+// NUMA state management (moved from ggml-cpu.c to resolve linking dependencies)
+struct ggml_numa_state {
+    enum ggml_numa_strategy strategy;
+    bool numa_enabled;
+    int numa_nodes;
+    int isolate_node;
+    int cache_strategy;
+    bool initialized;
+    struct ggml_threadpool_params threadpool_params;
+    bool threadpool_params_valid;
+};
+
+static struct ggml_numa_state g_numa_state = {
+    .strategy = GGML_NUMA_STRATEGY_DISABLED,
+    .numa_enabled = false,
+    .numa_nodes = 1,
+    .isolate_node = -1,
+    .cache_strategy = 0,
+    .initialized = false,
+    .threadpool_params_valid = false,
+};
+
+//
+// NUMA Management Function Implementations
+//
+
+// Weak symbol declarations for coordinator functions (defined in ggml-cpu if available)
+#ifdef GGML_NUMA_MIRROR
+__attribute__((weak)) bool ggml_numa_simple_coordinator_init(struct ggml_threadpool_params * tpp);
+__attribute__((weak)) int ggml_numa_simple_coordinator_get_num_nodes(void);
+#endif
+
+static void ggml_numa_init_coordinator(enum ggml_numa_strategy numa_strategy, const struct ggml_threadpool_params * tpp) {
+#ifdef GGML_NUMA_MIRROR
+    if (numa_strategy == GGML_NUMA_STRATEGY_DISABLED) {
+        return;  // Don't create coordinator for disabled NUMA
+    }
+
+    // Check if coordinator functions are available (will be NULL if ggml-cpu is not linked)
+    if (ggml_numa_simple_coordinator_init == NULL || ggml_numa_simple_coordinator_get_num_nodes == NULL) {
+        // Coordinator functions not available, fall back to basic NUMA support
+        g_numa_state.numa_enabled = false;
+        g_numa_state.numa_nodes = 1;
+        return;
+    }
+
+    // Initialize simple coordinator with threadpool parameters
+    if (ggml_numa_simple_coordinator_init((struct ggml_threadpool_params *)tpp)) {
+        g_numa_state.numa_enabled = true;
+        
+        // Get number of NUMA nodes from simple coordinator
+        g_numa_state.numa_nodes = ggml_numa_simple_coordinator_get_num_nodes();
+        if (g_numa_state.numa_nodes <= 0) {
+            g_numa_state.numa_nodes = 1;
+        }
+    } else {
+        // Coordinator creation failed, fall back to no NUMA
+        g_numa_state.numa_enabled = false;
+        g_numa_state.numa_nodes = 1;
+    }
+#else
+    // No coordinator available
+    UNUSED(numa_strategy);
+    UNUSED(tpp);
+    g_numa_state.numa_enabled = false;
+    g_numa_state.numa_nodes = 1;
+#endif
+}
+
+void ggml_numa_init_with_threadpool_params(enum ggml_numa_strategy numa_strategy, const struct ggml_threadpool_params * tpp) {
+    g_numa_state.strategy = numa_strategy;
+    g_numa_state.initialized = true;
+    
+    if (tpp) {
+        g_numa_state.threadpool_params = *tpp;
+        g_numa_state.threadpool_params_valid = true;
+    }
+    
+    // Initialize coordinator with full context
+    ggml_numa_init_coordinator(numa_strategy, tpp);
+}
+
+void ggml_numa_init(enum ggml_numa_strategy numa_flag) {
+    // Set strategy and initialization state FIRST
+    g_numa_state.strategy = numa_flag;
+    g_numa_state.initialized = true;
+    
+    // Legacy initialization - use threadpool params if available, otherwise basic init
+    if (g_numa_state.threadpool_params_valid) {
+        ggml_numa_init_coordinator(numa_flag, &g_numa_state.threadpool_params);
+    } else {
+        // Fallback: create basic threadpool params
+        struct ggml_threadpool_params tpp;
+        ggml_threadpool_params_init(&tpp, -1);  // Use default thread count
+        ggml_numa_init_coordinator(numa_flag, &tpp);
+    }
+}
+
+bool ggml_is_numa(void) {
+    return g_numa_state.numa_enabled;
+}
+
+int ggml_numa_node_count(void) {
+    return g_numa_state.numa_nodes;
+}
+
+enum ggml_numa_strategy ggml_get_numa_strategy(void) {
+    return g_numa_state.strategy;
+}
+
+#ifdef GGML_NUMA_MIRROR
+bool ggml_numa_should_mirror(void) {
+    // Enable mirroring ONLY when there are actually multiple physical NUMA nodes
+    // AND we're using a mirroring strategy (not MIRROR_FORCE which is for virtual testing)
+    return g_numa_state.initialized && 
+           g_numa_state.numa_enabled &&
+           g_numa_state.numa_nodes > 1 &&
+           g_numa_state.strategy == GGML_NUMA_STRATEGY_MIRROR;
+    // Note: MIRROR_FORCE is for coordinator testing with virtual nodes,
+    // but tensor data access should still use regular pointers on single-node systems
+}
+
+bool ggml_numa_should_dispatch(void) {
+    // Check for fallback recursion prevention flag
+    if (in_numa_fallback) {
+        return false;  // Disable NUMA dispatch during fallback to prevent infinite recursion
+    }
+    
+    // Check for performance testing override
+    if (numa_dispatch_override_enabled) {
+        return numa_dispatch_override_value && g_numa_state.initialized;
+    }
+    
+    // Enable dispatcher for NUMA mirror strategy on multi-node systems
+    return g_numa_state.initialized && 
+           g_numa_state.numa_enabled &&
+           g_numa_state.strategy == GGML_NUMA_STRATEGY_MIRROR;
+}
+
+// Functions to control fallback recursion prevention
+void ggml_numa_set_fallback_flag(bool value) {
+    in_numa_fallback = value;
+}
+
+bool ggml_numa_is_fallback_active(void) {
+    return in_numa_fallback;
+}
+
+// Functions to control NUMA dispatch for performance testing
+void ggml_numa_set_dispatch_enabled(bool enabled) {
+    numa_dispatch_override_enabled = true;
+    numa_dispatch_override_value = enabled;
+}
+
+bool ggml_numa_get_dispatch_enabled(void) {
+    if (numa_dispatch_override_enabled) {
+        return numa_dispatch_override_value;
+    }
+    return g_numa_state.numa_enabled;
+}
+
+void ggml_numa_clear_dispatch_override(void) {
+    numa_dispatch_override_enabled = false;
+}
+#endif
+
+// Cache strategy management functions
+void ggml_numa_set_cache_strategy(int cache_strategy) {
+    g_numa_state.cache_strategy = cache_strategy;
+}
+
+int ggml_numa_get_cache_strategy(void) {
+    return g_numa_state.cache_strategy;
+}
+
+// Helper function to configure threadpool params for NUMA node isolation
+static void configure_threadpool_params_for_node_isolation(struct ggml_threadpool_params * tpp, int isolate_node) {
+    if (!tpp || isolate_node < 0) {
+        return;
+    }
+    
+#ifdef GGML_NUMA_MIRROR
+    // Check if the requested node exists
+    if (numa_available() == -1 || isolate_node >= numa_max_node() + 1) {
+        GGML_LOG_WARN("NUMA node %d not available, falling back to default configuration\n", isolate_node);
+        return;
+    }
+    
+    // Clear existing CPU mask
+    memset(tpp->cpumask, 0, sizeof(tpp->cpumask));
+    
+    // Get CPUs for the specified NUMA node
+    struct bitmask* node_cpus = numa_allocate_cpumask();
+    if (node_cpus) {
+        int result = numa_node_to_cpus(isolate_node, node_cpus);
+        if (result == 0) {
+            int cpu_count = 0;
+            for (int cpu = 0; cpu < numa_num_possible_cpus() && cpu < GGML_MAX_N_THREADS; cpu++) {
+                if (numa_bitmask_isbitset(node_cpus, cpu)) {
+                    tpp->cpumask[cpu] = true;
+                    cpu_count++;
+                }
+            }
+            
+            // If user didn't specify thread count, use the number of CPUs on this node
+            if (tpp->n_threads <= 0) {
+                tpp->n_threads = cpu_count;
+            } else {
+                // Limit thread count to available CPUs on this node
+                tpp->n_threads = (tpp->n_threads < cpu_count) ? tpp->n_threads : cpu_count;
+            }
+            
+            // Enable strict CPU placement for isolation
+            tpp->strict_cpu = true;
+            tpp->numa_aware = true;
+            
+            GGML_LOG_INFO("Configured threadpool for NUMA node %d: %d threads on %d CPUs\n", 
+                         isolate_node, tpp->n_threads, cpu_count);
+        } else {
+            GGML_LOG_WARN("Failed to get CPUs for NUMA node %d\n", isolate_node);
+        }
+        numa_free_cpumask(node_cpus);
+    } else {
+        GGML_LOG_WARN("Failed to allocate CPU mask for NUMA node %d\n", isolate_node);
+    }
+#else
+    UNUSED(isolate_node);
+    GGML_LOG_WARN("NUMA support not compiled in, ignoring node isolation request\n");
+#endif
+}
+
+void ggml_numa_init_with_node(enum ggml_numa_strategy numa_flag, int isolate_node) {
+    // Set strategy and initialization state FIRST
+    g_numa_state.strategy = numa_flag;
+    g_numa_state.initialized = true;
+    g_numa_state.isolate_node = isolate_node;
+    
+    // For node isolation, we need to modify threadpool params if available
+    if (g_numa_state.threadpool_params_valid) {
+        struct ggml_threadpool_params tpp = g_numa_state.threadpool_params;
+        // Configure threadpool params for the specified NUMA node
+        configure_threadpool_params_for_node_isolation(&tpp, isolate_node);
+        ggml_numa_init_coordinator(numa_flag, &tpp);
+    } else {
+        // Fallback: create basic threadpool params with node isolation
+        struct ggml_threadpool_params tpp;
+        ggml_threadpool_params_init(&tpp, -1);
+        // Configure threadpool params for the specified NUMA node
+        configure_threadpool_params_for_node_isolation(&tpp, isolate_node);
+        ggml_numa_init_coordinator(numa_flag, &tpp);
+    }
+}
+
+// Helper function to determine NUMA allocation strategy for tensor creation
+static enum ggml_numa_strategy ggml_numa_get_tensor_allocation_strategy(void) {
+    if (!g_numa_state.initialized || !g_numa_state.numa_enabled) {
+        return GGML_NUMA_STRATEGY_DISABLED;
+    }
+    
+    // Return the current strategy for tensor allocation decisions
+    return g_numa_state.strategy;
+}
+
+// Internal functions for ggml-cpu.c compatibility
+static enum ggml_numa_strategy ggml_numa_get_strategy_cpu(void) {
+    return g_numa_state.strategy;
+}
+
+static int ggml_numa_get_isolate_node_cpu(void) {
+    return g_numa_state.isolate_node;
+}
 
 // Force linking NUMA allocator symbols  
 void ggml_force_link_numa_allocator_symbols(void);
@@ -1749,8 +2041,16 @@ static struct ggml_tensor * ggml_new_tensor_impl(
     if (view_src == NULL && !ctx->no_alloc && obj_alloc_size > 0) {
         // Data is allocated right after the tensor struct
         void * tensor_data_ptr = (char *)result + GGML_TENSOR_SIZE;
-        // Use tensor_set_data to properly handle NUMA mirroring
+        
+        // Use NUMA-aware allocation when compiled with NUMA support
+#ifdef GGML_NUMA_MIRROR
+        // tensor_set_data_numa_mirror() automatically checks current strategy
+        // and creates NUMA mirrors only when appropriate (MIRROR strategy + multi-node)
+        tensor_set_data_numa_mirror(result, tensor_data_ptr);
+#else
+        // Fallback to regular allocation when NUMA mirroring not compiled
         tensor_set_data(result, tensor_data_ptr);
+#endif
     } else if (view_src != NULL) {
         // For view tensors, copy data pointers from source
 #ifdef GGML_NUMA_MIRROR
@@ -7040,20 +7340,26 @@ bool ggml_threadpool_params_match(const struct ggml_threadpool_params * p0, cons
 }
 
 // NUMA function stubs - these provide default implementations when CPU backend is not available
-// The real implementations in ggml-cpu.c will override these when CPU backend is linked
+// The real implementations are now in ggml.c (this file)
 
-#ifdef GGML_NUMA_MIRROR
-__attribute__((weak)) bool ggml_numa_should_mirror(void) {
-    return false;  // NUMA mirroring disabled by default
-}
-#endif
+//
+// NUMA state management (moved from ggml-cpu.c)
+//
 
-__attribute__((weak)) bool ggml_is_numa(void) {
-    return false;  // NUMA not available by default
+int ggml_numa_get_strategy(void) {
+    return (int)g_numa_state.strategy;
 }
 
-__attribute__((weak)) int ggml_numa_node_count(void) {
-    return 1;  // Default to single node
+int ggml_numa_get_isolate_node(void) {
+    return g_numa_state.isolate_node;
+}
+
+void ggml_numa_set_strategy(int strategy) {
+    g_numa_state.strategy = (enum ggml_numa_strategy)strategy;
+}
+
+void ggml_numa_set_isolate_node(int node) {
+    g_numa_state.isolate_node = node;
 }
 
 

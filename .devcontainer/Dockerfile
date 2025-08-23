@@ -33,6 +33,8 @@ RUN apt-get update && \
         python3-venv \
         libcurl4-openssl-dev \
         libnuma-dev \
+        linux-tools-generic \
+        linux-tools-common \
         numactl \
         hwloc-nox \
         libhwloc-dev \

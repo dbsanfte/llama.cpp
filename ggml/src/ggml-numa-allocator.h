@@ -17,11 +17,8 @@ extern "C" {
 
 // NUMA allocation strategy
 typedef enum {
-    GGML_NUMA_ALLOC_STRATEGY_DEFAULT = 0,    // Use system default (usually broken in containers)
-    GGML_NUMA_ALLOC_STRATEGY_INTERLEAVE,     // Interleave across all nodes
-    GGML_NUMA_ALLOC_STRATEGY_DISTRIBUTE,     // Distribute chunks across nodes
-    GGML_NUMA_ALLOC_STRATEGY_LOCAL,          // Allocate on current node
-    GGML_NUMA_ALLOC_STRATEGY_EXPLICIT        // Explicit per-node allocation
+    GGML_NUMA_ALLOC_STRATEGY_LOCAL,          // Allocate on current/specified node (for ISOLATE)
+    GGML_NUMA_ALLOC_STRATEGY_MIRROR          // Create copies on all nodes (for MIRROR mode)
 } ggml_numa_alloc_strategy_t;
 
 // NUMA allocation context
@@ -59,6 +56,12 @@ bool ggml_numa_is_numa_allocated(void* ptr);
 
 // Free NUMA-allocated memory
 void ggml_numa_free(void* ptr);
+
+// Assert that memory allocation is on the expected NUMA node
+void ggml_numa_assert_allocation(void* ptr, int expected_node, const char* context);
+
+// Get the NUMA node of a memory address  
+int get_memory_numa_node(void* ptr);
 
 // Force linking of NUMA allocator symbols (internal use)
 void ggml_force_link_numa_allocator_symbols(void);

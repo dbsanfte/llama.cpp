@@ -7,11 +7,55 @@
 
 #pragma once
 
-#include "ggml-impl.h"
+#include "ggml.h"
+#include <assert.h>
+#include <stdio.h>
 #include <assert.h>
 
 // ============================================================================
-// NUMA Logging Macros
+// NUMA Type Definitions
+// ============================================================================
+
+/**
+ * Forward declarations for NUMA types
+ */
+struct ggml_compute_params;
+
+/**
+ * NUMA work function type - function pointer for kernel execution
+ * Used by coordinator to execute work on specific NUMA nodes
+ */
+typedef enum ggml_status (*ggml_numa_work_function_t)(
+    void * work_context,                    // Function-specific context data
+    struct ggml_compute_params * params     // Compute parameters (threads, buffer, etc.)
+);
+
+/**
+ * Node distribution strategies - how work is distributed across NUMA nodes
+ */
+typedef enum {
+    NUMA_NODE_STRATEGY_SINGLE,            // Execute on a single node
+    NUMA_NODE_STRATEGY_DATA_PARALLEL      // Distribute data across multiple nodes
+} ggml_numa_node_strategy_t;
+
+/**
+ * On-node execution strategies - how work is executed within each NUMA node
+ */
+typedef enum {
+    NUMA_ON_NODE_STRATEGY_SINGLE_THREAD,  // Single thread execution
+    NUMA_ON_NODE_STRATEGY_MULTI_THREAD    // Multi-threaded execution
+} ggml_numa_on_node_strategy_t;
+
+/**
+ * Combined execution strategy - combines node distribution and on-node execution
+ */
+typedef struct {
+    ggml_numa_node_strategy_t node_strategy;      // How to distribute across nodes
+    ggml_numa_on_node_strategy_t on_node_strategy; // How to execute within each node
+} ggml_numa_execution_strategy_t;
+
+// ============================================================================
+// NUMA Logging Macros (Simplified versions without ggml-impl dependency)
 // ============================================================================
 
 /**
@@ -19,33 +63,45 @@
  * Usage: NUMA_COORD_LOG_DEBUG(numa_node, "Message %d", value);
  */
 #define NUMA_COORD_LOG_DEBUG(numa_node, ...) \
-    GGML_LOG_DEBUG("NUMA[%d]: " __VA_ARGS__, (int)(numa_node))
+    fprintf(stderr, "NUMA[%d] DEBUG: " __VA_ARGS__, (int)(numa_node)); \
+    fprintf(stderr, "\n")
 
 /**
  * Info logging with NUMA node context
  */
 #define NUMA_COORD_LOG_INFO(numa_node, ...) \
-    GGML_LOG_INFO("NUMA[%d]: " __VA_ARGS__, (int)(numa_node))
+    fprintf(stderr, "NUMA[%d] INFO: " __VA_ARGS__, (int)(numa_node)); \
+    fprintf(stderr, "\n")
 
 /**
  * Warning logging with NUMA node context
  */
 #define NUMA_COORD_LOG_WARN(numa_node, ...) \
-    GGML_LOG_WARN("NUMA[%d]: " __VA_ARGS__, (int)(numa_node))
+    fprintf(stderr, "NUMA[%d] WARNING: " __VA_ARGS__, (int)(numa_node)); \
+    fprintf(stderr, "\n")
 
 /**
  * Error logging with NUMA node context
  */
 #define NUMA_COORD_LOG_ERROR(numa_node, ...) \
-    GGML_LOG_ERROR("NUMA[%d]: " __VA_ARGS__, (int)(numa_node))
+    fprintf(stderr, "NUMA[%d] ERROR: " __VA_ARGS__, (int)(numa_node)); \
+    fprintf(stderr, "\n")
 
 /**
  * General NUMA logging without node-specific context
  */
-#define NUMA_LOG_DEBUG(...) GGML_LOG_DEBUG("NUMA: " __VA_ARGS__)
-#define NUMA_LOG_INFO(...)  GGML_LOG_INFO("NUMA: " __VA_ARGS__)
-#define NUMA_LOG_WARN(...)  GGML_LOG_WARN("NUMA: " __VA_ARGS__)
-#define NUMA_LOG_ERROR(...) GGML_LOG_ERROR("NUMA: " __VA_ARGS__)
+#define NUMA_LOG_DEBUG(...) \
+    fprintf(stderr, "NUMA DEBUG: " __VA_ARGS__); \
+    fprintf(stderr, "\n")
+#define NUMA_LOG_INFO(...) \
+    fprintf(stderr, "NUMA INFO: " __VA_ARGS__); \
+    fprintf(stderr, "\n")
+#define NUMA_LOG_WARN(...) \
+    fprintf(stderr, "NUMA WARNING: " __VA_ARGS__); \
+    fprintf(stderr, "\n")
+#define NUMA_LOG_ERROR(...) \
+    fprintf(stderr, "NUMA ERROR: " __VA_ARGS__); \
+    fprintf(stderr, "\n")
 
 // ============================================================================
 // NUMA Assertions
@@ -77,6 +133,12 @@
             assert(condition); \
         } \
     } while(0)
+
+/**
+ * Simple NUMA assertion macro (for backward compatibility)
+ * Usage: NUMA_ASSERT(condition, "Description of what failed");
+ */
+#define NUMA_ASSERT(condition, message) NUMA_ASSERT_MSG(condition, message)
 
 // ============================================================================
 // NUMA Utility Macros

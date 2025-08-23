@@ -1,14 +1,12 @@
 /*
  * NUMA Kernel: Element-wise Addition (ADD)
  * 
- * Simplified implementation for the new architecture.
- * Uses direct tensor access rather than complex work dispatching.
+ * Uses pre-allocated NUMA-local mirrored data directly without migration.
  */
 
 #include "../binary-ops.h"
 #include "add.h"
 #include <immintrin.h>  // For AVX2 SIMD instructions
-#include <sys/mman.h>   // For madvise() page migration
 #include "numa-kernels.h"  // For cache types
 #include "../ggml-numa-shared.h"          // Shared NUMA logging and utilities
 #include "../ggml-numa-simple-coordinator.h"  // For ggml_numa_get_current_node()
@@ -16,6 +14,7 @@
 #include "../ggml-impl.h"
 #include "../vec.h"  // For SIMD functions
 #include "../ggml-numa-perf.h"  // Performance instrumentation
+#include "../../ggml-numa-allocator.h"  // For NUMA memory assertion functions
 
 #ifdef GGML_NUMA_MIRROR
 #include <numa.h>  // For numa_num_configured_nodes()
@@ -54,86 +53,43 @@ static bool validate_tensor_inputs(const struct ggml_tensor * tensor) {
 }
 
 /**
- * Calculate NUMA data slicing parameters based on execution strategy
+ * Calculate NUMA slice bounds using coordinator-assigned virtual node
+ * For data-parallel execution, each node processes a different slice of the data
+ * For single-node execution, the node processes ALL data
  */
 static void calculate_numa_slice(const struct ggml_tensor * tensor, 
-                                int64_t base_start, int64_t base_end,
-                                int64_t * numa_start, int64_t * numa_end) {
-    const ggml_numa_execution_strategy_t strategy = ggml_numa_kernel_add_get_strategy(tensor);
+                                int64_t start_offset, 
+                                int64_t total_elements,
+                                int64_t * numa_start, 
+                                int64_t * numa_end,
+                                bool is_data_parallel_execution) {
+    extern int ggml_numa_node_count(void);
+    extern __thread int ggml_current_numa_node;
+    const int total_numa_nodes = ggml_numa_node_count();
+    const int current_numa_node = ggml_current_numa_node; // Use coordinator-assigned virtual node!
     
-    *numa_start = base_start;
-    *numa_end = base_end;
-    
-    if (strategy.node_strategy == NUMA_NODE_STRATEGY_DATA_PARALLEL) {
-        // Split work across NUMA nodes
-        const int current_numa_node = ggml_numa_get_current_node();
-        const int total_numa_nodes = numa_num_configured_nodes();
-        const int64_t total_iterations = base_end - base_start;
-        
-        printf("DEBUG ADD: Data slicing - current_node=%d, total_nodes=%d, base_range=[%ld,%ld], total_iter=%ld\n",
-               current_numa_node, total_numa_nodes, base_start, base_end, total_iterations);
-        
-        const int64_t elements_per_node = total_iterations / total_numa_nodes;
-        const int64_t numa_offset = current_numa_node * elements_per_node;
-        const int64_t numa_end_offset = (current_numa_node == total_numa_nodes - 1) ? 
-            total_iterations : numa_offset + elements_per_node;
-        
-        *numa_start = base_start + numa_offset;
-        *numa_end = base_start + numa_end_offset;
-        
-        printf("DEBUG ADD: Node %d processing slice [%ld,%ld] (elements_per_node=%ld)\n",
-               current_numa_node, *numa_start, *numa_end, elements_per_node);
+    if (total_numa_nodes <= 1 || current_numa_node < 0 || !is_data_parallel_execution) {
+        // Single node, invalid node, or single-node execution mode - process ALL data
+        *numa_start = start_offset;
+        *numa_end = total_elements;
+        printf("DEBUG: NUMA ADD SLICE: Node %d processing ALL elements [%lld,%lld) of %lld total (single-node mode)\n",
+               current_numa_node, (long long)*numa_start, (long long)*numa_end, (long long)total_elements);
+        return;
     }
-    // For SINGLE strategy, use full range (no change needed)
-}
-
-/**
- * Process ADD operation for contiguous src1 (optimized SIMD path)
- */
-static void process_contiguous_add(const struct ggml_tensor * tensor,
-                                  const struct ggml_tensor * src0, 
-                                  const struct ggml_tensor * src1,
-                                  int64_t i03, int64_t i02, int64_t i01,
-                                  const size_t * nb, const size_t * nb0, const size_t * nb1) {
-    // Calculate memory pointers for this slice
-    float * dst_ptr = (float *)((char *)tensor_data(tensor) + i03*nb[3] + i02*nb[2] + i01*nb[1]);
-    const float * src0_ptr = (const float *)((const char *)tensor_data(src0) + i03*nb0[3] + i02*nb0[2] + i01*nb0[1]);
-    const float * src1_ptr = (const float *)((const char *)tensor_data(src1) + 
-                             (i03 % src1->ne[3])*nb1[3] + (i02 % src1->ne[2])*nb1[2] + (i01 % src1->ne[1])*nb1[1]);
     
-    // SIMD optimized addition with broadcasting
-    const int64_t ne0 = tensor->ne[0];
-    const int64_t ne10 = src1->ne[0];
-    const int64_t nr0 = ne0 / ne10;
+    // For data-parallel execution, each NUMA node processes a different slice
+    const int64_t elements_per_node = total_elements / total_numa_nodes;
+    *numa_start = start_offset + current_numa_node * elements_per_node;
     
-    for (int64_t r = 0; r < nr0; ++r) {
-        ggml_vec_add_f32(ne10, dst_ptr + r*ne10, src0_ptr + r*ne10, src1_ptr);
+    // Last node gets any remainder elements
+    if (current_numa_node == total_numa_nodes - 1) {
+        *numa_end = total_elements;
+    } else {
+        *numa_end = *numa_start + elements_per_node;
     }
-}
-
-/**
- * Process ADD operation for non-contiguous src1 (element-wise path)
- */
-static void process_noncontiguous_add(const struct ggml_tensor * tensor,
-                                     const struct ggml_tensor * src0, 
-                                     const struct ggml_tensor * src1,
-                                     int64_t i03, int64_t i02, int64_t i01,
-                                     const size_t * nb, const size_t * nb0, const size_t * nb1) {
-    // Calculate base pointers for this slice
-    float * dst_ptr = (float *)((char *)tensor_data(tensor) + i03*nb[3] + i02*nb[2] + i01*nb[1]);
-    const float * src0_ptr = (const float *)((const char *)tensor_data(src0) + i03*nb0[3] + i02*nb0[2] + i01*nb0[1]);
-    const float * src1_base = (const float *)((const char *)tensor_data(src1) + 
-                              (i03 % src1->ne[3])*nb1[3] + (i02 % src1->ne[2])*nb1[2] + (i01 % src1->ne[1])*nb1[1]);
     
-    // Element-wise addition with broadcasting
-    const int64_t ne0 = tensor->ne[0];
-    const int64_t ne10 = src1->ne[0];
-    
-    for (int64_t i = 0; i < ne0; ++i) {
-        const int64_t i10 = i % ne10;
-        const float * src1_ptr = (const float *)((const char *)src1_base + i10*nb1[0]);
-        dst_ptr[i] = src0_ptr[i] + (*src1_ptr);
-    }
+    printf("DEBUG: NUMA ADD SLICE: Node %d processing elements [%lld,%lld) of %lld total (data-parallel mode)\n",
+           current_numa_node, (long long)*numa_start, (long long)*numa_end, (long long)total_elements);
 }
 
 // ============================================================================
@@ -148,55 +104,39 @@ bool ggml_numa_kernel_add_supports(const struct ggml_tensor * tensor) {
 
 ggml_numa_execution_strategy_t ggml_numa_kernel_add_get_strategy(const struct ggml_tensor * tensor) {
     ggml_numa_execution_strategy_t strategy = {
-        .node_strategy = NUMA_NODE_STRATEGY_SINGLE,
-        .on_node_strategy = NUMA_ON_NODE_STRATEGY_MULTI_THREAD
+        .node_strategy = NUMA_NODE_STRATEGY_DATA_PARALLEL,
+        .on_node_strategy = NUMA_ON_NODE_STRATEGY_SINGLE_THREAD
     };
     
-    if (!tensor) {
-        return strategy;
-    }
-    
-    size_t tensor_size = ggml_nelements(tensor);
-    
-    // Use data-parallel execution for large tensors
-    if (tensor_size >= 32768) {  // 32K elements threshold
-        strategy.node_strategy = NUMA_NODE_STRATEGY_DATA_PARALLEL;
+    // For very small tensors, use single node to avoid overhead
+    const int64_t elements = ggml_nelements(tensor);
+    if (elements < 8192) {  // < 32KB
+        strategy.node_strategy = NUMA_NODE_STRATEGY_SINGLE;
     }
     
     return strategy;
 }
 
-size_t ggml_numa_kernel_add_get_buffer_size(const struct ggml_tensor * tensor) {
-    // Element-wise ADD doesn't need significant work buffers
-    // Just a small buffer for potential temporary calculations
-    (void)tensor;  // Unused for ADD
-    return 1024;   // 1KB per thread should be sufficient
+size_t ggml_numa_kernel_add_get_work_buffer_size(const struct ggml_tensor * tensor) {
+    // Element-wise ADD doesn't need work buffers - it operates directly on tensor data
+    return 0;
 }
 
-ggml_numa_work_function_t ggml_numa_kernel_add_get_work_function(const struct ggml_tensor * tensor) {
-    (void)tensor;  // For ADD, we use the same work function regardless of tensor
-    return ggml_numa_kernel_add_work_function;
+float ggml_numa_kernel_add_get_efficiency_score(const struct ggml_tensor * tensor) {
+    // Very high efficiency for element-wise operations
+    return 0.98f;  
 }
 
-float ggml_numa_kernel_add_get_efficiency(const struct ggml_tensor * tensor) {
-    if (!tensor) {
-        return 0.0f;
-    }
-    
-    size_t tensor_size = ggml_nelements(tensor);
-    
-    // ADD is highly parallel, efficiency depends mainly on data size
-    if (tensor_size >= 32768) {
-        return 0.95f;  // Very high efficiency for large tensors
-    } else if (tensor_size >= 4096) {
-        return 0.80f;  // Good efficiency for medium tensors
-    } else {
-        return 0.50f;  // Lower efficiency for small tensors due to overhead
-    }
+const char * ggml_numa_kernel_add_get_name(const struct ggml_tensor * tensor) {
+    return "NUMA ADD (Direct Mirrored Data)";
 }
 
-// Work function that will be called by the coordinator
-enum ggml_status ggml_numa_kernel_add_work_function(void * work_context, struct ggml_compute_params * params) {
+// ============================================================================
+// Main Execution Function
+// ============================================================================
+
+enum ggml_status ggml_numa_kernel_add_execute(void * work_context, 
+                                              struct ggml_compute_params * params) {
     // Extract and validate inputs
     struct ggml_tensor * tensor = (struct ggml_tensor *)work_context;
     
@@ -215,306 +155,248 @@ enum ggml_status ggml_numa_kernel_add_work_function(void * work_context, struct 
         return GGML_STATUS_FAILED;
     }
     
-    // Extract tensor dimensions and strides
-    const size_t nb[4]  = { tensor->nb[0], tensor->nb[1], tensor->nb[2], tensor->nb[3] };
-    const size_t nb0[4] = { src0->nb[0], src0->nb[1], src0->nb[2], src0->nb[3] };
-    const size_t nb1[4] = { src1->nb[0], src1->nb[1], src1->nb[2], src1->nb[3] };
-    
-    // Validate stride assumptions
-    NUMA_ASSERT(nb[0] == sizeof(float), "Destination stride must match float size");
-    NUMA_ASSERT(nb0[0] == sizeof(float), "Source 0 stride must match float size");
-    
-    // Calculate work range for element-wise operation (not row-wise!)
-    // For ADD, we want to process ALL elements as a flat array for optimal SIMD
+    // Calculate work range for this NUMA node using coordinator-assigned virtual node
     const int64_t total_elements = ggml_nelements(tensor);
     int64_t numa_start, numa_end;
-    calculate_numa_slice(tensor, 0, total_elements, &numa_start, &numa_end);
     
-    printf("DEBUG ADD: Total elements=%ld, processing range [%ld,%ld]\n", 
-           total_elements, numa_start, numa_end);
+    // Check if we're in data-parallel execution mode
+    extern __thread bool ggml_numa_is_data_parallel_execution;
+    extern int ggml_numa_node_count(void);
+    extern __thread int ggml_current_numa_node;
+    const int current_numa_node = ggml_current_numa_node;
     
-    // Check if src1 is contiguous for optimization
-    const bool is_src1_contiguous = (nb1[0] == sizeof(float));
+    // Use the proper slicing function
+    calculate_numa_slice(tensor, 0, total_elements, &numa_start, &numa_end, ggml_numa_is_data_parallel_execution);
     
-    if (!is_src1_contiguous) {
-        // Ensure compatible shapes for non-contiguous case
-        NUMA_ASSERT(ggml_are_same_shape(src0, src1), "Non-contiguous broadcast requires same shapes");
-    }
+    size_t elements_in_slice = numa_end - numa_start;
     
-    // Process assigned NUMA slice with proper broadcasting support
-    // For element-wise operations, work with flat array for optimal performance
+    // Record start time for concurrency analysis
+    struct timespec kernel_start_time, compute_start_time, compute_end_time;
+    clock_gettime(CLOCK_MONOTONIC, &kernel_start_time);
+    
+    printf("⏰ NUMA ADD KERNEL (START): Node %d starting at %ld.%09ld\n", 
+           current_numa_node, kernel_start_time.tv_sec, kernel_start_time.tv_nsec);
+    
+    printf("🚀 NUMA ADD KERNEL (DIRECT): Processing %zu elements [%ld,%ld) on node %d\n", 
+           elements_in_slice, numa_start, numa_end, current_numa_node);
+    
+    // DEBUG: Check what ggml_current_numa_node is set to during execution
+    extern __thread int ggml_current_numa_node;
+    printf("🔍 NUMA ADD KERNEL: ggml_current_numa_node=%d, current_numa_node=%d\n", 
+           ggml_current_numa_node, current_numa_node);
+    
+    // Get NUMA-local data pointers directly (no migration needed!)
+    // Extract tensor data using NUMA-aware tensor_data() function
     const float * src0_data = (const float *)tensor_data(src0);
     const float * src1_data = (const float *)tensor_data(src1);
     float * dst_data = (float *)tensor_data(tensor);
     
-    // Process elements in this NUMA slice
-    size_t elements_in_slice = numa_end - numa_start;
-    const int current_numa_node = ggml_numa_get_current_node();
+    printf("DEBUG: ADD kernel - node %d: src0=%p src1=%p dst=%p (elements=%zu, slice=[%zu,%zu))\n",           current_numa_node, (void*)src0_data, (void*)src1_data, (void*)dst_data,           numa_end - numa_start, numa_start, numa_end);
     
-    // Get tensor sizes for broadcasting calculations
+    // Show first few values of input data for debugging
+    printf("DEBUG: ADD kernel - node %d: src0_slice=[%.3f, %.3f, %.3f, %.3f], src1_slice=[%.3f, %.3f, %.3f, %.3f]\n",           current_numa_node,            src0_data[numa_start], src0_data[numa_start+1], src0_data[numa_start+2], src0_data[numa_start+3],            src1_data[numa_start], src1_data[numa_start+1], src1_data[numa_start+2], src1_data[numa_start+3]);    printf("🔗 NUMA ADD KERNEL: Using mirrored data pointers: src0=%p, src1=%p, dst=%p\n", 
+           (void*)src0_data, (void*)src1_data, (void*)dst_data);
+    
+    // ⚠️  CRITICAL NUMA DATA LOCALITY ASSERTIONS ⚠️
+    // All data MUST be on the same NUMA node as assigned by coordinator
+    // Cross-NUMA access is a hard failure that destroys performance
+    printf("🔍 NUMA ADD KERNEL: Validating data locality on coordinator-assigned node %d\n", current_numa_node);
+    
+    // Assert src0 data is on the correct NUMA node
+    ggml_numa_assert_allocation((void*)src0_data, current_numa_node, "ADD kernel src0 data");
+    
+    // Assert src1 data is on the correct NUMA node  
+    ggml_numa_assert_allocation((void*)src1_data, current_numa_node, "ADD kernel src1 data");
+    
+    // Assert dst data is on the correct NUMA node
+    ggml_numa_assert_allocation((void*)dst_data, current_numa_node, "ADD kernel dst data");
+    
+    // Note: Work buffers would be asserted here if this kernel used them
+    // For ADD operation, no additional compute buffers are needed
+    
+    printf("✅ NUMA ADD KERNEL: All data validated on node %d - proceeding with computation\n", current_numa_node);
+    
+    // Broadcasting support: check if src1 has fewer elements
     const int64_t src1_elements = ggml_nelements(src1);
-    const int64_t dst_elements = ggml_nelements(tensor);
+    const bool needs_broadcasting = (src1_elements < total_elements);
     
-    printf("DEBUG ADD KERNEL: Processing %zu elements from %zu to %zu on NUMA node %d\n", 
-           elements_in_slice, numa_start, numa_end, current_numa_node);
-    printf("DEBUG ADD KERNEL: Broadcasting: dst=%ld elements, src1=%ld elements\n", 
-           dst_elements, src1_elements);
-
-    printf("DEBUG ADD KERNEL: Implementing FIRST TOUCH policy for optimal NUMA locality\n");
-
-    // Set local allocation policy for this thread to ensure new pages go to current NUMA node
-    if (numa_run_on_node(current_numa_node) == 0) {
-        printf("DEBUG ADD KERNEL: Set thread affinity to NUMA node %d\n", current_numa_node);
+    if (needs_broadcasting) {
+        printf("📡 NUMA ADD KERNEL: Broadcasting src1 (%ld elements) to dst (%ld elements)\n", 
+               src1_elements, total_elements);
     }
     
-    // Set memory allocation policy to prefer local node
-    struct bitmask *local_nodes = numa_allocate_nodemask();
-    numa_bitmask_setbit(local_nodes, current_numa_node);
-    numa_set_membind(local_nodes);
-    printf("DEBUG ADD KERNEL: Set memory binding to NUMA node %d\n", current_numa_node);
-    numa_free_nodemask(local_nodes);
-
-    // SMART PAGE MIGRATION: Check if we can safely migrate destination pages
-    // Only attempt madvise on aligned memory regions that we fully control
-    float* dst_ptr = (float*)dst_data + numa_start;
-    const float* src0_ptr = src0_data + numa_start;
-    // NOTE: src1_ptr calculation moved to per-element loop for proper broadcasting
+    // Process this NUMA node's slice with SIMD optimization
+    clock_gettime(CLOCK_MONOTONIC, &compute_start_time);
     
-    printf("DEBUG ADD KERNEL: Smart page migration to NUMA node %d\n", current_numa_node);
+    printf("⚡ NUMA ADD KERNEL (COMPUTE START): Node %d beginning computation at %ld.%09ld\n", 
+           current_numa_node, compute_start_time.tv_sec, compute_start_time.tv_nsec);
     
-    struct timespec migration_start, migration_end;
-    clock_gettime(CLOCK_MONOTONIC, &migration_start);
-    
-    const size_t page_size = 4096;
-    const size_t page_size_floats = page_size / sizeof(float);  // 1024 floats per page
-    
-    // For destination memory: attempt page migration only if we have page-aligned access
-    uintptr_t dst_addr = (uintptr_t)dst_ptr;
-    size_t dst_size = elements_in_slice * sizeof(float);
-    
-    // Check if our slice starts on a page boundary and covers complete pages
-    bool can_migrate_dst = (dst_addr % page_size == 0) && (dst_size >= page_size) && (dst_size % page_size == 0);
-    
-    if (can_migrate_dst && dst_size <= 256 * 1024 * 1024) { // Safety limit: 256MB max
-        printf("DEBUG ADD KERNEL: Attempting safe page migration for %zu bytes at %p\n", dst_size, (void*)dst_addr);
+    if (needs_broadcasting) {
+        // Get tensor dimensions for proper multidimensional broadcasting
+        const int64_t ne00 = src0->ne[0];  // src0 dim 0 
+        const int64_t ne01 = src0->ne[1];  // src0 dim 1
+        const int64_t ne02 = src0->ne[2];  // src0 dim 2
+        const int64_t ne03 = src0->ne[3];  // src0 dim 3
         
-        if (madvise((void*)dst_addr, dst_size, MADV_DONTNEED) == 0) {
-            printf("DEBUG ADD KERNEL: ✅ Destination pages unmapped successfully\n");
+        const int64_t ne10 = src1->ne[0];  // src1 dim 0
+        const int64_t ne11 = src1->ne[1];  // src1 dim 1  
+        const int64_t ne12 = src1->ne[2];  // src1 dim 2
+        const int64_t ne13 = src1->ne[3];  // src1 dim 3
+        
+        printf("🔍 NUMA ADD KERNEL: Broadcasting dimensions - src0[%ld,%ld,%ld,%ld], src1[%ld,%ld,%ld,%ld]\n",
+               ne00, ne01, ne02, ne03, ne10, ne11, ne12, ne13);
+        
+        // Element-wise with proper multidimensional broadcasting
+        for (int64_t i = numa_start; i < numa_end; ++i) {
+            // Convert linear index i to 4D coordinates (i0, i1, i2, i3) for src0/dst
+            const int64_t i03 = i / (ne02 * ne01 * ne00);
+            const int64_t i02 = (i % (ne02 * ne01 * ne00)) / (ne01 * ne00);
+            const int64_t i01 = (i % (ne01 * ne00)) / ne00;
+            const int64_t i00 = i % ne00;
             
-            // First-touch to reallocate on current NUMA node
-            volatile float* dst_volatile = (volatile float*)dst_ptr;
-            for (size_t i = 0; i < elements_in_slice; i += page_size_floats) {
-                dst_volatile[i] = 0.0f; // Write to allocate page on current node
-            }
-            printf("DEBUG ADD KERNEL: ✅ Destination pages reallocated on node %d\n", current_numa_node);
-        } else {
-            printf("DEBUG ADD KERNEL: ⚠️  Page migration failed, using fallback approach\n");
-            can_migrate_dst = false;
+            // Apply broadcasting: src1 coordinates use modulo for each dimension
+            const int64_t i13 = i03 % ne13;
+            const int64_t i12 = i02 % ne12;
+            const int64_t i11 = i01 % ne11;
+            const int64_t i10 = i00 % ne10;
+            
+            // Convert 4D coordinates back to linear indices
+            const int64_t src1_idx = i13 * (ne12 * ne11 * ne10) + 
+                                   i12 * (ne11 * ne10) + 
+                                   i11 * ne10 + 
+                                   i10;
+            
+            dst_data[i] = src0_data[i] + src1_data[src1_idx];
         }
     } else {
-        printf("DEBUG ADD KERNEL: ⚠️  Unsafe to migrate (addr=%p, size=%zu, aligned=%s), using first-touch\n", 
-               (void*)dst_addr, dst_size, (dst_addr % page_size == 0) ? "yes" : "no");
-        can_migrate_dst = false;
+        // Direct SIMD operation (most efficient path)
+        const float * src0_slice = src0_data + numa_start;
+        const float * src1_slice = src1_data + numa_start;
+        float * dst_slice = dst_data + numa_start;
+        
+        ggml_vec_add_f32(elements_in_slice, dst_slice, src0_slice, src1_slice);
     }
     
-    // For source memory: always use safe first-touch (can't use MADV_DONTNEED as it would lose data)
-    printf("DEBUG ADD KERNEL: First-touch prefaulting source pages with broadcasting support\n");
-    volatile float prefault_sum = 0.0f;  // Prevent optimization
+    clock_gettime(CLOCK_MONOTONIC, &compute_end_time);
+    printf("⚡ NUMA ADD KERNEL (COMPUTE END): Node %d finished computation at %ld.%09ld\n", 
+           current_numa_node, compute_end_time.tv_sec, compute_end_time.tv_nsec);
     
-    for (size_t i = 0; i < elements_in_slice; i += page_size_floats) {
-        // Touch each page to ensure it's accessible and potentially migrate if kernel allows
-        // Apply proper broadcasting for src1 access
-        size_t dst_idx = numa_start + i;
-        size_t src1_idx = dst_idx % src1_elements;  // Proper broadcasting
-        
-        prefault_sum += src0_ptr[i] + src1_data[src1_idx];
-        
-        // Touch end of page too if different
-        size_t page_end = (i + page_size_floats < elements_in_slice) ? i + page_size_floats : elements_in_slice;
-        if (page_end - 1 > i) {
-            size_t end_dst_idx = numa_start + (page_end - 1);
-            size_t end_src1_idx = end_dst_idx % src1_elements;  // Proper broadcasting
-            prefault_sum += src0_ptr[page_end - 1] + src1_data[end_src1_idx];
-        }
-    }
+    double compute_time_ms = (compute_end_time.tv_sec - compute_start_time.tv_sec) * 1000.0 + 
+                            (compute_end_time.tv_nsec - compute_start_time.tv_nsec) / 1000000.0;
     
-    // If we couldn't migrate destination pages, use first-touch
-    if (!can_migrate_dst) {
-        volatile float* dst_volatile = (volatile float*)dst_ptr;
-        for (size_t i = 0; i < elements_in_slice; i += page_size_floats) {
-            dst_volatile[i] = 0.0f; // First-touch allocation
-        }
-    }
-    
-    clock_gettime(CLOCK_MONOTONIC, &migration_end);
-    double migration_time_ms = (migration_end.tv_sec - migration_start.tv_sec) * 1000.0 + 
-                               (migration_end.tv_nsec - migration_start.tv_nsec) / 1000000.0;
-    printf("DEBUG ADD KERNEL: Memory preparation completed in %.3fms (sum=%.6f to prevent optimization)\n", 
-           migration_time_ms, prefault_sum);
-
-    printf("DEBUG ADD KERNEL: Starting SIMD-optimized ADD with broadcasting for %zu elements on NUMA node %d\n", 
-           elements_in_slice, current_numa_node);    
-    struct timespec time_start, time_end;
-    clock_gettime(CLOCK_MONOTONIC, &time_start);
-    
-    // For proper broadcasting, we need to check if src1 is truly compatible
-    // Only use simple SIMD if no broadcasting is needed (same size tensors)
-    const bool can_use_simple_simd = (src1_elements == dst_elements);
-    
-    if (can_use_simple_simd) {
-        printf("DEBUG ADD KERNEL: Using optimized SIMD path (no broadcasting)\n");
-        // Simple SIMD ADD - no broadcasting needed
-        const size_t simd_width = 8; // AVX2 processes 8 floats at once
-        const size_t simd_end_idx = (elements_in_slice / simd_width) * simd_width;
-        
-        const float* src1_ptr = src1_data + numa_start;
-        
-#if defined(__AVX2__)
-        // Process SIMD chunks using AVX2
-        for (size_t i = 0; i < simd_end_idx; i += simd_width) {
-            __m256 a = _mm256_loadu_ps(&src0_ptr[i]);
-            __m256 b = _mm256_loadu_ps(&src1_ptr[i]);
-            __m256 result = _mm256_add_ps(a, b);
-            _mm256_storeu_ps(&dst_ptr[i], result);
-        }
-#else
-        // Fallback to scalar for the SIMD portion if AVX2 not available
-        for (size_t i = 0; i < simd_end_idx; i++) {
-            dst_ptr[i] = src0_ptr[i] + src1_ptr[i];
-        }
-#endif
-        
-        // Handle remainder elements
-        for (size_t i = simd_end_idx; i < elements_in_slice; i++) {
-            dst_ptr[i] = src0_ptr[i] + src1_ptr[i];
-        }
-    } else {
-        printf("DEBUG ADD KERNEL: Using element-wise broadcasting path\n");
-        // Element-wise path with proper 2D broadcasting semantics
-        
-        // Get tensor dimensions for proper broadcasting
-        const int64_t dst_ne0 = tensor->ne[0];  // columns
-        const int64_t dst_ne1 = tensor->ne[1];  // rows  
-        const int64_t src1_ne0 = src1->ne[0];   // columns
-        const int64_t src1_ne1 = src1->ne[1];   // rows
-        
-        for (size_t i = 0; i < elements_in_slice; i++) {
-            size_t dst_idx = numa_start + i;
-            
-            // Convert flat index to 2D coordinates
-            size_t dst_row = dst_idx / dst_ne0;
-            size_t dst_col = dst_idx % dst_ne0;
-            
-            // Apply broadcasting rules to find src1 element
-            size_t src1_row = dst_row % src1_ne1;
-            size_t src1_col = dst_col % src1_ne0;
-            size_t src1_idx = src1_row * src1_ne0 + src1_col;
-            
-            dst_ptr[i] = src0_ptr[i] + src1_data[src1_idx];
-        }
-    }
-    
-    clock_gettime(CLOCK_MONOTONIC, &time_end);
-    double simd_time_ms = (time_end.tv_sec - time_start.tv_sec) * 1000.0 + 
-                          (time_end.tv_nsec - time_start.tv_nsec) / 1000000.0;
-    printf("DEBUG ADD KERNEL: Direct SIMD time: %.3fms for %zu elements\n", simd_time_ms, elements_in_slice);
-    
-    printf("DEBUG ADD KERNEL: Completed NUMA node %d processing\n", current_numa_node);
+    printf("✅ NUMA ADD KERNEL: Completed %zu elements in %.3f ms (%.2f GB/s)\n", 
+           elements_in_slice, compute_time_ms, 
+           (elements_in_slice * 3 * sizeof(float)) / (compute_time_ms * 1000000.0));
     
     return GGML_STATUS_SUCCESS;
 }
 
-// Cache registration interface - kernel provides its own cache entries
-void ggml_numa_kernel_add_populate_cache(void * cache_array) {
-    ggml_numa_cache_entry_t * cache = (ggml_numa_cache_entry_t *)cache_array;
-    // Pre-compute all ADD operation strategies across complexity classes
-    for (int complexity = 0; complexity < COMPLEXITY_COUNT; complexity++) {
-        ggml_numa_cache_entry_t * entry = &cache[complexity];
-        
-        entry->valid = true;
-        entry->kernel_name = "NUMA Add";
-        entry->work_function = ggml_numa_kernel_add_work_function;
-        entry->work_buffer_size_per_thread = 1024; // Minimal for element-wise ops
-        switch (complexity) {
-            case COMPLEXITY_TINY:
-            case COMPLEXITY_SMALL:
-                // Small tensors: single-node execution
-                entry->strategy.node_strategy = NUMA_NODE_STRATEGY_SINGLE;
-                entry->strategy.on_node_strategy = NUMA_ON_NODE_STRATEGY_MULTI_THREAD;
-                entry->efficiency_score = 0.60f; // Lower due to overhead
-                break;
-                
-            case COMPLEXITY_MEDIUM:
-            case COMPLEXITY_LARGE:
-            case COMPLEXITY_HUGE:
-                // Large tensors: data-parallel across nodes
-                entry->strategy.node_strategy = NUMA_NODE_STRATEGY_DATA_PARALLEL;
-                entry->strategy.on_node_strategy = NUMA_ON_NODE_STRATEGY_MULTI_THREAD;
-                entry->efficiency_score = 0.95f; // Excellent for large parallel work
-                break;
-                
-            default:
-                entry->valid = false;
-                break;
-        }
-    }
-}
+// ============================================================================
+// Performance and Debugging Support
+// ============================================================================
 
-enum ggml_status ggml_numa_kernel_add_execute(struct ggml_tensor * tensor, struct ggml_cplan * cplan) {
-    int current_numa_node = ggml_numa_get_current_node();
-    size_t tensor_size = ggml_nbytes(tensor);
-    
-    NUMA_PERF_START(NUMA_PERF_KERNEL_NUMA_EXEC, "ADD", "numa_add_kernel", current_numa_node, tensor_size, 1);
-    
-    if (!ggml_numa_kernel_add_supports(tensor)) {
-        NUMA_PERF_END();
+/**
+ * Debug function to verify NUMA data locality
+ */
+enum ggml_status ggml_numa_kernel_add_debug_data_locality(const struct ggml_tensor * tensor) {
+#ifdef GGML_NUMA_MIRROR
+    if (!tensor || !validate_tensor_inputs(tensor)) {
+        printf("❌ Invalid tensor for locality debug\n");
         return GGML_STATUS_FAILED;
     }
     
     const struct ggml_tensor * src0 = tensor->src[0];
     const struct ggml_tensor * src1 = tensor->src[1];
     
-    const int64_t total_elements = ggml_nelements(tensor);
+    extern int ggml_numa_node_count(void);
+    const int node_count = ggml_numa_node_count();
     
-    GGML_LOG_DEBUG("ADD kernel: Processing %ld elements with %d threads\n", 
-                   total_elements, cplan ? cplan->n_threads : 1);
+    printf("🔍 NUMA ADD: Data locality debug for %d nodes:\n", node_count);
     
-    // Add timing for actual computation
-    struct timespec start_time, end_time;
-    clock_gettime(CLOCK_MONOTONIC, &start_time);
+    for (int node = 0; node < node_count && node < GGML_NUMA_MAX_NODES; node++) {
+        printf("   Node %d: src0=%p, src1=%p, dst=%p\n", 
+               node, 
+               tensor->src[0]->__data[node],
+               tensor->src[1]->__data[node], 
+               tensor->__data[node]);
+    }
     
-    // Direct SIMD addition across all elements
-    ggml_vec_add_f32(total_elements,
-        (float *)ggml_get_data(tensor),
-        (const float *)ggml_get_data(src0),
-        (const float *)ggml_get_data(src1));
-    
-    clock_gettime(CLOCK_MONOTONIC, &end_time);
-    
-    double computation_time_ms = ((end_time.tv_sec - start_time.tv_sec) * 1000.0) +
-                                ((end_time.tv_nsec - start_time.tv_nsec) / 1000000.0);
-    
-    printf("DEBUG ADD: Node %d - Computation time: %.3fms for %ld elements\n", 
-           current_numa_node, computation_time_ms, total_elements);
-    
-    NUMA_PERF_END();
     return GGML_STATUS_SUCCESS;
+#else
+    printf("⚠️  NUMA mirroring not compiled in\n");
+    return GGML_STATUS_FAILED;
+#endif
 }
 
-// Legacy function for backward compatibility (different signature)
-float ggml_numa_kernel_add_get_efficiency_legacy(const struct ggml_tensor * tensor, size_t tensor_size) {
-    if (!ggml_numa_kernel_add_supports(tensor)) {
-        return -1.0f;
-    }
+// ============================================================================
+// Cache Population for Registry
+// ============================================================================
+
+void ggml_numa_kernel_add_populate_cache(void * cache_array) {
+    ggml_numa_cache_entry_t * cache = (ggml_numa_cache_entry_t *)cache_array;
     
-    // ADD is highly parallelizable - excellent efficiency for large tensors
-    const size_t OPTIMAL_SIZE = 4096;
+    // TINY: < 1K elements - single node execution
+    cache[COMPLEXITY_TINY] = (ggml_numa_cache_entry_t){
+        .valid = true,
+        .strategy = { 
+            .node_strategy = NUMA_NODE_STRATEGY_SINGLE, 
+            .on_node_strategy = NUMA_ON_NODE_STRATEGY_SINGLE_THREAD 
+        },
+        .work_buffer_size_per_thread = 0,
+        .work_function = ggml_numa_kernel_add_execute,
+        .efficiency_score = 0.95f,
+        .kernel_name = "NUMA ADD (Single/Single)"
+    };
     
-    if (tensor_size >= OPTIMAL_SIZE * 4) {
-        return 0.95f;  // Excellent efficiency for large tensors
-    } else if (tensor_size >= OPTIMAL_SIZE) {
-        return 0.85f;  // Good efficiency for medium tensors
-    } else {
-        return 0.6f;   // Reduced efficiency for small tensors
-    }
+    // SMALL: 1K - 16K elements - single node with multi-thread
+    cache[COMPLEXITY_SMALL] = (ggml_numa_cache_entry_t){
+        .valid = true,
+        .strategy = { 
+            .node_strategy = NUMA_NODE_STRATEGY_SINGLE,
+            .on_node_strategy = NUMA_ON_NODE_STRATEGY_MULTI_THREAD 
+        },
+        .work_buffer_size_per_thread = 0,
+        .work_function = ggml_numa_kernel_add_execute,
+        .efficiency_score = 0.96f,
+        .kernel_name = "NUMA ADD (Single/Multi)"
+    };
+    
+    // MEDIUM: 16K - 256K elements - data parallel
+    cache[COMPLEXITY_MEDIUM] = (ggml_numa_cache_entry_t){
+        .valid = true,
+        .strategy = { 
+            .node_strategy = NUMA_NODE_STRATEGY_DATA_PARALLEL,
+            .on_node_strategy = NUMA_ON_NODE_STRATEGY_SINGLE_THREAD 
+        },
+        .work_buffer_size_per_thread = 0,
+        .work_function = ggml_numa_kernel_add_execute,
+        .efficiency_score = 0.97f,
+        .kernel_name = "NUMA ADD (Data-Parallel/Single)"
+    };
+    
+    // LARGE: 256K - 4M elements - data parallel with multi-thread
+    cache[COMPLEXITY_LARGE] = (ggml_numa_cache_entry_t){
+        .valid = true,
+        .strategy = { 
+            .node_strategy = NUMA_NODE_STRATEGY_DATA_PARALLEL,
+            .on_node_strategy = NUMA_ON_NODE_STRATEGY_MULTI_THREAD 
+        },
+        .work_buffer_size_per_thread = 0,
+        .work_function = ggml_numa_kernel_add_execute,
+        .efficiency_score = 0.98f,
+        .kernel_name = "NUMA ADD (Data-Parallel/Multi)"
+    };
+    
+    // HUGE: > 4M elements - data parallel with multi-thread
+    cache[COMPLEXITY_HUGE] = (ggml_numa_cache_entry_t){
+        .valid = true,
+        .strategy = { 
+            .node_strategy = NUMA_NODE_STRATEGY_DATA_PARALLEL,
+            .on_node_strategy = NUMA_ON_NODE_STRATEGY_MULTI_THREAD 
+        },
+        .work_buffer_size_per_thread = 0,
+        .work_function = ggml_numa_kernel_add_execute,
+        .efficiency_score = 0.98f,
+        .kernel_name = "NUMA ADD (Data-Parallel/Multi)"
+    };
 }

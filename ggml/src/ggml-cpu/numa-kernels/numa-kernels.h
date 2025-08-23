@@ -9,7 +9,7 @@
 #pragma once
 
 #include "ggml.h"
-#include "../ggml-numa-coordinator.h"  // For execution strategy types
+#include "ggml-numa-shared.h"  // For execution strategy types
 
 #ifdef __cplusplus
 extern "C" {

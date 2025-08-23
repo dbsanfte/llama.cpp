@@ -85,6 +85,21 @@ struct ggml_threadpool * ggml_numa_simple_coordinator_get_fallback_threadpool(vo
  */
 int ggml_numa_simple_coordinator_get_fallback_thread_count(void);
 
+/**
+ * NUMA thread binding validation (hard failure)
+ * @param expected_node Expected NUMA node (-1 to skip validation)
+ * @param thread_type Description of thread type for error messages
+ * @param thread_id Thread identifier for error messages
+ */
+void ggml_numa_simple_coordinator_assert_thread_binding(int expected_node, const char* thread_type, int thread_id);
+
+/**
+ * Thread-local flag indicating data-parallel execution mode
+ * When true, kernels should slice data across NUMA nodes
+ * When false, kernels should process entire dataset
+ */
+extern __thread bool ggml_numa_is_data_parallel_execution;
+
 #ifdef __cplusplus
 }
 #endif

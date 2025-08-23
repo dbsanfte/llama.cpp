@@ -12,7 +12,7 @@
 #include "ggml-numa-simple-coordinator.h"  // For fallback threadpool functions
 #include "ggml-cpu-impl.h"
 #include "ggml-impl.h"
-#include "ggml-cpu.h"  // For ggml_compute_forward_* function declarations
+#include "ggml-cpu.h"  // For ggml_compute_forward_* function declarations and NUMA strategy functions
 #include "ops.h"       // For actual ggml_compute_forward_* declarations
 #include "ggml-numa-perf.h"  // Performance instrumentation
 
@@ -27,6 +27,9 @@
 
 // Kernel headers - using the new query interface
 #include "numa-kernels/numa-kernels.h"  // New centralized query interface
+
+// External test tracking function (has weak default implementation in ggml-cpu.c)
+extern void test_track_data_parallel(void);
 
 // Missing struct definition for MUL_MAT_ID work buffer calculation
 struct mmid_row_mapping {
@@ -197,6 +200,9 @@ enum ggml_status ggml_numa_executor_execute_tensor(struct ggml_tensor * tensor, 
         GGML_LOG_DEBUG("NUMA Executor: Dispatching %s for data-parallel execution across %d nodes\n", 
                        op_name, num_numa_nodes);
         
+        // Track data-parallel execution for debugging
+        test_track_data_parallel();
+        
         result = ggml_numa_simple_coordinator_execute_data_parallel(
             query_result.work_function, tensor, query_result.work_buffer_size_per_thread);
             
@@ -204,11 +210,43 @@ enum ggml_status ggml_numa_executor_execute_tensor(struct ggml_tensor * tensor, 
         NUMA_PERF_END();
         
     } else {
-        // Single-node execution - choose optimal node (for now, use node 0)
-        NUMA_PERF_START(NUMA_PERF_EXECUTOR_KERNEL_EXEC, op_name, query_result.kernel_name, 0, tensor_size, 1);
-        int target_node = 0;
+        // Single-node execution - choose target node based on NUMA strategy and data locality
+        enum ggml_numa_strategy strategy = ggml_numa_get_strategy();
+        int target_node = 0;  // Default to node 0
         
-        printf("DEBUG: NUMA Executor: Taking SINGLE_NODE path, target_node=%d\n", target_node);
+        if (strategy == GGML_NUMA_STRATEGY_ISOLATE) {
+            // For isolate mode, use the specified isolation node
+            int isolate_node = ggml_numa_get_isolate_node();
+            if (isolate_node >= 0) {
+                target_node = isolate_node;
+                printf("DEBUG: NUMA Executor: ISOLATE mode - using isolation node %d\n", target_node);
+            } else {
+                printf("DEBUG: NUMA Executor: ISOLATE mode - no valid isolation node, using default node 0\n");
+            }
+        } else {
+            // For other strategies, detect optimal node based on data locality
+            // Check where the source data is actually located
+            if (tensor->src[0]) {
+                extern int get_memory_numa_node(void* ptr);
+                void* src_data = ggml_get_data(tensor->src[0]);
+                if (src_data) {
+                    int data_node = get_memory_numa_node(src_data);
+                    if (data_node >= 0) {
+                        target_node = data_node;
+                        printf("DEBUG: NUMA Executor: Data locality detection - src0 data on node %d, using that node\n", target_node);
+                    } else {
+                        printf("DEBUG: NUMA Executor: Data locality detection failed, using default node 0\n");
+                    }
+                } else {
+                    printf("DEBUG: NUMA Executor: No source data available, using default node 0\n");
+                }
+            } else {
+                printf("DEBUG: NUMA Executor: No source tensor available, using default node 0\n");
+            }
+        }
+        
+        NUMA_PERF_START(NUMA_PERF_EXECUTOR_KERNEL_EXEC, op_name, query_result.kernel_name, target_node, tensor_size, 1);
+        printf("DEBUG: NUMA Executor: Taking SINGLE_NODE path, target_node=%d (strategy=%d)\n", target_node, strategy);
         GGML_LOG_DEBUG("NUMA Executor: Dispatching %s for single-node execution on node %d\n", 
                        ggml_op_name(tensor->op), target_node);
         
@@ -342,6 +380,8 @@ enum ggml_status ggml_numa_executor_fallback_to_cpu(struct ggml_tensor * tensor,
         if (numa_available() >= 0) {
             work_data = numa_alloc_onnode(needed_work_size, 0);
             if (work_data) {
+                // Initialize pages to ensure proper NUMA placement
+                memset(work_data, 0, needed_work_size);
                 allocated_work_buffer = true;
                 GGML_LOG_DEBUG("NUMA Fallback: Allocated %zu bytes work buffer on NUMA node 0\n", needed_work_size);
             }

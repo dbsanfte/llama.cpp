@@ -56,6 +56,7 @@ BIN_DIR="$BUILD_DIR/bin"
 # Test binaries to run (in order of complexity)
 NUMA_TESTS=(
     "test-numa-mathematical-correctness-add"
+    "test-numa-data-slicing-verification"
 )
 
 # Performance benchmark tests (separate category)
