@@ -1643,34 +1643,29 @@ void ggml_compute_forward(struct ggml_compute_params * params, struct ggml_tenso
 
 #ifdef GGML_NUMA_MIRROR
     // Direct NUMA execution via simple coordinator and executor
-    // Check if we should use NUMA dispatch for large operations
+    // Let the NUMA registry decide if the operation is worth coordinating
     if (params->ith == 0 && ggml_numa_should_dispatch()) { // Only for main thread AND when dispatch enabled
-        GGML_LOG_DEBUG("💡 Direct NUMA check: op=%s, ith=%d, nelements=%zu, threshold=10000\n", 
+        GGML_LOG_DEBUG("💡 Direct NUMA check: op=%s, ith=%d, nelements=%zu\n", 
                       ggml_op_name(tensor->op), params->ith, ggml_nelements(tensor));
         
-        if (ggml_nelements(tensor) >= 10000) { // Lowered threshold for testing
-            // Create minimal compute plan for executor
-            struct ggml_cplan cplan = {0};
-            cplan.work_size = 0;
-            cplan.work_data = NULL;
-            cplan.n_threads = params->nth;
-            cplan.threadpool = params->threadpool;
-            cplan.abort_callback = NULL;
-            cplan.abort_callback_data = NULL;
-            
-            enum ggml_status numa_result = ggml_numa_executor_execute_tensor(tensor, &cplan);
-            if (numa_result == GGML_STATUS_SUCCESS) {
-                GGML_LOG_DEBUG("Tensor operation %s successfully executed via NUMA executor\n", ggml_op_name(tensor->op));
-                return; // Successfully handled by NUMA executor
-            }
-            // If NUMA failed, fall through to standard execution
-            GGML_LOG_DEBUG("Tensor operation %s falling back to standard CPU path\n", ggml_op_name(tensor->op));
-        } else {
-            GGML_LOG_DEBUG("Tensor operation %s skipped direct NUMA (too small: %zu elements)\n", 
-                          ggml_op_name(tensor->op), ggml_nelements(tensor));
+        // Create minimal compute plan for executor
+        struct ggml_cplan cplan = {0};
+        cplan.work_size = 0;
+        cplan.work_data = NULL;
+        cplan.n_threads = params->nth;
+        cplan.threadpool = params->threadpool;
+        cplan.abort_callback = NULL;
+        cplan.abort_callback_data = NULL;
+        
+        enum ggml_status numa_result = ggml_numa_executor_execute_tensor(tensor, &cplan);
+        if (numa_result == GGML_STATUS_SUCCESS) {
+            GGML_LOG_DEBUG("Tensor operation %s successfully executed via NUMA executor\n", ggml_op_name(tensor->op));
+            return; // Successfully handled by NUMA executor
         }
+        // If NUMA failed, fall through to standard execution
+        GGML_LOG_DEBUG("Tensor operation %s falling back to standard CPU path\n", ggml_op_name(tensor->op));
     } else {
-        GGML_LOG_DEBUG("Tensor operation %s skipped direct NUMA (thread %d, not main)\n", 
+        GGML_LOG_DEBUG("Tensor operation %s skipped direct NUMA dispatch (thread %d, not main)\n", 
                       ggml_op_name(tensor->op), params->ith);
     }
 #endif
