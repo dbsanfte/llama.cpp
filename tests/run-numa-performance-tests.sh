@@ -42,7 +42,7 @@ for arg in "$@"; do
             echo "Options:"
             echo "  --verbose         Show detailed benchmark output from each test"
             echo "  --quick           Run reduced test suite for faster results"
-            echo "  --operation=OP    Run benchmarks only for specific operation (e.g., ADD)"
+            echo "  --operation=OP    Run benchmarks only for specific operation (e.g., ADD, MUL_MAT)"
             echo "  --output=FORMAT   Output format: summary, detailed, csv, json (default: summary)"
             echo "  --no-hyperthreading  Use only physical cores, exclude hyperthreading"
             echo "  --physical-cores-only  Same as --no-hyperthreading"
@@ -56,10 +56,10 @@ for arg in "$@"; do
             echo ""
             echo "Examples:"
             echo "  $0                              # Run all performance tests"
-            echo "  $0 --verbose --operation=ADD   # Detailed ADD operation benchmarks"
+            echo "  $0 --verbose --operation=MUL_MAT # Detailed MUL_MAT operation benchmarks"
             echo "  $0 --quick --output=csv        # Quick test suite with CSV output"
             echo "  $0 --no-hyperthreading         # Use only physical cores for testing"
-            echo "  $0 --operation=ADD --no-hyperthreading  # ADD with physical cores only"
+            echo "  $0 --operation=MUL_MAT --no-hyperthreading  # MUL_MAT with physical cores only"
             exit 0
             ;;
         *)
@@ -306,7 +306,7 @@ discover_performance_tests() {
     fi
     
     # Define supported operation types based on the new extensible test
-    local all_operations=("ADD")
+    local all_operations=("ADD" "MUL_MAT")
     
     # Filter operations based on operation filter if provided
     if [ -n "$OPERATION_FILTER" ]; then

@@ -147,6 +147,7 @@ cp tests/test-numa-mathematical-correctness-template.cpp tests/test-numa-mathema
 
 **✅ Supported Operations:**
 - **ADD** - Element-wise addition with SIMD optimization and no-aggregation breakthrough
+- **MUL_MAT** - Matrix multiplication with chunk-based work distribution and type-specific SIMD operations
 
 **🚀 Performance Characteristics:**
 - **O(1) Strategy Lookups** - Pre-computed cache eliminates runtime overhead
@@ -403,6 +404,7 @@ ggml/src/ggml-cpu/ggml-numa-shared.h              # Debug control and shared uti
 ggml/src/ggml-cpu/ggml-cpu.c                      # Mathematical kernels (reference)
 tests/test-numa-mathematical-correctness-*.cpp    # Correctness tests
 tests/run-numa-performance-tests.sh               # Performance test orchestrator
+tests/test-numa-execution-modes.cpp               # Runs individual op performance tests for the Performance test orchestrator across a variety of NUMA modes
 docs/numa-architecture.md                         # Architecture documentation
 ```
 

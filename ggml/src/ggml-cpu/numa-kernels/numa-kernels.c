@@ -13,6 +13,7 @@
 
 #include "numa-kernels.h"
 #include "add.h"
+#include "mul_mat.h"
 #include "../ggml-impl.h"
 
 // ============================================================================
@@ -78,24 +79,36 @@ static bool build_kernel_cache(void) {
     }
     
     // Populate supported operations - each kernel provides its own cache entries
-    NUMA_LOG_DEBUG("NUMA Cache: Temporarily disabling ADD cache for debugging");
-    GGML_LOG_DEBUG("NUMA Cache: Temporarily disabling ADD cache for debugging\n");
+    NUMA_LOG_DEBUG("NUMA Cache: Populating ADD cache entries");
+    GGML_LOG_DEBUG("NUMA Cache: Populating ADD cache entries\n");
     ggml_numa_kernel_add_populate_cache(g_numa_cache[GGML_OP_ADD]); // ADD kernel
     
-    // Verify ADD cache entries were populated
+    NUMA_LOG_DEBUG("NUMA Cache: Populating MUL_MAT cache entries");
+    GGML_LOG_DEBUG("NUMA Cache: Populating MUL_MAT cache entries\n");
+    ggml_numa_kernel_mul_mat_populate_cache(g_numa_cache[GGML_OP_MUL_MAT]); // MUL_MAT kernel
+    
+    // Verify cache entries were populated
     for (int complexity = 0; complexity < COMPLEXITY_COUNT; complexity++) {
-        ggml_numa_cache_entry_t * entry = &g_numa_cache[GGML_OP_ADD][complexity];
+        ggml_numa_cache_entry_t * add_entry = &g_numa_cache[GGML_OP_ADD][complexity];
         NUMA_LOG_DEBUG("NUMA Cache: ADD[%d] valid=%s, kernel=%s", 
-               complexity, entry->valid ? "true" : "false", 
-               entry->valid ? entry->kernel_name : "N/A");
+               complexity, add_entry->valid ? "true" : "false", 
+               add_entry->valid ? add_entry->kernel_name : "N/A");
         GGML_LOG_DEBUG("NUMA Cache: ADD[%d] valid=%s, kernel=%s\n", 
-                       complexity, entry->valid ? "true" : "false", 
-                       entry->valid ? entry->kernel_name : "N/A");
+                       complexity, add_entry->valid ? "true" : "false", 
+                       add_entry->valid ? add_entry->kernel_name : "N/A");
+        
+        ggml_numa_cache_entry_t * mul_mat_entry = &g_numa_cache[GGML_OP_MUL_MAT][complexity];
+        NUMA_LOG_DEBUG("NUMA Cache: MUL_MAT[%d] valid=%s, kernel=%s", 
+               complexity, mul_mat_entry->valid ? "true" : "false", 
+               mul_mat_entry->valid ? mul_mat_entry->kernel_name : "N/A");
+        GGML_LOG_DEBUG("NUMA Cache: MUL_MAT[%d] valid=%s, kernel=%s\n", 
+                       complexity, mul_mat_entry->valid ? "true" : "false", 
+                       mul_mat_entry->valid ? mul_mat_entry->kernel_name : "N/A");
     }
     
     // Mark unsupported operations (can be extended as kernels are added)
     for (int op = 0; op < GGML_OP_COUNT; op++) {
-        if (op != GGML_OP_ADD) {  // Mark all operations except ADD as unsupported 
+        if (op != GGML_OP_ADD && op != GGML_OP_MUL_MAT) {  // Mark all operations except ADD and MUL_MAT as unsupported 
             populate_unsupported_operation((enum ggml_op)op);
         }
     }

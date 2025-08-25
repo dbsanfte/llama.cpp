@@ -17,7 +17,8 @@
 
 // Supported NUMA operation types for testing
 enum class NumaOperationType {
-    ADD                 // Element-wise addition (a + b) - IMPLEMENTED
+    ADD,                // Element-wise addition (a + b) - IMPLEMENTED
+    MUL_MAT             // Matrix multiplication (a * b) - IMPLEMENTED
 };
 
 // Supported NUMA strategies for testing
@@ -64,6 +65,7 @@ void verify_numa_setup(TestNumaStrategy strategy);
 std::string operation_type_to_string(NumaOperationType operation) {
     switch (operation) {
         case NumaOperationType::ADD: return "ADD";
+        case NumaOperationType::MUL_MAT: return "MUL_MAT";
         default: return "UNKNOWN";
     }
 }
@@ -95,7 +97,7 @@ std::string size_to_string(TensorSize size) {
 TestConfig parse_arguments(int argc, char* argv[]) {
     if (argc != 4) {
         printf("Usage: %s <OPERATION> <STRATEGY> <SIZE>\n", argv[0]);
-        printf("  OPERATION: ADD\n");
+        printf("  OPERATION: ADD, MUL_MAT\n");
         printf("  STRATEGY: ISOLATE_NODE_0, ISOLATE_NODE_1, MIRROR\n");
         printf("  SIZE: SMALL, LARGE, HUGE, GIGANTIC_1GB, GIGANTIC_2GB, GIGANTIC_4GB, GIGANTIC_8GB, GIGANTIC_16GB\n");
         exit(1);
@@ -106,6 +108,8 @@ TestConfig parse_arguments(int argc, char* argv[]) {
     // Parse operation
     if (strcmp(argv[1], "ADD") == 0) {
         config.operation = NumaOperationType::ADD;
+    } else if (strcmp(argv[1], "MUL_MAT") == 0) {
+        config.operation = NumaOperationType::MUL_MAT;
     } else {
         printf("❌ Unknown operation: %s\n", argv[1]);
         exit(1);
@@ -124,45 +128,46 @@ TestConfig parse_arguments(int argc, char* argv[]) {
     }
     
     // Parse size and set dimensions
+    std::string operation_name = operation_type_to_string(config.operation);
     if (strcmp(argv[3], "SMALL") == 0) {
         config.size = TensorSize::SMALL;
         config.dim1 = 128; config.dim2 = 128; config.dim3 = 16;   // ~1 MB
-        config.name = "ADD_SMALL";
+        config.name = operation_name + "_SMALL";
         config.description = "Small tensor (1 MB)";
     } else if (strcmp(argv[3], "LARGE") == 0) {
         config.size = TensorSize::LARGE;
         config.dim1 = 256; config.dim2 = 256; config.dim3 = 64;   // ~32 MB
-        config.name = "ADD_LARGE";  
+        config.name = operation_name + "_LARGE";  
         config.description = "Large tensor (32 MB)";
     } else if (strcmp(argv[3], "HUGE") == 0) {
         config.size = TensorSize::HUGE;
         config.dim1 = 512; config.dim2 = 512; config.dim3 = 256;  // ~1 GB
-        config.name = "ADD_HUGE";
+        config.name = operation_name + "_HUGE";
         config.description = "Huge tensor (1 GB)";
     } else if (strcmp(argv[3], "GIGANTIC_1GB") == 0) {
         config.size = TensorSize::GIGANTIC_1GB;
         config.dim1 = 645; config.dim2 = 645; config.dim3 = 645;  // ~1 GB (268M elements)
-        config.name = "ADD_GIGANTIC_1GB";
+        config.name = operation_name + "_GIGANTIC_1GB";
         config.description = "Gigantic tensor (1 GB)";
     } else if (strcmp(argv[3], "GIGANTIC_2GB") == 0) {
         config.size = TensorSize::GIGANTIC_2GB;
         config.dim1 = 813; config.dim2 = 813; config.dim3 = 813;  // ~2 GB (537M elements)
-        config.name = "ADD_GIGANTIC_2GB";
+        config.name = operation_name + "_GIGANTIC_2GB";
         config.description = "Gigantic tensor (2 GB)";
     } else if (strcmp(argv[3], "GIGANTIC_4GB") == 0) {
         config.size = TensorSize::GIGANTIC_4GB;
         config.dim1 = 1024; config.dim2 = 1024; config.dim3 = 1024;  // ~4 GB (1073M elements)
-        config.name = "ADD_GIGANTIC_4GB";
+        config.name = operation_name + "_GIGANTIC_4GB";
         config.description = "Gigantic tensor (4 GB)";
     } else if (strcmp(argv[3], "GIGANTIC_8GB") == 0) {
         config.size = TensorSize::GIGANTIC_8GB;
         config.dim1 = 1290; config.dim2 = 1290; config.dim3 = 1290;  // ~8 GB (2146M elements)
-        config.name = "ADD_GIGANTIC_8GB";
+        config.name = operation_name + "_GIGANTIC_8GB";
         config.description = "Gigantic tensor (8 GB)";
     } else if (strcmp(argv[3], "GIGANTIC_16GB") == 0) {
         config.size = TensorSize::GIGANTIC_16GB;
         config.dim1 = 1625; config.dim2 = 1625; config.dim3 = 1625;  // ~16 GB (4291M elements)
-        config.name = "ADD_GIGANTIC_16GB";
+        config.name = operation_name + "_GIGANTIC_16GB";
         config.description = "Gigantic tensor (16 GB)";
     } else {
         printf("❌ Unknown size: %s\n", argv[3]);
@@ -306,6 +311,15 @@ OperationSetup create_operation(struct ggml_context* ctx, const TestConfig& conf
             setup.operation_name = "ADD";
             break;
         }
+        case NumaOperationType::MUL_MAT: {
+            // For matrix multiplication: A[k,m] * B[k,n] => C[m,n]
+            // Use dim1 as k (shared dimension), dim2 as m, dim3 as n
+            setup.tensor_a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, config.dim1, config.dim2);  // [k,m]
+            setup.tensor_b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, config.dim1, config.dim3);  // [k,n]
+            setup.result = ggml_mul_mat(ctx, setup.tensor_a, setup.tensor_b);                    // [m,n]
+            setup.operation_name = "MUL_MAT";
+            break;
+        }
         default:
             printf("❌ Unsupported operation type\n");
             break;
@@ -325,6 +339,21 @@ void initialize_operation_data(const OperationSetup& setup, const TestConfig& co
             for (size_t i = 0; i < total_elements; i++) {
                 a_data[i] = 1.5f + (i % 100) * 0.01f;
                 b_data[i] = 2.5f + (i % 100) * 0.01f;
+            }
+            break;
+        }
+        case NumaOperationType::MUL_MAT: {
+            float* a_data = (float*)ggml_get_data(setup.tensor_a);
+            float* b_data = (float*)ggml_get_data(setup.tensor_b);
+            size_t elements_a = ggml_nelements(setup.tensor_a);
+            size_t elements_b = ggml_nelements(setup.tensor_b);
+            
+            // Initialize with small values to avoid overflow
+            for (size_t i = 0; i < elements_a; i++) {
+                a_data[i] = 0.1f + (i % 10) * 0.01f;
+            }
+            for (size_t i = 0; i < elements_b; i++) {
+                b_data[i] = 0.1f + (i % 10) * 0.01f;
             }
             break;
         }
@@ -358,7 +387,9 @@ double run_test(const TestConfig& config) {
     // Create operation based on config type
     OperationSetup op = create_operation(ctx, config);
     
-    if (!op.tensor_a || !op.result || (config.operation == NumaOperationType::ADD && !op.tensor_b)) {
+    if (!op.tensor_a || !op.result || 
+        (config.operation == NumaOperationType::ADD && !op.tensor_b) ||
+        (config.operation == NumaOperationType::MUL_MAT && !op.tensor_b)) {
         printf("❌ Failed to create tensors for %s operation\n", op.operation_name.c_str());
         ggml_free(ctx);
         return -1.0;

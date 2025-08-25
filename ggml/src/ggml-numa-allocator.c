@@ -151,6 +151,19 @@ static void assert_numa_allocation(void* ptr, int expected_node, const char* con
     }
 }
 
+// Non-recursive fallback allocation - breaks infinite recursion
+static void* ggml_numa_fallback_alloc(size_t size, ggml_numa_alloc_context_t* numa_ctx) {
+    void* mem = aligned_alloc(64, size);
+    if (mem) {
+        memset(mem, 0, size);
+        numa_ctx->total_allocated += size;
+        if (numa_ctx->debug_enabled) {
+            printf("🔄 Fallback allocation: %zu bytes (breaking recursion)\n", size);
+        }
+    }
+    return mem;
+}
+
 void* ggml_numa_aligned_malloc(size_t size, ggml_numa_alloc_context_t* numa_ctx) {
     if (!numa_ctx) {
         // Use global context
@@ -295,7 +308,7 @@ void* ggml_numa_aligned_malloc(size_t size, ggml_numa_alloc_context_t* numa_ctx)
     }
     
     if (preferred_node < 0 || preferred_node >= numa_ctx->num_numa_nodes) {
-        return ggml_numa_aligned_malloc(size, numa_ctx);
+        return ggml_numa_fallback_alloc(size, numa_ctx);
     }
     
     // Check if NUMA is available at all
@@ -325,7 +338,7 @@ void* ggml_numa_aligned_malloc(size_t size, ggml_numa_alloc_context_t* numa_ctx)
                        MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (memory == MAP_FAILED) {
         printf("❌ mmap failed for %zu bytes on node %d\n", size, preferred_node);
-        return ggml_numa_aligned_malloc(size, numa_ctx);
+        return ggml_numa_fallback_alloc(size, numa_ctx);
     }
     
     // Bind current thread to target node for first-touch
