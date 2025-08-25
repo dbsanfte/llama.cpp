@@ -30,6 +30,9 @@
 // Forward declarations
 static void verify_threadpool_numa_binding_fatal(struct ggml_threadpool * threadpool, int expected_numa_node);
 
+// Forward declaration for no-aggregation kernel function
+extern enum ggml_status ggml_numa_kernel_add_execute_no_aggregation(void * work_context, struct ggml_compute_params * params);
+
 // Thread-local execution mode for kernel communication
 /**
  * Thread-local NUMA execution context
@@ -1169,34 +1172,45 @@ enum ggml_status ggml_numa_simple_coordinator_execute_data_parallel(
     
     // CRITICAL: Data aggregation step for data-parallel execution
     // After all NUMA nodes complete, we need to aggregate their results into a single coherent output
+    // OPTIMIZATION: Skip aggregation for kernels that write directly to final tensor
     if (final_status == GGML_STATUS_SUCCESS) {
-        printf("DEBUG: Starting data aggregation from %d NUMA nodes\n", num_nodes);
-        struct timespec agg_start_time;
-        clock_gettime(CLOCK_MONOTONIC, &agg_start_time);
-        
-        // work_context is the tensor that was processed
         struct ggml_tensor * result_tensor = (struct ggml_tensor *)work_context;
         
-        // Aggregate data from all NUMA nodes into the final result
-        enum ggml_status agg_status = ggml_numa_aggregate_tensor_data(result_tensor, num_nodes);
-        
-        struct timespec agg_end_time;
-        clock_gettime(CLOCK_MONOTONIC, &agg_end_time);
-        double agg_time_ms = (agg_end_time.tv_sec - agg_start_time.tv_sec) * 1000.0 + 
-                             (agg_end_time.tv_nsec - agg_start_time.tv_nsec) / 1000000.0;
-        
-        if (agg_status == GGML_STATUS_SUCCESS) {
-            printf("DEBUG: Data aggregation completed successfully in %.3fms\n", agg_time_ms);
-            
-            // CRITICAL: Set ggml_current_numa_node to 0 so that subsequent ggml_get_data() calls
-            // read from node 0 where we aggregated the result
-            extern __thread int ggml_current_numa_node;
-            ggml_current_numa_node = 0;
-            printf("DEBUG: Set ggml_current_numa_node=0 for result reading\n");
-        } else {
-            printf("ERROR: Data aggregation failed - status %d\n", agg_status);
-            final_status = agg_status;
+        // Check if this is a no-aggregation kernel by comparing function pointers
+        bool needs_aggregation = true;
+        if (work_function == ggml_numa_kernel_add_execute_no_aggregation) {
+            needs_aggregation = false;
+            printf("DEBUG: Skipping data aggregation - no-aggregation kernel writes directly to final tensor\n");
         }
+        
+        if (needs_aggregation) {
+            printf("DEBUG: Starting data aggregation from %d NUMA nodes\n", num_nodes);
+            struct timespec agg_start_time;
+            clock_gettime(CLOCK_MONOTONIC, &agg_start_time);
+            
+            // Aggregate data from all NUMA nodes into the final result
+            enum ggml_status agg_status = ggml_numa_aggregate_tensor_data(result_tensor, num_nodes);
+            
+            struct timespec agg_end_time;
+            clock_gettime(CLOCK_MONOTONIC, &agg_end_time);
+            double agg_time_ms = (agg_end_time.tv_sec - agg_start_time.tv_sec) * 1000.0 + 
+                                 (agg_end_time.tv_nsec - agg_start_time.tv_nsec) / 1000000.0;
+            
+            if (agg_status == GGML_STATUS_SUCCESS) {
+                printf("DEBUG: Data aggregation completed successfully in %.3fms\n", agg_time_ms);
+            } else {
+                printf("ERROR: Data aggregation failed - status %d\n", agg_status);
+                final_status = agg_status;
+            }
+        } else {
+            printf("DEBUG: Data aggregation skipped - result already coherent from in-place operations\n");
+        }
+        
+        // CRITICAL: Set ggml_current_numa_node to 0 so that subsequent ggml_get_data() calls
+        // read from node 0 where we aggregated the result (or where coherent result is located)
+        extern __thread int ggml_current_numa_node;
+        ggml_current_numa_node = 0;
+        printf("DEBUG: Set ggml_current_numa_node=0 for result reading\n");
     }
     
     NUMA_PERF_END();

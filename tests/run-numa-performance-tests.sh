@@ -293,6 +293,21 @@ run_performance_test() {
             "$operation_name ISOLATE_NODE_0 HUGE"
             "$operation_name ISOLATE_NODE_1 HUGE"
             "$operation_name MIRROR HUGE"
+            "$operation_name ISOLATE_NODE_0 GIGANTIC_1GB"
+            "$operation_name ISOLATE_NODE_1 GIGANTIC_1GB"
+            "$operation_name MIRROR GIGANTIC_1GB"
+            "$operation_name ISOLATE_NODE_0 GIGANTIC_2GB"
+            "$operation_name ISOLATE_NODE_1 GIGANTIC_2GB"
+            "$operation_name MIRROR GIGANTIC_2GB"
+            "$operation_name ISOLATE_NODE_0 GIGANTIC_4GB"
+            "$operation_name ISOLATE_NODE_1 GIGANTIC_4GB"
+            "$operation_name MIRROR GIGANTIC_4GB"
+            "$operation_name ISOLATE_NODE_0 GIGANTIC_8GB"
+            "$operation_name ISOLATE_NODE_1 GIGANTIC_8GB"
+            "$operation_name MIRROR GIGANTIC_8GB"
+            "$operation_name ISOLATE_NODE_0 GIGANTIC_16GB"
+            "$operation_name ISOLATE_NODE_1 GIGANTIC_16GB"
+            "$operation_name MIRROR GIGANTIC_16GB"
         )
     fi
     
@@ -453,7 +468,7 @@ generate_performance_summary() {
         
         # Display the full table for this operation
         if [ -n "${OPERATION_TABLES[$operation]}" ]; then
-            echo "${OPERATION_TABLES[$operation]}"
+            echo -e "${OPERATION_TABLES[$operation]}"
         else
             echo "⚠️  No detailed table available for $operation"
         fi

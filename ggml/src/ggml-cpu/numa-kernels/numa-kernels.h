@@ -27,7 +27,12 @@ typedef enum {
     COMPLEXITY_SMALL,       // 1K - 16K elements  
     COMPLEXITY_MEDIUM,      // 16K - 256K elements
     COMPLEXITY_LARGE,       // 256K - 4M elements
-    COMPLEXITY_HUGE,        // > 4M elements
+    COMPLEXITY_HUGE,        // 4M - 64M elements
+    COMPLEXITY_GIGANTIC_1GB,  // 64M - 512M elements (~1GB)
+    COMPLEXITY_GIGANTIC_2GB,  // 512M - 1024M elements (~2GB)
+    COMPLEXITY_GIGANTIC_4GB,  // 1024M - 2048M elements (~4GB)
+    COMPLEXITY_GIGANTIC_8GB,  // 2048M - 4096M elements (~8GB)
+    COMPLEXITY_GIGANTIC_16GB, // > 4096M elements (~16GB+)
     COMPLEXITY_COUNT
 } ggml_numa_complexity_class_t;
 

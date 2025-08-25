@@ -31,7 +31,12 @@ enum class TestNumaStrategy {
 enum class TensorSize {
     SMALL,              // Small tensor (1 MB)
     LARGE,              // Large tensor (32 MB)
-    HUGE                // Huge tensor (1 GB)
+    HUGE,               // Huge tensor (1 GB)
+    GIGANTIC_1GB,       // Gigantic tensor (1 GB)
+    GIGANTIC_2GB,       // Gigantic tensor (2 GB) 
+    GIGANTIC_4GB,       // Gigantic tensor (4 GB)
+    GIGANTIC_8GB,       // Gigantic tensor (8 GB)
+    GIGANTIC_16GB       // Gigantic tensor (16 GB)
 };
 
 // Single test configuration
@@ -77,6 +82,11 @@ std::string size_to_string(TensorSize size) {
         case TensorSize::SMALL: return "SMALL";
         case TensorSize::LARGE: return "LARGE";
         case TensorSize::HUGE: return "HUGE";
+        case TensorSize::GIGANTIC_1GB: return "GIGANTIC_1GB";
+        case TensorSize::GIGANTIC_2GB: return "GIGANTIC_2GB";
+        case TensorSize::GIGANTIC_4GB: return "GIGANTIC_4GB";
+        case TensorSize::GIGANTIC_8GB: return "GIGANTIC_8GB";
+        case TensorSize::GIGANTIC_16GB: return "GIGANTIC_16GB";
         default: return "UNKNOWN";
     }
 }
@@ -87,7 +97,7 @@ TestConfig parse_arguments(int argc, char* argv[]) {
         printf("Usage: %s <OPERATION> <STRATEGY> <SIZE>\n", argv[0]);
         printf("  OPERATION: ADD\n");
         printf("  STRATEGY: ISOLATE_NODE_0, ISOLATE_NODE_1, MIRROR\n");
-        printf("  SIZE: SMALL, LARGE, HUGE\n");
+        printf("  SIZE: SMALL, LARGE, HUGE, GIGANTIC_1GB, GIGANTIC_2GB, GIGANTIC_4GB, GIGANTIC_8GB, GIGANTIC_16GB\n");
         exit(1);
     }
     
@@ -129,6 +139,31 @@ TestConfig parse_arguments(int argc, char* argv[]) {
         config.dim1 = 512; config.dim2 = 512; config.dim3 = 256;  // ~1 GB
         config.name = "ADD_HUGE";
         config.description = "Huge tensor (1 GB)";
+    } else if (strcmp(argv[3], "GIGANTIC_1GB") == 0) {
+        config.size = TensorSize::GIGANTIC_1GB;
+        config.dim1 = 645; config.dim2 = 645; config.dim3 = 645;  // ~1 GB (268M elements)
+        config.name = "ADD_GIGANTIC_1GB";
+        config.description = "Gigantic tensor (1 GB)";
+    } else if (strcmp(argv[3], "GIGANTIC_2GB") == 0) {
+        config.size = TensorSize::GIGANTIC_2GB;
+        config.dim1 = 813; config.dim2 = 813; config.dim3 = 813;  // ~2 GB (537M elements)
+        config.name = "ADD_GIGANTIC_2GB";
+        config.description = "Gigantic tensor (2 GB)";
+    } else if (strcmp(argv[3], "GIGANTIC_4GB") == 0) {
+        config.size = TensorSize::GIGANTIC_4GB;
+        config.dim1 = 1024; config.dim2 = 1024; config.dim3 = 1024;  // ~4 GB (1073M elements)
+        config.name = "ADD_GIGANTIC_4GB";
+        config.description = "Gigantic tensor (4 GB)";
+    } else if (strcmp(argv[3], "GIGANTIC_8GB") == 0) {
+        config.size = TensorSize::GIGANTIC_8GB;
+        config.dim1 = 1290; config.dim2 = 1290; config.dim3 = 1290;  // ~8 GB (2146M elements)
+        config.name = "ADD_GIGANTIC_8GB";
+        config.description = "Gigantic tensor (8 GB)";
+    } else if (strcmp(argv[3], "GIGANTIC_16GB") == 0) {
+        config.size = TensorSize::GIGANTIC_16GB;
+        config.dim1 = 1625; config.dim2 = 1625; config.dim3 = 1625;  // ~16 GB (4291M elements)
+        config.name = "ADD_GIGANTIC_16GB";
+        config.description = "Gigantic tensor (16 GB)";
     } else {
         printf("❌ Unknown size: %s\n", argv[3]);
         exit(1);

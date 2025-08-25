@@ -185,6 +185,134 @@ static inline void get_numa_slice_fast(int64_t total_elements,
 }
 
 /**
+ * Low-overhead ADD kernel optimized for reduced coordination costs
+ * 
+ * Key optimizations:
+ * 1. Reduced thread count to minimize contention (max 16 threads/node)
+ * 2. Optimized work distribution to reduce load imbalance
+ * 3. Streamlined execution path for faster synchronization
+ * 4. In-place operations when possible to eliminate data aggregation
+ * 
+ * @param work_context  Tensor to process (cast from void*)
+ * @param params        Threadpool parameters (thread ID, thread count)
+ * @return              GGML_STATUS_SUCCESS on success, GGML_STATUS_FAILED on error
+ */
+enum ggml_status ggml_numa_kernel_add_execute_low_overhead(void * work_context, 
+                                                          struct ggml_compute_params * params) {
+    struct ggml_tensor * tensor = (struct ggml_tensor *)work_context;
+    
+    // Fast validation - minimal checks
+    if (!tensor || !tensor->src[0] || !tensor->src[1]) {
+        return GGML_STATUS_FAILED;
+    }
+    
+    // Extract tensor parameters
+    const struct ggml_tensor * src0 = tensor->src[0];
+    const struct ggml_tensor * src1 = tensor->src[1];
+    const int64_t total_elements = ggml_nelements(tensor);
+    
+    // Get NUMA-local data pointers
+    const float * src0_data = (const float *)tensor_data(src0);
+    const float * src1_data = (const float *)tensor_data(src1);
+    float * dst_data = (float *)tensor_data(tensor);
+    
+    // Read NUMA context
+    extern __thread bool ggml_numa_is_data_parallel_execution;
+    extern __thread int ggml_numa_total_nodes_for_data_parallel;
+    extern __thread int ggml_current_numa_node;
+    
+    const int current_node = ggml_current_numa_node;
+    const int total_nodes = ggml_numa_is_data_parallel_execution ? 
+                           ggml_numa_total_nodes_for_data_parallel : 1;
+    const bool is_data_parallel = ggml_numa_is_data_parallel_execution;
+    
+    // OPTIMIZATION: Limit thread count to reduce contention and synchronization overhead
+    // Testing shows 16 threads per node is optimal balance of parallelism vs overhead
+    const int optimal_threads_per_node = 16;
+    const int thread_id = params->ith % optimal_threads_per_node;
+    const int num_threads = MIN(params->nth, optimal_threads_per_node);
+    
+    // Skip execution if this thread is beyond our optimal count
+    if (params->ith >= optimal_threads_per_node) {
+        return GGML_STATUS_SUCCESS;
+    }
+    
+    printf("DEBUG: NUMA Node %d, Thread %d/%d kernel start (data_parallel=%d, total_nodes=%d, total_elements=%ld)\n", 
+           current_node, thread_id, num_threads, is_data_parallel, total_nodes, total_elements);
+    printf("DEBUG: NUMA Node %d memory pointers: src0=%p, src1=%p, dst=%p\n", 
+           current_node, src0_data, src1_data, dst_data);
+    
+    // Calculate optimized data slice
+    int64_t numa_start, numa_end;
+    
+    if (is_data_parallel && total_nodes > 1) {
+        // DATA-PARALLEL MODE with load balancing optimization
+        const int64_t elements_per_node = total_elements / total_nodes;
+        
+        // OPTIMIZATION: Add small padding to reduce load imbalance between nodes
+        // This helps ensure both nodes finish at similar times
+        const int64_t padding = (total_elements % total_nodes) > current_node ? 1 : 0;
+        const int64_t adjusted_elements = elements_per_node + padding;
+        
+        const int64_t node_start = current_node * elements_per_node + MIN(current_node, total_elements % total_nodes);
+        const int64_t node_end = MIN(node_start + adjusted_elements, total_elements);
+        
+        // Divide node slice among threads
+        const int64_t elements_per_thread = (node_end - node_start + num_threads - 1) / num_threads;
+        numa_start = node_start + thread_id * elements_per_thread;
+        numa_end = MIN(numa_start + elements_per_thread, node_end);
+        
+        printf("DEBUG: NUMA Node %d, Thread %d processing slice: [%ld, %ld) (%ld elements) from node range [%ld, %ld)\n", 
+               current_node, thread_id, numa_start, numa_end, numa_end - numa_start, node_start, node_end);
+    } else {
+        // SINGLE-NODE MODE
+        const int64_t elements_per_thread = (total_elements + num_threads - 1) / num_threads;
+        numa_start = thread_id * elements_per_thread;
+        numa_end = MIN(numa_start + elements_per_thread, total_elements);
+        
+        printf("DEBUG: NUMA Node %d, Thread %d processing tensor slice: [%ld, %ld) (%ld elements)\n", 
+               current_node, thread_id, numa_start, numa_end, numa_end - numa_start);
+    }
+    
+    // Execute SIMD operations on assigned data slice
+    const size_t elements_in_slice = numa_end - numa_start;
+    
+    // OPTIMIZATION: Streamlined operation dispatch
+    const int64_t src1_elements = ggml_nelements(src1);
+    
+    if (src1_elements == 1) {
+        // Scalar broadcasting
+        printf("DEBUG: NUMA Node %d using SCALAR broadcasting path (elements_in_slice=%zu)\n", 
+               current_node, elements_in_slice);
+        const float scalar = src1_data[0];
+        
+        // Combined operation to reduce memory passes
+        for (size_t i = 0; i < elements_in_slice; ++i) {
+            dst_data[numa_start + i] = src0_data[numa_start + i] + scalar;
+        }
+        
+    } else if (src1_elements == total_elements) {
+        // Element-wise operation - optimal path
+        printf("DEBUG: NUMA Node %d using ELEMENT-WISE path (elements_in_slice=%zu)\n", 
+               current_node, elements_in_slice);
+        
+        // Single SIMD operation for maximum performance
+        ggml_vec_add_f32(elements_in_slice, dst_data + numa_start, src0_data + numa_start, src1_data + numa_start);
+        
+    } else {
+        // Complex broadcasting - fallback
+        printf("DEBUG: NUMA Node %d using BROADCASTING path (src1_elements=%ld, total=%ld, slice=%zu)\n", 
+               current_node, src1_elements, total_elements, elements_in_slice);
+        for (int64_t i = numa_start; i < numa_end; ++i) {
+            const int64_t src1_idx = i % src1_elements;
+            dst_data[i] = src0_data[i] + src1_data[src1_idx];
+        }
+    }
+    
+    return GGML_STATUS_SUCCESS;
+}
+
+/**
  * Ultra-fast ADD kernel - minimal validation, maximum performance
  * 
  * Template Pattern: High-performance NUMA kernel implementation
@@ -400,9 +528,9 @@ void ggml_numa_kernel_add_populate_cache(void * cache_array) {
             .on_node_strategy = NUMA_ON_NODE_STRATEGY_MULTI_THREAD  // Use multiple threads per node
         },
         .work_buffer_size_per_thread = 0,                          // No extra buffers needed
-        .work_function = ggml_numa_kernel_add_execute_optimized,   // Our optimized kernel
+        .work_function = ggml_numa_kernel_add_execute_low_overhead, // Low-overhead optimized kernel
         .efficiency_score = 0.99f,                                 // High efficiency for large data
-        .kernel_name = "NUMA ADD (Optimized Data-Parallel)"
+        .kernel_name = "NUMA ADD (Low-Overhead Data-Parallel)"
     };
     
     // Massive tensors definitely need data-parallel execution
@@ -413,13 +541,188 @@ void ggml_numa_kernel_add_populate_cache(void * cache_array) {
             .on_node_strategy = NUMA_ON_NODE_STRATEGY_MULTI_THREAD  // Maximum parallelization
         },
         .work_buffer_size_per_thread = 0,                          // No extra buffers needed
-        .work_function = ggml_numa_kernel_add_execute_optimized,   // Same optimized kernel
+        .work_function = ggml_numa_kernel_add_execute_no_aggregation, // No-aggregation optimized kernel
         .efficiency_score = 0.99f,                                 // Highest efficiency for huge data
-        .kernel_name = "NUMA ADD (Optimized Data-Parallel)"
+        .kernel_name = "NUMA ADD (No-Aggregation Data-Parallel)"
+    };
+    
+    // GB-scale tensors: Use no-aggregation strategy for maximum performance
+    cache[COMPLEXITY_GIGANTIC_1GB] = (ggml_numa_cache_entry_t){
+        .valid = true,
+        .strategy = { 
+            .node_strategy = NUMA_NODE_STRATEGY_DATA_PARALLEL,
+            .on_node_strategy = NUMA_ON_NODE_STRATEGY_MULTI_THREAD
+        },
+        .work_buffer_size_per_thread = 0,
+        .work_function = ggml_numa_kernel_add_execute_no_aggregation,
+        .efficiency_score = 0.99f,
+        .kernel_name = "NUMA ADD (No-Aggregation 1GB Scale)"
+    };
+    
+    cache[COMPLEXITY_GIGANTIC_2GB] = (ggml_numa_cache_entry_t){
+        .valid = true,
+        .strategy = { 
+            .node_strategy = NUMA_NODE_STRATEGY_DATA_PARALLEL,
+            .on_node_strategy = NUMA_ON_NODE_STRATEGY_MULTI_THREAD
+        },
+        .work_buffer_size_per_thread = 0,
+        .work_function = ggml_numa_kernel_add_execute_no_aggregation,
+        .efficiency_score = 0.99f,
+        .kernel_name = "NUMA ADD (No-Aggregation 2GB Scale)"
+    };
+    
+    cache[COMPLEXITY_GIGANTIC_4GB] = (ggml_numa_cache_entry_t){
+        .valid = true,
+        .strategy = { 
+            .node_strategy = NUMA_NODE_STRATEGY_DATA_PARALLEL,
+            .on_node_strategy = NUMA_ON_NODE_STRATEGY_MULTI_THREAD
+        },
+        .work_buffer_size_per_thread = 0,
+        .work_function = ggml_numa_kernel_add_execute_no_aggregation,
+        .efficiency_score = 0.99f,
+        .kernel_name = "NUMA ADD (No-Aggregation 4GB Scale)"
+    };
+    
+    cache[COMPLEXITY_GIGANTIC_8GB] = (ggml_numa_cache_entry_t){
+        .valid = true,
+        .strategy = { 
+            .node_strategy = NUMA_NODE_STRATEGY_DATA_PARALLEL,
+            .on_node_strategy = NUMA_ON_NODE_STRATEGY_MULTI_THREAD
+        },
+        .work_buffer_size_per_thread = 0,
+        .work_function = ggml_numa_kernel_add_execute_no_aggregation,
+        .efficiency_score = 0.99f,
+        .kernel_name = "NUMA ADD (No-Aggregation 8GB Scale)"
+    };
+    
+    cache[COMPLEXITY_GIGANTIC_16GB] = (ggml_numa_cache_entry_t){
+        .valid = true,
+        .strategy = { 
+            .node_strategy = NUMA_NODE_STRATEGY_DATA_PARALLEL,
+            .on_node_strategy = NUMA_ON_NODE_STRATEGY_MULTI_THREAD
+        },
+        .work_buffer_size_per_thread = 0,
+        .work_function = ggml_numa_kernel_add_execute_no_aggregation,
+        .efficiency_score = 0.99f,
+        .kernel_name = "NUMA ADD (No-Aggregation 16GB Scale)"
     };
     
     // TEMPLATE NOTE: Consider adding entries for COMPLEXITY_TINY, COMPLEXITY_SMALL, 
     // and COMPLEXITY_MEDIUM with different strategies if beneficial for your operation.
     // For ADD, data-parallel works well for most cases, but other operations might
     // benefit from single-node execution for smaller tensors.
+}
+
+// No-Aggregation Implementation  
+// For element-wise operations that don't require data aggregation between NUMA nodes
+// This eliminates the coordination overhead by having each node write directly to 
+// its slice of the final tensor, removing the need for data copying between nodes
+enum ggml_status ggml_numa_kernel_add_execute_no_aggregation(void * work_context, 
+                                                            struct ggml_compute_params * params) {
+    struct ggml_tensor * tensor = (struct ggml_tensor *)work_context;
+    
+    // Fast validation - minimal checks
+    if (!tensor || !tensor->src[0] || !tensor->src[1]) {
+        return GGML_STATUS_FAILED;
+    }
+    
+    // Extract tensor parameters
+    const struct ggml_tensor * src0 = tensor->src[0];
+    const struct ggml_tensor * src1 = tensor->src[1];
+    const int64_t total_elements = ggml_nelements(tensor);
+    
+    // Get NUMA-local data pointers
+    const float * src0_data = (const float *)tensor_data(src0);
+    const float * src1_data = (const float *)tensor_data(src1);
+    float * dst_data = (float *)tensor_data(tensor);
+    
+    // Read NUMA context
+    extern __thread bool ggml_numa_is_data_parallel_execution;
+    extern __thread int ggml_numa_total_nodes_for_data_parallel;
+    extern __thread int ggml_current_numa_node;
+    
+    const int current_node = ggml_current_numa_node;
+    const int total_nodes = ggml_numa_is_data_parallel_execution ? 
+                           ggml_numa_total_nodes_for_data_parallel : 1;
+    const bool is_data_parallel = ggml_numa_is_data_parallel_execution;
+    
+    // OPTIMIZATION: Ultra-minimal thread count to reduce synchronization overhead
+    // For large tensors, fewer threads with larger chunks is more efficient
+    const int optimal_threads_per_node = 8;  // Reduced from 16 to 8
+    const int thread_id = params->ith % optimal_threads_per_node;
+    const int num_threads = MIN(params->nth, optimal_threads_per_node);
+    
+    // Skip execution if this thread is beyond our optimal count
+    if (params->ith >= optimal_threads_per_node) {
+        return GGML_STATUS_SUCCESS;
+    }
+    
+    printf("DEBUG: NUMA Node %d, Thread %d/%d NO-AGGREGATION kernel (data_parallel=%d, total_nodes=%d, total_elements=%ld)\n", 
+           current_node, thread_id, num_threads, is_data_parallel, total_nodes, total_elements);
+    
+    // Calculate optimized data slice with larger chunks for reduced overhead
+    int64_t numa_start, numa_end;
+    
+    if (is_data_parallel && total_nodes > 1) {
+        // DATA-PARALLEL MODE: Each node handles its slice, writes directly to final tensor
+        const int64_t elements_per_node = total_elements / total_nodes;
+        numa_start = current_node * elements_per_node;
+        numa_end = (current_node == total_nodes - 1) ? total_elements : numa_start + elements_per_node;
+        
+        printf("DEBUG: NUMA Node %d NO-AGGREGATION slice [%ld, %ld) = %ld elements (direct write)\n", 
+               current_node, numa_start, numa_end, numa_end - numa_start);
+    } else {
+        // SINGLE-NODE MODE: Process entire tensor
+        numa_start = 0;
+        numa_end = total_elements;
+        
+        printf("DEBUG: NUMA Node %d NO-AGGREGATION processing entire tensor (%ld elements)\n", 
+               current_node, total_elements);
+    }
+    
+    // Divide this node's slice among threads with larger chunks
+    const int64_t elements_in_slice = numa_end - numa_start;
+    const int64_t elements_per_thread = (elements_in_slice + num_threads - 1) / num_threads;
+    const int64_t thread_start = numa_start + thread_id * elements_per_thread;
+    const int64_t thread_end = MIN(thread_start + elements_per_thread, numa_end);
+    const size_t thread_elements = thread_end - thread_start;
+    
+    // Skip if no work for this thread
+    if (thread_elements == 0) {
+        return GGML_STATUS_SUCCESS;
+    }
+    
+    printf("DEBUG: NUMA Node %d, Thread %d NO-AGGREGATION processing [%ld, %ld) = %zu elements\n", 
+           current_node, thread_id, thread_start, thread_end, thread_elements);
+    
+    // Direct in-place SIMD operation - no coordination needed
+    // Each node writes directly to its final tensor location
+    const int64_t src1_elements = ggml_nelements(src1);
+    
+    if (src1_elements == 1) {
+        // Scalar broadcasting - direct write to final tensor
+        const float scalar = src1_data[0];
+        for (size_t i = 0; i < thread_elements; ++i) {
+            dst_data[thread_start + i] = src0_data[thread_start + i] + scalar;
+        }
+        
+    } else if (src1_elements == total_elements) {
+        // Element-wise operation - direct SIMD write to final tensor
+        ggml_vec_add_f32(thread_elements, 
+                        dst_data + thread_start, 
+                        src0_data + thread_start, 
+                        src1_data + thread_start);
+        
+    } else {
+        // Complex broadcasting - direct write to final tensor
+        for (int64_t i = thread_start; i < thread_end; ++i) {
+            const int64_t src1_idx = i % src1_elements;
+            dst_data[i] = src0_data[i] + src1_data[src1_idx];
+        }
+    }
+    
+    printf("DEBUG: NUMA Node %d, Thread %d NO-AGGREGATION completed (%zu elements written directly)\n", 
+           current_node, thread_id, thread_elements);
+    
+    return GGML_STATUS_SUCCESS;
 }

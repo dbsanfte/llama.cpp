@@ -40,7 +40,12 @@ static inline ggml_numa_complexity_class_t get_complexity_class(size_t num_eleme
     if (num_elements < 16384) return COMPLEXITY_SMALL;
     if (num_elements < 1048576) return COMPLEXITY_MEDIUM;  // Increased to 1M elements (4MB for float32)
     if (num_elements < 16777216) return COMPLEXITY_LARGE;  // Increased to 16M elements (64MB for float32)
-    return COMPLEXITY_HUGE;
+    if (num_elements < 67108864) return COMPLEXITY_HUGE;   // Up to 64M elements (256MB for float32)
+    if (num_elements < 536870912) return COMPLEXITY_GIGANTIC_1GB;  // Up to 512M elements (~2GB for float32)
+    if (num_elements < 1073741824) return COMPLEXITY_GIGANTIC_2GB; // Up to 1024M elements (~4GB for float32)
+    if (num_elements < 2147483648UL) return COMPLEXITY_GIGANTIC_4GB; // Up to 2048M elements (~8GB for float32)
+    if (num_elements < 4294967296UL) return COMPLEXITY_GIGANTIC_8GB; // Up to 4096M elements (~16GB for float32)
+    return COMPLEXITY_GIGANTIC_16GB;
 }
 
 static inline size_t get_tensor_complexity_score(const struct ggml_tensor * tensor) {

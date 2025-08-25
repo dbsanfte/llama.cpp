@@ -24,6 +24,12 @@ const char * ggml_numa_kernel_add_get_name(const struct ggml_tensor * tensor);
 enum ggml_status ggml_numa_kernel_add_execute(void * work_context, 
                                               struct ggml_compute_params * params);
 
+// Optimized execution functions
+enum ggml_status ggml_numa_kernel_add_execute_low_overhead(void * work_context, 
+                                                          struct ggml_compute_params * params);
+enum ggml_status ggml_numa_kernel_add_execute_no_aggregation(void * work_context, 
+                                                            struct ggml_compute_params * params);
+
 // Debug and performance functions  
 enum ggml_status ggml_numa_kernel_add_debug_data_locality(const struct ggml_tensor * tensor);
 
