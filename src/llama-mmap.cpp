@@ -17,25 +17,61 @@
 #include <numaif.h>
 #include <sys/syscall.h>
 #include <unistd.h>
+#include <sys/mman.h>
+#include "../ggml/src/ggml-cpu/ggml-numa-shared.h"
 
-// Container-compatible NUMA allocation function - TEMPORARY: Use regular allocation
+// Container-compatible NUMA allocation function - Use mmap with first-touch
 static void* numa_alloc_onnode_fixed(size_t size, int node) {
-    // TEMPORARY FIX: Use regular allocation and zero-initialize to prevent garbage data
-    void* ptr = aligned_alloc(64, size);
-    if (!ptr) {
-        return nullptr;
+    // Use mmap + first-touch approach (more reliable in containers)
+    void* memory = mmap(NULL, size, PROT_READ | PROT_WRITE, 
+                       MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (memory == MAP_FAILED) {
+        printf("❌ mmap failed for %zu bytes on node %d: %s\n", size, node, strerror(errno));
+        // Fallback to regular allocation
+        void* ptr = aligned_alloc(64, size);
+        if (ptr) {
+            memset(ptr, 0, size);
+        }
+        return ptr;
     }
     
-    // CRITICAL: Zero the memory to prevent NaN values from garbage data
-    memset(ptr, 0, size);
+    // Bind current thread to target node for first-touch
+    if (numa_available() >= 0) {
+        numa_run_on_node(node);
+        
+        struct bitmask *old_mask = numa_get_membind();
+        struct bitmask *mask = numa_allocate_nodemask();
+        numa_bitmask_setbit(mask, node);
+        numa_set_membind(mask);
+        
+        // First-touch all pages to establish NUMA locality
+        volatile char* mem_ptr = (volatile char*)memory;
+        const size_t page_size = 4096;
+        for (size_t i = 0; i < size; i += page_size) {
+            mem_ptr[i] = 0; // Zero and establish NUMA placement
+        }
+        
+        // Restore original NUMA policy
+        numa_set_membind(old_mask);
+        numa_free_nodemask(mask);
+        numa_free_nodemask(old_mask);
+        
+        NUMA_LOG_DEBUG("✅ NUMA allocation successful for node %d (size=%zu) at %p\n", node, size, memory);
+    } else {
+        // No NUMA support, just zero the memory
+        memset(memory, 0, size);
+        NUMA_LOG_DEBUG("✅ Non-NUMA allocation (size=%zu) at %p\n", size, memory);
+    }
     
-    printf("🔧 TEMPORARY FIX: Using zeroed allocation for node %d (size=%zu)\n", node, size);
-    return ptr;
+    return memory;
 }
 
 static void numa_free_fixed(void* ptr, size_t size) {
-    (void)size; // Size not needed for free()
-    free(ptr);
+    // Check if this was an mmap allocation by trying munmap first
+    if (munmap(ptr, size) != 0) {
+        // If munmap fails, it might be a regular malloc allocation, use free
+        free(ptr);
+    }
 }
 #endif
 
@@ -520,7 +556,7 @@ struct llama_mmap::impl {
             if (!node_mem) {
                 // Clean up any previous allocations before throwing
                 for (const auto& mapping : numa_mappings) {
-                    munmap(mapping.addr, mapping.size);
+                    numa_free_fixed(mapping.addr, mapping.size);
                 }
                 LLAMA_LOG_ERROR("Failed to allocate %zu bytes on NUMA node %d\n", total_size, node);
                 throw std::runtime_error(format("numa_alloc_onnode failed for node %d: %s", node, strerror(errno)));
@@ -651,12 +687,8 @@ struct llama_mmap::impl {
             if (!node_addr) {
                 LLAMA_LOG_ERROR("Failed to allocate %zu bytes on NUMA node %d\n", total_size, node);
                 // Clean up any previous allocations
-                for (int cleanup_node = 0; cleanup_node < node; ++cleanup_node) {
-                    for (auto& mapping : numa_mappings) {
-                        if (mapping.addr) {
-                            numa_free_fixed(mapping.addr, mapping.size);
-                        }
-                    }
+                for (const auto& mapping : numa_mappings) {
+                    numa_free_fixed(mapping.addr, mapping.size);
                 }
                 throw std::runtime_error(format("Failed to allocate memory on NUMA node %d", node));
             }

@@ -67,7 +67,7 @@ static void populate_unsupported_operation(enum ggml_op op) {
 }
 
 static bool build_kernel_cache(void) {
-    printf("DEBUG: NUMA Cache: Building high-speed operation cache...\n");
+    NUMA_LOG_DEBUG("NUMA Cache: Building high-speed operation cache...");
     GGML_LOG_INFO("🔧 NUMA Cache: Building high-speed operation cache...\n");
     
     // Initialize all entries as invalid
@@ -78,14 +78,14 @@ static bool build_kernel_cache(void) {
     }
     
     // Populate supported operations - each kernel provides its own cache entries
-    printf("DEBUG: NUMA Cache: Temporarily disabling ADD cache for debugging\n");
+    NUMA_LOG_DEBUG("NUMA Cache: Temporarily disabling ADD cache for debugging");
     GGML_LOG_DEBUG("NUMA Cache: Temporarily disabling ADD cache for debugging\n");
     ggml_numa_kernel_add_populate_cache(g_numa_cache[GGML_OP_ADD]); // ADD kernel
     
     // Verify ADD cache entries were populated
     for (int complexity = 0; complexity < COMPLEXITY_COUNT; complexity++) {
         ggml_numa_cache_entry_t * entry = &g_numa_cache[GGML_OP_ADD][complexity];
-        printf("DEBUG: NUMA Cache: ADD[%d] valid=%s, kernel=%s\n", 
+        NUMA_LOG_DEBUG("NUMA Cache: ADD[%d] valid=%s, kernel=%s", 
                complexity, entry->valid ? "true" : "false", 
                entry->valid ? entry->kernel_name : "N/A");
         GGML_LOG_DEBUG("NUMA Cache: ADD[%d] valid=%s, kernel=%s\n", 
@@ -100,7 +100,7 @@ static bool build_kernel_cache(void) {
         }
     }
     
-    printf("DEBUG: NUMA Cache: Cache built successfully with %d operations cached\n", GGML_OP_COUNT);
+    NUMA_LOG_DEBUG("NUMA Cache: Cache built successfully with %d operations cached", GGML_OP_COUNT);
     GGML_LOG_INFO("✅ NUMA Cache: Cache built successfully with %d operations cached\n", GGML_OP_COUNT);
     return true;
 }
@@ -157,22 +157,18 @@ ggml_numa_kernel_query_result_t ggml_numa_kernels_query(const struct ggml_tensor
     size_t complexity_score = get_tensor_complexity_score(tensor);
     ggml_numa_complexity_class_t complexity_class = get_complexity_class(complexity_score);
     
-    printf("DEBUG: NUMA Query: op=%s, complexity_score=%zu, complexity_class=%d\n", 
+    NUMA_LOG_VERBOSE("op=%s, complexity_score=%zu, complexity_class=%d", 
            ggml_op_name(tensor->op), complexity_score, complexity_class);
-    GGML_LOG_DEBUG("NUMA Query: op=%s, complexity_score=%zu, complexity_class=%d\n", 
-                   ggml_op_name(tensor->op), complexity_score, complexity_class);
     
     // O(1) cache lookup - zero runtime overhead
     const ggml_numa_cache_entry_t * entry = &g_numa_cache[tensor->op][complexity_class];
     
-    printf("DEBUG: NUMA Query: Cache entry valid=%s for op=%s[%d]\n", 
+    NUMA_LOG_VERBOSE("Cache entry valid=%s for op=%s[%d]", 
            entry->valid ? "true" : "false", ggml_op_name(tensor->op), complexity_class);
-    GGML_LOG_DEBUG("NUMA Query: Cache entry valid=%s for op=%s[%d]\n", 
-                   entry->valid ? "true" : "false", ggml_op_name(tensor->op), complexity_class);
     
     if (!entry->valid) {
         // Cache miss - operation not supported
-        printf("DEBUG: NUMA Query: Cache miss for op %s complexity %d\n", 
+        NUMA_LOG_DEBUG("Cache miss for op %s complexity %d", 
                ggml_op_name(tensor->op), complexity_class);
         GGML_LOG_DEBUG("NUMA Query: Cache miss for op %s complexity %d\n", 
                        ggml_op_name(tensor->op), complexity_class);
@@ -187,10 +183,8 @@ ggml_numa_kernel_query_result_t ggml_numa_kernels_query(const struct ggml_tensor
     result.efficiency_score = entry->efficiency_score;
     result.kernel_name = entry->kernel_name;
     
-    printf("DEBUG: NUMA Query: Cache hit for op %s - kernel=%s, efficiency=%.2f, work_function=%p\n", 
+    NUMA_LOG_DEBUG("Cache hit for op %s - kernel=%s, efficiency=%.2f, work_function=%p", 
            ggml_op_name(tensor->op), entry->kernel_name, entry->efficiency_score, entry->work_function);
-    GGML_LOG_DEBUG("NUMA Query: Cache hit for op %s - kernel=%s, efficiency=%.2f\n", 
-                   ggml_op_name(tensor->op), entry->kernel_name, entry->efficiency_score);
     
     return result;
 }

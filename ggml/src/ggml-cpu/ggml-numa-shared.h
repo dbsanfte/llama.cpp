@@ -10,7 +10,7 @@
 #include "ggml.h"
 #include <assert.h>
 #include <stdio.h>
-#include <assert.h>
+#include <stdlib.h>
 
 // ============================================================================
 // NUMA Type Definitions
@@ -59,12 +59,37 @@ typedef struct {
 // ============================================================================
 
 /**
+ * Environment variable-controlled debug logging system
+ * Set GGML_NUMA_DEBUG=1 to enable debug output
+ * Set GGML_NUMA_DEBUG=2 for verbose debug output
+ */
+static inline int ggml_numa_debug_enabled(void) {
+    static int debug_level = -1;
+    if (debug_level == -1) {
+        const char *env = getenv("GGML_NUMA_DEBUG");
+        debug_level = env ? atoi(env) : 0;
+    }
+    return debug_level;
+}
+
+/**
  * Debug logging with NUMA node context
  * Usage: NUMA_COORD_LOG_DEBUG(numa_node, "Message %d", value);
  */
 #define NUMA_COORD_LOG_DEBUG(numa_node, ...) \
-    fprintf(stderr, "NUMA[%d] DEBUG: " __VA_ARGS__, (int)(numa_node)); \
-    fprintf(stderr, "\n")
+    do { if (ggml_numa_debug_enabled() >= 1) { \
+        fprintf(stderr, "NUMA[%d] DEBUG: " __VA_ARGS__, (int)(numa_node)); \
+        fprintf(stderr, "\n"); \
+    } } while(0)
+
+/**
+ * Verbose debug logging (only with GGML_NUMA_DEBUG=2 or higher)
+ */
+#define NUMA_COORD_LOG_VERBOSE(numa_node, ...) \
+    do { if (ggml_numa_debug_enabled() >= 2) { \
+        fprintf(stderr, "NUMA[%d] VERBOSE: " __VA_ARGS__, (int)(numa_node)); \
+        fprintf(stderr, "\n"); \
+    } } while(0)
 
 /**
  * Info logging with NUMA node context
@@ -91,8 +116,17 @@ typedef struct {
  * General NUMA logging without node-specific context
  */
 #define NUMA_LOG_DEBUG(...) \
-    fprintf(stderr, "NUMA DEBUG: " __VA_ARGS__); \
-    fprintf(stderr, "\n")
+    do { if (ggml_numa_debug_enabled() >= 1) { \
+        fprintf(stderr, "NUMA DEBUG: " __VA_ARGS__); \
+        fprintf(stderr, "\n"); \
+    } } while(0)
+
+#define NUMA_LOG_VERBOSE(...) \
+    do { if (ggml_numa_debug_enabled() >= 2) { \
+        fprintf(stderr, "NUMA VERBOSE: " __VA_ARGS__); \
+        fprintf(stderr, "\n"); \
+    } } while(0)
+
 #define NUMA_LOG_INFO(...) \
     fprintf(stderr, "NUMA INFO: " __VA_ARGS__); \
     fprintf(stderr, "\n")

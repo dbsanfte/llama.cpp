@@ -375,6 +375,8 @@ llama_context::llama_context(
 
 llama_context::~llama_context() {
 #ifdef GGML_NUMA_MIRROR
+    // Ensure all NUMA operations are complete before cleanup
+    synchronize();
     // NUMA system cleanup is handled globally
 #endif
     ggml_opt_free(opt_ctx);
@@ -927,7 +929,9 @@ int llama_context::encode(const llama_batch & batch_inp) {
         cross.n_embd = t_embd->ne[0];
         cross.n_enc  = t_embd->ne[1];
         cross.v_embd.resize(cross.n_embd*cross.n_enc);
-        memcpy(cross.v_embd.data(), embd, ggml_nbytes(t_embd));
+        
+        // Use proper tensor access instead of raw memcpy to ensure NUMA compatibility
+        ggml_backend_tensor_get(t_embd, cross.v_embd.data(), 0, ggml_nbytes(t_embd));
 
         const auto & batch = balloc->get_batch();
 

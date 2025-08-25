@@ -170,6 +170,43 @@ cmake -B build -DCMAKE_BUILD_TYPE=Debug -DCMAKE_EXPORT_COMPILE_COMMANDS=ON -DGGM
 cmake --build build --parallel
 ```
 
+### Debug Environment Variable Control
+
+**NUMA Debug Logging Control**: All NUMA debug messages are controlled by the `GGML_NUMA_DEBUG` environment variable:
+
+```bash
+# Clean, silent operation (default) - no debug messages
+unset GGML_NUMA_DEBUG
+# OR
+export GGML_NUMA_DEBUG=0
+
+# Enable debug messages - shows NUMA strategy decisions and execution details
+export GGML_NUMA_DEBUG=1
+
+# Enable verbose debug messages - shows additional internal details
+export GGML_NUMA_DEBUG=2
+```
+
+**Debug Message Categories:**
+- **Executor Debug**: Strategy selection, kernel queries, execution paths
+- **Coordinator Debug**: Thread management, NUMA binding verification, dispatch decisions
+- **Kernel Debug**: Mathematical operation details, data slicing, SIMD optimizations
+- **Memory Debug**: NUMA allocation successes, memory mirroring operations
+
+**Performance Impact**: When `GGML_NUMA_DEBUG` is unset or 0, all debug output is completely disabled, eliminating printf overhead during inference loops.
+
+**Usage Examples:**
+```bash
+# Production inference - silent, maximum performance
+./build/bin/llama-server -m model.gguf --numa mirror
+
+# Development debugging - rich diagnostic output
+GGML_NUMA_DEBUG=1 ./build/bin/llama-bench -m model.gguf --numa mirror
+
+# Detailed troubleshooting - verbose internal details
+GGML_NUMA_DEBUG=2 ./build/bin/llama-server -m model.gguf --numa mirror
+```
+
 ### Quick Model Validation
 ```bash
 # Download test model
@@ -338,6 +375,22 @@ cmake --build build --target ggml-cpu llama && echo "🎉 Complete!" || echo "�
 - **SIMD First**: Always use `ggml_vec_*` functions instead of scalar loops
 - **Registry Integration**: Add cache entries for all complexity classes
 - **Architecture Flow**: Follow Executor → Registry Query → Coordinator pattern
+- **Debug Control**: Use `GGML_NUMA_DEBUG=1` for development debugging, unset for performance testing
+
+### Debug Message Implementation
+When adding new NUMA components, always use the centralized debug control system:
+```c
+// Include the debug header
+#include "ggml-numa-shared.h"
+
+// Use controlled debug macros instead of printf
+NUMA_LOG_DEBUG("Your debug message: %d\n", value);
+NUMA_LOG_VERBOSE("Detailed debug info: %f\n", detail);
+
+// Never use printf directly for debug messages - use controlled macros
+// printf("Debug: ..."); // ❌ DON'T DO THIS
+// NUMA_LOG_DEBUG("Debug: ..."); // ✅ DO THIS
+```
 
 ## 📋 Quick Reference
 
@@ -346,6 +399,7 @@ cmake --build build --target ggml-cpu llama && echo "🎉 Complete!" || echo "�
 ggml/src/ggml-cpu/numa-kernels/numa-kernels.c     # Kernel registry with O(1) cache
 ggml/src/ggml-cpu/ggml-numa-executor.c            # Strategy engine and orchestration
 ggml/src/ggml-cpu/ggml-numa-coordinator.c         # Resource management
+ggml/src/ggml-cpu/ggml-numa-shared.h              # Debug control and shared utilities
 ggml/src/ggml-cpu/ggml-cpu.c                      # Mathematical kernels (reference)
 tests/test-numa-mathematical-correctness-*.cpp    # Correctness tests
 tests/run-numa-performance-tests.sh               # Performance test orchestrator
@@ -359,6 +413,7 @@ docs/numa-architecture.md                         # Architecture documentation
 - [ ] Implement kernel function in `numa-kernels/` directory  
 - [ ] Add cache entries to registry for all complexity classes
 - [ ] Use `NUMA_ASSERT` for validation with proper coordinator signaling
+- [ ] Use `NUMA_LOG_DEBUG` macros instead of printf for debug messages
 - [ ] Create test from template with multi-dimensional validation
 - [ ] Add to CMake and verify builds successfully
 - [ ] Verify core architecture builds: `cmake --build build --target ggml-cpu llama`

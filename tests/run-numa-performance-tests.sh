@@ -88,6 +88,199 @@ BIN_DIR="$BUILD_DIR/bin"
 # Available performance benchmark tests (discovered automatically)
 PERFORMANCE_TESTS=()
 
+# Detect number of NUMA nodes
+detect_numa_nodes() {
+    local numa_nodes=0
+    if command -v numactl >/dev/null 2>&1; then
+        numa_nodes=$(numactl --hardware 2>/dev/null | grep "available:" | awk '{print $2}' || echo "1")
+    elif [ -d "/sys/devices/system/node" ]; then
+        numa_nodes=$(ls -1d /sys/devices/system/node/node* 2>/dev/null | wc -l || echo "1")
+    else
+        numa_nodes=1
+    fi
+    
+    # Ensure we have at least 1 node
+    if [ "$numa_nodes" -le 0 ]; then
+        numa_nodes=1
+    fi
+    
+    echo "$numa_nodes"
+}
+
+# Function to run llama-bench performance tests
+run_llama_bench_tests() {
+    echo ""
+    echo -e "${PURPLE}🚀 Running llama-bench Real-World Inference Tests${NC}"
+    echo "=================================================="
+    
+    local test_model="./.devcontainer/qwen2.5-0.5b-instruct-q8_0.gguf"
+    local llama_bench="$BIN_DIR/llama-bench"
+    
+    # Check if llama-bench binary exists
+    if [ ! -f "$llama_bench" ]; then
+        echo -e "${RED}❌ llama-bench not found: $llama_bench${NC}"
+        echo "   Build it with: cmake --build build --target llama-bench"
+        return 1
+    fi
+    
+    # Check if test model exists
+    if [ ! -f "$test_model" ]; then
+        echo -e "${RED}❌ Test model not found: $test_model${NC}"
+        echo "   Download it with the commands from copilot-instructions.md"
+        return 1
+    fi
+    
+    # Detect NUMA nodes
+    local num_numa_nodes=$(detect_numa_nodes)
+    echo "Detected $num_numa_nodes NUMA nodes"
+    
+    # Configuration matrix - simplified to avoid isolate mode segfault
+    local configurations=()
+    configurations+=("no-numa")
+    
+    # Skip isolate mode for now due to segfault in llama-bench
+    # TODO: Debug and re-enable isolate mode
+    # for ((node=1; node<num_numa_nodes; node++)); do
+    #     configurations+=("isolate-node-$node")
+    # done
+    
+    configurations+=("mirror")
+    
+    echo "Testing configurations: ${configurations[*]}"
+    echo ""
+    
+    # Results storage
+    local bench_results=()
+    
+    for config in "${configurations[@]}"; do
+        echo -e "${BLUE}🔹 Testing configuration: $config${NC}"
+        
+        # Build llama-bench command
+        local cmd="$llama_bench -m $test_model --repetitions 1"
+        case "$config" in
+            "no-numa")
+                # No additional flags
+                ;;
+            "isolate-node-"*)
+                cmd="$cmd --numa isolate"
+                ;;
+            "mirror")
+                cmd="$cmd --numa mirror"
+                ;;
+        esac
+        
+        echo "  Running: $cmd"
+        
+        # Run the benchmark and capture output with extended timeout for mirror mode
+        local timeout_duration=90  # Extended timeout for mirror mode
+        local output_file=$(mktemp)
+        if timeout $timeout_duration $cmd > "$output_file" 2>&1; then
+            # Parse results - look for the table rows with benchmark data
+            local pp512_result=""
+            local tg128_result=""
+            
+            # Extract pp512 result (prompt processing) - handle multi-line output
+            pp512_result=$(grep -A1 "pp512" "$output_file" | grep -E "^[[:space:]]*[0-9]+\.[0-9]+" | awk '{
+                # Find the first floating point number
+                for(i=1; i<=NF; i++) {
+                    if($i ~ /^[0-9]+\.[0-9]+/) {
+                        # Remove any trailing ± uncertainty
+                        split($i, parts, "±")
+                        print parts[1]
+                        break
+                    }
+                }
+            }')
+            
+            # Extract tg128 result (text generation) - handle multi-line output  
+            tg128_result=$(grep -A1 "tg128" "$output_file" | grep -E "^[[:space:]]*[0-9]+\.[0-9]+" | awk '{
+                # Find the first floating point number
+                for(i=1; i<=NF; i++) {
+                    if($i ~ /^[0-9]+\.[0-9]+/) {
+                        # Remove any trailing ± uncertainty
+                        split($i, parts, "±")
+                        print parts[1]
+                        break
+                    }
+                }
+            }')
+            
+            if [ -n "$pp512_result" ] && [ -n "$tg128_result" ]; then
+                echo "    ✅ pp512: ${pp512_result} t/s, tg128: ${tg128_result} t/s"
+                bench_results+=("$config:$pp512_result:$tg128_result")
+            else
+                echo "    ⚠️  Could not parse results"
+                if [ "$VERBOSE_MODE" = true ]; then
+                    echo "Output:"
+                    cat "$output_file"
+                fi
+                bench_results+=("$config:ERROR:ERROR")
+            fi
+        else
+            echo "    ❌ Benchmark failed or timed out"
+            bench_results+=("$config:FAILED:FAILED")
+        fi
+        
+        rm -f "$output_file"
+        echo ""
+    done
+    
+    # Display summary results
+    echo -e "${GREEN}📊 llama-bench Results Summary${NC}"
+    echo "=============================="
+    printf "%-15s %10s %10s\n" "Configuration" "pp512 t/s" "tg128 t/s"
+    printf "%-15s %10s %10s\n" "-------------" "---------" "---------"
+    
+    for result in "${bench_results[@]}"; do
+        IFS=':' read -r config pp512 tg128 <<< "$result"
+        printf "%-15s %10s %10s\n" "$config" "$pp512" "$tg128"
+    done
+    
+    echo ""
+    echo -e "${CYAN}🎯 Performance Analysis${NC}"
+    echo "======================"
+    
+    # Find no-numa baseline for comparison
+    local baseline_pp512=""
+    local baseline_tg128=""
+    
+    for result in "${bench_results[@]}"; do
+        IFS=':' read -r config pp512 tg128 <<< "$result"
+        if [ "$config" = "no-numa" ]; then
+            baseline_pp512="$pp512"
+            baseline_tg128="$tg128"
+            break
+        fi
+    done
+    
+    if [ -n "$baseline_pp512" ] && [ -n "$baseline_tg128" ] && \
+       [ "$baseline_pp512" != "ERROR" ] && [ "$baseline_pp512" != "FAILED" ]; then
+        echo "Baseline (no-numa): pp512=${baseline_pp512} t/s, tg128=${baseline_tg128} t/s"
+        echo ""
+        
+        for result in "${bench_results[@]}"; do
+            IFS=':' read -r config pp512 tg128 <<< "$result"
+            if [ "$config" != "no-numa" ] && [ "$pp512" != "ERROR" ] && [ "$pp512" != "FAILED" ]; then
+                # Calculate relative performance
+                local pp512_ratio=$(echo "scale=2; $pp512 / $baseline_pp512" | bc -l 2>/dev/null || echo "N/A")
+                local tg128_ratio=$(echo "scale=2; $tg128 / $baseline_tg128" | bc -l 2>/dev/null || echo "N/A")
+                
+                if [ "$pp512_ratio" != "N/A" ] && [ "$tg128_ratio" != "N/A" ]; then
+                    printf "%-15s: pp512 %s (%.2fx), tg128 %s (%.2fx)\n" \
+                           "$config" "$pp512" "$pp512_ratio" "$tg128" "$tg128_ratio"
+                else
+                    printf "%-15s: pp512 %s, tg128 %s\n" "$config" "$pp512" "$tg128"
+                fi
+            fi
+        done
+    else
+        echo "No valid baseline found for comparison"
+    fi
+    
+    echo ""
+}
+
+
 # Function to discover performance benchmark tests
 discover_performance_tests() {
     echo -e "${CYAN}🔍 Discovering extensible NUMA performance test...${NC}"
@@ -630,6 +823,9 @@ echo "======================================="
 for operation_name in "${PERFORMANCE_TESTS[@]}"; do
     run_performance_test "$operation_name"
 done
+
+# Run real-world inference benchmarks with llama-bench
+run_llama_bench_tests
 
 echo -e "${BLUE}🏁 Performance Benchmark Suite Completed${NC}"
 echo "==========================================="

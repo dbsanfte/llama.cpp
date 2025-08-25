@@ -237,10 +237,10 @@ enum ggml_status ggml_numa_kernel_add_execute_low_overhead(void * work_context,
         return GGML_STATUS_SUCCESS;
     }
     
-    printf("DEBUG: NUMA Node %d, Thread %d/%d kernel start (data_parallel=%d, total_nodes=%d, total_elements=%ld)\n", 
-           current_node, thread_id, num_threads, is_data_parallel, total_nodes, total_elements);
-    printf("DEBUG: NUMA Node %d memory pointers: src0=%p, src1=%p, dst=%p\n", 
-           current_node, src0_data, src1_data, dst_data);
+    NUMA_LOG_DEBUG("NUMA Node %d, Thread %d/%d kernel start (data_parallel=%d, total_nodes=%d, total_elements=%ld)", 
+                   current_node, thread_id, num_threads, is_data_parallel, total_nodes, total_elements);
+    NUMA_LOG_DEBUG("NUMA Node %d memory pointers: src0=%p, src1=%p, dst=%p", 
+                   current_node, src0_data, src1_data, dst_data);
     
     // Calculate optimized data slice
     int64_t numa_start, numa_end;
@@ -262,16 +262,16 @@ enum ggml_status ggml_numa_kernel_add_execute_low_overhead(void * work_context,
         numa_start = node_start + thread_id * elements_per_thread;
         numa_end = MIN(numa_start + elements_per_thread, node_end);
         
-        printf("DEBUG: NUMA Node %d, Thread %d processing slice: [%ld, %ld) (%ld elements) from node range [%ld, %ld)\n", 
-               current_node, thread_id, numa_start, numa_end, numa_end - numa_start, node_start, node_end);
+        NUMA_LOG_DEBUG("NUMA Node %d, Thread %d processing slice: [%ld, %ld) (%ld elements) from node range [%ld, %ld)", 
+                       current_node, thread_id, numa_start, numa_end, numa_end - numa_start, node_start, node_end);
     } else {
         // SINGLE-NODE MODE
         const int64_t elements_per_thread = (total_elements + num_threads - 1) / num_threads;
         numa_start = thread_id * elements_per_thread;
         numa_end = MIN(numa_start + elements_per_thread, total_elements);
         
-        printf("DEBUG: NUMA Node %d, Thread %d processing tensor slice: [%ld, %ld) (%ld elements)\n", 
-               current_node, thread_id, numa_start, numa_end, numa_end - numa_start);
+        NUMA_LOG_DEBUG("NUMA Node %d, Thread %d processing tensor slice: [%ld, %ld) (%ld elements)", 
+                       current_node, thread_id, numa_start, numa_end, numa_end - numa_start);
     }
     
     // Execute SIMD operations on assigned data slice
@@ -282,8 +282,8 @@ enum ggml_status ggml_numa_kernel_add_execute_low_overhead(void * work_context,
     
     if (src1_elements == 1) {
         // Scalar broadcasting
-        printf("DEBUG: NUMA Node %d using SCALAR broadcasting path (elements_in_slice=%zu)\n", 
-               current_node, elements_in_slice);
+        NUMA_LOG_DEBUG("NUMA Node %d using SCALAR broadcasting path (elements_in_slice=%zu)", 
+                       current_node, elements_in_slice);
         const float scalar = src1_data[0];
         
         // Combined operation to reduce memory passes
@@ -293,16 +293,16 @@ enum ggml_status ggml_numa_kernel_add_execute_low_overhead(void * work_context,
         
     } else if (src1_elements == total_elements) {
         // Element-wise operation - optimal path
-        printf("DEBUG: NUMA Node %d using ELEMENT-WISE path (elements_in_slice=%zu)\n", 
-               current_node, elements_in_slice);
+        NUMA_LOG_DEBUG("NUMA Node %d using ELEMENT-WISE path (elements_in_slice=%zu)", 
+                       current_node, elements_in_slice);
         
         // Single SIMD operation for maximum performance
         ggml_vec_add_f32(elements_in_slice, dst_data + numa_start, src0_data + numa_start, src1_data + numa_start);
         
     } else {
         // Complex broadcasting - fallback
-        printf("DEBUG: NUMA Node %d using BROADCASTING path (src1_elements=%ld, total=%ld, slice=%zu)\n", 
-               current_node, src1_elements, total_elements, elements_in_slice);
+        NUMA_LOG_DEBUG("NUMA Node %d using BROADCASTING path (src1_elements=%ld, total=%ld, slice=%zu)", 
+                       current_node, src1_elements, total_elements, elements_in_slice);
         for (int64_t i = numa_start; i < numa_end; ++i) {
             const int64_t src1_idx = i % src1_elements;
             dst_data[i] = src0_data[i] + src1_data[src1_idx];
@@ -372,10 +372,10 @@ enum ggml_status ggml_numa_kernel_add_execute_optimized(void * work_context,
     const int num_threads = params->nth;
     
     // TEMPLATE DEBUG: Log execution context for development/debugging
-    printf("DEBUG: NUMA Node %d, Thread %d/%d kernel start (data_parallel=%d, total_nodes=%d, total_elements=%ld)\n", 
-           current_node, thread_id, num_threads, is_data_parallel, total_nodes, total_elements);
-    printf("DEBUG: NUMA Node %d memory pointers: src0=%p, src1=%p, dst=%p\n", 
-           current_node, src0_data, src1_data, dst_data);
+    NUMA_LOG_DEBUG("NUMA Node %d, Thread %d/%d kernel start (data_parallel=%d, total_nodes=%d, total_elements=%ld)", 
+                   current_node, thread_id, num_threads, is_data_parallel, total_nodes, total_elements);
+    NUMA_LOG_DEBUG("NUMA Node %d memory pointers: src0=%p, src1=%p, dst=%p", 
+                   current_node, src0_data, src1_data, dst_data);
     
     // TEMPLATE STEP 6: Calculate data slice for this thread/node combination
     // This is the core of NUMA data-parallel processing
@@ -399,8 +399,8 @@ enum ggml_status ggml_numa_kernel_add_execute_optimized(void * work_context,
         numa_start = node_start + thread_id * elements_per_thread;
         numa_end = MIN(numa_start + elements_per_thread, node_end);
         
-        printf("DEBUG: NUMA Node %d, Thread %d processing slice: [%ld, %ld) (%ld elements) from node range [%ld, %ld)\n", 
-               current_node, thread_id, numa_start, numa_end, numa_end - numa_start, node_start, node_end);
+        NUMA_LOG_DEBUG("NUMA Node %d, Thread %d processing slice: [%ld, %ld) (%ld elements) from node range [%ld, %ld)", 
+                       current_node, thread_id, numa_start, numa_end, numa_end - numa_start, node_start, node_end);
     } else {
         // TEMPLATE PATTERN B: SINGLE-NODE MODE
         // All threads process slices of the entire tensor (no NUMA slicing)
@@ -410,8 +410,8 @@ enum ggml_status ggml_numa_kernel_add_execute_optimized(void * work_context,
         numa_start = thread_id * elements_per_thread;
         numa_end = MIN(numa_start + elements_per_thread, total_elements);
         
-        printf("DEBUG: NUMA Node %d, Thread %d processing tensor slice: [%ld, %ld) (%ld elements)\n", 
-               current_node, thread_id, numa_start, numa_end, numa_end - numa_start);
+        NUMA_LOG_DEBUG("NUMA Node %d, Thread %d processing tensor slice: [%ld, %ld) (%ld elements)", 
+                       current_node, thread_id, numa_start, numa_end, numa_end - numa_start);
     }
     
     // TEMPLATE STEP 7: Execute SIMD operations on assigned data slice
@@ -424,8 +424,8 @@ enum ggml_status ggml_numa_kernel_add_execute_optimized(void * work_context,
     
     if (src1_elements == 1) {
         // TEMPLATE PATTERN: Scalar broadcasting (very common, optimize heavily)
-        printf("DEBUG: NUMA Node %d using SCALAR broadcasting path (elements_in_slice=%zu)\n", 
-               ggml_current_numa_node, elements_in_slice);
+        NUMA_LOG_DEBUG("NUMA Node %d using SCALAR broadcasting path (elements_in_slice=%zu)", 
+                       ggml_current_numa_node, elements_in_slice);
         const float scalar = src1_data[0];
         
         // Use SIMD for scalar addition - direct access to global positions
@@ -434,16 +434,16 @@ enum ggml_status ggml_numa_kernel_add_execute_optimized(void * work_context,
         
     } else if (src1_elements == total_elements) {
         // TEMPLATE PATTERN: Element-wise operation (most common, should be fastest)
-        printf("DEBUG: NUMA Node %d using ELEMENT-WISE path (elements_in_slice=%zu)\n", 
-               ggml_current_numa_node, elements_in_slice);
+        NUMA_LOG_DEBUG("NUMA Node %d using ELEMENT-WISE path (elements_in_slice=%zu)", 
+                       ggml_current_numa_node, elements_in_slice);
         
         // Pure SIMD operation on global positions - maximum performance path
         ggml_vec_add_f32(elements_in_slice, dst_data + numa_start, src0_data + numa_start, src1_data + numa_start);
         
     } else {
         // TEMPLATE PATTERN: Complex broadcasting (avoid if possible, performance cost)
-        printf("DEBUG: NUMA Node %d using SLOW BROADCASTING path (src1_elements=%ld, total=%ld, slice=%zu)\n", 
-               ggml_current_numa_node, src1_elements, total_elements, elements_in_slice);
+        NUMA_LOG_DEBUG("NUMA Node %d using SLOW BROADCASTING path (src1_elements=%ld, total=%ld, slice=%zu)", 
+                       ggml_current_numa_node, src1_elements, total_elements, elements_in_slice);
         for (int64_t i = numa_start; i < numa_end; ++i) {
             // Simplified broadcasting for common patterns
             const int64_t src1_idx = i % src1_elements;
@@ -504,6 +504,33 @@ void ggml_numa_kernel_add_populate_cache(void * cache_array) {
     
     // TEMPLATE PATTERN: Define strategies for different complexity levels
     // Tailor these to your operation's characteristics and performance profile
+    
+    // CRITICAL FIX: Add support for small operations during text generation
+    // Tiny tensors: single-node, single-thread for minimal overhead
+    cache[COMPLEXITY_TINY] = (ggml_numa_cache_entry_t){
+        .valid = true,
+        .strategy = { 
+            .node_strategy = NUMA_NODE_STRATEGY_SINGLE,             // Stay on one node
+            .on_node_strategy = NUMA_ON_NODE_STRATEGY_SINGLE_THREAD // Single thread for tiny ops
+        },
+        .work_buffer_size_per_thread = 0,                          // No extra buffers needed
+        .work_function = ggml_numa_kernel_add_execute_optimized,   // Our optimized kernel
+        .efficiency_score = 0.98f,                                 // Very efficient for tiny data
+        .kernel_name = "NUMA ADD (Single-Node Single-Thread)"
+    };
+    
+    // Small tensors: single-node, multi-thread for good performance
+    cache[COMPLEXITY_SMALL] = (ggml_numa_cache_entry_t){
+        .valid = true,
+        .strategy = { 
+            .node_strategy = NUMA_NODE_STRATEGY_SINGLE,             // Stay on one node
+            .on_node_strategy = NUMA_ON_NODE_STRATEGY_MULTI_THREAD  // Multi-thread for small ops
+        },
+        .work_buffer_size_per_thread = 0,                          // No extra buffers needed
+        .work_function = ggml_numa_kernel_add_execute_optimized,   // Our optimized kernel
+        .efficiency_score = 0.96f,                                 // Good efficiency for small data
+        .kernel_name = "NUMA ADD (Single-Node Multi-Thread)"
+    };
     
     // Medium tensors: use single-node execution for better efficiency
     // This avoids thread overhead for moderately-sized tensors
@@ -657,8 +684,8 @@ enum ggml_status ggml_numa_kernel_add_execute_no_aggregation(void * work_context
         return GGML_STATUS_SUCCESS;
     }
     
-    printf("DEBUG: NUMA Node %d, Thread %d/%d NO-AGGREGATION kernel (data_parallel=%d, total_nodes=%d, total_elements=%ld)\n", 
-           current_node, thread_id, num_threads, is_data_parallel, total_nodes, total_elements);
+    NUMA_LOG_DEBUG("NUMA Node %d, Thread %d/%d NO-AGGREGATION kernel (data_parallel=%d, total_nodes=%d, total_elements=%ld)", 
+                   current_node, thread_id, num_threads, is_data_parallel, total_nodes, total_elements);
     
     // Calculate optimized data slice with larger chunks for reduced overhead
     int64_t numa_start, numa_end;
@@ -669,15 +696,15 @@ enum ggml_status ggml_numa_kernel_add_execute_no_aggregation(void * work_context
         numa_start = current_node * elements_per_node;
         numa_end = (current_node == total_nodes - 1) ? total_elements : numa_start + elements_per_node;
         
-        printf("DEBUG: NUMA Node %d NO-AGGREGATION slice [%ld, %ld) = %ld elements (direct write)\n", 
-               current_node, numa_start, numa_end, numa_end - numa_start);
+        NUMA_LOG_DEBUG("NUMA Node %d NO-AGGREGATION slice [%ld, %ld) = %ld elements (direct write)", 
+                       current_node, numa_start, numa_end, numa_end - numa_start);
     } else {
         // SINGLE-NODE MODE: Process entire tensor
         numa_start = 0;
         numa_end = total_elements;
         
-        printf("DEBUG: NUMA Node %d NO-AGGREGATION processing entire tensor (%ld elements)\n", 
-               current_node, total_elements);
+        NUMA_LOG_DEBUG("NUMA Node %d NO-AGGREGATION processing entire tensor (%ld elements)", 
+                       current_node, total_elements);
     }
     
     // Divide this node's slice among threads with larger chunks
@@ -692,8 +719,8 @@ enum ggml_status ggml_numa_kernel_add_execute_no_aggregation(void * work_context
         return GGML_STATUS_SUCCESS;
     }
     
-    printf("DEBUG: NUMA Node %d, Thread %d NO-AGGREGATION processing [%ld, %ld) = %zu elements\n", 
-           current_node, thread_id, thread_start, thread_end, thread_elements);
+    NUMA_LOG_DEBUG("NUMA Node %d, Thread %d NO-AGGREGATION processing [%ld, %ld) = %zu elements", 
+                   current_node, thread_id, thread_start, thread_end, thread_elements);
     
     // Direct in-place SIMD operation - no coordination needed
     // Each node writes directly to its final tensor location
@@ -721,8 +748,8 @@ enum ggml_status ggml_numa_kernel_add_execute_no_aggregation(void * work_context
         }
     }
     
-    printf("DEBUG: NUMA Node %d, Thread %d NO-AGGREGATION completed (%zu elements written directly)\n", 
-           current_node, thread_id, thread_elements);
+    NUMA_LOG_DEBUG("NUMA Node %d, Thread %d NO-AGGREGATION completed (%zu elements written directly)", 
+                   current_node, thread_id, thread_elements);
     
     return GGML_STATUS_SUCCESS;
 }

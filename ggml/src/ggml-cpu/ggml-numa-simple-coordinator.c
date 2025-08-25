@@ -32,6 +32,7 @@ static void verify_threadpool_numa_binding_fatal(struct ggml_threadpool * thread
 
 // Forward declaration for no-aggregation kernel function
 extern enum ggml_status ggml_numa_kernel_add_execute_no_aggregation(void * work_context, struct ggml_compute_params * params);
+extern void ggml_numa_set_isolate_node(int node);
 
 // Thread-local execution mode for kernel communication
 /**
@@ -89,7 +90,7 @@ static void assert_numa_thread_binding_fatal(int expected_node, const char* thre
         printf("   Actual binding: %s %d → NUMA node %d\n", thread_type, thread_id, current_node);
         abort();
     }
-    printf("✅ NUMA BINDING VERIFIED: %s %d correctly bound to node %d\n", 
+    NUMA_LOG_DEBUG("✅ NUMA BINDING VERIFIED: %s %d correctly bound to node %d\n", 
            thread_type, thread_id, expected_node);
 }
 
@@ -98,10 +99,10 @@ static void assert_numa_strategy_compliance_fatal(void) {
     int isolate_node = ggml_numa_get_isolate_node();
     
     if (strategy == GGML_NUMA_STRATEGY_ISOLATE && isolate_node >= 0) {
-        printf("🔍 NUMA ISOLATE MODE: Verifying all threads bound to node %d\n", isolate_node);
+        NUMA_LOG_DEBUG("🔍 NUMA ISOLATE MODE: Verifying all threads bound to node %d\n", isolate_node);
         // Will be verified per thread in assert_numa_thread_binding_fatal
     } else if (strategy == GGML_NUMA_STRATEGY_MIRROR) {
-        printf("🔍 NUMA MIRROR MODE: Verifying per-node thread binding\n");
+        NUMA_LOG_DEBUG("🔍 NUMA MIRROR MODE: Verifying per-node thread binding\n");
         // Will be verified per thread in assert_numa_thread_binding_fatal  
     }
 }
@@ -160,7 +161,7 @@ static void verify_threadpool_numa_binding_fatal(struct ggml_threadpool * thread
         .verification_mutex = PTHREAD_MUTEX_INITIALIZER
     };
     
-    printf("🔍 Verifying threadpool %p binding to NUMA node %d...\n", threadpool, expected_numa_node);
+    NUMA_LOG_DEBUG("🔍 Verifying threadpool %p binding to NUMA node %d...\n", threadpool, expected_numa_node);
     
     // Create a simple compute plan to exercise the threadpool
     struct ggml_cplan cplan = {
@@ -182,13 +183,13 @@ static void verify_threadpool_numa_binding_fatal(struct ggml_threadpool * thread
     
     // Execute verification task on the threadpool
     // This will cause all worker threads to run our verification function
-    printf("🧪 Running NUMA binding verification task on threadpool %p (expected node %d)\n", 
+    NUMA_LOG_DEBUG("🧪 Running NUMA binding verification task on threadpool %p (expected node %d)\n", 
            threadpool, expected_numa_node);
     
     // Note: This is a simplified verification approach
     // In a real implementation, we would use the threadpool's task execution mechanism
     // For now, we'll verify the main thread binding and log that threadpool exists
-    printf("✅ Threadpool %p created for NUMA node %d (worker binding will be verified during execution)\n", 
+    NUMA_LOG_DEBUG("✅ Threadpool %p created for NUMA node %d (worker binding will be verified during execution)\n", 
            threadpool, expected_numa_node);
 #else
     printf("ℹ️  Non-Linux system, skipping threadpool NUMA binding verification\n");
@@ -265,21 +266,21 @@ static void* numa_dispatch_worker(void* arg) {
     
     assert_numa_thread_binding_fatal(expected_node, "dispatch thread", numa_node);
     
-    printf("DEBUG: NUMA dispatch thread %d bound to node %d\n", numa_node, numa_node);
+    NUMA_LOG_DEBUG("NUMA dispatch thread %d bound to node %d", numa_node, numa_node);
     
     // Main dispatch loop
-    printf("DEBUG: Dispatch thread %d entering main loop (initialized=%d)\n", numa_node, g_simple_coordinator.initialized);
+    NUMA_LOG_DEBUG("Dispatch thread %d entering main loop (initialized=%d)", numa_node, g_simple_coordinator.initialized);
     while (g_simple_coordinator.initialized) {
-        printf("DEBUG: Dispatch thread %d waiting for work...\n", numa_node);
+        NUMA_LOG_DEBUG("Dispatch thread %d waiting for work...", numa_node);
         pthread_mutex_lock(&g_simple_coordinator.dispatch_mutex[numa_node]);
         
         // Wait for work to be available
         while (!atomic_load(&g_simple_coordinator.dispatch_work_available[numa_node]) && 
                g_simple_coordinator.initialized) {
-            printf("DEBUG: Dispatch thread %d blocked on condition variable\n", numa_node);
+            NUMA_LOG_DEBUG("Dispatch thread %d blocked on condition variable", numa_node);
             pthread_cond_wait(&g_simple_coordinator.dispatch_cond[numa_node], 
                              &g_simple_coordinator.dispatch_mutex[numa_node]);
-            printf("DEBUG: Dispatch thread %d woke up from condition variable\n", numa_node);
+            NUMA_LOG_DEBUG("Dispatch thread %d woke up from condition variable", numa_node);
         }
         
         pthread_mutex_unlock(&g_simple_coordinator.dispatch_mutex[numa_node]);
@@ -288,7 +289,7 @@ static void* numa_dispatch_worker(void* arg) {
         
         // Execute work on this NUMA node's threadpool
         if (atomic_load(&g_simple_coordinator.dispatch_work_available[numa_node])) {
-            printf("DEBUG: Dispatch thread %d executing work on threadpool\n", numa_node);
+            NUMA_LOG_DEBUG("Dispatch thread %d executing work on threadpool", numa_node);
             
             struct timespec work_start_time, work_end_time;
             clock_gettime(CLOCK_MONOTONIC, &work_start_time);
@@ -307,7 +308,7 @@ static void* numa_dispatch_worker(void* arg) {
             // CRITICAL: Set thread-local NUMA node for tensor_data() access
             extern __thread int ggml_current_numa_node;
             ggml_current_numa_node = numa_node;
-            printf("DEBUG: Set ggml_current_numa_node=%d before calling work function on node %d\n", 
+            NUMA_LOG_DEBUG("Set ggml_current_numa_node=%d before calling work function on node %d", 
                    ggml_current_numa_node, numa_node);
             
             // CRITICAL: Set data-parallel execution flag for kernel to enable proper data slicing
@@ -320,7 +321,7 @@ static void* numa_dispatch_worker(void* arg) {
             enum ggml_status result = GGML_STATUS_SUCCESS;
             
             if (work_params.nth > 1) {
-                printf("DEBUG: NUMA Node %d using parallel multi-threading with %d threads\n", 
+                NUMA_LOG_DEBUG("NUMA Node %d using parallel multi-threading with %d threads", 
                        numa_node, work_params.nth);
                 
                 // Create thread-specific parameters and run threads in parallel
@@ -336,11 +337,11 @@ static void* numa_dispatch_worker(void* arg) {
                     thread_data[ith].work_context = g_simple_coordinator.active_work_context;
                     thread_data[ith].work_function = g_simple_coordinator.active_work_function;
                     
-                    printf("DEBUG: NUMA Node %d creating thread %d/%d\n", 
+                    NUMA_LOG_DEBUG("NUMA Node %d creating thread %d/%d", 
                            numa_node, ith, work_params.nth);
                     
                     if (pthread_create(&threads[ith], NULL, thread_worker, &thread_data[ith]) != 0) {
-                        printf("ERROR: Failed to create thread %d on NUMA node %d\n", ith, numa_node);
+                        fprintf(stderr, "ERROR: Failed to create thread %d on NUMA node %d\n", ith, numa_node);
                         result = GGML_STATUS_FAILED;
                         break;
                     }
@@ -352,18 +353,18 @@ static void* numa_dispatch_worker(void* arg) {
                         pthread_join(threads[ith], NULL);
                         
                         if (thread_data[ith].result != GGML_STATUS_SUCCESS) {
-                            printf("DEBUG: NUMA Node %d thread %d failed with status %d\n", 
+                            NUMA_LOG_DEBUG("NUMA Node %d thread %d failed with status %d", 
                                    numa_node, ith, thread_data[ith].result);
                             result = thread_data[ith].result;
                         }
                     }
                 }
                 
-                printf("DEBUG: NUMA Node %d completed parallel multi-threaded execution with %d threads\n", 
+                NUMA_LOG_DEBUG("NUMA Node %d completed parallel multi-threaded execution with %d threads", 
                        numa_node, work_params.nth);
             } else {
                 // Single-threaded execution
-                printf("DEBUG: NUMA Node %d single-threaded execution\n", numa_node);
+                NUMA_LOG_DEBUG("NUMA Node %d single-threaded execution", numa_node);
                 result = g_simple_coordinator.active_work_function(
                     g_simple_coordinator.active_work_context, &work_params);
             }
@@ -381,14 +382,14 @@ static void* numa_dispatch_worker(void* arg) {
                         (result == GGML_STATUS_SUCCESS));
             atomic_store(&g_simple_coordinator.dispatch_work_available[numa_node], false);
             
-            printf("DEBUG: Dispatch thread %d completed work with status %d (%.3fms)\n", numa_node, result, work_time_ms);
+            NUMA_LOG_DEBUG("Dispatch thread %d completed work with status %d (%.3fms)", numa_node, result, work_time_ms);
             
             // Signal completion by waiting at the barrier
             pthread_barrier_wait(&g_simple_coordinator.completion_barrier);
         }
     }
     
-    printf("DEBUG: NUMA dispatch thread %d exiting\n", numa_node);
+    NUMA_LOG_DEBUG("DEBUG: NUMA dispatch thread %d exiting\n", numa_node);
     return NULL;
 }
 
@@ -450,13 +451,13 @@ static enum ggml_status ggml_numa_aggregate_tensor_data(struct ggml_tensor * ten
         return GGML_STATUS_SUCCESS; // Nothing to aggregate
     }
     
-    printf("DEBUG: Aggregating tensor data from %d NUMA nodes\n", num_nodes);
+    NUMA_LOG_DEBUG("Aggregating tensor data from %d NUMA nodes", num_nodes);
     
     size_t total_elements = ggml_nelements(tensor);
     size_t element_size = ggml_type_size(tensor->type);
     size_t elements_per_node = total_elements / num_nodes;
     
-    printf("DEBUG: Tensor aggregation - %zu total elements, %zu per node, %zu bytes per element\n", 
+    NUMA_LOG_DEBUG("Tensor aggregation - %zu total elements, %zu per node, %zu bytes per element", 
            total_elements, elements_per_node, element_size);
     
     // For data-parallel execution, each NUMA node processed a slice of the data
@@ -473,7 +474,7 @@ static enum ggml_status ggml_numa_aggregate_tensor_data(struct ggml_tensor * ten
         printf("ERROR: Failed to get node 0 tensor data for aggregation\n");
         return GGML_STATUS_FAILED;
     }
-    printf("DEBUG: Aggregating into node 0 tensor data at %p (direct access)\n", node0_data);
+    NUMA_LOG_DEBUG("Aggregating into node 0 tensor data at %p (direct access)", node0_data);
     
     // Aggregate results from all nodes into node 0's copy
     for (int src_node = 0; src_node < num_nodes; src_node++) {
@@ -482,7 +483,7 @@ static enum ggml_status ggml_numa_aggregate_tensor_data(struct ggml_tensor * ten
         size_t end_element = (src_node == num_nodes - 1) ? total_elements : (src_node + 1) * elements_per_node;
         size_t slice_elements = end_element - start_element;
         
-        printf("DEBUG: Aggregating slice from node %d: elements [%zu, %zu) (%zu elements)\n", 
+        NUMA_LOG_DEBUG("Aggregating slice from node %d: elements [%zu, %zu) (%zu elements)", 
                src_node, start_element, end_element, slice_elements);
         
         // Get source data from this node's copy (direct access)
@@ -494,7 +495,7 @@ static enum ggml_status ggml_numa_aggregate_tensor_data(struct ggml_tensor * ten
         
         // DEBUG: Show first few values before copying
         float * src_float = (float *)src_data;
-        printf("DEBUG: Node %d data before copy: [%.3f, %.3f, %.3f, %.3f, ...]\n", 
+        NUMA_LOG_VERBOSE("Node %d data before copy: [%.3f, %.3f, %.3f, %.3f, ...]", 
                src_node, src_float[start_element], src_float[start_element+1], 
                src_float[start_element+2], src_float[start_element+3]);
         
@@ -507,14 +508,14 @@ static enum ggml_status ggml_numa_aggregate_tensor_data(struct ggml_tensor * ten
         
         // DEBUG: Show first few values after copying
         float * dst_float = (float *)node0_data;
-        printf("DEBUG: Node 0 result after copying node %d: [%.3f, %.3f, %.3f, %.3f, ...]\n", 
+        NUMA_LOG_VERBOSE("Node 0 result after copying node %d: [%.3f, %.3f, %.3f, %.3f, ...]", 
                src_node, dst_float[start_element], dst_float[start_element+1], 
                dst_float[start_element+2], dst_float[start_element+3]);
         
-        printf("DEBUG: Copied %zu bytes from node %d slice to node 0 result\n", slice_bytes, src_node);
+        NUMA_LOG_DEBUG("Copied %zu bytes from node %d slice to node 0 result", slice_bytes, src_node);
     }
     
-    printf("DEBUG: Data aggregation completed - all slices merged into coherent result\n");
+    NUMA_LOG_DEBUG("Data aggregation completed - all slices merged into coherent result");
     return GGML_STATUS_SUCCESS;
 }
 
@@ -539,7 +540,7 @@ static bool allocate_numa_work_buffers(size_t work_size) {
                     // Initialize pages to ensure proper NUMA placement
                     memset(g_simple_coordinator.numa_work_buffers[node], 0, work_size);
                     g_simple_coordinator.numa_work_buffer_sizes[node] = work_size;
-                    printf("DEBUG: Allocated %zu bytes work buffer on NUMA node %d\n", work_size, node);
+                    NUMA_LOG_DEBUG("Allocated %zu bytes work buffer on NUMA node %d", work_size, node);
                 } else {
                     printf("ERROR: Failed to allocate work buffer on NUMA node %d\n", node);
                     return false;
@@ -559,7 +560,7 @@ static bool allocate_numa_work_buffers(size_t work_size) {
                 // Initialize pages to ensure proper NUMA placement
                 memset(g_simple_coordinator.fallback_work_buffer, 0, work_size);
                 g_simple_coordinator.fallback_work_buffer_size = work_size;
-                printf("DEBUG: Allocated %zu bytes fallback work buffer on NUMA node 0\n", work_size);
+                NUMA_LOG_DEBUG("Allocated %zu bytes fallback work buffer on NUMA node 0", work_size);
             } else {
                 printf("ERROR: Failed to allocate fallback work buffer on NUMA node 0\n");
                 return false;
@@ -715,22 +716,22 @@ static void create_optimal_cpu_masks(struct ggml_threadpool_params *tpp, int num
                 }
                 
                 // First pass: assign primary cores
-                printf("DEBUG: NUMA node %d - assigning primary cores (count=%d)\n", node, primary_count);
+                NUMA_LOG_DEBUG("NUMA node %d - assigning primary cores (count=%d)", node, primary_count);
                 for (int i = 0; i < primary_count && assigned < target_threads_node; i++) {
                     int cpu = primary_cpus[i];
                     tpp->cpumask[cpu] = true;
                     assigned++;
-                    printf("DEBUG: Assigned primary CPU %d to node %d\n", cpu, node);
+                    NUMA_LOG_DEBUG("Assigned primary CPU %d to node %d", cpu, node);
                 }
                 
                 // Second pass: assign hyperthreads if needed
-                printf("DEBUG: NUMA node %d - assigning hyperthreads if needed (count=%d, still need=%d)\n", 
+                NUMA_LOG_DEBUG("NUMA node %d - assigning hyperthreads if needed (count=%d, still need=%d)", 
                        node, hyperthread_count, target_threads_node - assigned);
                 for (int i = 0; i < hyperthread_count && assigned < target_threads_node; i++) {
                     int cpu = hyperthread_cpus[i];
                     tpp->cpumask[cpu] = true;
                     assigned++;
-                    printf("DEBUG: Assigned hyperthread CPU %d to node %d\n", cpu, node);
+                    NUMA_LOG_DEBUG("Assigned hyperthread CPU %d to node %d", cpu, node);
                 }
             }
             numa_free_cpumask(node_cpus);
@@ -759,7 +760,8 @@ bool ggml_numa_simple_coordinator_init(struct ggml_threadpool_params * tpp) {
     
     // Initialize performance measurement system
     ggml_numa_perf_init();
-    ggml_numa_perf_set_enabled(true);  // Enable by default for NUMA coordinator
+    // Performance instrumentation respects GGML_NUMA_DEBUG environment variable
+    // No need to explicitly enable - it's controlled by debug settings in perf_init()
     
 #ifdef GGML_NUMA_MIRROR
     if (numa_available() < 0) {
@@ -780,6 +782,12 @@ bool ggml_numa_simple_coordinator_init(struct ggml_threadpool_params * tpp) {
     
     // FATAL ASSERTION: For ISOLATE mode, validate isolate_node is valid
     if (current_strategy == GGML_NUMA_STRATEGY_ISOLATE) {
+        // Handle -1 as "use current CPU's NUMA node"
+        if (isolate_node == -1) {
+            isolate_node = numa_node_of_cpu(sched_getcpu());
+            NUMA_LOG_DEBUG("NUMA ISOLATE: Auto-detected current node %d\n", isolate_node);
+        }
+        
         if (isolate_node < 0 || isolate_node >= g_simple_coordinator.num_numa_nodes) {
             printf("❌ FATAL NUMA ISOLATE ERROR: Invalid isolate node %d (valid range: 0-%d)\n",
                    isolate_node, g_simple_coordinator.num_numa_nodes - 1);
@@ -789,6 +797,9 @@ bool ggml_numa_simple_coordinator_init(struct ggml_threadpool_params * tpp) {
         printf("🔒 NUMA ISOLATE MODE: All operations will be restricted to node %d\n", isolate_node);
         // For ISOLATE mode, only create threadpool for the specified node
         g_simple_coordinator.num_numa_nodes = 1; // Override to single node
+        
+        // Update the global isolate node value for other functions
+        ggml_numa_set_isolate_node(isolate_node);
     }
     
     // Create threadpools for each NUMA node with proper CPU filtering
@@ -903,7 +914,7 @@ bool ggml_numa_simple_coordinator_init(struct ggml_threadpool_params * tpp) {
     // CRITICAL: Verify fallback threadpool NUMA binding
     verify_threadpool_numa_binding_fatal(g_simple_coordinator.fallback_threadpool, fallback_node);
     
-    printf("DEBUG: Created dedicated fallback threadpool: %p (threads=%d, bound to NUMA node 0)\n", 
+    NUMA_LOG_DEBUG("DEBUG: Created dedicated fallback threadpool: %p (threads=%d, bound to NUMA node 0)\n", 
            g_simple_coordinator.fallback_threadpool, fallback_tpp.n_threads);
            
 #else
@@ -961,7 +972,7 @@ bool ggml_numa_simple_coordinator_init(struct ggml_threadpool_params * tpp) {
         }
     }
     
-    printf("DEBUG: Created %d NUMA dispatch threads\n", actual_numa_nodes);
+    NUMA_LOG_DEBUG("DEBUG: Created %d NUMA dispatch threads\n", actual_numa_nodes);
     
     // FATAL ASSERTION: Verify NUMA strategy compliance
     assert_numa_strategy_compliance_fatal();
@@ -1052,7 +1063,7 @@ enum ggml_status ggml_numa_simple_coordinator_execute_single_node(
         return GGML_STATUS_FAILED;
     }
 
-    printf("DEBUG: Coordinator Single-Node: Using node %d threadpool=%p, threads=%d\n", 
+    NUMA_LOG_DEBUG("Coordinator Single-Node: Using node %d threadpool=%p, threads=%d", 
            target_node, threadpool, g_simple_coordinator.threads_per_node[target_node]);
 
     // For single-node execution, we can execute directly without coordination overhead
@@ -1068,7 +1079,7 @@ enum ggml_status ggml_numa_simple_coordinator_execute_single_node(
     // CRITICAL: Set thread-local NUMA node for tensor_data() access
     extern __thread int ggml_current_numa_node;
     ggml_current_numa_node = target_node;
-    printf("DEBUG: Single-node execution: Set ggml_current_numa_node=%d for target_node=%d\n", 
+    NUMA_LOG_DEBUG("Single-node execution: Set ggml_current_numa_node=%d for target_node=%d", 
            ggml_current_numa_node, target_node);
     
     enum ggml_status result = work_function(work_context, &params);
@@ -1129,7 +1140,7 @@ enum ggml_status ggml_numa_simple_coordinator_execute_data_parallel(
     struct timespec coord_start_time, coord_end_time;
     clock_gettime(CLOCK_MONOTONIC, &coord_start_time);
     
-    printf("DEBUG: Starting TRUE async dispatch execution across %d nodes (optimal NUMA architecture!)\n", num_nodes);
+    NUMA_LOG_DEBUG("Starting TRUE async dispatch execution across %d nodes (optimal NUMA architecture!)", num_nodes);
     
     // Set up work for dispatch threads
     g_simple_coordinator.active_work_function = work_function;
@@ -1142,10 +1153,10 @@ enum ggml_status ggml_numa_simple_coordinator_execute_data_parallel(
         atomic_store(&g_simple_coordinator.dispatch_work_available[node], true);
         pthread_cond_signal(&g_simple_coordinator.dispatch_cond[node]);
         pthread_mutex_unlock(&g_simple_coordinator.dispatch_mutex[node]);
-        printf("DEBUG: Signaled dispatch thread %d to start work\n", node);
+        NUMA_LOG_DEBUG("Signaled dispatch thread %d to start work", node);
     }
     
-    printf("DEBUG: Waiting for all dispatch threads to complete...\n");
+    NUMA_LOG_DEBUG("Waiting for all dispatch threads to complete...");
     
     struct timespec barrier_start_time;
     clock_gettime(CLOCK_MONOTONIC, &barrier_start_time);
@@ -1157,13 +1168,13 @@ enum ggml_status ggml_numa_simple_coordinator_execute_data_parallel(
     clock_gettime(CLOCK_MONOTONIC, &barrier_end_time);
     double barrier_wait_ms = (barrier_end_time.tv_sec - barrier_start_time.tv_sec) * 1000.0 + 
                              (barrier_end_time.tv_nsec - barrier_start_time.tv_nsec) / 1000000.0;
-    printf("DEBUG: Barrier wait completed in %.3fms\n", barrier_wait_ms);
+    NUMA_LOG_DEBUG("Barrier wait completed in %.3fms", barrier_wait_ms);
     
     // Collect results from all nodes
     enum ggml_status final_status = GGML_STATUS_SUCCESS;
     for (int node = 0; node < num_nodes; node++) {
         bool node_success = atomic_load(&g_simple_coordinator.work_completion_status[node]);
-        printf("DEBUG: NUMA node %d completed with status %s\n", 
+        NUMA_LOG_DEBUG("NUMA node %d completed with status %s", 
                node, node_success ? "SUCCESS" : "FAILED");
         if (!node_success) {
             final_status = GGML_STATUS_FAILED;
@@ -1180,11 +1191,11 @@ enum ggml_status ggml_numa_simple_coordinator_execute_data_parallel(
         bool needs_aggregation = true;
         if (work_function == ggml_numa_kernel_add_execute_no_aggregation) {
             needs_aggregation = false;
-            printf("DEBUG: Skipping data aggregation - no-aggregation kernel writes directly to final tensor\n");
+            NUMA_LOG_DEBUG("Skipping data aggregation - no-aggregation kernel writes directly to final tensor");
         }
         
         if (needs_aggregation) {
-            printf("DEBUG: Starting data aggregation from %d NUMA nodes\n", num_nodes);
+            NUMA_LOG_DEBUG("Starting data aggregation from %d NUMA nodes", num_nodes);
             struct timespec agg_start_time;
             clock_gettime(CLOCK_MONOTONIC, &agg_start_time);
             
@@ -1197,20 +1208,20 @@ enum ggml_status ggml_numa_simple_coordinator_execute_data_parallel(
                                  (agg_end_time.tv_nsec - agg_start_time.tv_nsec) / 1000000.0;
             
             if (agg_status == GGML_STATUS_SUCCESS) {
-                printf("DEBUG: Data aggregation completed successfully in %.3fms\n", agg_time_ms);
+                NUMA_LOG_DEBUG("Data aggregation completed successfully in %.3fms", agg_time_ms);
             } else {
                 printf("ERROR: Data aggregation failed - status %d\n", agg_status);
                 final_status = agg_status;
             }
         } else {
-            printf("DEBUG: Data aggregation skipped - result already coherent from in-place operations\n");
+            NUMA_LOG_DEBUG("Data aggregation skipped - result already coherent from in-place operations");
         }
         
         // CRITICAL: Set ggml_current_numa_node to 0 so that subsequent ggml_get_data() calls
         // read from node 0 where we aggregated the result (or where coherent result is located)
         extern __thread int ggml_current_numa_node;
         ggml_current_numa_node = 0;
-        printf("DEBUG: Set ggml_current_numa_node=0 for result reading\n");
+        NUMA_LOG_DEBUG("Set ggml_current_numa_node=0 for result reading");
     }
     
     NUMA_PERF_END();
@@ -1219,7 +1230,7 @@ enum ggml_status ggml_numa_simple_coordinator_execute_data_parallel(
     double total_coord_time_ms = (coord_end_time.tv_sec - coord_start_time.tv_sec) * 1000.0 + 
                                  (coord_end_time.tv_nsec - coord_start_time.tv_nsec) / 1000000.0;
     
-    printf("DEBUG: All dispatch NUMA work completed, final status: %d (total coordination time: %.3fms)\n", 
+    NUMA_LOG_DEBUG("All dispatch NUMA work completed, final status: %d (total coordination time: %.3fms)", 
            final_status, total_coord_time_ms);
     NUMA_PERF_END();
     return final_status;
@@ -1254,7 +1265,7 @@ int ggml_numa_get_current_node(void) {
         if (current_cpu >= 0) {
             int current_node = numa_node_of_cpu(current_cpu);
             if (current_node >= 0) {
-                printf("DEBUG: Using physical NUMA node %d (CPU %d)\n", current_node, current_cpu);
+                NUMA_LOG_DEBUG("Using physical NUMA node %d (CPU %d)", current_node, current_cpu);
                 return current_node;
             }
         }
@@ -1262,7 +1273,7 @@ int ggml_numa_get_current_node(void) {
 #endif
 
     // Fallback: return node 0 if detection fails
-    printf("DEBUG: Using fallback NUMA node 0\n");
+    NUMA_LOG_DEBUG("Using fallback NUMA node 0");
     return 0;
 }
 

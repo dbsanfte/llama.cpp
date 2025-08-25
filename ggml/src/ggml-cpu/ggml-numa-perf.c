@@ -6,6 +6,7 @@
  */
 
 #include "ggml-numa-perf.h"
+#include "ggml-numa-shared.h"  // For debug environment variable control
 #include "ggml-impl.h"  // For GGML_LOG_* macros
 #include <pthread.h>
 #include <stdlib.h>
@@ -112,15 +113,13 @@ bool ggml_numa_perf_init(void) {
         // Initialize statistics
         memset(g_perf_stats, 0, sizeof(g_perf_stats));
         
-        // Enable performance measurement by default in debug builds
-        // But keep detailed logging disabled to avoid cluttering output
-        #ifdef DEBUG
-        g_numa_perf_enabled = true;
-        g_numa_perf_detailed_logging = false;  // Disabled by default for cleaner output
-        #endif
+        // Enable performance measurement only when debug environment variable is set
+        // This eliminates performance overhead and output clutter in production
+        g_numa_perf_enabled = (ggml_numa_debug_enabled() >= 1);
+        g_numa_perf_detailed_logging = (ggml_numa_debug_enabled() >= 2);  // Verbose mode only
         
         g_perf_initialized = true;
-        GGML_LOG_INFO("NUMA Performance instrumentation initialized (enabled=%s, detailed=%s)\n",
+        NUMA_LOG_DEBUG("NUMA Performance instrumentation initialized (enabled=%s, detailed=%s)",
                       g_numa_perf_enabled ? "true" : "false",
                       g_numa_perf_detailed_logging ? "true" : "false");
     }
@@ -138,7 +137,7 @@ void ggml_numa_perf_shutdown(void) {
             ggml_numa_perf_print_summary();
         }
         g_perf_initialized = false;
-        GGML_LOG_INFO("NUMA Performance instrumentation shutdown\n");
+        NUMA_LOG_DEBUG("NUMA Performance instrumentation shutdown");
     }
     pthread_mutex_unlock(&g_perf_mutex);
 }
