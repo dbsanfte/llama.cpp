@@ -55,13 +55,64 @@ inline static void ggml_vec_cpy_i32(const int n, int32_t * y, const int32_t * x)
 
 inline static void ggml_vec_set_f16(const int n, ggml_fp16_t * x, const ggml_fp16_t v) { for (int i = 0; i < n; ++i) x[i] = v; }
 inline static void ggml_vec_set_bf16(const int n, ggml_bf16_t * x, const ggml_bf16_t v) { for (int i = 0; i < n; ++i) x[i] = v; }
-inline static void ggml_vec_add_f32 (const int n, float * z, const float * x, const float * y) { for (int i = 0; i < n; ++i) z[i]  = x[i] + y[i]; }
+inline static void ggml_vec_add_f32 (const int n, float * z, const float * x, const float * y) {
+#if defined(GGML_SIMD)
+    const int np = (n & ~(GGML_F32_STEP - 1));
+
+    GGML_F32_VEC ax[GGML_F32_ARR];
+    GGML_F32_VEC ay[GGML_F32_ARR];
+    GGML_F32_VEC az[GGML_F32_ARR];
+
+    for (int i = 0; i < np; i += GGML_F32_STEP) {
+        for (int j = 0; j < GGML_F32_ARR; j++) {
+            ax[j] = GGML_F32_VEC_LOAD(x + i + j*GGML_F32_EPR);
+            ay[j] = GGML_F32_VEC_LOAD(y + i + j*GGML_F32_EPR);
+            az[j] = GGML_F32_VEC_ADD(ax[j], ay[j]);
+
+            GGML_F32_VEC_STORE(z + i + j*GGML_F32_EPR, az[j]);
+        }
+    }
+
+    // leftovers
+    for (int i = np; i < n; ++i) {
+        z[i] = x[i] + y[i];
+    }
+#else
+    // scalar fallback
+    for (int i = 0; i < n; ++i) z[i] = x[i] + y[i];
+#endif
+}
 inline static void ggml_vec_add_f16 (const int n, ggml_fp16_t * z, const ggml_fp16_t * x, const ggml_fp16_t * y) {
     for (int i = 0; i < n; ++i) {
         z[i] = GGML_CPU_FP32_TO_FP16(GGML_CPU_FP16_TO_FP32(x[i]) + GGML_CPU_FP16_TO_FP32(y[i]));
     }
 }
-inline static void ggml_vec_add1_f32(const int n, float * z, const float * x, const float   v) { for (int i = 0; i < n; ++i) z[i]  = x[i] + v;    }
+inline static void ggml_vec_add1_f32(const int n, float * z, const float * x, const float   v) {
+#if defined(GGML_SIMD)
+    const int np = (n & ~(GGML_F32_STEP - 1));
+
+    GGML_F32_VEC vx = GGML_F32_VEC_SET1(v);
+    GGML_F32_VEC ax[GGML_F32_ARR];
+    GGML_F32_VEC az[GGML_F32_ARR];
+
+    for (int i = 0; i < np; i += GGML_F32_STEP) {
+        for (int j = 0; j < GGML_F32_ARR; j++) {
+            ax[j] = GGML_F32_VEC_LOAD(x + i + j*GGML_F32_EPR);
+            az[j] = GGML_F32_VEC_ADD(ax[j], vx);
+
+            GGML_F32_VEC_STORE(z + i + j*GGML_F32_EPR, az[j]);
+        }
+    }
+
+    // leftovers
+    for (int i = np; i < n; ++i) {
+        z[i] = x[i] + v;
+    }
+#else
+    // scalar fallback
+    for (int i = 0; i < n; ++i) z[i] = x[i] + v;
+#endif
+}
 inline static void ggml_vec_acc_f32 (const int n, float * y, const float * x)                  { for (int i = 0; i < n; ++i) y[i] += x[i];        }
 inline static void ggml_vec_acc1_f32(const int n, float * y, const float   v)                  { for (int i = 0; i < n; ++i) y[i] += v;           }
 inline static void ggml_vec_sub_f32 (const int n, float * z, const float * x, const float * y) { for (int i = 0; i < n; ++i) z[i]  = x[i] - y[i]; }

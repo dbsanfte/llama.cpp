@@ -70,7 +70,6 @@ bool ggml_numa_simple_coordinator_is_initialized(void);
 /**
  * NUMA node detection functions (moved from complex coordinator)
  */
-void ggml_numa_set_virtual_node(int node);
 int ggml_numa_get_current_node(void);
 
 /**

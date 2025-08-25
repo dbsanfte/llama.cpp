@@ -1,5 +1,6 @@
-/*
- * NUMA Kernel Registry Implementation - High-Performance Caching System
+/**
+ * @file numa-kernels.c
+ * @brief NUMA Kernel Registry Implementation - High-Performance Caching System
  * 
  * This module provides lightning-fast kernel lookups through a one-off cache
  * of supported operations with pre-computed strategies and work functions.
@@ -37,8 +38,8 @@ static bool g_numa_cache_initialized = false;
 static inline ggml_numa_complexity_class_t get_complexity_class(size_t num_elements) {
     if (num_elements < 1024) return COMPLEXITY_TINY;
     if (num_elements < 16384) return COMPLEXITY_SMALL;
-    if (num_elements < 262144) return COMPLEXITY_MEDIUM;
-    if (num_elements < 4194304) return COMPLEXITY_LARGE;
+    if (num_elements < 1048576) return COMPLEXITY_MEDIUM;  // Increased to 1M elements (4MB for float32)
+    if (num_elements < 16777216) return COMPLEXITY_LARGE;  // Increased to 16M elements (64MB for float32)
     return COMPLEXITY_HUGE;
 }
 

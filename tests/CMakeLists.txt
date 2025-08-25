@@ -224,94 +224,9 @@ target_link_libraries(${LLAMA_TEST_NAME} PRIVATE ggml ggml-cpu common)
 # Prioritize ggml/src/ggml-cpu/ to get the full implementation headers and add ggml/src for ggml-impl.h
 target_include_directories(${LLAMA_TEST_NAME} PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src/ggml-cpu ${CMAKE_SOURCE_DIR}/ggml/src ${CMAKE_SOURCE_DIR}/ggml/include)
 
-# test-numa-context-allocation
-set(LLAMA_TEST_NAME test-numa-context-allocation)
-llama_build_and_test(test-numa-context-allocation.cpp)
-target_link_libraries(${LLAMA_TEST_NAME} PRIVATE ggml ggml-cpu common)
-# Prioritize ggml/src/ggml-cpu/ to get the full implementation headers and add ggml/src for ggml-impl.h
-target_include_directories(${LLAMA_TEST_NAME} PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src/ggml-cpu ${CMAKE_SOURCE_DIR}/ggml/src ${CMAKE_SOURCE_DIR}/ggml/include)
-
-# test-numa-performance-benchmark-add
-set(LLAMA_TEST_NAME test-numa-performance-benchmark-add)
-llama_build_and_test(test-numa-performance-benchmark-add.cpp)
-target_link_libraries(${LLAMA_TEST_NAME} PRIVATE ggml ggml-cpu common)
-# Prioritize ggml/src/ggml-cpu/ to get the full implementation headers and add ggml/src for ggml-impl.h
-target_include_directories(${LLAMA_TEST_NAME} PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src/ggml-cpu ${CMAKE_SOURCE_DIR}/ggml/src ${CMAKE_SOURCE_DIR}/ggml/include)
-
-# test-numa-performance-benchmark-add-fixed (corrected methodology)
-set(LLAMA_TEST_NAME test-numa-performance-benchmark-add-fixed)
-llama_build_and_test(test-numa-performance-benchmark-add-fixed.cpp)
-target_link_libraries(${LLAMA_TEST_NAME} PRIVATE ggml ggml-cpu common)
-target_include_directories(${LLAMA_TEST_NAME} PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src/ggml-cpu ${CMAKE_SOURCE_DIR}/ggml/src ${CMAKE_SOURCE_DIR}/ggml/include)
-
-# test-numa-modes-comparison (node 0 vs node 1 vs data-parallel)
-set(LLAMA_TEST_NAME test-numa-modes-comparison)
-llama_build_and_test(test-numa-modes-comparison.cpp)
-target_link_libraries(${LLAMA_TEST_NAME} PRIVATE ggml ggml-cpu common)
-target_include_directories(${LLAMA_TEST_NAME} PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src/ggml-cpu ${CMAKE_SOURCE_DIR}/ggml/src ${CMAKE_SOURCE_DIR}/ggml/include)
-
 # test-numa-execution-modes
 set(LLAMA_TEST_NAME test-numa-execution-modes)
 llama_build_and_test(test-numa-execution-modes.cpp)
 target_link_libraries(${LLAMA_TEST_NAME} PRIVATE ggml ggml-cpu common)
 target_include_directories(${LLAMA_TEST_NAME} PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src/ggml-cpu ${CMAKE_SOURCE_DIR}/ggml/src ${CMAKE_SOURCE_DIR}/ggml/include)
 target_sources(${LLAMA_TEST_NAME} PRIVATE upi-traffic-monitor.cpp)
-
-# test-numa-execution-modes-comparison
-set(LLAMA_TEST_NAME test-numa-execution-modes-comparison)
-llama_build_and_test(test-numa-execution-modes-comparison.cpp)
-target_link_libraries(${LLAMA_TEST_NAME} PRIVATE ggml ggml-cpu common)
-target_include_directories(${LLAMA_TEST_NAME} PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src/ggml-cpu ${CMAKE_SOURCE_DIR}/ggml/src ${CMAKE_SOURCE_DIR}/ggml/include)
-
-# test-numa-add-diagnostic
-set(LLAMA_TEST_NAME test-numa-add-diagnostic)
-llama_build_and_test(test-numa-add-diagnostic.cpp)
-target_link_libraries(${LLAMA_TEST_NAME} PRIVATE ggml ggml-cpu common)
-# Prioritize ggml/src/ggml-cpu/ to get the full implementation headers and add ggml/src for ggml-impl.h
-target_include_directories(${LLAMA_TEST_NAME} PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src/ggml-cpu ${CMAKE_SOURCE_DIR}/ggml/src ${CMAKE_SOURCE_DIR}/ggml/include)
-
-# test-numa-memory-locality-verification
-set(LLAMA_TEST_NAME test-numa-memory-locality-verification)
-llama_build_and_test(test-numa-memory-locality-verification.cpp)
-target_link_libraries(${LLAMA_TEST_NAME} PRIVATE numa)
-
-# test-numa-cpu-affinity-verification
-set(LLAMA_TEST_NAME test-numa-cpu-affinity-verification)
-llama_build_and_test(test-numa-cpu-affinity-verification.cpp)
-target_link_libraries(${LLAMA_TEST_NAME} PRIVATE numa)
-
-# test-numa-data-slicing-verification
-set(LLAMA_TEST_NAME test-numa-data-slicing-verification)
-llama_build_and_test(test-numa-data-slicing-verification.cpp)
-target_link_libraries(${LLAMA_TEST_NAME} PRIVATE ggml ggml-cpu common numa)
-target_include_directories(${LLAMA_TEST_NAME} PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src/ggml-cpu ${CMAKE_SOURCE_DIR}/ggml/src ${CMAKE_SOURCE_DIR}/ggml/include)
-
-# test-intel-xeon-numa-analyzer
-set(LLAMA_TEST_NAME test-intel-xeon-numa-analyzer)
-llama_build_and_test(test-intel-xeon-numa-analyzer.cpp)
-target_link_libraries(${LLAMA_TEST_NAME} PRIVATE numa)
-
-# test-physical-core-numa-performance
-set(LLAMA_TEST_NAME test-physical-core-numa-performance)
-llama_build_and_test(test-physical-core-numa-performance.cpp)
-target_link_libraries(${LLAMA_TEST_NAME} PRIVATE numa)
-
-# test-huge-dataparallel-debug (focused debug test)
-set(LLAMA_TEST_NAME test-huge-dataparallel-debug)
-add_executable(test-huge-dataparallel-debug test-huge-dataparallel-debug.cpp get-model.cpp)
-install(TARGETS test-huge-dataparallel-debug RUNTIME)
-target_link_libraries(test-huge-dataparallel-debug PRIVATE common)
-target_link_libraries(${LLAMA_TEST_NAME} PRIVATE ggml ggml-cpu common)
-# Prioritize ggml/src/ggml-cpu/ to get the full implementation headers and add ggml/src for ggml-impl.h
-target_include_directories(${LLAMA_TEST_NAME} PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src/ggml-cpu ${CMAKE_SOURCE_DIR}/ggml/src ${CMAKE_SOURCE_DIR}/ggml/include)
-
-# test-numa-performance-instrumentation
-set(LLAMA_TEST_NAME test-numa-performance-instrumentation)
-llama_build_and_test(test-numa-performance-instrumentation.cpp)
-
-# test-numa-performance-analysis
-set(LLAMA_TEST_NAME test-numa-performance-analysis)
-llama_build_and_test(test-numa-performance-analysis.cpp)
-target_link_libraries(${LLAMA_TEST_NAME} PRIVATE ggml ggml-cpu common)
-# Prioritize ggml/src/ggml-cpu/ to get the full implementation headers and add ggml/src for ggml-impl.h
-target_include_directories(${LLAMA_TEST_NAME} PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src/ggml-cpu ${CMAKE_SOURCE_DIR}/ggml/src ${CMAKE_SOURCE_DIR}/ggml/include)

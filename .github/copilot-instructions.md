@@ -134,8 +134,6 @@ cp tests/test-numa-mathematical-correctness-template.cpp tests/test-numa-mathema
 
 **✅ Supported Operations:**
 - **ADD** - Element-wise addition with SIMD optimization
-- **RMS_NORM** - Root mean square normalization with data-parallel execution  
-- **MUL_MAT** - Matrix multiplication with specialized chunking strategies
 
 **🚀 Performance Characteristics:**
 - **O(1) Strategy Lookups** - Pre-computed cache eliminates runtime overhead

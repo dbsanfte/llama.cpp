@@ -6,7 +6,7 @@
  * 
  * USAGE INSTRUCTIONS:
  * 1. Copy this template to create a new test file (e.g., test-numa-mathematical-correctness-OPERATION.cpp)
- * 2. Replace TEMPLATE_OPERATION with your operation name (e.g., MUL_MAT, ADD, etc.)
+ * 2. Replace TEMPLATE_OPERATION with your operation name (e.g., MUL_MAT, RMS_NORM, etc.)
  * 3. Implement test_single_OPERATION_case() for your specific operation
  * 4. Define appropriate test dimensions and thread strategies for your operation
  * 5. Update the operation-specific logic in test_OPERATION_mathematical_equivalence()
@@ -39,7 +39,8 @@
 #include "ggml.h"
 #include "ggml-cpu.h"
 #include "ggml-numa-executor.h"
-#include "ggml-numa-coordinator.h"
+#include "ggml-numa-simple-coordinator.h"  // For NUMA functions
+#include "ggml-cpu/binary-ops.h"
 
 // Test result structure
 struct TestResult {
@@ -111,44 +112,126 @@ private:
         bool case_passed = false;
         
         // TODO: Create input tensors appropriate for your operation
-        // Example for a binary operation:
-        // struct ggml_tensor* input_a = ggml_new_tensor_2d(test_ctx, GGML_TYPE_F32, dim1, dim2);
-        // struct ggml_tensor* input_b = ggml_new_tensor_2d(test_ctx, GGML_TYPE_F32, dim1, dim2);
+        // Examples for different operation types:
         
-        // TODO: Fill tensors with deterministic test data
-        // Example:
-        // float* a_data = (float*)ggml_get_data(input_a);
-        // float* b_data = (float*)ggml_get_data(input_b);
-        // for (int i = 0; i < ggml_nelements(input_a); i++) {
-        //     a_data[i] = 0.1f + (i % 37) * 0.01f; // Deterministic test pattern
-        // }
+        // For binary operations (like ADD, MUL, SUB):
+        // struct ggml_tensor* input_a = ggml_new_tensor_3d(test_ctx, GGML_TYPE_F32, dim1, dim2, dim3);
+        // struct ggml_tensor* input_b = ggml_new_tensor_3d(test_ctx, GGML_TYPE_F32, dim1, dim2, dim3);
+        
+        // For unary operations (like RMS_NORM, GELU):
+        // struct ggml_tensor* input_a = ggml_new_tensor_3d(test_ctx, GGML_TYPE_F32, dim1, dim2, dim3);
+        
+        // For matrix operations (like MUL_MAT):
+        // struct ggml_tensor* input_a = ggml_new_tensor_2d(test_ctx, GGML_TYPE_F32, dim1, dim2);
+        // struct ggml_tensor* input_b = ggml_new_tensor_2d(test_ctx, GGML_TYPE_F32, dim2, dim3);
+        
+        // PLACEHOLDER: Create example tensors (replace with your operation's requirements)
+        struct ggml_tensor* input_a = ggml_new_tensor_3d(test_ctx, GGML_TYPE_F32, dim1, dim2, dim3);
+        struct ggml_tensor* input_b = ggml_new_tensor_3d(test_ctx, GGML_TYPE_F32, dim1, dim2, dim3);
+        
+        if (!input_a || !input_b) {
+            printf("      ❌ Failed to create input tensors for %s\n", size_label);
+            ggml_free(test_ctx);
+            return false;
+        }
+        
+        // TODO: Fill tensors with deterministic test data appropriate for your operation
+        float* a_data = (float*)ggml_get_data(input_a);
+        float* b_data = (float*)ggml_get_data(input_b);
+        int total_elements = ggml_nelements(input_a);
+        
+        for (int i = 0; i < total_elements; i++) {
+            a_data[i] = 0.1f + (i % 37) * 0.01f; // Deterministic test pattern
+            // TODO: For unary operations, you might not need b_data
+            if (input_b) {
+                b_data[i] = 0.05f + (i % 23) * 0.015f; // Different pattern for B
+            }
+        }
+        
+        // CRITICAL: Re-initialize NUMA mirroring after filling data to ensure all NUMA copies have correct data
+        // The initial NUMA mirroring during tensor creation copied uninitialized memory (zeros)
+        // We need to re-mirror with the actual test data we just wrote
+        tensor_set_data_numa_mirror(input_a, a_data);
+        if (input_b) {
+            tensor_set_data_numa_mirror(input_b, b_data);
+        }
         
         // TODO: Create TEMPLATE_OPERATION operation
-        // Example:
-        // struct ggml_tensor* numa_result = ggml_TEMPLATE_OPERATION(test_ctx, input_a, input_b);
+        // Examples for different operations:
+        // struct ggml_tensor* numa_result = ggml_add(test_ctx, input_a, input_b);       // Binary
+        // struct ggml_tensor* numa_result = ggml_rms_norm(test_ctx, input_a, 1e-5f);   // Unary with params
+        // struct ggml_tensor* numa_result = ggml_mul_mat(test_ctx, input_a, input_b);  // Matrix multiplication
         
-        // TODO: Execute via NUMA intercept
-        // struct ggml_compute_params numa_params = {0, num_threads, 0, nullptr};
-        // enum ggml_status dispatch_result = ggml_numa_intercept_operation(numa_result, &numa_params);
+        // PLACEHOLDER: Create example operation (replace with your operation)
+        struct ggml_tensor* numa_result = ggml_add(test_ctx, input_a, input_b);
         
-        // TODO: Create reference computation using appropriate reference method
-        // This could be:
-        // - Direct mathematical kernel call (like ggml_compute_forward_OPERATION_one_chunk)
-        // - Serial execution with single thread
-        // - Known mathematical formula implementation
+        if (!numa_result) {
+            printf("      ❌ Failed to create TEMPLATE_OPERATION operation for %s\n", size_label);
+            ggml_free(test_ctx);
+            return false;
+        }
         
-        // TODO: Compare results using compare_float_arrays()
-        // Example:
-        // float* numa_data = (float*)ggml_get_data(numa_result);
-        // float* ref_data = (float*)ggml_get_data(ref_result);
-        // int total_elements = ggml_nelements(numa_result);
-        // case_passed = compare_float_arrays(numa_data, ref_data, total_elements, "TEMPLATE_OPERATION");
+        // Execute via NUMA executor
+        struct ggml_compute_params numa_params;
+        numa_params.ith = 0;
+        numa_params.nth = num_threads;
+        numa_params.wsize = 0;
+        numa_params.wdata = nullptr;
+        numa_params.threadpool = nullptr;
+        
+        // Create minimal compute plan for single tensor execution
+        struct ggml_cplan cplan = {};
+        cplan.work_size = 0;
+        cplan.work_data = nullptr;
+        cplan.n_threads = num_threads;
+        cplan.threadpool = nullptr;
+        cplan.abort_callback = nullptr;
+        cplan.abort_callback_data = nullptr;
+        
+        // Execute with new executor architecture
+        enum ggml_status dispatch_result = ggml_numa_executor_execute_tensor(numa_result, &cplan);
+        
+        if (dispatch_result != GGML_STATUS_SUCCESS) {
+            printf("      ❌ NUMA dispatch failed for %s: %d\n", size_label, dispatch_result);
+            ggml_free(test_ctx);
+            return false;
+        }
+        
+        // TODO: Create reference computation using serial execution
+        // This should use the appropriate reference implementation for your operation
+        // Examples:
+        
+        // For operations with existing reference functions:
+        // struct ggml_tensor* ref_result = ggml_add(test_ctx, input_a, input_b);
+        // struct ggml_compute_params ref_params = {0, 1, 0, nullptr, nullptr};
+        // ggml_compute_forward_add_non_quantized(&ref_params, ref_result);
+        
+        // For operations needing direct kernel calls:
+        // ggml_compute_forward_rms_norm_f32(&ref_params, ref_result);
+        
+        // PLACEHOLDER: Create reference computation (replace with your operation's reference)
+        struct ggml_tensor* ref_result = ggml_add(test_ctx, input_a, input_b);
+        struct ggml_compute_params ref_params;
+        ref_params.ith = 0;
+        ref_params.nth = 1;
+        ref_params.wsize = 0;
+        ref_params.wdata = nullptr;
+        ref_params.threadpool = nullptr;
+        ggml_compute_forward_add_non_quantized(&ref_params, ref_result);
+        
+        // Compare results
+        float* numa_data = (float*)ggml_get_data(numa_result);
+        float* ref_data = (float*)ggml_get_data(ref_result);
+        case_passed = compare_float_arrays(numa_data, ref_data, total_elements, "TEMPLATE_OPERATION");
+        
+        if (case_passed) {
+            printf("      ✅ %s TEMPLATE_OPERATION case passed (threads=%d)\n", size_label, num_threads);
+        } else {
+            printf("      ❌ %s TEMPLATE_OPERATION case failed (threads=%d)\n", size_label, num_threads);
+        }
         
         ggml_free(test_ctx);
-        
-        // TODO: Remove this placeholder return and implement actual logic
-        printf("      ⚠️  TEMPLATE METHOD - IMPLEMENT FOR YOUR OPERATION\n");
-        return true; // Placeholder - replace with actual test result
+        return case_passed;
     }
 
     void test_TEMPLATE_OPERATION_mathematical_equivalence() {
@@ -303,11 +386,21 @@ private:
 int main() {
     printf("🌟 Initializing NUMA system for mathematical correctness testing...\n");
     
-    // Initialize the NUMA coordinator system
-    struct ggml_numa_coordinator_manager* mgr = ggml_numa_coordinator_manager_get_global(8); // true = force_multi_socket
-    if (!mgr) {
-        printf("❌ Failed to initialize NUMA coordinator manager\n");
-        return 1;
+    // Initialize NUMA system before tests with auto-detection
+    if (ggml_numa_is_available()) {
+        printf("🔧 Initializing NUMA mirroring mode...\n");
+        
+        // Initialize with auto-detection pattern used in ADD test
+        int numa_initialization_result = ggml_numa_auto_init_mirror();
+        
+        if (numa_initialization_result != 0) {
+            printf("⚠️  NUMA auto-initialization failed with code: %d, proceeding with default configuration\n", numa_initialization_result);
+            // Continue with tests as NUMA will fall back to CPU implementation
+        } else {
+            printf("✅ NUMA mirroring mode initialized successfully\n");
+        }
+    } else {
+        printf("⚠️  NUMA not available on this system, tests will use CPU-only execution\n");
     }
     
     printf("✅ NUMA system initialized successfully\n\n");
@@ -323,21 +416,41 @@ int main() {
  * 
  * When adapting this template for a new operation:
  * 
- * 1. ✅ Replace all instances of "TEMPLATE_OPERATION" with your operation name
- * 2. ✅ Update test dimensions in test_cases[] array to match your operation's needs
+ * 1. ✅ Replace all instances of "TEMPLATE_OPERATION" with your operation name (e.g., "GLU", "RMS_NORM")
+ * 2. ✅ Update test dimensions in test_cases[] array to match your operation's needs:
+ *    - Binary ops (ADD, MUL): Use matching dimensions for both inputs
+ *    - Unary ops (RMS_NORM, GELU): Single input tensor dimensions
+ *    - Matrix ops (MUL_MAT): Consider [M, K] x [K, N] → [M, N] patterns
  * 3. ✅ Implement test_single_OPERATION_case() with:
- *    - Appropriate tensor creation for your operation
- *    - Deterministic test data generation
- *    - NUMA operation execution via ggml_numa_intercept_operation
- *    - Reference implementation (serial computation or mathematical kernel)
+ *    - Appropriate tensor creation (ggml_new_tensor_*) for your operation
+ *    - Deterministic test data generation (avoid random data for reproducibility)
+ *    - NUMA mirroring setup using tensor_set_data_numa_mirror() after data filling
+ *    - NUMA operation execution via ggml_numa_executor_execute_tensor()
+ *    - Reference implementation using appropriate serial computation
  *    - Result comparison using compare_float_arrays()
- * 4. ✅ Update CMakeLists.txt to include your new test file
- * 5. ✅ Test your implementation with: ./tests/run-numa-tests.sh
- * 6. ✅ Verify all test combinations pass before considering complete
+ * 4. ✅ Update CMakeLists.txt to include your new test file:
+ *    - Add executable definition
+ *    - Link against required libraries (ggml-cpu, common, etc.)
+ *    - Include in test target dependencies
+ * 5. ✅ Add your test to tests/run-numa-tests.sh script
+ * 6. ✅ Test your implementation thoroughly:
+ *    - Run individual test: cmake --build build --target test-numa-mathematical-correctness-YOUR_OPERATION
+ *    - Run full test suite: ./tests/run-numa-tests.sh
+ *    - Verify all test combinations pass before considering complete
  * 
  * REFERENCE IMPLEMENTATIONS:
- * - See test-numa-mathematical-correctness.cpp for working MUL_MAT example
- * - Mathematical kernels available in ggml/src/ggml-cpu/ggml-cpu-impl.h
+ * - See test-numa-mathematical-correctness-add.cpp for binary operation example
+ * - See test-numa-mathematical-correctness-rms-norm.cpp for unary operation example
+ * - Mathematical kernels available in ggml/src/ggml-cpu/ggml-cpu.c
+ * - NUMA kernels available in ggml/src/ggml-cpu/numa-kernels/
+ * 
+ * TESTING PATTERNS:
+ * - TINY: Single-node, single-thread execution
+ * - SMALL: Single-node, multi-thread execution  
+ * - MEDIUM: Multi-node, single-thread per node
+ * - LARGE: Multi-node, multi-thread execution
+ * - HUGE: Full NUMA parallelization with optimal chunking
+ */
  * - Operation dispatch examples in ggml/src/ggml-cpu/ggml-numa-operation-dispatch.c
  * 
  * TESTING PRINCIPLES:
