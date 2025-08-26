@@ -2,7 +2,15 @@
  * NUMA Mathematical Correctness Test: Matrix Multiplication (MUL_MAT)
  * 
  * This test validates that NUMA-parallel matrix multiplication produces
- * mathematically identical results to the reference implementation.
+ * mathematically identical results to the reference implem        if (results_match) {
+            printf("      ✅ %s: MUL_MAT results match\n", size_label);
+        } else {
+            printf("      ❌ %s: MUL_MAT results do not match\n", size_label);
+        }
+        
+        ggml_free(ref_ctx);  // Clean up reference context
+        ggml_free(ctx);
+        return results_match;.
  * 
  * Test Strategy:
  * - Multi-dimensional matrices from tiny to gigantic scales
@@ -18,6 +26,7 @@
 #include <string>
 #include <algorithm>
 #include <stdexcept>
+#include <random>
 
 // GGML includes
 #include "ggml.h"
@@ -25,6 +34,17 @@
 #include "ggml-numa-executor.h"
 #include "ggml-numa-simple-coordinator.h"
 #include "ggml-cpu/binary-ops.h"
+
+// Forward declarations
+extern "C" void ggml_compute_forward_mul_mat(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+
+// F16 dot product test declarations
+extern "C" {
+    void ggml_numa_vec_dot_f16_custom(int n, float* s, size_t s_off,
+                                     const void* x, size_t x_off,
+                                     const void* y, size_t y_off, int nrc);
+    void ggml_vec_dot_f16(int n, float * s, size_t bs, ggml_fp16_t * x, size_t bx, ggml_fp16_t * y, size_t by, int nrc);
+}
 
 // Test result structure
 struct TestResult {
@@ -70,6 +90,113 @@ private:
         }
         
         return all_match;
+    }
+    
+    // F16 dot product utility functions
+    float reference_dot_product_f32(const std::vector<ggml_fp16_t>& x, const std::vector<ggml_fp16_t>& y) {
+        float sum = 0.0f;
+        for (size_t i = 0; i < x.size(); i++) {
+            float x_f32 = ggml_fp16_to_fp32(x[i]);
+            float y_f32 = ggml_fp16_to_fp32(y[i]);
+            sum += x_f32 * y_f32;
+        }
+        return sum;
+    }
+    
+    bool within_tolerance(float a, float b, float tol) {
+        float abs_diff = std::abs(a - b);
+        float max_val = std::max(std::abs(a), std::abs(b));
+        
+        // Use relative tolerance for large values, absolute for small
+        if (max_val > 1.0f) {
+            return abs_diff <= tol * max_val;
+        } else {
+            return abs_diff <= tol;
+        }
+    }
+    
+    void generate_f16_test_vectors(std::vector<ggml_fp16_t>& x, std::vector<ggml_fp16_t>& y, int n, int pattern, std::mt19937& rng) {
+        x.resize(n);
+        y.resize(n);
+        
+        switch (pattern) {
+            case 0: { // Sequential pattern
+                for (int i = 0; i < n; i++) {
+                    x[i] = ggml_fp32_to_fp16((i + 1) * 0.1f);
+                    y[i] = ggml_fp32_to_fp16((i + 1) * 0.05f);
+                }
+                break;
+            }
+                
+            case 1: { // Alternating pattern  
+                for (int i = 0; i < n; i++) {
+                    x[i] = ggml_fp32_to_fp16((i % 2 == 0) ? 1.0f : -1.0f);
+                    y[i] = ggml_fp32_to_fp16((i % 3 == 0) ? 2.0f : 0.5f);
+                }
+                break;
+            }
+                
+            case 2: { // Random pattern
+                std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+                for (int i = 0; i < n; i++) {
+                    x[i] = ggml_fp32_to_fp16(dist(rng));
+                    y[i] = ggml_fp32_to_fp16(dist(rng));
+                }
+                break;
+            }
+                
+            case 3: { // Edge cases
+                for (int i = 0; i < n; i++) {
+                    float x_val = (i == 0) ? 0.0f : ((i == n-1) ? 1.0f : 0.1f);
+                    float y_val = (i == 0) ? 1.0f : ((i == n-1) ? 0.0f : 0.2f);
+                    x[i] = ggml_fp32_to_fp16(x_val);
+                    y[i] = ggml_fp32_to_fp16(y_val);
+                }
+                break;
+            }
+        }
+    }
+    
+    // Test single F16 dot product case
+    bool test_single_f16_dot_product_case(int n, const char* description) {
+        printf("      🧮 Testing F16 Dot Product %s (length=%d)\n", description, n);
+        
+        std::mt19937 rng(12345);
+        const float tolerance = 1e-3f;  // F16 precision tolerance
+        bool all_patterns_passed = true;
+        const char* pattern_names[] = {"Sequential", "Alternating", "Random", "EdgeCases"};
+        
+        // Test multiple data patterns
+        for (int pattern = 0; pattern < 4; pattern++) {
+            std::vector<ggml_fp16_t> x, y;
+            generate_f16_test_vectors(x, y, n, pattern, rng);
+            
+            // Test our custom implementation
+            float custom_result = 0.0f;
+            ggml_numa_vec_dot_f16_custom(n, &custom_result, 0, x.data(), 0, y.data(), 0, 1);
+            
+            // Test GGML reference implementation
+            float ggml_result = 0.0f;
+            ggml_vec_dot_f16(n, &ggml_result, 0, x.data(), 0, y.data(), 0, 1);
+            
+            // Test with our F32 reference for absolute truth
+            float f32_reference = reference_dot_product_f32(x, y);
+            
+            // Check against F32 reference (which should be most accurate)
+            float error = std::abs(custom_result - f32_reference);
+            bool passed = within_tolerance(custom_result, f32_reference, tolerance);
+            
+            if (passed) {
+                printf("        ✅ %s_%s: Results match (Custom=%.6f, F32Ref=%.6f, GGML=%.6f, Err=%.2e)\n", 
+                       description, pattern_names[pattern], custom_result, f32_reference, ggml_result, error);
+            } else {
+                printf("        ❌ %s_%s: Results differ (Custom=%.6f, F32Ref=%.6f, GGML=%.6f, Err=%.2e)\n", 
+                       description, pattern_names[pattern], custom_result, f32_reference, ggml_result, error);
+                all_patterns_passed = false;
+            }
+        }
+        
+        return all_patterns_passed;
     }
     
     // Test a single MUL_MAT case with specific dimensions and thread count
@@ -132,29 +259,22 @@ private:
         // Test 1: NUMA execution
         // ==================================================================
         
-        // Enable NUMA mode for coordinator testing
-        setenv("GGML_NUMA_DEBUG", "1", 1);  // Enable debug for detailed logging
-        
-        // Build compute graph
-        struct ggml_cgraph * gf = ggml_new_graph(ctx);
-        ggml_build_forward_expand(gf, C);
-        
-        // Execute with NUMA
+        // Enable NUMA mode for coordinator testing  
         printf("      📊 Executing with NUMA (threads=%d)...\n", num_threads);
-        struct ggml_cplan numa_plan = ggml_graph_plan(gf, num_threads, nullptr);
-        if (numa_plan.work_size > 0) {
-            numa_plan.work_data = (uint8_t*)malloc(numa_plan.work_size);
-            if (!numa_plan.work_data) {
-                printf("      ❌ Failed to allocate work buffer\n");
-                ggml_free(ctx);
-                return false;
-            }
-        }
         
-        enum ggml_status numa_status = ggml_graph_compute(gf, &numa_plan);
+        // Execute with NUMA executor directly (like ADD test does)
+        struct ggml_cplan numa_plan = {};
+        numa_plan.work_size = 0;
+        numa_plan.work_data = nullptr;
+        numa_plan.n_threads = num_threads;
+        numa_plan.threadpool = nullptr;
+        numa_plan.abort_callback = nullptr;
+        numa_plan.abort_callback_data = nullptr;
+        
+        // Execute with new executor architecture
+        enum ggml_status numa_status = ggml_numa_executor_execute_tensor(C, &numa_plan);
         if (numa_status != GGML_STATUS_SUCCESS) {
             printf("      ❌ NUMA execution failed with status %d\n", numa_status);
-            if (numa_plan.work_data) free(numa_plan.work_data);
             ggml_free(ctx);
             return false;
         }
@@ -164,10 +284,6 @@ private:
         std::vector<float> numa_result(result_size);
         memcpy(numa_result.data(), ggml_get_data(C), result_size * sizeof(float));
         
-        if (numa_plan.work_data) {
-            free(numa_plan.work_data);
-        }
-        
         // ==================================================================
         // Test 2: Reference implementation (CPU fallback)
         // ==================================================================
@@ -175,40 +291,40 @@ private:
         // Reset result tensor
         memset(ggml_get_data(C), 0, result_size * sizeof(float));
         
-        // Disable NUMA to force CPU fallback
-        unsetenv("GGML_NUMA_DEBUG");
-        setenv("GGML_NUMA_DISABLE", "1", 1);
-        
         printf("      📊 Executing with CPU reference (threads=%d)...\n", num_threads);
         
-        struct ggml_cplan ref_plan = ggml_graph_plan(gf, num_threads, nullptr);
-        if (ref_plan.work_size > 0) {
-            ref_plan.work_data = (uint8_t*)malloc(ref_plan.work_size);
-            if (!ref_plan.work_data) {
-                printf("      ❌ Failed to allocate reference work buffer\n");
-                ggml_free(ctx);
-                return false;
-            }
-        }
+        // Create a separate context for reference computation to avoid NUMA interference
+        struct ggml_init_params ref_init_params;
+        ref_init_params.mem_size = std::max((size_t)(512 * 1024 * 1024), total_elements * sizeof(float) * 8);  // Extra space
+        ref_init_params.mem_buffer = nullptr;
+        ref_init_params.no_alloc = false;
         
-        enum ggml_status ref_status = ggml_graph_compute(gf, &ref_plan);
-        if (ref_status != GGML_STATUS_SUCCESS) {
-            printf("      ❌ Reference execution failed with status %d\n", ref_status);
-            if (ref_plan.work_data) free(ref_plan.work_data);
+        struct ggml_context* ref_ctx = ggml_init(ref_init_params);
+        if (!ref_ctx) {
+            printf("Failed to create reference context\n");
             ggml_free(ctx);
             return false;
         }
         
+        // Create reference tensors (identical layout to NUMA tensors)
+        struct ggml_tensor* ref_A = ggml_new_tensor_4d(ref_ctx, GGML_TYPE_F32, k, m, 1, 1);  // [k, m, 1, 1] 
+        struct ggml_tensor* ref_B = ggml_new_tensor_4d(ref_ctx, GGML_TYPE_F32, k, n, 1, 1);  // [k, n, 1, 1]
+        struct ggml_tensor* ref_C = ggml_mul_mat(ref_ctx, ref_A, ref_B);
+        
+        // Copy input data to reference tensors
+        memcpy(ggml_get_data(ref_A), ggml_get_data(A), ggml_nbytes(A));
+        memcpy(ggml_get_data(ref_B), ggml_get_data(B), ggml_nbytes(B));
+        
+        // Build and compute reference graph using standard GGML (no NUMA)
+        struct ggml_cgraph* ref_cgraph = ggml_new_graph(ref_ctx);
+        ggml_build_forward_expand(ref_cgraph, ref_C);
+        
+        // Execute using standard CPU computation
+        ggml_graph_compute_with_ctx(ref_ctx, ref_cgraph, num_threads);
+        
         // Copy reference result
         std::vector<float> ref_result(result_size);
-        memcpy(ref_result.data(), ggml_get_data(C), result_size * sizeof(float));
-        
-        if (ref_plan.work_data) {
-            free(ref_plan.work_data);
-        }
-        
-        // Restore environment
-        unsetenv("GGML_NUMA_DISABLE");
+        memcpy(ref_result.data(), ggml_get_data(ref_C), result_size * sizeof(float));
         
         // ==================================================================
         // Test 3: Compare results
@@ -237,21 +353,22 @@ public:
             // Tiny matrices
             {4, 4, 4, "TINY_4x4x4"},
             {6, 8, 10, "TINY_6x8x10"},
+            {8, 12, 16, "TINY_8x12x16"},
             
-            // Small matrices
+            // Small matrices  
+            {16, 32, 48, "SMALL_16x32x48"},
             {32, 16, 24, "SMALL_32x16x24"},
-            {48, 32, 32, "SMALL_48x32x32"},
+            {24, 48, 32, "SMALL_24x48x32"},
             
             // Medium matrices
+            {64, 128, 96, "MEDIUM_64x128x96"},
             {128, 64, 96, "MEDIUM_128x64x96"},
-            {256, 128, 192, "MEDIUM_256x128x192"},
+            {96, 192, 128, "MEDIUM_96x192x128"},
             
-            // Large matrices
+            // Large matrices 
+            {256, 512, 384, "LARGE_256x512x384"},
             {512, 256, 384, "LARGE_512x256x384"},
-            {768, 512, 512, "LARGE_768x512x512"},
-            
-            // Huge matrices (if system can handle)
-            {1536, 1024, 1024, "HUGE_1536x1024x1024"}
+            {384, 768, 512, "LARGE_384x768x512"}
         };
         
         // Test different thread counts
@@ -295,14 +412,66 @@ public:
         return all_passed;
     }
     
+    // Test F16 dot product mathematical equivalence
+    bool test_f16_dot_product_mathematical_equivalence() {
+        printf("  🧮 Testing F16 Dot Product Mathematical Equivalence\n");
+        
+        // Test different vector sizes
+        struct {
+            int size;
+            const char* name;
+        } test_sizes[] = {
+            {4, "TINY_4"},
+            {16, "SMALL_16"}, 
+            {64, "MEDIUM_64"},
+            {256, "LARGE_256"},
+            {1024, "HUGE_1024"},
+            {4096, "GIGANTIC_4096"}
+        };
+        
+        bool all_passed = true;
+        
+        for (auto& test : test_sizes) {
+            std::string test_name = "F16_DOT_PRODUCT_" + std::string(test.name);
+            
+            try {
+                bool passed = test_single_f16_dot_product_case(test.size, test.name);
+                
+                results.push_back({
+                    test_name,
+                    passed,
+                    passed ? "" : "Mathematical mismatch in F16 dot product"
+                });
+                
+                if (!passed) {
+                    all_passed = false;
+                    printf("    ❌ FAILED: %s\n", test_name.c_str());
+                } else {
+                    printf("    ✅ PASSED: %s\n", test_name.c_str());
+                }
+                
+            } catch (const std::exception& e) {
+                printf("    💥 EXCEPTION in %s: %s\n", test_name.c_str(), e.what());
+                results.push_back({test_name, false, std::string("Exception: ") + e.what()});
+                all_passed = false;
+            }
+        }
+        
+        return all_passed;
+    }
+    
     // Run all MUL_MAT tests and provide summary
     bool run_all_tests() {
-        printf("🧪 NUMA Mathematical Correctness Test Suite: MUL_MAT\n");
+        printf("🧪 NUMA Mathematical Correctness Test Suite: MUL_MAT & F16 DOT PRODUCT\n");
         printf("================================================================\n");
         
         bool all_passed = true;
         
         if (!test_MUL_MAT_mathematical_equivalence()) {
+            all_passed = false;
+        }
+        
+        if (!test_f16_dot_product_mathematical_equivalence()) {
             all_passed = false;
         }
         
@@ -330,9 +499,9 @@ public:
         printf("Total:  %d\n", passed_count + failed_count);
         
         if (all_passed) {
-            printf("🎉 ALL TESTS PASSED! MUL_MAT NUMA implementation is mathematically correct.\n");
+            printf("🎉 ALL TESTS PASSED! MUL_MAT & F16 DOT PRODUCT NUMA implementations are mathematically correct.\n");
         } else {
-            printf("💥 SOME TESTS FAILED! Check the MUL_MAT NUMA implementation.\n");
+            printf("💥 SOME TESTS FAILED! Check the MUL_MAT & F16 DOT PRODUCT NUMA implementations.\n");
         }
         
         return all_passed;

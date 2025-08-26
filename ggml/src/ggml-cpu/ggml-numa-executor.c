@@ -112,7 +112,7 @@ enum ggml_status ggml_numa_executor_compute_graph(struct ggml_cgraph * cgraph, s
 
 enum ggml_status ggml_numa_executor_execute_tensor(struct ggml_tensor * tensor, struct ggml_cplan * cplan) {
     if (!tensor || !cplan) {
-        printf("DEBUG: NUMA Executor: NULL tensor=%p or cplan=%p, returning FAILED\n", tensor, cplan);
+        NUMA_LOG_DEBUG("DEBUG: NUMA Executor: NULL tensor=%p or cplan=%p, returning FAILED\n", tensor, cplan);
         return GGML_STATUS_FAILED;
     }
     
@@ -121,17 +121,17 @@ enum ggml_status ggml_numa_executor_execute_tensor(struct ggml_tensor * tensor, 
     
     NUMA_PERF_START(NUMA_PERF_OPERATION_TOTAL, op_name, "numa_executor", -1, tensor_size, cplan->n_threads);
     
-    printf("DEBUG: NUMA Executor: Starting execution for %s, threads=%d\n", op_name, cplan->n_threads);
+    NUMA_LOG_DEBUG("DEBUG: NUMA Executor: Starting execution for %s, threads=%d\n", op_name, cplan->n_threads);
     
     // Check NUMA environment
     #ifdef __linux__
     int current_cpu = sched_getcpu();
     int current_node = numa_node_of_cpu(current_cpu);
     int numa_nodes = numa_max_node() + 1;
-    printf("DEBUG: NUMA Executor: Running on CPU %d (NUMA node %d), %d nodes available\n", 
+    NUMA_LOG_DEBUG("DEBUG: NUMA Executor: Running on CPU %d (NUMA node %d), %d nodes available\n", 
            current_cpu, current_node, numa_nodes);
     #else
-    printf("DEBUG: NUMA Executor: NUMA info not available (not Linux)\n");
+    NUMA_LOG_DEBUG("DEBUG: NUMA Executor: NUMA info not available (not Linux)\n");
     #endif
     
     // Query the kernel registry for execution information
@@ -139,7 +139,7 @@ enum ggml_status ggml_numa_executor_execute_tensor(struct ggml_tensor * tensor, 
     ggml_numa_kernel_query_result_t query_result = ggml_numa_kernels_query(tensor);
     NUMA_PERF_END();
     
-    printf("DEBUG: NUMA Executor: Query result - supported=%s, kernel=%s\n", 
+    NUMA_LOG_DEBUG("DEBUG: NUMA Executor: Query result - supported=%s, kernel=%s\n", 
            query_result.supported ? "true" : "false", 
            query_result.supported ? query_result.kernel_name : "N/A");
     
@@ -189,14 +189,14 @@ enum ggml_status ggml_numa_executor_execute_tensor(struct ggml_tensor * tensor, 
     enum ggml_status result = GGML_STATUS_SUCCESS;
     
     int num_numa_nodes = ggml_numa_simple_coordinator_get_num_nodes();
-    printf("DEBUG: NUMA Executor: num_numa_nodes=%d, strategy=%s\n", 
+    NUMA_LOG_DEBUG("DEBUG: NUMA Executor: num_numa_nodes=%d, strategy=%s\n", 
            num_numa_nodes,
            (query_result.strategy.node_strategy == NUMA_NODE_STRATEGY_DATA_PARALLEL) ? "data-parallel" : "single-node");
            
     if (query_result.strategy.node_strategy == NUMA_NODE_STRATEGY_DATA_PARALLEL && num_numa_nodes > 1) {
         // Multi-node data-parallel execution
         NUMA_PERF_START(NUMA_PERF_EXECUTOR_KERNEL_EXEC, op_name, query_result.kernel_name, -1, tensor_size, num_numa_nodes);
-        printf("DEBUG: NUMA Executor: Taking DATA_PARALLEL path with %d nodes\n", num_numa_nodes);
+        NUMA_LOG_DEBUG("DEBUG: NUMA Executor: Taking DATA_PARALLEL path with %d nodes\n", num_numa_nodes);
         GGML_LOG_DEBUG("NUMA Executor: Dispatching %s for data-parallel execution across %d nodes\n", 
                        op_name, num_numa_nodes);
         
@@ -206,7 +206,7 @@ enum ggml_status ggml_numa_executor_execute_tensor(struct ggml_tensor * tensor, 
         result = ggml_numa_simple_coordinator_execute_data_parallel(
             query_result.work_function, tensor, query_result.work_buffer_size_per_thread);
             
-        printf("DEBUG: NUMA Executor: Data-parallel execution result=%d\n", result);
+        NUMA_LOG_DEBUG("DEBUG: NUMA Executor: Data-parallel execution result=%d\n", result);
         NUMA_PERF_END();
         
     } else {
@@ -219,9 +219,9 @@ enum ggml_status ggml_numa_executor_execute_tensor(struct ggml_tensor * tensor, 
             int isolate_node = ggml_numa_get_isolate_node();
             if (isolate_node >= 0) {
                 target_node = isolate_node;
-                printf("DEBUG: NUMA Executor: ISOLATE mode - using isolation node %d\n", target_node);
+                NUMA_LOG_DEBUG("DEBUG: NUMA Executor: ISOLATE mode - using isolation node %d\n", target_node);
             } else {
-                printf("DEBUG: NUMA Executor: ISOLATE mode - no valid isolation node, using default node 0\n");
+                NUMA_LOG_DEBUG("DEBUG: NUMA Executor: ISOLATE mode - no valid isolation node, using default node 0\n");
             }
         } else {
             // For other strategies, detect optimal node based on data locality
@@ -233,37 +233,37 @@ enum ggml_status ggml_numa_executor_execute_tensor(struct ggml_tensor * tensor, 
                     int data_node = get_memory_numa_node(src_data);
                     if (data_node >= 0) {
                         target_node = data_node;
-                        printf("DEBUG: NUMA Executor: Data locality detection - src0 data on node %d, using that node\n", target_node);
+                        NUMA_LOG_DEBUG("DEBUG: NUMA Executor: Data locality detection - src0 data on node %d, using that node\n", target_node);
                     } else {
-                        printf("DEBUG: NUMA Executor: Data locality detection failed, using default node 0\n");
+                        NUMA_LOG_DEBUG("DEBUG: NUMA Executor: Data locality detection failed, using default node 0\n");
                     }
                 } else {
-                    printf("DEBUG: NUMA Executor: No source data available, using default node 0\n");
+                    NUMA_LOG_DEBUG("DEBUG: NUMA Executor: No source data available, using default node 0\n");
                 }
             } else {
-                printf("DEBUG: NUMA Executor: No source tensor available, using default node 0\n");
+                NUMA_LOG_DEBUG("DEBUG: NUMA Executor: No source tensor available, using default node 0\n");
             }
         }
         
         NUMA_PERF_START(NUMA_PERF_EXECUTOR_KERNEL_EXEC, op_name, query_result.kernel_name, target_node, tensor_size, 1);
-        printf("DEBUG: NUMA Executor: Taking SINGLE_NODE path, target_node=%d (strategy=%d)\n", target_node, strategy);
+        NUMA_LOG_DEBUG("DEBUG: NUMA Executor: Taking SINGLE_NODE path, target_node=%d (strategy=%d)\n", target_node, strategy);
         GGML_LOG_DEBUG("NUMA Executor: Dispatching %s for single-node execution on node %d\n", 
                        ggml_op_name(tensor->op), target_node);
         
         result = ggml_numa_simple_coordinator_execute_single_node(
             query_result.work_function, tensor, target_node, query_result.work_buffer_size_per_thread);
         
-        printf("DEBUG: NUMA Executor: Single-node execution result=%d\n", result);
+        NUMA_LOG_DEBUG("DEBUG: NUMA Executor: Single-node execution result=%d\n", result);
         NUMA_PERF_END();
     }
     
-    printf("DEBUG: NUMA Executor: Final result=%d for %s\n", result, op_name);
+    NUMA_LOG_DEBUG("DEBUG: NUMA Executor: Final result=%d for %s\n", result, op_name);
     if (result == GGML_STATUS_SUCCESS) {
-        printf("DEBUG: NUMA Executor: SUCCESS - returning GGML_STATUS_SUCCESS\n");
+        NUMA_LOG_DEBUG("DEBUG: NUMA Executor: SUCCESS - returning GGML_STATUS_SUCCESS\n");
         GGML_LOG_DEBUG("NUMA Executor: Successfully completed %s using %s\n", 
                        op_name, query_result.kernel_name);
     } else {
-        printf("DEBUG: NUMA Executor: FAILURE - returning status %d\n", result);
+        NUMA_LOG_DEBUG("DEBUG: NUMA Executor: FAILURE - returning status %d\n", result);
         GGML_LOG_ERROR("NUMA Executor: Failed to execute %s using %s (status=%d)\n", 
                        op_name, query_result.kernel_name, (int)result);
     }

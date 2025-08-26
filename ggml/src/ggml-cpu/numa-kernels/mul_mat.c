@@ -66,6 +66,65 @@
 #endif
 
 // ============================================================================
+// Custom F16 Dot Product Implementation  
+// ============================================================================
+
+/**
+ * Custom F16 dot product implementation optimized for NUMA execution
+ * 
+ * This function provides a specialized F16 dot product that can be tested
+ * against the reference implementation for mathematical correctness.
+ * 
+ * @param n      Vector length
+ * @param s      Output scalar result
+ * @param s_off  Output offset (should be 0)
+ * @param x      First vector (F16 data)  
+ * @param x_off  First vector offset
+ * @param y      Second vector (F16 data)
+ * @param y_off  Second vector offset
+ * @param nrc    Number of rows per call (should be 1)
+ */
+void ggml_numa_vec_dot_f16_custom(int n, float * restrict s, size_t s_off, 
+                                 const void * restrict x, size_t x_off,
+                                 const void * restrict y, size_t y_off, int nrc) {
+    // Ensure single row operation
+    assert(nrc == 1);
+    assert(s_off == 0);
+    
+    const ggml_fp16_t * restrict x_f16 = (const ggml_fp16_t *)x + x_off;
+    const ggml_fp16_t * restrict y_f16 = (const ggml_fp16_t *)y + y_off;
+    
+    // Custom F16 dot product implementation
+    float sum = 0.0f;
+    
+    // Process in chunks of 4 for better cache utilization and potential SIMD
+    int i = 0;
+    for (; i + 3 < n; i += 4) {
+        // Convert F16 to F32 and accumulate
+        float x0 = ggml_fp16_to_fp32(x_f16[i + 0]);
+        float y0 = ggml_fp16_to_fp32(y_f16[i + 0]);
+        float x1 = ggml_fp16_to_fp32(x_f16[i + 1]);
+        float y1 = ggml_fp16_to_fp32(y_f16[i + 1]);
+        float x2 = ggml_fp16_to_fp32(x_f16[i + 2]);
+        float y2 = ggml_fp16_to_fp32(y_f16[i + 2]);
+        float x3 = ggml_fp16_to_fp32(x_f16[i + 3]);
+        float y3 = ggml_fp16_to_fp32(y_f16[i + 3]);
+        
+        // Accumulate products (unrolled for better performance)
+        sum += x0 * y0 + x1 * y1 + x2 * y2 + x3 * y3;
+    }
+    
+    // Handle remaining elements
+    for (; i < n; i++) {
+        float x_val = ggml_fp16_to_fp32(x_f16[i]);
+        float y_val = ggml_fp16_to_fp32(y_f16[i]);
+        sum += x_val * y_val;
+    }
+    
+    *s = sum;
+}
+
+// ============================================================================
 // Type Traits Access for vec_dot Operations
 // ============================================================================
 
@@ -158,10 +217,12 @@ enum ggml_status ggml_numa_kernel_mul_mat_execute(void * work_context,
     const int64_t ne0  = dst->ne[0],  ne1  = dst->ne[1],  ne2  = dst->ne[2],  ne3  = dst->ne[3];
     const size_t  nb0  = dst->nb[0],  nb1  = dst->nb[1],  nb2  = dst->nb[2],  nb3  = dst->nb[3];
     
-    // Validate matrix multiplication constraints
-    if (ne00 != ne01 || ne1 != ne11 || ne2 != ne12 || ne3 != ne13) {
-        NUMA_LOG_DEBUG("MUL_MAT kernel: Dimension mismatch - ne00=%ld, ne01=%ld, ne1=%ld, ne11=%ld", 
-                       ne00, ne01, ne1, ne11);
+    // Validate matrix multiplication constraints: C = A × B
+    // A's columns (ne00) must match B's rows (ne10)
+    // Result dimensions: ne0=A_rows(ne01), ne1=B_cols(ne11) 
+    if (ne00 != ne10 || ne0 != ne01 || ne1 != ne11 || ne2 != ne12 || ne3 != ne13) {
+        NUMA_LOG_DEBUG("MUL_MAT kernel: Dimension mismatch - A:[%ld,%ld] × B:[%ld,%ld] -> C:[%ld,%ld], batch:[%ld,%ld]", 
+                       ne01, ne00, ne10, ne11, ne0, ne1, ne2, ne3);
         return GGML_STATUS_FAILED;
     }
     
@@ -170,6 +231,9 @@ enum ggml_status ggml_numa_kernel_mul_mat_execute(void * work_context,
     ggml_vec_dot_t const vec_dot = type_traits->vec_dot;
     enum ggml_type const vec_dot_type = type_traits->vec_dot_type;
     const int64_t vec_dot_num_rows = type_traits->nrows;
+    
+    // Check if we should use custom F16 dot product for testing
+    bool use_custom_f16_dot = (src0->type == GGML_TYPE_F16 && vec_dot_type == GGML_TYPE_F16);
     
     // Get NUMA-local data pointers
     const void * src0_data = tensor_data(src0);
@@ -204,6 +268,9 @@ enum ggml_status ggml_numa_kernel_mul_mat_execute(void * work_context,
     const int thread_id = params->ith;
     const int num_threads = params->nth;
     
+    NUMA_LOG_DEBUG("MUL_MAT Node %d: src0_type=%d, src1_type=%d, vec_dot_type=%d, use_custom_f16=%s", 
+                   current_node, src0->type, src1->type, vec_dot_type, use_custom_f16_dot ? "true" : "false");
+    
     NUMA_LOG_DEBUG("MUL_MAT Node %d, Thread %d/%d: dims=[%ld,%ld,%ld,%ld] x [%ld,%ld,%ld,%ld] -> [%ld,%ld,%ld,%ld]", 
                    current_node, thread_id, num_threads,
                    ne00, ne01, ne02, ne03, ne10, ne11, ne12, ne13, ne0, ne1, ne2, ne3);
@@ -226,6 +293,12 @@ enum ggml_status ggml_numa_kernel_mul_mat_execute(void * work_context,
     if (nchunk0 * nchunk1 < num_threads * 4) {
         nchunk0 = nr0 > nr1 ? num_threads : 1;
         nchunk1 = nr0 > nr1 ? 1 : num_threads;
+    }
+    
+    // CRITICAL FIX: If we have only 1 thread, it must process all chunks
+    if (num_threads == 1) {
+        nchunk0 = 1;
+        nchunk1 = 1;
     }
     
     const int64_t dr0 = (nr0 + nchunk0 - 1) / nchunk0;
@@ -269,8 +342,11 @@ enum ggml_status ggml_numa_kernel_mul_mat_execute(void * work_context,
     
     // Early exit if no work assigned
     if (ir0_start >= ir0_end || ir1_start >= ir1_end) {
+        NUMA_LOG_DEBUG("MUL_MAT Node %d, Thread %d: NO WORK ASSIGNED - early exit", current_node, thread_id);
         return GGML_STATUS_SUCCESS;
     }
+    
+    NUMA_LOG_DEBUG("MUL_MAT Node %d, Thread %d: STARTING COMPUTATION LOOPS", current_node, thread_id);
     
     // Calculate src1 column stride for contiguous vs non-contiguous data
     const size_t src1_col_stride = src1_cont || src1->type != vec_dot_type ? row_size : nb11;
@@ -280,6 +356,7 @@ enum ggml_status ggml_numa_kernel_mul_mat_execute(void * work_context,
     const int64_t blck_1 = 16;
     
     // Main computation loop following original ggml_compute_forward_mul_mat_one_chunk pattern
+    int total_operations = 0;
     for (int64_t iir1 = ir1_start; iir1 < ir1_end; iir1 += blck_1) {
         for (int64_t iir0 = ir0_start; iir0 < ir0_end; iir0 += blck_0) {
             for (int64_t ir1 = iir1; ir1 < iir1 + blck_1 && ir1 < ir1_end; ir1 += vec_dot_num_rows) {
@@ -310,8 +387,13 @@ enum ggml_status ggml_numa_kernel_mul_mat_execute(void * work_context,
                 // Process rows in the current block
                 for (int64_t ir0 = iir0; ir0 < iir0 + blck_0 && ir0 < ir0_end; ir0 += vec_dot_num_rows) {
                     if (vec_dot_num_rows == 1) {
-                        // Single row case - direct vec_dot (matching original)
-                        vec_dot(ne00, &dst_col[ir0], 0, src0_row + ir0*nb01, 0, src1_col, 0, 1);
+                        // Single row case - use custom F16 dot product if applicable
+                        if (use_custom_f16_dot) {
+                            ggml_numa_vec_dot_f16_custom(ne00, &dst_col[ir0], 0, src0_row + ir0*nb01, 0, src1_col, 0, 1);
+                        } else {
+                            vec_dot(ne00, &dst_col[ir0], 0, src0_row + ir0*nb01, 0, src1_col, 0, 1);
+                        }
+                        total_operations++;
                     } else {
                         // Multi-row case for SIMD optimizations (matching original)
                         for (int cn = 0; cn < vec_dot_num_rows; ++cn) {
@@ -319,13 +401,20 @@ enum ggml_status ggml_numa_kernel_mul_mat_execute(void * work_context,
                             const char * src0_ptr = src0_row + (ir0 + cn) * nb01;
                             const char * src1_ptr = src1_col + cn * src1_col_stride;
                             
-                            vec_dot(ne00, dst_ptr, 0, src0_ptr, 0, src1_ptr, 0, 1);
+                            if (use_custom_f16_dot) {
+                                ggml_numa_vec_dot_f16_custom(ne00, dst_ptr, 0, src0_ptr, 0, src1_ptr, 0, 1);
+                            } else {
+                                vec_dot(ne00, dst_ptr, 0, src0_ptr, 0, src1_ptr, 0, 1);
+                            }
+                            total_operations++;
                         }
                     }
                 }
             }
         }
     }
+    
+    NUMA_LOG_DEBUG("MUL_MAT Node %d, Thread %d: COMPLETED %d operations", current_node, thread_id, total_operations);
     
     return GGML_STATUS_SUCCESS;
 }
@@ -443,6 +532,16 @@ ggml_numa_kernel_query_result_t ggml_numa_kernel_mul_mat_query(const struct ggml
     const struct ggml_tensor * src0 = tensor->src[0];
     const struct ggml_tensor * src1 = tensor->src[1];
     
+    // CRITICAL: Only support F32 operations for now
+    // Our kernel was developed and tested with F32 data only.
+    // Quantized types (Q8_0, etc.) require additional validation and testing.
+    if (src0->type != GGML_TYPE_F32 || src1->type != GGML_TYPE_F32) {
+        NUMA_LOG_DEBUG("MUL_MAT query: REJECTING - src0_type=%d, src1_type=%d (only F32 supported)", 
+                       src0->type, src1->type);
+        result.supported = false;
+        return result;
+    }
+    
     // Calculate total elements in result tensor
     const size_t total_elements = ggml_nelements(tensor);
     
@@ -464,7 +563,7 @@ ggml_numa_kernel_query_result_t ggml_numa_kernel_mul_mat_query(const struct ggml
     result.efficiency_score = selected_strategy->efficiency_score;
     result.kernel_name = selected_strategy->kernel_name;
     
-    NUMA_LOG_DEBUG("MUL_MAT query: %zu elements -> %s (efficiency: %.2f)", 
+    NUMA_LOG_DEBUG("MUL_MAT query: ACCEPTING F32 - %zu elements -> %s (efficiency: %.2f)", 
                    total_elements, result.kernel_name, result.efficiency_score);
     
     return result;
@@ -477,76 +576,18 @@ ggml_numa_kernel_query_result_t ggml_numa_kernel_mul_mat_query(const struct ggml
 void ggml_numa_kernel_mul_mat_populate_cache(ggml_numa_cache_entry_t cache_entries[COMPLEXITY_COUNT]) {
     NUMA_LOG_DEBUG("Populating MUL_MAT NUMA cache entries (legacy compatibility)");
     
-    // Map old complexity classes to new threshold system for backward compatibility
-    // This will be removed once fully migrated to threshold-based queries
+    // CRITICAL: Disable legacy cache to force use of query-based validation
+    // The legacy cache bypasses our type validation in the query function.
+    // All cache entries are set to invalid to prevent fallback execution.
     
-    cache_entries[COMPLEXITY_TINY] = (ggml_numa_cache_entry_t){
-        .valid = true,
-        .strategy = MUL_MAT_THRESHOLDS[0].strategy,
-        .work_buffer_size_per_thread = MUL_MAT_THRESHOLDS[0].work_buffer_size_per_thread,
-        .work_function = ggml_numa_kernel_mul_mat_execute,
-        .efficiency_score = MUL_MAT_THRESHOLDS[0].efficiency_score,
-        .kernel_name = MUL_MAT_THRESHOLDS[0].kernel_name
-    };
-    
-    cache_entries[COMPLEXITY_SMALL] = (ggml_numa_cache_entry_t){
-        .valid = true,
-        .strategy = MUL_MAT_THRESHOLDS[1].strategy,
-        .work_buffer_size_per_thread = MUL_MAT_THRESHOLDS[1].work_buffer_size_per_thread,
-        .work_function = ggml_numa_kernel_mul_mat_execute,
-        .efficiency_score = MUL_MAT_THRESHOLDS[1].efficiency_score,
-        .kernel_name = MUL_MAT_THRESHOLDS[1].kernel_name
-    };
-    
-    cache_entries[COMPLEXITY_MEDIUM] = (ggml_numa_cache_entry_t){
-        .valid = true,
-        .strategy = MUL_MAT_THRESHOLDS[2].strategy,
-        .work_buffer_size_per_thread = MUL_MAT_THRESHOLDS[2].work_buffer_size_per_thread,
-        .work_function = ggml_numa_kernel_mul_mat_execute,
-        .efficiency_score = MUL_MAT_THRESHOLDS[2].efficiency_score,
-        .kernel_name = MUL_MAT_THRESHOLDS[2].kernel_name
-    };
-    
-    cache_entries[COMPLEXITY_LARGE] = (ggml_numa_cache_entry_t){
-        .valid = true,
-        .strategy = MUL_MAT_THRESHOLDS[3].strategy,
-        .work_buffer_size_per_thread = MUL_MAT_THRESHOLDS[3].work_buffer_size_per_thread,
-        .work_function = ggml_numa_kernel_mul_mat_execute,
-        .efficiency_score = MUL_MAT_THRESHOLDS[3].efficiency_score,
-        .kernel_name = MUL_MAT_THRESHOLDS[3].kernel_name
-    };
-    
-    cache_entries[COMPLEXITY_HUGE] = (ggml_numa_cache_entry_t){
-        .valid = true,
-        .strategy = MUL_MAT_THRESHOLDS[4].strategy,
-        .work_buffer_size_per_thread = MUL_MAT_THRESHOLDS[4].work_buffer_size_per_thread,
-        .work_function = ggml_numa_kernel_mul_mat_execute,
-        .efficiency_score = MUL_MAT_THRESHOLDS[4].efficiency_score,
-        .kernel_name = MUL_MAT_THRESHOLDS[4].kernel_name
-    };
-    
-    // Map GB-scale complexities to appropriate thresholds
-    cache_entries[COMPLEXITY_GIGANTIC_1GB] = (ggml_numa_cache_entry_t){
-        .valid = true,
-        .strategy = MUL_MAT_THRESHOLDS[5].strategy,
-        .work_buffer_size_per_thread = MUL_MAT_THRESHOLDS[5].work_buffer_size_per_thread,
-        .work_function = ggml_numa_kernel_mul_mat_execute,
-        .efficiency_score = MUL_MAT_THRESHOLDS[5].efficiency_score,
-        .kernel_name = MUL_MAT_THRESHOLDS[5].kernel_name
-    };
-    
-    // Use ultra-large strategy for remaining GB-scale classes
-    cache_entries[COMPLEXITY_GIGANTIC_2GB] = (ggml_numa_cache_entry_t){
-        .valid = true,
-        .strategy = MUL_MAT_THRESHOLDS[6].strategy,
-        .work_buffer_size_per_thread = MUL_MAT_THRESHOLDS[6].work_buffer_size_per_thread,
-        .work_function = ggml_numa_kernel_mul_mat_execute,
-        .efficiency_score = MUL_MAT_THRESHOLDS[6].efficiency_score,
-        .kernel_name = MUL_MAT_THRESHOLDS[6].kernel_name
-    };
-    
-    // No more duplication - just reference the ultra-large strategy
-    cache_entries[COMPLEXITY_GIGANTIC_4GB] = cache_entries[COMPLEXITY_GIGANTIC_2GB];
-    cache_entries[COMPLEXITY_GIGANTIC_8GB] = cache_entries[COMPLEXITY_GIGANTIC_2GB];
-    cache_entries[COMPLEXITY_GIGANTIC_16GB] = cache_entries[COMPLEXITY_GIGANTIC_2GB];
+    for (int i = 0; i < COMPLEXITY_COUNT; i++) {
+        cache_entries[i] = (ggml_numa_cache_entry_t){
+            .valid = false,
+            .strategy = { .node_strategy = NUMA_NODE_STRATEGY_SINGLE, .on_node_strategy = NUMA_ON_NODE_STRATEGY_SINGLE_THREAD },
+            .work_buffer_size_per_thread = 0,
+            .work_function = NULL,
+            .efficiency_score = 0.0f,
+            .kernel_name = "MUL_MAT Cache Disabled"
+        };
+    }
 }

@@ -18,12 +18,27 @@ extern "C" {
 /**
  * Execute NUMA-aware matrix multiplication kernel
  * 
- * @param work_context  Tensor to process (cast from void*)
- * @param params        Threadpool parameters (thread ID, thread count)
- * @return              GGML_STATUS_SUCCESS on success, GGML_STATUS_FAILED on error
+ * @param work_context The tensor to process (cast from void*)
+ * @param params       Thread parameters with thread ID and count
+ * @return             GGML_STATUS_SUCCESS on success
  */
-enum ggml_status ggml_numa_kernel_mul_mat_execute(void * work_context, 
-                                                  struct ggml_compute_params * params);
+enum ggml_status ggml_numa_kernel_mul_mat_execute(void * work_context, struct ggml_compute_params * params);
+
+/**
+ * Custom F16 dot product implementation for testing and optimization
+ * 
+ * @param n      Vector length
+ * @param s      Output scalar result
+ * @param s_off  Output offset (should be 0)
+ * @param x      First vector (F16 data)  
+ * @param x_off  First vector offset
+ * @param y      Second vector (F16 data)
+ * @param y_off  Second vector offset
+ * @param nrc    Number of rows per call (should be 1)
+ */
+void ggml_numa_vec_dot_f16_custom(int n, float * restrict s, size_t s_off, 
+                                 const void * restrict x, size_t x_off,
+                                 const void * restrict y, size_t y_off, int nrc);
 
 /**
  * Query MUL_MAT kernel for optimal strategy based on tensor characteristics
