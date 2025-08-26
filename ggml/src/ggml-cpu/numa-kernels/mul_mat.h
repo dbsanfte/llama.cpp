@@ -26,7 +26,19 @@ enum ggml_status ggml_numa_kernel_mul_mat_execute(void * work_context,
                                                   struct ggml_compute_params * params);
 
 /**
+ * Query MUL_MAT kernel for optimal strategy based on tensor characteristics
+ * 
+ * This function analyzes the tensor and returns the optimal execution strategy
+ * using operation-specific thresholds rather than rigid complexity classes.
+ * 
+ * @param tensor The tensor to analyze
+ * @return Query result with optimal strategy, or unsupported result if not applicable
+ */
+ggml_numa_kernel_query_result_t ggml_numa_kernel_mul_mat_query(const struct ggml_tensor * tensor);
+
+/**
  * Populate cache entries for MUL_MAT operation across all complexity levels
+ * (Legacy compatibility function for backward compatibility during transition)
  * 
  * @param cache_entries Array of cache entries to populate (COMPLEXITY_COUNT elements)
  */

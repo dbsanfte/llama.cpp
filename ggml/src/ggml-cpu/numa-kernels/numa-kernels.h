@@ -1,9 +1,9 @@
 /*
- * NUMA Kernel Registry - Centralized Kernel Management
+ * NUMA Kernel Registry - Flexible Threshold-Based Strategy Selection
  * 
- * This module provides a centralized registry for all NUMA kernels,
- * acting as a database that the executor queries to determine
- * execution strategies, compute buffer requirements, and work functions.
+ * This module provides a centralized registry for all NUMA kernels with
+ * improved threshold-based strategy selection. Operations define their
+ * own optimal thresholds rather than fitting into rigid complexity classes.
  */
 
 #pragma once
@@ -19,8 +19,8 @@ extern "C" {
 struct ggml_cplan;
 
 /**
- * Complexity classes for kernel performance optimization
- * Used to select optimal execution strategies based on tensor size
+ * Legacy complexity classes for backward compatibility during transition
+ * New operations should use threshold-based queries instead
  */
 typedef enum {
     COMPLEXITY_TINY = 0,    // < 1K elements
@@ -37,8 +37,8 @@ typedef enum {
 } ggml_numa_complexity_class_t;
 
 /**
- * Pre-computed cache entry for ultra-fast lookups
- * All decisions made at init time, zero overhead during execution
+ * Legacy cache entry for backward compatibility during transition
+ * New operations should use kernel-specific query functions instead
  */
 typedef struct {
     bool valid;                                    // Cache entry is valid
@@ -52,6 +52,9 @@ typedef struct {
 /**
  * Kernel execution information returned by registry queries
  * Contains all information needed for the executor to dispatch work to coordinator
+ * 
+ * This is the primary interface between the registry and executor.
+ * Both legacy cache lookups and new threshold-based queries return this structure.
  */
 typedef struct {
     bool supported;                                    // Whether this operation is supported
@@ -84,6 +87,9 @@ void ggml_numa_kernels_cleanup(void);
  * - How much compute buffer each thread needs
  * - Which work function the coordinator should execute
  * 
+ * IMPROVED: Now calls kernel-specific threshold queries first,
+ * falling back to legacy cache for operations without threshold support.
+ * 
  * @param tensor The tensor operation to query about
  * @return Query result with all execution information
  */
@@ -112,7 +118,6 @@ enum ggml_status ggml_numa_kernels_execute(struct ggml_tensor * tensor, struct g
  * @param tensor_size The size of the tensor in bytes
  * @return Efficiency score (0.0 to 1.0), or 0.0 if no kernel available
  */
-// Get efficiency score for a kernel with the given tensor
 float ggml_numa_kernels_get_efficiency(enum ggml_op op, const struct ggml_tensor * tensor, size_t tensor_size);
 
 /**
@@ -120,7 +125,6 @@ float ggml_numa_kernels_get_efficiency(enum ggml_op op, const struct ggml_tensor
  * 
  * @return Number of registered NUMA kernels
  */
-// Get total number of registered kernels
 size_t ggml_numa_kernels_get_count(void);
 
 #ifdef __cplusplus

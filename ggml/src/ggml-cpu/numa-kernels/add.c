@@ -532,11 +532,148 @@ bool ggml_numa_kernel_add_supports_optimized(const struct ggml_tensor * tensor) 
 }
 
 // ============================================================================
-// Cache Population for Optimized Kernel
+// ============================================================================
+// ADD Threshold-Based Strategy Selection
+// ============================================================================
+
+/**
+ * ADD operation-specific thresholds for optimal strategy selection
+ * These thresholds are tuned specifically for element-wise addition characteristics
+ */
+typedef struct {
+    size_t element_threshold;                      // Threshold in number of elements
+    ggml_numa_execution_strategy_t strategy;      // Strategy to use
+    size_t work_buffer_size_per_thread;          // Buffer size needed (0 for ADD)
+    ggml_numa_work_function_t work_function;     // Work function to use
+    float efficiency_score;                       // Expected efficiency
+    const char * kernel_name;                     // Strategy description
+} ggml_add_strategy_threshold_t;
+
+/**
+ * ADD-specific strategy thresholds
+ * Optimized for element-wise addition workload characteristics
+ */
+static const ggml_add_strategy_threshold_t ADD_THRESHOLDS[] = {
+    // Very small tensors: single-threaded is fastest due to minimal overhead
+    {
+        .element_threshold = 1024,  // < 1K elements
+        .strategy = { .node_strategy = NUMA_NODE_STRATEGY_SINGLE, .on_node_strategy = NUMA_ON_NODE_STRATEGY_SINGLE_THREAD },
+        .work_buffer_size_per_thread = 0,
+        .work_function = ggml_numa_kernel_add_execute_optimized,
+        .efficiency_score = 0.98f,
+        .kernel_name = "NUMA ADD (Single/Single)"
+    },
+    
+    // Small tensors: multi-threaded on single node for good performance
+    {
+        .element_threshold = 16384,  // 1K - 16K elements
+        .strategy = { .node_strategy = NUMA_NODE_STRATEGY_SINGLE, .on_node_strategy = NUMA_ON_NODE_STRATEGY_MULTI_THREAD },
+        .work_buffer_size_per_thread = 0,
+        .work_function = ggml_numa_kernel_add_execute_optimized,
+        .efficiency_score = 0.96f,
+        .kernel_name = "NUMA ADD (Single/Multi)"
+    },
+    
+    // Medium tensors: single-node multi-thread for cache efficiency
+    {
+        .element_threshold = 262144,  // 16K - 256K elements
+        .strategy = { .node_strategy = NUMA_NODE_STRATEGY_SINGLE, .on_node_strategy = NUMA_ON_NODE_STRATEGY_MULTI_THREAD },
+        .work_buffer_size_per_thread = 0,
+        .work_function = ggml_numa_kernel_add_execute_optimized,
+        .efficiency_score = 0.95f,
+        .kernel_name = "NUMA ADD (Single/Multi-Med)"
+    },
+    
+    // Large tensors: data-parallel with low-overhead optimization
+    {
+        .element_threshold = 16777216,  // 256K - 16M elements
+        .strategy = { .node_strategy = NUMA_NODE_STRATEGY_DATA_PARALLEL, .on_node_strategy = NUMA_ON_NODE_STRATEGY_MULTI_THREAD },
+        .work_buffer_size_per_thread = 0,
+        .work_function = ggml_numa_kernel_add_execute_low_overhead,
+        .efficiency_score = 0.99f,
+        .kernel_name = "NUMA ADD (Low-Overhead Data-Parallel)"
+    },
+    
+    // Huge tensors: no-aggregation for maximum performance
+    {
+        .element_threshold = 268435456,  // 16M - 256M elements (1GB scale)
+        .strategy = { .node_strategy = NUMA_NODE_STRATEGY_DATA_PARALLEL, .on_node_strategy = NUMA_ON_NODE_STRATEGY_MULTI_THREAD },
+        .work_buffer_size_per_thread = 0,
+        .work_function = ggml_numa_kernel_add_execute_no_aggregation,
+        .efficiency_score = 0.99f,
+        .kernel_name = "NUMA ADD (No-Aggregation 1GB Scale)"
+    },
+    
+    // Ultra-large tensors: no-aggregation for GB+ scale
+    {
+        .element_threshold = SIZE_MAX,  // 256M+ elements (multi-GB scale)
+        .strategy = { .node_strategy = NUMA_NODE_STRATEGY_DATA_PARALLEL, .on_node_strategy = NUMA_ON_NODE_STRATEGY_MULTI_THREAD },
+        .work_buffer_size_per_thread = 0,
+        .work_function = ggml_numa_kernel_add_execute_no_aggregation,
+        .efficiency_score = 0.99f,
+        .kernel_name = "NUMA ADD (No-Aggregation Ultra Scale)"
+    }
+};
+
+#define ADD_THRESHOLD_COUNT (sizeof(ADD_THRESHOLDS) / sizeof(ADD_THRESHOLDS[0]))
+
+/**
+ * Query ADD kernel for optimal strategy based on tensor characteristics
+ * 
+ * This function analyzes the tensor and returns the optimal execution strategy
+ * without requiring exact complexity class matching.
+ * 
+ * @param tensor The tensor to analyze
+ * @return Query result with optimal strategy, or unsupported result if not applicable
+ */
+ggml_numa_kernel_query_result_t ggml_numa_kernel_add_query(const struct ggml_tensor * tensor) {
+    ggml_numa_kernel_query_result_t result = { .supported = false };
+    
+    // Validate this is an ADD operation
+    if (!tensor || tensor->op != GGML_OP_ADD) {
+        return result;
+    }
+    
+    // Validate tensor structure for ADD
+    if (!tensor->src[0] || !tensor->src[1]) {
+        NUMA_LOG_DEBUG("ADD query: Missing source tensors");
+        return result;
+    }
+    
+    // Calculate total elements for strategy selection
+    const size_t total_elements = ggml_nelements(tensor);
+    
+    // Find optimal strategy using threshold search
+    const ggml_add_strategy_threshold_t * selected_strategy = &ADD_THRESHOLDS[ADD_THRESHOLD_COUNT - 1];
+    
+    for (size_t i = 0; i < ADD_THRESHOLD_COUNT; i++) {
+        if (total_elements < ADD_THRESHOLDS[i].element_threshold) {
+            selected_strategy = &ADD_THRESHOLDS[i];
+            break;
+        }
+    }
+    
+    // Build successful query result
+    result.supported = true;
+    result.strategy = selected_strategy->strategy;
+    result.work_buffer_size_per_thread = selected_strategy->work_buffer_size_per_thread;
+    result.work_function = selected_strategy->work_function;
+    result.efficiency_score = selected_strategy->efficiency_score;
+    result.kernel_name = selected_strategy->kernel_name;
+    
+    NUMA_LOG_DEBUG("ADD query: %zu elements -> %s (efficiency: %.2f)", 
+                   total_elements, result.kernel_name, result.efficiency_score);
+    
+    return result;
+}
+
+// ============================================================================
+// Legacy Cache Population for Backward Compatibility
 // ============================================================================
 
 /**
  * Populate NUMA kernel cache with ADD operation strategies
+ * (Legacy compatibility function for backward compatibility during transition)
  * 
  * Template Pattern: Registry integration for kernel strategies
  * 

@@ -158,6 +158,32 @@ ggml_numa_kernel_query_result_t ggml_numa_kernels_query(const struct ggml_tensor
         return result;
     }
     
+    // First try kernel-specific threshold-based query functions (new approach)
+    switch (tensor->op) {
+        case GGML_OP_ADD:
+            result = ggml_numa_kernel_add_query(tensor);
+            if (result.supported) {
+                NUMA_LOG_DEBUG("ADD query: Using threshold-based strategy - %s", result.kernel_name);
+                return result;
+            }
+            break;
+            
+        case GGML_OP_MUL_MAT:
+            result = ggml_numa_kernel_mul_mat_query(tensor);
+            if (result.supported) {
+                NUMA_LOG_DEBUG("MUL_MAT query: Using threshold-based strategy - %s", result.kernel_name);
+                return result;
+            }
+            break;
+            
+        default:
+            // Operation doesn't have threshold-based query yet, fall back to legacy cache
+            break;
+    }
+    
+    // Fallback to legacy complexity-based cache system for operations without threshold queries
+    NUMA_LOG_DEBUG("Falling back to legacy cache system for op %s", ggml_op_name(tensor->op));
+    
     if (!g_numa_cache_initialized) {
         GGML_LOG_DEBUG("NUMA Query: Cache not initialized, initializing for op %s\n", ggml_op_name(tensor->op));
         if (!ggml_numa_kernels_init()) {
