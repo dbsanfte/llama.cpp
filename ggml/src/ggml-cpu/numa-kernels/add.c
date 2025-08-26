@@ -428,9 +428,10 @@ enum ggml_status ggml_numa_kernel_add_execute_optimized(void * work_context,
                        ggml_current_numa_node, elements_in_slice);
         const float scalar = src1_data[0];
         
-        // Use SIMD for scalar addition - direct access to global positions
-        ggml_vec_scale_f32(elements_in_slice, dst_data + numa_start, scalar);
-        ggml_vec_add_f32(elements_in_slice, dst_data + numa_start, dst_data + numa_start, src0_data + numa_start);
+        // Scalar addition: dst = src0 + scalar
+        for (size_t i = 0; i < elements_in_slice; ++i) {
+            dst_data[numa_start + i] = src0_data[numa_start + i] + scalar;
+        }
         
     } else if (src1_elements == total_elements) {
         // TEMPLATE PATTERN: Element-wise operation (most common, should be fastest)
@@ -441,13 +442,67 @@ enum ggml_status ggml_numa_kernel_add_execute_optimized(void * work_context,
         ggml_vec_add_f32(elements_in_slice, dst_data + numa_start, src0_data + numa_start, src1_data + numa_start);
         
     } else {
-        // TEMPLATE PATTERN: Complex broadcasting (avoid if possible, performance cost)
-        NUMA_LOG_DEBUG("NUMA Node %d using SLOW BROADCASTING path (src1_elements=%ld, total=%ld, slice=%zu)", 
+        // TEMPLATE PATTERN: Complex broadcasting - use reference implementation approach
+        NUMA_LOG_DEBUG("NUMA Node %d using BROADCASTING path (src1_elements=%ld, total=%ld, slice=%zu)", 
                        ggml_current_numa_node, src1_elements, total_elements, elements_in_slice);
-        for (int64_t i = numa_start; i < numa_end; ++i) {
-            // Simplified broadcasting for common patterns
-            const int64_t src1_idx = i % src1_elements;
-            dst_data[i] = src0_data[i] + src1_data[src1_idx];
+        
+        // Get tensor shapes and strides for proper broadcasting
+        const int64_t ne0 = tensor->ne[0];
+        const int64_t ne1 = tensor->ne[1]; 
+        const int64_t ne2 = tensor->ne[2];
+        const int64_t ne3 = tensor->ne[3];
+        
+        const size_t nb0 = tensor->nb[0];
+        const size_t nb1 = tensor->nb[1];
+        const size_t nb2 = tensor->nb[2];
+        const size_t nb3 = tensor->nb[3];
+        
+        const int64_t ne10 = src1->ne[0];
+        const int64_t ne11 = src1->ne[1];
+        const int64_t ne12 = src1->ne[2];
+        const int64_t ne13 = src1->ne[3];
+        
+        const size_t nb10 = src1->nb[0];
+        const size_t nb11 = src1->nb[1];
+        const size_t nb12 = src1->nb[2];
+        const size_t nb13 = src1->nb[3];
+        
+        // For broadcasting, use row-based approach (consistent with reference)
+        // Convert numa slice to row indices 
+        const int64_t total_rows = ne1 * ne2 * ne3;
+        const int64_t elements_per_row = ne0;
+        
+        const int64_t start_row = numa_start / elements_per_row;
+        const int64_t end_row = (numa_end - 1) / elements_per_row + 1;
+        
+        // Process rows using reference broadcasting logic
+        for (int64_t ir = start_row; ir < end_row; ++ir) {
+            const int64_t i03 = ir / (ne2 * ne1);
+            const int64_t i02 = (ir - i03 * ne2 * ne1) / ne1;
+            const int64_t i01 = ir - i03 * ne2 * ne1 - i02 * ne1;
+            
+            // Apply broadcasting with modulo (like reference)
+            const int64_t i13 = i03 % ne13;
+            const int64_t i12 = i02 % ne12;
+            const int64_t i11 = i01 % ne11;
+            
+            // Calculate row pointers using byte strides (like reference)
+            float * dst_row  = (float *)       ((char *) dst_data  + i03*nb3  + i02*nb2  + i01*nb1);
+            const float * src0_row = (const float *) ((const char *) src0_data + i03*nb3  + i02*nb2  + i01*nb1);
+            const float * src1_row = (const float *) ((const char *) src1_data + i13*nb13 + i12*nb12 + i11*nb11);
+            
+            // Calculate start/end within this row based on numa slice
+            const int64_t row_start_idx = ir * elements_per_row;
+            const int64_t row_end_idx = (ir + 1) * elements_per_row;
+            
+            const int64_t slice_start = (row_start_idx < numa_start) ? numa_start - row_start_idx : 0;
+            const int64_t slice_end = (row_end_idx > numa_end) ? numa_end - row_start_idx : elements_per_row;
+            
+            // Process this row's slice element-wise
+            for (int64_t i0 = slice_start; i0 < slice_end; ++i0) {
+                const int64_t i10 = i0 % ne10;  // Broadcasting in dimension 0
+                dst_row[i0] = src0_row[i0] + src1_row[i10];
+            }
         }
     }
     
