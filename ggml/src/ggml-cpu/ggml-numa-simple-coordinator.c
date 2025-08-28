@@ -12,6 +12,7 @@
 #include "ggml-cpu-impl.h"
 #include "ggml-impl.h"
 #include "numa-kernels/numa-kernels.h"
+#include "numa-kernels/mul_mat.h"  // For MUL_MAT kernel function declaration
 #include "ggml-cpu.h"  // For threadpool functions
 #include <stdatomic.h>  // For atomic operations
 #include "ggml-numa-perf.h"  // Performance instrumentation
@@ -41,6 +42,10 @@ extern void ggml_numa_set_isolate_node(int node);
 __thread int ggml_current_numa_node = 0;                    // Current NUMA node for this thread
 __thread bool ggml_numa_is_data_parallel_execution = false; // Whether we're in data-parallel mode
 __thread int ggml_numa_total_nodes_for_data_parallel = 1;   // Total NUMA nodes in data-parallel execution
+__thread void * ggml_numa_shared_result_tensor_data = NULL; // Shared result tensor data pointer for data-parallel operations
+
+// Global variable to expose shared result tensor data to NUMA kernels (accessed from multiple threads)
+void * g_simple_coordinator_shared_result_tensor_data = NULL;
 
 // Thread data structure for parallel execution
 struct thread_work_data {
@@ -49,6 +54,9 @@ struct thread_work_data {
     int numa_node;
     void * work_context;
     enum ggml_status (*work_function)(void *, struct ggml_compute_params *);
+    void * shared_tensor_data; // Shared result tensor data for data-parallel operations
+    bool is_data_parallel; // Flag indicating data-parallel execution
+    int total_nodes; // Total number of NUMA nodes for data-parallel
 };
 
 // Thread worker function
@@ -59,10 +67,15 @@ static void * thread_worker(void * arg) {
     extern __thread int ggml_current_numa_node;
     extern __thread bool ggml_numa_is_data_parallel_execution;
     extern __thread int ggml_numa_total_nodes_for_data_parallel;
+    extern __thread void * ggml_numa_shared_result_tensor_data;
     
     ggml_current_numa_node = data->numa_node;
-    ggml_numa_is_data_parallel_execution = true;
-    ggml_numa_total_nodes_for_data_parallel = 2; // TODO: make dynamic
+    ggml_numa_is_data_parallel_execution = data->is_data_parallel;
+    ggml_numa_total_nodes_for_data_parallel = data->total_nodes;
+    ggml_numa_shared_result_tensor_data = data->shared_tensor_data;
+    
+    NUMA_LOG_DEBUG("Thread worker on node %d: shared_tensor_data=%p, data_parallel=%s", 
+           data->numa_node, data->shared_tensor_data, data->is_data_parallel ? "true" : "false");
     
     // Execute the kernel for this thread
     data->result = data->work_function(data->work_context, &data->params);
@@ -70,6 +83,7 @@ static void * thread_worker(void * arg) {
     // Reset context
     ggml_numa_is_data_parallel_execution = false;
     ggml_numa_total_nodes_for_data_parallel = 1;
+    ggml_numa_shared_result_tensor_data = NULL;
     
     return NULL;
 }
@@ -218,6 +232,9 @@ struct ggml_numa_simple_coordinator {
     size_t active_work_size;
     _Atomic bool work_completion_status[GGML_NUMA_MAX_NODES];
     
+    // Shared result tensor data pointer for data-parallel operations
+    void * shared_result_tensor_data;
+    
     // NUMA-aware work buffers - one per node
     void * numa_work_buffers[GGML_NUMA_MAX_NODES];
     size_t numa_work_buffer_sizes[GGML_NUMA_MAX_NODES];
@@ -314,8 +331,10 @@ static void* numa_dispatch_worker(void* arg) {
             // CRITICAL: Set data-parallel execution flag for kernel to enable proper data slicing
             extern __thread bool ggml_numa_is_data_parallel_execution;
             extern __thread int ggml_numa_total_nodes_for_data_parallel;
+            extern __thread void * ggml_numa_shared_result_tensor_data;
             ggml_numa_is_data_parallel_execution = true;
             ggml_numa_total_nodes_for_data_parallel = g_simple_coordinator.num_numa_nodes; // Pass total nodes
+            ggml_numa_shared_result_tensor_data = g_simple_coordinator.shared_result_tensor_data; // Pass shared tensor data
             
             // Execute work using proper multi-threading
             enum ggml_status result = GGML_STATUS_SUCCESS;
@@ -336,6 +355,9 @@ static void* numa_dispatch_worker(void* arg) {
                     thread_data[ith].result = GGML_STATUS_SUCCESS;
                     thread_data[ith].work_context = g_simple_coordinator.active_work_context;
                     thread_data[ith].work_function = g_simple_coordinator.active_work_function;
+                    thread_data[ith].shared_tensor_data = g_simple_coordinator.shared_result_tensor_data;
+                    thread_data[ith].is_data_parallel = true; // This is data-parallel execution
+                    thread_data[ith].total_nodes = g_simple_coordinator.num_numa_nodes;
                     
                     NUMA_LOG_DEBUG("NUMA Node %d creating thread %d/%d", 
                            numa_node, ith, work_params.nth);
@@ -363,10 +385,18 @@ static void* numa_dispatch_worker(void* arg) {
                 NUMA_LOG_DEBUG("NUMA Node %d completed parallel multi-threaded execution with %d threads", 
                        numa_node, work_params.nth);
             } else {
-                // Single-threaded execution
+                // Single-threaded execution - ensure thread-local variables are set
                 NUMA_LOG_DEBUG("NUMA Node %d single-threaded execution", numa_node);
+                
+                // Set thread-local variables for single-threaded execution
+                extern __thread void * ggml_numa_shared_result_tensor_data;
+                ggml_numa_shared_result_tensor_data = g_simple_coordinator.shared_result_tensor_data;
+                
                 result = g_simple_coordinator.active_work_function(
                     g_simple_coordinator.active_work_context, &work_params);
+                
+                // Reset shared tensor data pointer
+                ggml_numa_shared_result_tensor_data = NULL;
             }
             
             // Reset data-parallel flag after execution
@@ -441,81 +471,6 @@ static enum ggml_status ensure_numa_tensor_copies(struct ggml_tensor * tensor) {
         }
     }
     
-    return GGML_STATUS_SUCCESS;
-}
-
-// Aggregate tensor data from multiple NUMA nodes to node 0
-// This is critical for data-parallel execution where each node processes a slice
-static enum ggml_status ggml_numa_aggregate_tensor_data(struct ggml_tensor * tensor, int num_nodes) {
-    if (!tensor || num_nodes <= 1) {
-        return GGML_STATUS_SUCCESS; // Nothing to aggregate
-    }
-    
-    NUMA_LOG_DEBUG("Aggregating tensor data from %d NUMA nodes", num_nodes);
-    
-    size_t total_elements = ggml_nelements(tensor);
-    size_t element_size = ggml_type_size(tensor->type);
-    size_t elements_per_node = total_elements / num_nodes;
-    
-    NUMA_LOG_DEBUG("Tensor aggregation - %zu total elements, %zu per node, %zu bytes per element", 
-           total_elements, elements_per_node, element_size);
-    
-    // For data-parallel execution, each NUMA node processed a slice of the data
-    // Node 0: elements [0, elements_per_node)
-    // Node 1: elements [elements_per_node, 2*elements_per_node)
-    // etc.
-    
-    // Simple direct aggregation - copy from each node's tensor data to node 0's tensor data
-    // This bypasses the complex virtual node system and just does direct memory copying
-    
-    // Get node 0's tensor data (destination for aggregation)
-    void * node0_data = tensor->__data[0];
-    if (!node0_data) {
-        NUMA_LOG_DEBUG("ERROR: Failed to get node 0 tensor data for aggregation\n");
-        return GGML_STATUS_FAILED;
-    }
-    NUMA_LOG_DEBUG("Aggregating into node 0 tensor data at %p (direct access)", node0_data);
-    
-    // Aggregate results from all nodes into node 0's copy
-    for (int src_node = 0; src_node < num_nodes; src_node++) {
-        // Calculate the slice this node processed
-        size_t start_element = src_node * elements_per_node;
-        size_t end_element = (src_node == num_nodes - 1) ? total_elements : (src_node + 1) * elements_per_node;
-        size_t slice_elements = end_element - start_element;
-        
-        NUMA_LOG_DEBUG("Aggregating slice from node %d: elements [%zu, %zu) (%zu elements)", 
-               src_node, start_element, end_element, slice_elements);
-        
-        // Get source data from this node's copy (direct access)
-        void * src_data = tensor->__data[src_node];
-        if (!src_data) {
-            NUMA_LOG_DEBUG("ERROR: Failed to get tensor data from node %d\n", src_node);
-            return GGML_STATUS_FAILED;
-        }
-        
-        // DEBUG: Show first few values before copying
-        float * src_float = (float *)src_data;
-        NUMA_LOG_VERBOSE("Node %d data before copy: [%.3f, %.3f, %.3f, %.3f, ...]", 
-               src_node, src_float[start_element], src_float[start_element+1], 
-               src_float[start_element+2], src_float[start_element+3]);
-        
-        // Copy the slice from this node's result to the corresponding slice in node 0's result
-        void * src_slice = (char *)src_data + start_element * element_size;
-        void * dst_slice = (char *)node0_data + start_element * element_size;
-        size_t slice_bytes = slice_elements * element_size;
-        
-        memcpy(dst_slice, src_slice, slice_bytes);
-        
-        // DEBUG: Show first few values after copying
-        float * dst_float = (float *)node0_data;
-        NUMA_LOG_VERBOSE("Node 0 result after copying node %d: [%.3f, %.3f, %.3f, %.3f, ...]", 
-               src_node, dst_float[start_element], dst_float[start_element+1], 
-               dst_float[start_element+2], dst_float[start_element+3]);
-        
-        NUMA_LOG_DEBUG("Copied %zu bytes from node %d slice to node 0 result", slice_bytes, src_node);
-    }
-    
-    NUMA_LOG_DEBUG("Data aggregation completed - all slices merged into coherent result");
     return GGML_STATUS_SUCCESS;
 }
 
@@ -1098,7 +1053,10 @@ enum ggml_status ggml_numa_simple_coordinator_execute_single_node(
 enum ggml_status ggml_numa_simple_coordinator_execute_data_parallel(
     ggml_numa_work_function_t work_function,
     void * work_context,
-    size_t work_size) {
+    size_t work_size,
+    ggml_numa_aggregation_policy_t aggregation_policy,
+    ggml_numa_aggregation_function_t aggregation_function,
+    void * aggregation_user_data) {
     
     NUMA_PERF_START(NUMA_PERF_COORDINATOR_DISPATCH, "async_dispatch", "simple_coordinator", -1, 0, g_simple_coordinator.num_numa_nodes);
     
@@ -1137,7 +1095,10 @@ enum ggml_status ggml_numa_simple_coordinator_execute_data_parallel(
         return GGML_STATUS_FAILED;
     }
 
-    int num_nodes = g_simple_coordinator.num_numa_nodes;
+    // Calculate actual NUMA nodes to match barrier initialization logic
+    enum ggml_numa_strategy current_strategy = g_simple_coordinator.last_strategy;
+    int actual_numa_nodes = (current_strategy == GGML_NUMA_STRATEGY_ISOLATE) ? 1 : g_simple_coordinator.num_numa_nodes;
+    int num_nodes = actual_numa_nodes;
     struct timespec coord_start_time, coord_end_time;
     clock_gettime(CLOCK_MONOTONIC, &coord_start_time);
     
@@ -1148,8 +1109,27 @@ enum ggml_status ggml_numa_simple_coordinator_execute_data_parallel(
     g_simple_coordinator.active_work_context = work_context;
     g_simple_coordinator.active_work_size = work_size;
     
+    // CRITICAL: Store the original result tensor data pointer for shared access across NUMA nodes
+    // This ensures all nodes write to the same result tensor memory rather than local copies
+    struct ggml_tensor * result_tensor = (struct ggml_tensor *)work_context;
+    if (result_tensor) {
+        // Get the original (non-NUMA) result tensor data pointer  
+        // Use ggml_current_numa_node=0 to get the original data pointer
+        extern __thread int ggml_current_numa_node;
+        int saved_numa_node = ggml_current_numa_node;
+        ggml_current_numa_node = 0; // Temporarily set to 0 to get original data pointer
+        g_simple_coordinator.shared_result_tensor_data = tensor_data(result_tensor);
+        g_simple_coordinator_shared_result_tensor_data = g_simple_coordinator.shared_result_tensor_data; // Expose to kernels
+        ggml_current_numa_node = saved_numa_node; // Restore
+        NUMA_LOG_DEBUG("Set shared result tensor data pointer: %p", g_simple_coordinator.shared_result_tensor_data);
+    } else {
+        g_simple_coordinator.shared_result_tensor_data = NULL;
+    }
+    
     // Signal all dispatch threads to start work IN PARALLEL
-    for (int node = 0; node < num_nodes; node++) {
+    int isolate_node = ggml_numa_get_isolate_node();
+    for (int i = 0; i < num_nodes; i++) {
+        int node = (current_strategy == GGML_NUMA_STRATEGY_ISOLATE) ? isolate_node : i;
         pthread_mutex_lock(&g_simple_coordinator.dispatch_mutex[node]);
         atomic_store(&g_simple_coordinator.dispatch_work_available[node], true);
         pthread_cond_signal(&g_simple_coordinator.dispatch_cond[node]);
@@ -1182,26 +1162,50 @@ enum ggml_status ggml_numa_simple_coordinator_execute_data_parallel(
         }
     }
     
-    // CRITICAL: Data aggregation step for data-parallel execution
-    // After all NUMA nodes complete, we need to aggregate their results into a single coherent output
-    // OPTIMIZATION: Skip aggregation for kernels that write directly to final tensor
+    // CRITICAL: Data aggregation step for data-parallel execution  
+    // After all NUMA nodes complete, we only support two modes:
+    // 1. CUSTOM: Use kernel-provided aggregation function
+    // 2. NONE: No aggregation needed, kernel wrote directly to final location
     if (final_status == GGML_STATUS_SUCCESS) {
         struct ggml_tensor * result_tensor = (struct ggml_tensor *)work_context;
         
-        // Check if this is a no-aggregation kernel by comparing function pointers
-        bool needs_aggregation = true;
-        if (work_function == ggml_numa_kernel_add_execute_no_aggregation) {
-            needs_aggregation = false;
-            NUMA_LOG_DEBUG("Skipping data aggregation - no-aggregation kernel writes directly to final tensor");
+        bool needs_aggregation = false;
+        
+        // Simplified aggregation policy - only two modes supported
+        switch (aggregation_policy) {
+            case GGML_NUMA_AGGREGATION_CUSTOM:
+                // Use kernel-provided custom aggregation function
+                if (aggregation_function) {
+                    needs_aggregation = true;
+                    NUMA_LOG_DEBUG("Aggregation policy CUSTOM: using kernel-provided aggregation function");
+                } else {
+                    needs_aggregation = false;
+                    NUMA_LOG_DEBUG("Aggregation policy CUSTOM: no function provided, skipping aggregation");
+                }
+                break;
+                
+            case GGML_NUMA_AGGREGATION_NONE:
+            default:
+                needs_aggregation = false;
+                NUMA_LOG_DEBUG("Aggregation policy NONE: kernel writes directly to final tensor location");
+                break;
         }
         
         if (needs_aggregation) {
-            NUMA_LOG_DEBUG("Starting data aggregation from %d NUMA nodes", num_nodes);
+            NUMA_LOG_DEBUG("Starting kernel-provided custom aggregation from %d NUMA nodes", num_nodes);
             struct timespec agg_start_time;
             clock_gettime(CLOCK_MONOTONIC, &agg_start_time);
             
-            // Aggregate data from all NUMA nodes into the final result
-            enum ggml_status agg_status = ggml_numa_aggregate_tensor_data(result_tensor, num_nodes);
+            enum ggml_status agg_status = GGML_STATUS_SUCCESS;
+            
+            // Call kernel-provided custom aggregation function
+            NUMA_LOG_DEBUG("Calling kernel-provided custom aggregation function");
+            agg_status = aggregation_function(work_context, num_nodes, aggregation_user_data);
+            if (agg_status != GGML_STATUS_SUCCESS) {
+                NUMA_LOG_DEBUG("Custom aggregation function failed with status %d", agg_status);
+            } else {
+                NUMA_LOG_DEBUG("Custom aggregation function completed successfully");
+            }
             
             struct timespec agg_end_time;
             clock_gettime(CLOCK_MONOTONIC, &agg_end_time);
@@ -1209,19 +1213,20 @@ enum ggml_status ggml_numa_simple_coordinator_execute_data_parallel(
                                  (agg_end_time.tv_nsec - agg_start_time.tv_nsec) / 1000000.0;
             
             if (agg_status == GGML_STATUS_SUCCESS) {
-                NUMA_LOG_DEBUG("Data aggregation completed successfully in %.3fms", agg_time_ms);
+                NUMA_LOG_DEBUG("Custom aggregation completed successfully in %.3fms", agg_time_ms);
             } else {
-                NUMA_LOG_DEBUG("ERROR: Data aggregation failed - status %d\n", agg_status);
+                NUMA_LOG_DEBUG("ERROR: Custom aggregation failed - status %d\n", agg_status);
                 final_status = agg_status;
             }
         } else {
-            NUMA_LOG_DEBUG("Data aggregation skipped - result already coherent from in-place operations");
+            NUMA_LOG_DEBUG("No aggregation needed - result already coherent from direct kernel writes");
         }
         
         // CRITICAL: Set ggml_current_numa_node to 0 so that subsequent ggml_get_data() calls
         // read from node 0 where we aggregated the result (or where coherent result is located)
         extern __thread int ggml_current_numa_node;
         ggml_current_numa_node = 0;
+        g_simple_coordinator_shared_result_tensor_data = NULL; // Clear global reference
         NUMA_LOG_DEBUG("Set ggml_current_numa_node=0 for result reading");
     }
     

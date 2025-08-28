@@ -1070,7 +1070,30 @@ void ggml_compute_forward_mul_mat_one_chunk_legacy(
                 //}
 
                 for (int64_t ir0 = iir0; ir0 < iir0 + blck_0 && ir0 < ir0_end; ir0 += num_rows_per_vec_dot) {
+                    // DEBUG: Log reference vec_dot operations for comparison with NUMA kernel
+                    if (getenv("GGML_NUMA_DEBUG")) {
+                        printf("[STANDARD] vec_dot call: ne00=%ld, ir0=%ld, ir1=%ld, src0_type=%d, src1_type=%d\n",
+                               ne00, ir0, ir1, src0->type, src1->type);
+                        
+                        // Log first few bytes of src0 and src1 data for this vec_dot call
+                        const char* src0_ptr = src0_row + ir0 * nb01;
+                        printf("[STANDARD] src0 bytes: ");
+                        for (int i = 0; i < MIN(16, ne00 * ggml_type_size(src0->type)); i++) {
+                            printf("%02x ", ((unsigned char*)src0_ptr)[i]);
+                        }
+                        printf("\n[STANDARD] src1 bytes: ");
+                        for (int i = 0; i < MIN(16, ne00 * ggml_type_size(src1->type)); i++) {
+                            printf("%02x ", ((unsigned char*)src1_col)[i]);
+                        }
+                        printf("\n");
+                    }
+                    
                     vec_dot(ne00, &tmp[ir0 - iir0], (num_rows_per_vec_dot > 1 ? 16 : 0), src0_row + ir0 * nb01, (num_rows_per_vec_dot > 1 ? nb01 : 0), src1_col, (num_rows_per_vec_dot > 1 ? src1_col_stride : 0), num_rows_per_vec_dot);
+                    
+                    // DEBUG: Log result of vec_dot call
+                    if (getenv("GGML_NUMA_DEBUG")) {
+                        printf("[STANDARD] vec_dot result: %.8f\n", tmp[ir0 - iir0]);
+                    }
                 }
 
                 for (int cn = 0; cn < num_rows_per_vec_dot; ++cn) {
@@ -1154,8 +1177,26 @@ void ggml_compute_forward_mul_mat_one_chunk(
                 // Direct assignment version of the legacy logic (no tmp buffer)
                 for (int64_t ir0 = iir0; ir0 < iir0 + blck_0 && ir0 < ir0_end; ir0 += num_rows_per_vec_dot) {
                     if (num_rows_per_vec_dot == 1) {
+                        // Log detailed vec_dot operation (REFERENCE IMPLEMENTATION)
+                        if (getenv("GGML_NUMA_DEBUG")) {
+                            printf("[REFERENCE] Pre-vec_dot[%ld,%ld]: vec_dot=%p, ne00=%ld, dst=%p, src0=%p, src1=%p\n",
+                                   ir0, ir1, (void*)vec_dot, ne00, (void*)&dst_col[ir0], 
+                                   (void*)(src0_row + ir0*nb01), (void*)src1_col);
+                            
+                            // Log first few elements of input data
+                            const float* src0_data = (const float*)(src0_row + ir0*nb01);
+                            const float* src1_data = (const float*)src1_col;
+                            printf("[REFERENCE] Input data - src0[0:3]: %.8f %.8f %.8f, src1[0:3]: %.8f %.8f %.8f\n",
+                                   src0_data[0], src0_data[1], src0_data[2], src1_data[0], src1_data[1], src1_data[2]);
+                        }
+                        
                         // Simple case: mirror the memcpy pattern &dst_col[iir0 + ...]
                         vec_dot(ne00, &dst_col[ir0], 0, src0_row + ir0*nb01, 0, src1_col, 0, 1);
+                        
+                        // Log post-computation result
+                        if (getenv("GGML_NUMA_DEBUG")) {
+                            printf("[REFERENCE] Post-vec_dot[%ld,%ld]: result=%.8f\n", ir0, ir1, dst_col[ir0]);
+                        }
                     } else {
                         // Multi-row case: mirror the tmp buffer logic but write directly
                         for (int cn = 0; cn < num_rows_per_vec_dot; ++cn) {
@@ -1163,7 +1204,24 @@ void ggml_compute_forward_mul_mat_one_chunk(
                             const char * src0_ptr = src0_row + (ir0 + cn) * nb01;
                             const char * src1_ptr = src1_col + cn * src1_col_stride;
                             
+                            // Log detailed vec_dot operation (REFERENCE IMPLEMENTATION)
+                            if (getenv("GGML_NUMA_DEBUG")) {
+                                printf("[REFERENCE] Pre-vec_dot[%ld,%ld,%d]: vec_dot=%p, ne00=%ld, dst=%p, src0=%p, src1=%p\n",
+                                       ir0, ir1, cn, (void*)vec_dot, ne00, (void*)dst_ptr, (void*)src0_ptr, (void*)src1_ptr);
+                                
+                                // Log first few elements of input data
+                                const float* src0_data = (const float*)src0_ptr;
+                                const float* src1_data = (const float*)src1_ptr;
+                                printf("[REFERENCE] Input data - src0[0:3]: %.8f %.8f %.8f, src1[0:3]: %.8f %.8f %.8f\n",
+                                       src0_data[0], src0_data[1], src0_data[2], src1_data[0], src1_data[1], src1_data[2]);
+                            }
+                            
                             vec_dot(ne00, dst_ptr, 0, src0_ptr, 0, src1_ptr, 0, 1);
+                            
+                            // Log post-computation result
+                            if (getenv("GGML_NUMA_DEBUG")) {
+                                printf("[REFERENCE] Post-vec_dot[%ld,%ld,%d]: result=%.8f\n", ir0, ir1, cn, *dst_ptr);
+                            }
                         }
                     }
                 }
@@ -1178,6 +1236,16 @@ void ggml_compute_forward_mul_mat(
 
     const struct ggml_tensor * src0 = dst->src[0];
     const struct ggml_tensor * src1 = dst->src[1];
+
+    // DEBUG: Log standard MUL_MAT execution for comparison with NUMA kernel
+    if (getenv("GGML_NUMA_DEBUG")) {
+        printf("[STANDARD] ggml_compute_forward_mul_mat: src0_type=%d, src1_type=%d, dst_type=%d\n", 
+               src0->type, src1->type, dst->type);
+        printf("[STANDARD] Dimensions: src0=[%ld,%ld,%ld,%ld], src1=[%ld,%ld,%ld,%ld], dst=[%ld,%ld,%ld,%ld]\n",
+               src0->ne[0], src0->ne[1], src0->ne[2], src0->ne[3],
+               src1->ne[0], src1->ne[1], src1->ne[2], src1->ne[3],
+               dst->ne[0], dst->ne[1], dst->ne[2], dst->ne[3]);
+    }
 
     GGML_TENSOR_BINARY_OP_LOCALS
 

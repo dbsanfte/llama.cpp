@@ -57,12 +57,26 @@
  * MEMORY ACCESS PATTERN:
  * =====================
  * 
- * CRITICAL: Always use tensor_data() to get NUMA-local memory:
+ * CRITICAL: Use shared memory approach to eliminate aggregation overhead:
  * 
- * - tensor_data(tensor) returns the correct NUMA-local copy
- * - For data-parallel: returns local slice on each node
- * - For single-node: returns the original tensor data
- * - DO NOT access tensor->data directly in NUMA kernels
+ * 1. Check for shared result tensor data in data-parallel mode:
+ *    extern __thread void * ggml_numa_shared_result_tensor_data;
+ * 
+ * 2. Write directly to shared memory when available:
+ *    if (ggml_numa_shared_result_tensor_data != NULL) {
+ *        dst_data = (float *)ggml_numa_shared_result_tensor_data;
+ *    } else {
+ *        dst_data = (float *)tensor_data(tensor);  // Fallback
+ *    }
+ * 
+ * 3. This eliminates the need for aggregation by having all NUMA nodes
+ *    write directly to the final result tensor memory location
+ * 
+ * 4. Always use tensor_data() for source tensors to get NUMA-local copies:
+ *    - tensor_data(tensor) returns the correct NUMA-local copy
+ *    - For data-parallel: returns local slice on each node
+ *    - For single-node: returns the original tensor data
+ *    - DO NOT access tensor->data directly in NUMA kernels
  * 
  * SIMD OPTIMIZATION:
  * =================
@@ -80,12 +94,13 @@
  * ================================
  * 
  * ✅ 1. Extract tensor parameters and validate inputs
- * ✅ 2. Get NUMA-local data pointers using tensor_data()
- * ✅ 3. Read thread-local NUMA context variables
- * ✅ 4. Calculate data slice for this thread/node combination
- * ✅ 5. Use SIMD operations for computational core
- * ✅ 6. Handle edge cases (broadcasting, remainder elements)
- * ✅ 7. Return appropriate status code
+ * ✅ 2. Get NUMA-local source data pointers using tensor_data()
+ * ✅ 3. Set up shared memory destination pointer for direct writes
+ * ✅ 4. Read thread-local NUMA context variables  
+ * ✅ 5. Calculate data slice for this thread/node combination
+ * ✅ 6. Use SIMD operations for computational core
+ * ✅ 7. Handle edge cases (broadcasting, remainder elements)
+ * ✅ 8. Return appropriate status code
  * 
  * REGISTRY INTEGRATION:
  * ====================
@@ -97,6 +112,11 @@
  * - COMPLEXITY_MEDIUM: Large tensors, consider data-parallel
  * - COMPLEXITY_LARGE: Very large tensors, data-parallel/multi-thread
  * - COMPLEXITY_HUGE: Massive tensors, data-parallel/multi-thread
+ * 
+ * Set aggregation_policy to GGML_NUMA_AGGREGATION_NONE for shared memory approach:
+ * 
+ * .aggregation_policy = GGML_NUMA_AGGREGATION_NONE,  // Direct shared memory writes
+ * .aggregation_function = NULL,
  * 
  * PERFORMANCE CONSIDERATIONS:
  * ==========================
@@ -214,7 +234,20 @@ enum ggml_status ggml_numa_kernel_add_execute_low_overhead(void * work_context,
     // Get NUMA-local data pointers
     const float * src0_data = (const float *)tensor_data(src0);
     const float * src1_data = (const float *)tensor_data(src1);
-    float * dst_data = (float *)tensor_data(tensor);
+    
+    // For kernels with GGML_NUMA_AGGREGATION_NONE policy, write directly to shared result tensor
+    // This eliminates the need for data aggregation across NUMA nodes
+    extern __thread void * ggml_numa_shared_result_tensor_data;
+    float * dst_data;
+    if (ggml_numa_shared_result_tensor_data != NULL) {
+        // Use shared result tensor memory - eliminates aggregation overhead
+        dst_data = (float *)ggml_numa_shared_result_tensor_data;
+        NUMA_LOG_DEBUG("ADD Low-Overhead kernel using shared result tensor memory");
+    } else {
+        // Fallback to local tensor data for compatibility
+        dst_data = (float *)tensor_data(tensor);
+        NUMA_LOG_DEBUG("ADD Low-Overhead kernel using local tensor memory");
+    }
     
     // Read NUMA context
     extern __thread bool ggml_numa_is_data_parallel_execution;
@@ -225,6 +258,16 @@ enum ggml_status ggml_numa_kernel_add_execute_low_overhead(void * work_context,
     const int total_nodes = ggml_numa_is_data_parallel_execution ? 
                            ggml_numa_total_nodes_for_data_parallel : 1;
     const bool is_data_parallel = ggml_numa_is_data_parallel_execution;
+    
+    // NUMA OPTIMIZATION: In data-parallel mode, write results directly to shared tensor data
+    // This eliminates the need for complex aggregation logic at the end
+    if (is_data_parallel && ggml_numa_shared_result_tensor_data) {
+        dst_data = (float *)ggml_numa_shared_result_tensor_data;
+        NUMA_LOG_DEBUG("ADD Node %d: Using shared tensor data at %p (no aggregation needed)", 
+                       current_node, dst_data);
+    } else {
+        NUMA_LOG_DEBUG("ADD Node %d: Using local tensor data at %p", current_node, dst_data);
+    }
     
     // OPTIMIZATION: Limit thread count to reduce contention and synchronization overhead
     // Testing shows 16 threads per node is optimal balance of parallelism vs overhead
@@ -660,6 +703,13 @@ ggml_numa_kernel_query_result_t ggml_numa_kernel_add_query(const struct ggml_ten
     result.work_function = selected_strategy->work_function;
     result.efficiency_score = selected_strategy->efficiency_score;
     result.kernel_name = selected_strategy->kernel_name;
+    
+    // Set aggregation policy based on the selected work function
+    if (selected_strategy->work_function == ggml_numa_kernel_add_execute_no_aggregation) {
+        result.aggregation_policy = GGML_NUMA_AGGREGATION_NONE;
+    } else {
+        result.aggregation_policy = GGML_NUMA_AGGREGATION_NONE; // Traditional ADD kernels will now need custom aggregation if needed
+    }
     
     NUMA_LOG_DEBUG("ADD query: %zu elements -> %s (efficiency: %.2f)", 
                    total_elements, result.kernel_name, result.efficiency_score);

@@ -25,6 +25,17 @@ extern "C" {
 enum ggml_status ggml_numa_kernel_mul_mat_execute(void * work_context, struct ggml_compute_params * params);
 
 /**
+ * Calculate the exact work buffer size needed for MUL_MAT operation
+ * 
+ * This function analyzes the tensor types and dimensions to determine
+ * the precise buffer size needed for type conversion operations.
+ * 
+ * @param tensor The MUL_MAT tensor to analyze
+ * @return Size in bytes needed for work buffer, or 0 if no buffer needed
+ */
+size_t ggml_numa_kernel_mul_mat_calculate_work_buffer_size(const struct ggml_tensor * tensor);
+
+/**
  * Custom F16 dot product implementation for testing and optimization
  * 
  * @param n      Vector length

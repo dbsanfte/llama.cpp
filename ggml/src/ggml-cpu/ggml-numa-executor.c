@@ -204,7 +204,12 @@ enum ggml_status ggml_numa_executor_execute_tensor(struct ggml_tensor * tensor, 
         test_track_data_parallel();
         
         result = ggml_numa_simple_coordinator_execute_data_parallel(
-            query_result.work_function, tensor, query_result.work_buffer_size_per_thread);
+            query_result.work_function, 
+            tensor, 
+            query_result.work_buffer_size_per_thread, 
+            query_result.aggregation_policy,
+            query_result.aggregation_function,
+            query_result.aggregation_user_data);
             
         NUMA_LOG_DEBUG("DEBUG: NUMA Executor: Data-parallel execution result=%d\n", result);
         NUMA_PERF_END();
@@ -411,9 +416,10 @@ enum ggml_status ggml_numa_executor_fallback_to_cpu(struct ggml_tensor * tensor,
     // Try to get the dedicated fallback threadpool from coordinator
     fallback_threadpool = ggml_numa_simple_coordinator_get_fallback_threadpool();
     if (fallback_threadpool) {
-        fallback_thread_count = ggml_numa_simple_coordinator_get_fallback_thread_count();
+        // CRITICAL FIX: Respect the original graph plan's thread count instead of using the fallback threadpool's default
+        // This ensures mathematical equivalence between NUMA and non-NUMA execution paths
         GGML_LOG_DEBUG("🔧 Using dedicated fallback threadpool: %p (bound to NUMA node 0)\n", (void*)fallback_threadpool);
-        GGML_LOG_DEBUG("📊 Fallback Execution: threads=%d, threadpool=%p (disposable=true)\n", 
+        GGML_LOG_DEBUG("📊 Fallback Execution: threads=%d (respecting plan), threadpool=%p (disposable=true)\n", 
                        fallback_thread_count, (void*)fallback_threadpool);
     } else if (cplan->threadpool) {
         fallback_threadpool = cplan->threadpool;

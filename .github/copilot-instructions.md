@@ -68,15 +68,27 @@ size_t numa_end = (numa_node == total_numa_nodes - 1) ? total_elements : numa_st
 **NUMA Kernel Implementation Pattern:**
 ```c
 // Implement in numa-kernels/ directory
-enum ggml_status ggml_numa_kernel_your_operation_execute(struct ggml_tensor * tensor, struct ggml_cplan * cplan) {
+enum ggml_status ggml_numa_kernel_your_operation_execute(void * work_context, struct ggml_compute_params * params) {
+    struct ggml_tensor * tensor = (struct ggml_tensor *)work_context;
+    
     // 1. Validate inputs
     NUMA_ASSERT(tensor != nullptr, "Tensor cannot be null");
-    NUMA_ASSERT(cplan != nullptr, "Compute plan cannot be null");
+    NUMA_ASSERT(params != nullptr, "Compute params cannot be null");
     
-    // 2. Extract tensor data and parameters
-    const float * src0 = (const float *)tensor->src[0]->data;
-    const float * src1 = (const float *)tensor->src[1]->data;
-    float * dst = (float *)tensor->data;
+    // 2. Extract tensor data and parameters using shared memory approach
+    const float * src0 = (const float *)tensor_data(tensor->src[0]);
+    const float * src1 = (const float *)tensor->src[1] ? (const float *)tensor_data(tensor->src[1]) : NULL;
+    
+    // For GGML_NUMA_AGGREGATION_NONE policy, write directly to shared result tensor
+    extern __thread void * ggml_numa_shared_result_tensor_data;
+    float * dst;
+    if (ggml_numa_shared_result_tensor_data != NULL) {
+        // Use shared result tensor memory - eliminates aggregation overhead
+        dst = (float *)ggml_numa_shared_result_tensor_data;
+    } else {
+        // Fallback to local tensor data for compatibility
+        dst = (float *)tensor_data(tensor);
+    }
     
     // 3. Use SIMD operations for performance
     ggml_vec_add_f32(ggml_nelements(tensor), dst, src0, src1);
@@ -96,6 +108,8 @@ static void populate_your_operation_cache_entries(void) {
                      .on_node_strategy = NUMA_ON_NODE_STRATEGY_SINGLE_THREAD },
         .work_buffer_size_per_thread = 0,
         .work_function = ggml_numa_kernel_your_operation_execute,
+        .aggregation_policy = GGML_NUMA_AGGREGATION_NONE,  // No aggregation needed
+        .aggregation_function = NULL,
         .efficiency_score = 0.95f,
         .kernel_name = "NUMA Your Operation (Single/Single)"
     };
@@ -105,24 +119,26 @@ static void populate_your_operation_cache_entries(void) {
         .valid = true,
         .strategy = { .node_strategy = NUMA_NODE_STRATEGY_DATA_PARALLEL,
                      .on_node_strategy = NUMA_ON_NODE_STRATEGY_MULTI_THREAD },
-        .work_buffer_size_per_thread = 1024,  // If needed
+        .work_buffer_size_per_thread = 0,  // Shared memory approach eliminates buffers
         .work_function = ggml_numa_kernel_your_operation_execute,
+        .aggregation_policy = GGML_NUMA_AGGREGATION_NONE,  // Direct shared memory writes
+        .aggregation_function = NULL,
         .efficiency_score = 0.95f,
-        .kernel_name = "NUMA Your Operation (Data-Parallel/Multi-Thread)"
+        .kernel_name = "NUMA Your Operation (Data-Parallel Shared Memory)"
     };
     
-    // GIGANTIC_1GB: 64M - 512M elements (~1GB scale)
-    g_numa_cache[GGML_OP_YOUR_OPERATION][COMPLEXITY_GIGANTIC_1GB] = (ggml_numa_kernel_cache_entry_t){
+    // For operations needing custom aggregation (rare)
+    g_numa_cache[GGML_OP_YOUR_OPERATION][COMPLEXITY_CUSTOM] = (ggml_numa_kernel_cache_entry_t){
         .valid = true,
         .strategy = { .node_strategy = NUMA_NODE_STRATEGY_DATA_PARALLEL,
                      .on_node_strategy = NUMA_ON_NODE_STRATEGY_MULTI_THREAD },
-        .work_buffer_size_per_thread = 0,  // No-aggregation optimization
-        .work_function = ggml_numa_kernel_your_operation_no_aggregation_execute,
-        .efficiency_score = 0.99f,
-        .kernel_name = "NUMA Your Operation (No-Aggregation 1GB Scale)"
+        .work_buffer_size_per_thread = 0,
+        .work_function = ggml_numa_kernel_your_operation_execute,
+        .aggregation_policy = GGML_NUMA_AGGREGATION_CUSTOM,  // Kernel provides aggregation
+        .aggregation_function = ggml_numa_kernel_your_operation_aggregate,
+        .efficiency_score = 0.90f,
+        .kernel_name = "NUMA Your Operation (Custom Aggregation)"
     };
-    
-    // Continue for COMPLEXITY_GIGANTIC_2GB through COMPLEXITY_GIGANTIC_16GB...
 }
 ```
 
@@ -146,12 +162,15 @@ cp tests/test-numa-mathematical-correctness-template.cpp tests/test-numa-mathema
 - **NUMA Coordinator** - Resource management and work distribution (cleaned of legacy cruft)
 
 **✅ Supported Operations:**
-- **ADD** - Element-wise addition with SIMD optimization and no-aggregation breakthrough
+- **ADD** - Element-wise addition with SIMD optimization and shared memory approach
 - **MUL_MAT** - Matrix multiplication with chunk-based work distribution and type-specific SIMD operations
 
 **🚀 Performance Characteristics:**
 - **O(1) Strategy Lookups** - Pre-computed cache eliminates runtime overhead
 - **NUMA-Aware Scheduling** - Optimal thread and memory placement
+- **Cache-Optimized Execution** - Reduced memory bandwidth contention
+- **Simplified Aggregation** - Two-mode system: shared memory writes or custom kernel functions
+- **Direct Memory Access** - Eliminates expensive data copying between NUMA nodes
 - **Cache-Optimized Execution** - Reduced memory bandwidth contention
 - **No-Aggregation Optimization** - 62% performance improvement for large tensors
 - **GB-Scale Tensor Support** - Optimized handling of 1GB-16GB tensors
@@ -267,38 +286,42 @@ for (int row = numa_start_row; row < numa_end_row; row++) {
 - Validate with comprehensive multi-dimensional testing
 - Handle edge cases (uneven NUMA splits, remainder elements)
 
-### GB-Scale Tensor Infrastructure & No-Aggregation Optimization
+### GB-Scale Tensor Infrastructure & Shared Memory Optimization
 
 **Complexity Classification System:**
 The NUMA framework now supports 10 complexity levels for optimal strategy selection:
 - `COMPLEXITY_TINY` → `COMPLEXITY_HUGE`: Traditional levels for smaller tensors
 - `COMPLEXITY_GIGANTIC_1GB` through `COMPLEXITY_GIGANTIC_16GB`: New GB-scale levels
 
-**No-Aggregation Optimization Breakthrough:**
-For large tensors (1GB+), the no-aggregation optimization provides significant performance improvements:
-- **62% faster execution** by eliminating expensive data aggregation steps
-- **Direct in-place writes** to final tensor memory locations
+**Shared Memory Optimization:**
+For large tensors (1GB+), the shared memory approach provides significant performance improvements:
+- **Direct memory writes** to final tensor memory locations
 - **Zero-copy architecture** with proper NUMA memory locality
+- **Eliminates aggregation overhead** by writing directly to shared result tensor
 
-**Pattern: No-Aggregation Kernel Implementation**
+**Pattern: Shared Memory Kernel Implementation**
+Note: F32 example is shown but all quant types in `quants.c` must be supported.
+
 ```c
-// No-aggregation kernel for GB-scale tensors
-enum ggml_status ggml_numa_kernel_add_no_aggregation_execute(struct ggml_tensor * tensor, struct ggml_cplan * cplan) {
-    // Get NUMA execution context from thread-local variables
-    int numa_node = ggml_current_numa_node;
-    bool data_parallel = ggml_numa_is_data_parallel_execution; 
-    int total_nodes = ggml_numa_total_nodes_for_data_parallel;
+// Shared memory kernel for GB-scale tensors
+enum ggml_status ggml_numa_kernel_add_shared_memory_execute(void * work_context, struct ggml_compute_params * params) {
+    struct ggml_tensor * tensor = (struct ggml_tensor *)work_context;
     
-    if (data_parallel) {
-        // Calculate this NUMA node's data slice
-        size_t total_elements = ggml_nelements(tensor);
-        size_t elements_per_node = total_elements / total_nodes;
-        size_t numa_start = numa_node * elements_per_node;
-        size_t numa_end = (numa_node == total_nodes - 1) ? total_elements : numa_start + elements_per_node;
-        
-        // Direct SIMD operation on final tensor memory (no aggregation needed)
-        ggml_vec_add_f32(numa_end - numa_start, dst + numa_start, src0 + numa_start, src1 + numa_start);
+    // Get NUMA execution context from thread-local variables
+    extern __thread void * ggml_numa_shared_result_tensor_data;
+    extern __thread bool ggml_numa_is_data_parallel_execution;
+    extern __thread int ggml_current_numa_node;
+    
+    // Use shared memory for direct writes in data-parallel mode
+    float * dst_data;
+    if (ggml_numa_shared_result_tensor_data != NULL) {
+        dst_data = (float *)ggml_numa_shared_result_tensor_data;
+    } else {
+        dst_data = (float *)tensor_data(tensor);
     }
+    
+    // Direct SIMD operation on final tensor memory (no aggregation needed)
+    ggml_vec_add_f32(numa_end - numa_start, dst_data + numa_start, src0 + numa_start, src1 + numa_start);
     
     return GGML_STATUS_SUCCESS;
 }
@@ -412,8 +435,9 @@ docs/numa-architecture.md                         # Architecture documentation
 - [ ] Find mathematical kernel in `ggml-cpu.c`
 - [ ] Extract pure mathematical operations (no ggml threading)
 - [ ] Replace scalar loops with SIMD `ggml_vec_*` functions
-- [ ] Implement kernel function in `numa-kernels/` directory  
-- [ ] Add cache entries to registry for all complexity classes
+- [ ] Implement kernel function in `numa-kernels/` directory
+- [ ] Use shared memory setup: check `ggml_numa_shared_result_tensor_data` for direct writes
+- [ ] Add cache entries to registry with appropriate aggregation policy (NONE/CUSTOM)
 - [ ] Use `NUMA_ASSERT` for validation with proper coordinator signaling
 - [ ] Use `NUMA_LOG_DEBUG` macros instead of printf for debug messages
 - [ ] Create test from template with multi-dimensional validation

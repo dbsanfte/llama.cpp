@@ -187,6 +187,53 @@ typedef enum ggml_status (*ggml_numa_work_function_t)(
 );
 ```
 
+### Data Aggregation Architecture
+
+The coordinator uses a simplified two-mode aggregation system that eliminates complex coordinator logic and delegates responsibility to kernels:
+
+#### Aggregation Modes
+
+```c
+typedef enum {
+    GGML_NUMA_AGGREGATION_NONE = 0,      // No aggregation needed - kernel writes directly to final location
+    GGML_NUMA_AGGREGATION_CUSTOM         // Use kernel-provided custom aggregation function
+} ggml_numa_aggregation_policy_t;
+```
+
+#### **Mode 1: No Aggregation (`GGML_NUMA_AGGREGATION_NONE`)**
+Kernels write directly to shared result tensor memory, eliminating aggregation overhead:
+
+```c
+// Kernel writes directly to shared memory
+extern __thread void * ggml_numa_shared_result_tensor_data;
+float * dst_data;
+
+if (ggml_numa_shared_result_tensor_data != NULL) {
+    // Use shared result tensor memory - eliminates aggregation overhead
+    dst_data = (float *)ggml_numa_shared_result_tensor_data;
+} else {
+    // Fallback to local tensor data for compatibility
+    dst_data = (float *)tensor_data(tensor);
+}
+```
+
+#### **Mode 2: Custom Aggregation (`GGML_NUMA_AGGREGATION_CUSTOM`)**
+Kernels provide their own aggregation functions for complex operations:
+
+```c
+typedef enum ggml_status (*ggml_numa_aggregation_function_t)(
+    void * work_context,
+    int num_nodes,
+    void * user_data);
+```
+
+#### Aggregation Benefits
+
+- **Simplified Coordinator**: No operation-specific aggregation logic in coordinator
+- **Kernel Responsibility**: Aggregation becomes the kernel's concern, not the coordinator's
+- **Performance**: Direct shared memory writes eliminate expensive data copying
+- **Maintainability**: Clear separation of concerns between coordinator and kernels
+
 ---
 
 ## Integration with llama.cpp

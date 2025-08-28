@@ -206,12 +206,27 @@ ggml_numa_kernel_query_result_t ggml_numa_kernels_query(const struct ggml_tensor
            entry->valid ? "true" : "false", ggml_op_name(tensor->op), complexity_class);
     
     if (!entry->valid) {
-        // Cache miss - operation not supported
-        NUMA_LOG_DEBUG("Cache miss for op %s complexity %d", 
+        // Cache miss - try fallback to individual kernel query functions
+        NUMA_LOG_DEBUG("Cache miss for op %s complexity %d - trying kernel-specific query", 
                ggml_op_name(tensor->op), complexity_class);
-        GGML_LOG_DEBUG("NUMA Query: Cache miss for op %s complexity %d\n", 
+        GGML_LOG_DEBUG("NUMA Query: Cache miss for op %s complexity %d - trying kernel-specific query\n", 
                        ggml_op_name(tensor->op), complexity_class);
-        return result;
+        
+        // Try kernel-specific query functions
+        switch (tensor->op) {
+            case GGML_OP_MUL_MAT:
+                NUMA_LOG_DEBUG("Falling back to MUL_MAT kernel-specific query");
+                return ggml_numa_kernel_mul_mat_query(tensor);
+            
+            case GGML_OP_ADD:
+                NUMA_LOG_DEBUG("Falling back to ADD kernel-specific query");
+                // ADD uses legacy cache system only for now
+                return result;
+                
+            default:
+                NUMA_LOG_DEBUG("No kernel-specific query available for op %s", ggml_op_name(tensor->op));
+                return result;
+        }
     }
     
     // Cache hit - populate result with pre-computed values

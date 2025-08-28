@@ -53,7 +53,10 @@ enum ggml_status ggml_numa_simple_coordinator_execute_single_node(
 enum ggml_status ggml_numa_simple_coordinator_execute_data_parallel(
     ggml_numa_work_function_t work_function,
     void * work_context,
-    size_t work_size);
+    size_t work_size,
+    ggml_numa_aggregation_policy_t aggregation_policy,
+    ggml_numa_aggregation_function_t aggregation_function,
+    void * aggregation_user_data);
 
 /**
  * Get number of available NUMA nodes
@@ -98,6 +101,13 @@ void ggml_numa_simple_coordinator_assert_thread_binding(int expected_node, const
  * When false, kernels should process entire dataset
  */
 extern __thread bool ggml_numa_is_data_parallel_execution;
+
+/**
+ * Thread-local pointer to shared result tensor data for data-parallel operations
+ * When set, all NUMA nodes should write to this shared memory location
+ * rather than their local tensor copies
+ */
+extern __thread void * ggml_numa_shared_result_tensor_data;
 
 #ifdef __cplusplus
 }

@@ -50,6 +50,30 @@ typedef struct {
 } ggml_numa_cache_entry_t;
 
 /**
+ * Aggregation policy for NUMA kernels
+ * Defines how results should be combined across NUMA nodes
+ */
+typedef enum {
+    GGML_NUMA_AGGREGATION_NONE = 0,      // No aggregation needed, kernel writes directly to final location
+    GGML_NUMA_AGGREGATION_CUSTOM         // Use kernel-provided custom aggregation function
+} ggml_numa_aggregation_policy_t;
+
+/**
+ * Custom aggregation function provided by kernels
+ * Called by coordinator to aggregate results from multiple NUMA nodes
+ * 
+ * @param tensor       The tensor to aggregate
+ * @param num_nodes    Number of NUMA nodes that participated in computation
+ * @param user_data    Optional user data pointer provided by kernel
+ * @return GGML_STATUS_SUCCESS on success, error code on failure
+ */
+typedef enum ggml_status (*ggml_numa_aggregation_function_t)(
+    struct ggml_tensor * tensor, 
+    int num_nodes, 
+    void * user_data
+);
+
+/**
  * Kernel execution information returned by registry queries
  * Contains all information needed for the executor to dispatch work to coordinator
  * 
@@ -63,6 +87,9 @@ typedef struct {
     ggml_numa_work_function_t work_function;         // Function pointer for coordinator execution
     float efficiency_score;                           // Efficiency estimate (0.0-1.0)
     const char * kernel_name;                         // Human-readable kernel name
+    ggml_numa_aggregation_policy_t aggregation_policy; // How to handle result aggregation
+    ggml_numa_aggregation_function_t aggregation_function; // Custom aggregation function (if policy is CUSTOM)
+    void * aggregation_user_data;                     // User data passed to custom aggregation function
 } ggml_numa_kernel_query_result_t;
 
 /**
