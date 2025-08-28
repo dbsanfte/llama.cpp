@@ -70,65 +70,6 @@
 #endif
 
 // ============================================================================
-// Custom F16 Dot Product Implementation  
-// ============================================================================
-
-/**
- * Custom F16 dot product implementation optimized for NUMA execution
- * 
- * This function provides a specialized F16 dot product that can be tested
- * against the reference implementation for mathematical correctness.
- * 
- * @param n      Vector length
- * @param s      Output scalar result
- * @param s_off  Output offset (should be 0)
- * @param x      First vector (F16 data)  
- * @param x_off  First vector offset
- * @param y      Second vector (F16 data)
- * @param y_off  Second vector offset
- * @param nrc    Number of rows per call (should be 1)
- */
-void ggml_numa_vec_dot_f16_custom(int n, float * restrict s, size_t s_off, 
-                                 const void * restrict x, size_t x_off,
-                                 const void * restrict y, size_t y_off, int nrc) {
-    // Ensure single row operation
-    assert(nrc == 1);
-    assert(s_off == 0);
-    
-    const ggml_fp16_t * restrict x_f16 = (const ggml_fp16_t *)x + x_off;
-    const ggml_fp16_t * restrict y_f16 = (const ggml_fp16_t *)y + y_off;
-    
-    // Custom F16 dot product implementation
-    float sum = 0.0f;
-    
-    // Process in chunks of 4 for better cache utilization and potential SIMD
-    int i = 0;
-    for (; i + 3 < n; i += 4) {
-        // Convert F16 to F32 and accumulate
-        float x0 = ggml_fp16_to_fp32(x_f16[i + 0]);
-        float y0 = ggml_fp16_to_fp32(y_f16[i + 0]);
-        float x1 = ggml_fp16_to_fp32(x_f16[i + 1]);
-        float y1 = ggml_fp16_to_fp32(y_f16[i + 1]);
-        float x2 = ggml_fp16_to_fp32(x_f16[i + 2]);
-        float y2 = ggml_fp16_to_fp32(y_f16[i + 2]);
-        float x3 = ggml_fp16_to_fp32(x_f16[i + 3]);
-        float y3 = ggml_fp16_to_fp32(y_f16[i + 3]);
-        
-        // Accumulate products (unrolled for better performance)
-        sum += x0 * y0 + x1 * y1 + x2 * y2 + x3 * y3;
-    }
-    
-    // Handle remaining elements
-    for (; i < n; i++) {
-        float x_val = ggml_fp16_to_fp32(x_f16[i]);
-        float y_val = ggml_fp16_to_fp32(y_f16[i]);
-        sum += x_val * y_val;
-    }
-    
-    *s = sum;
-}
-
-// ============================================================================
 // Type Traits Access for vec_dot Operations
 // ============================================================================
 
@@ -596,8 +537,6 @@ enum ggml_status ggml_numa_kernel_mul_mat_execute(void * work_context,
                     
                     if (vec_dot_num_rows == 1) {
                         // Single row case: compute one dot product
-                        
-
                         
                         // DETAILED VEC_DOT DEBUGGING: Create wrapper to log internal computation
                         // This logs what happens inside the vec_dot function call
