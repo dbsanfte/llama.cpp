@@ -22,6 +22,22 @@
 #include <errno.h>     // For ETIMEDOUT
 #include <string.h>    // For strcmp, strcspn, strncpy
 
+// Conditional timing macros - only execute when performance measurement is enabled
+#define NUMA_TIMING_START(var_name) \
+    struct timespec var_name; \
+    if (g_numa_perf_enabled) { \
+        clock_gettime(CLOCK_MONOTONIC, &var_name); \
+    }
+
+#define NUMA_TIMING_END(start_var, end_var, result_ms_var) \
+    struct timespec end_var; \
+    double result_ms_var = 0.0; \
+    if (g_numa_perf_enabled) { \
+        clock_gettime(CLOCK_MONOTONIC, &end_var); \
+        result_ms_var = (end_var.tv_sec - start_var.tv_sec) * 1000.0 + \
+                        (end_var.tv_nsec - start_var.tv_nsec) / 1000000.0; \
+    }
+
 #ifdef __linux__
 #include <sched.h>     // For CPU affinity functions
 #include <numa.h>      // For NUMA functions
@@ -88,8 +104,11 @@ static void * thread_worker(void * arg) {
     return NULL;
 }
 
-// NUMA thread binding verification utilities
+// NUMA thread binding verification utilities with debug-only compilation
 #ifdef __linux__
+
+// Debug-only NUMA thread binding verification (compiled out in release builds)
+#if defined(DEBUG) || !defined(NDEBUG)
 static void assert_numa_thread_binding_fatal(int expected_node, const char* thread_type, int thread_id) {
     if (numa_available() < 0) {
         return; // NUMA not available, skip check
@@ -121,6 +140,19 @@ static void assert_numa_strategy_compliance_fatal(void) {
     }
 }
 #else
+// Release build - NUMA binding assertions compile to no-op for zero overhead
+static void assert_numa_thread_binding_fatal(int expected_node, const char* thread_type, int thread_id) {
+    (void)expected_node; (void)thread_type; (void)thread_id;
+    // Debug assertions disabled in release builds for optimal performance
+}
+
+static void assert_numa_strategy_compliance_fatal(void) {
+    // Debug assertions disabled in release builds for optimal performance
+}
+#endif
+
+#else
+// Non-Linux systems - no NUMA support
 static void assert_numa_thread_binding_fatal(int expected_node, const char* thread_type, int thread_id) {
     (void)expected_node; (void)thread_type; (void)thread_id;
     // No NUMA support on non-Linux systems
@@ -308,8 +340,7 @@ static void* numa_dispatch_worker(void* arg) {
         if (atomic_load(&g_simple_coordinator.dispatch_work_available[numa_node])) {
             NUMA_LOG_DEBUG("Dispatch thread %d executing work on threadpool", numa_node);
             
-            struct timespec work_start_time, work_end_time;
-            clock_gettime(CLOCK_MONOTONIC, &work_start_time);
+            NUMA_TIMING_START(work_start_time)
             
             // Create work parameters for this NUMA node
             struct ggml_compute_params work_params = {
@@ -403,9 +434,7 @@ static void* numa_dispatch_worker(void* arg) {
             ggml_numa_is_data_parallel_execution = false;
             ggml_numa_total_nodes_for_data_parallel = 1;
             
-            clock_gettime(CLOCK_MONOTONIC, &work_end_time);
-            double work_time_ms = (work_end_time.tv_sec - work_start_time.tv_sec) * 1000.0 + 
-                                  (work_end_time.tv_nsec - work_start_time.tv_nsec) / 1000000.0;
+            NUMA_TIMING_END(work_start_time, work_end_time, work_time_ms)
             
             // Store completion status
             atomic_store(&g_simple_coordinator.work_completion_status[numa_node], 
@@ -1099,8 +1128,7 @@ enum ggml_status ggml_numa_simple_coordinator_execute_data_parallel(
     enum ggml_numa_strategy current_strategy = g_simple_coordinator.last_strategy;
     int actual_numa_nodes = (current_strategy == GGML_NUMA_STRATEGY_ISOLATE) ? 1 : g_simple_coordinator.num_numa_nodes;
     int num_nodes = actual_numa_nodes;
-    struct timespec coord_start_time, coord_end_time;
-    clock_gettime(CLOCK_MONOTONIC, &coord_start_time);
+    NUMA_TIMING_START(coord_start_time)
     
     NUMA_LOG_DEBUG("Starting TRUE async dispatch execution across %d nodes (optimal NUMA architecture!)", num_nodes);
     
@@ -1139,16 +1167,12 @@ enum ggml_status ggml_numa_simple_coordinator_execute_data_parallel(
     
     NUMA_LOG_DEBUG("Waiting for all dispatch threads to complete...");
     
-    struct timespec barrier_start_time;
-    clock_gettime(CLOCK_MONOTONIC, &barrier_start_time);
+    NUMA_TIMING_START(barrier_start_time)
     
     // Wait at barrier for all dispatch threads to complete
     pthread_barrier_wait(&g_simple_coordinator.completion_barrier);
     
-    struct timespec barrier_end_time;
-    clock_gettime(CLOCK_MONOTONIC, &barrier_end_time);
-    double barrier_wait_ms = (barrier_end_time.tv_sec - barrier_start_time.tv_sec) * 1000.0 + 
-                             (barrier_end_time.tv_nsec - barrier_start_time.tv_nsec) / 1000000.0;
+    NUMA_TIMING_END(barrier_start_time, barrier_end_time, barrier_wait_ms)
     NUMA_LOG_DEBUG("Barrier wait completed in %.3fms", barrier_wait_ms);
     
     // Collect results from all nodes
@@ -1193,8 +1217,7 @@ enum ggml_status ggml_numa_simple_coordinator_execute_data_parallel(
         
         if (needs_aggregation) {
             NUMA_LOG_DEBUG("Starting kernel-provided custom aggregation from %d NUMA nodes", num_nodes);
-            struct timespec agg_start_time;
-            clock_gettime(CLOCK_MONOTONIC, &agg_start_time);
+            NUMA_TIMING_START(agg_start_time)
             
             enum ggml_status agg_status = GGML_STATUS_SUCCESS;
             
@@ -1207,10 +1230,7 @@ enum ggml_status ggml_numa_simple_coordinator_execute_data_parallel(
                 NUMA_LOG_DEBUG("Custom aggregation function completed successfully");
             }
             
-            struct timespec agg_end_time;
-            clock_gettime(CLOCK_MONOTONIC, &agg_end_time);
-            double agg_time_ms = (agg_end_time.tv_sec - agg_start_time.tv_sec) * 1000.0 + 
-                                 (agg_end_time.tv_nsec - agg_start_time.tv_nsec) / 1000000.0;
+            NUMA_TIMING_END(agg_start_time, agg_end_time, agg_time_ms)
             
             if (agg_status == GGML_STATUS_SUCCESS) {
                 NUMA_LOG_DEBUG("Custom aggregation completed successfully in %.3fms", agg_time_ms);
@@ -1232,9 +1252,7 @@ enum ggml_status ggml_numa_simple_coordinator_execute_data_parallel(
     
     NUMA_PERF_END();
     
-    clock_gettime(CLOCK_MONOTONIC, &coord_end_time);
-    double total_coord_time_ms = (coord_end_time.tv_sec - coord_start_time.tv_sec) * 1000.0 + 
-                                 (coord_end_time.tv_nsec - coord_start_time.tv_nsec) / 1000000.0;
+    NUMA_TIMING_END(coord_start_time, coord_end_time, total_coord_time_ms)
     
     NUMA_LOG_DEBUG("All dispatch NUMA work completed, final status: %d (total coordination time: %.3fms)", 
            final_status, total_coord_time_ms);

@@ -225,15 +225,24 @@ enum ggml_status ggml_numa_kernel_add_execute_low_overhead(void * work_context,
                                                           struct ggml_compute_params * params) {
     struct ggml_tensor * tensor = (struct ggml_tensor *)work_context;
     
-    // Fast validation - minimal checks
+    // Fast validation - minimal checks for critical errors
     if (!tensor || !tensor->src[0] || !tensor->src[1]) {
         return GGML_STATUS_FAILED;
     }
+    
+    // Debug-only assertions for non-critical validations (compiled out in release)
+    NUMA_DEBUG_ASSERT_MSG(params != NULL, "Compute params should not be NULL");
+    NUMA_DEBUG_ASSERT_FMT(tensor->type == GGML_TYPE_F32, "Expected F32 tensor, got type %d", tensor->type);
     
     // Extract tensor parameters
     const struct ggml_tensor * src0 = tensor->src[0];
     const struct ggml_tensor * src1 = tensor->src[1];
     const int64_t total_elements = ggml_nelements(tensor);
+    
+    // Debug-only data validation (zero overhead in release builds)
+    NUMA_DEBUG_ASSERT_MSG(total_elements > 0, "Tensor should have positive element count");
+    NUMA_DEBUG_ASSERT_FMT(src0->type == GGML_TYPE_F32, "Source tensor 0 expected F32, got type %d", src0->type);
+    NUMA_DEBUG_ASSERT_FMT(src1->type == GGML_TYPE_F32, "Source tensor 1 expected F32, got type %d", src1->type);
     
     // Get NUMA-local data pointers
     const float * src0_data = (const float *)tensor_data(src0);
@@ -769,170 +778,6 @@ ggml_numa_kernel_query_result_t ggml_numa_kernel_add_query(const struct ggml_ten
 }
 
 // ============================================================================
-// Legacy Cache Population for Backward Compatibility
-// ============================================================================
-
-/**
- * Populate NUMA kernel cache with ADD operation strategies
- * (Legacy compatibility function for backward compatibility during transition)
- * 
- * Template Pattern: Registry integration for kernel strategies
- * 
- * This function defines the execution strategies for different tensor
- * complexity levels. The NUMA executor queries this cache for O(1) 
- * strategy selection based on tensor size.
- * 
- * STRATEGY SELECTION GUIDE:
- * - COMPLEXITY_TINY: < 32K elements - single node, single thread
- * - COMPLEXITY_SMALL: 32K - 512K elements - single node, multi thread  
- * - COMPLEXITY_MEDIUM: 512K - 16M elements - consider data parallel
- * - COMPLEXITY_LARGE: 16M - 256M elements - data parallel recommended
- * - COMPLEXITY_HUGE: > 256M elements - data parallel required
- * 
- * @param cache_array Pointer to cache array (cast to ggml_numa_cache_entry_t*)
- */
-
-void ggml_numa_kernel_add_populate_cache(void * cache_array) {
-    ggml_numa_cache_entry_t * cache = (ggml_numa_cache_entry_t *)cache_array;
-    
-    // TEMPLATE PATTERN: Define strategies for different complexity levels
-    // Tailor these to your operation's characteristics and performance profile
-    
-    // CRITICAL FIX: Add support for small operations during text generation
-    // Tiny tensors: single-node, single-thread for minimal overhead
-    cache[COMPLEXITY_TINY] = (ggml_numa_cache_entry_t){
-        .valid = true,
-        .strategy = { 
-            .node_strategy = NUMA_NODE_STRATEGY_SINGLE,             // Stay on one node
-            .on_node_strategy = NUMA_ON_NODE_STRATEGY_SINGLE_THREAD // Single thread for tiny ops
-        },
-        .work_buffer_size_per_thread = 0,                          // No extra buffers needed
-        .work_function = ggml_numa_kernel_add_execute_optimized,   // Our optimized kernel
-        .efficiency_score = 0.98f,                                 // Very efficient for tiny data
-        .kernel_name = "NUMA ADD (Single-Node Single-Thread)"
-    };
-    
-    // Small tensors: single-node, multi-thread for good performance
-    cache[COMPLEXITY_SMALL] = (ggml_numa_cache_entry_t){
-        .valid = true,
-        .strategy = { 
-            .node_strategy = NUMA_NODE_STRATEGY_SINGLE,             // Stay on one node
-            .on_node_strategy = NUMA_ON_NODE_STRATEGY_MULTI_THREAD  // Multi-thread for small ops
-        },
-        .work_buffer_size_per_thread = 0,                          // No extra buffers needed
-        .work_function = ggml_numa_kernel_add_execute_optimized,   // Our optimized kernel
-        .efficiency_score = 0.96f,                                 // Good efficiency for small data
-        .kernel_name = "NUMA ADD (Single-Node Multi-Thread)"
-    };
-    
-    // Medium tensors: use single-node execution for better efficiency
-    // This avoids thread overhead for moderately-sized tensors
-    cache[COMPLEXITY_MEDIUM] = (ggml_numa_cache_entry_t){
-        .valid = true,
-        .strategy = { 
-            .node_strategy = NUMA_NODE_STRATEGY_SINGLE,             // Stay on one node
-            .on_node_strategy = NUMA_ON_NODE_STRATEGY_MULTI_THREAD  // Use multiple threads on that node
-        },
-        .work_buffer_size_per_thread = 0,                          // No extra buffers needed
-        .work_function = ggml_numa_kernel_add_execute_optimized,   // Our optimized kernel
-        .efficiency_score = 0.95f,                                 // Good efficiency for medium data
-        .kernel_name = "NUMA ADD (Single-Node Multi-Thread)"
-    };
-    
-    // Use optimized kernel for all large data-parallel cases
-    // Large tensors benefit significantly from NUMA parallelization
-    cache[COMPLEXITY_LARGE] = (ggml_numa_cache_entry_t){
-        .valid = true,
-        .strategy = { 
-            .node_strategy = NUMA_NODE_STRATEGY_DATA_PARALLEL,      // Slice data across nodes
-            .on_node_strategy = NUMA_ON_NODE_STRATEGY_MULTI_THREAD  // Use multiple threads per node
-        },
-        .work_buffer_size_per_thread = 0,                          // No extra buffers needed
-        .work_function = ggml_numa_kernel_add_execute_low_overhead, // Low-overhead optimized kernel
-        .efficiency_score = 0.99f,                                 // High efficiency for large data
-        .kernel_name = "NUMA ADD (Low-Overhead Data-Parallel)"
-    };
-    
-    // Massive tensors definitely need data-parallel execution
-    cache[COMPLEXITY_HUGE] = (ggml_numa_cache_entry_t){
-        .valid = true,
-        .strategy = { 
-            .node_strategy = NUMA_NODE_STRATEGY_DATA_PARALLEL,      // Essential for huge tensors
-            .on_node_strategy = NUMA_ON_NODE_STRATEGY_MULTI_THREAD  // Maximum parallelization
-        },
-        .work_buffer_size_per_thread = 0,                          // No extra buffers needed
-        .work_function = ggml_numa_kernel_add_execute_no_aggregation, // No-aggregation optimized kernel
-        .efficiency_score = 0.99f,                                 // Highest efficiency for huge data
-        .kernel_name = "NUMA ADD (No-Aggregation Data-Parallel)"
-    };
-    
-    // GB-scale tensors: Use no-aggregation strategy for maximum performance
-    cache[COMPLEXITY_GIGANTIC_1GB] = (ggml_numa_cache_entry_t){
-        .valid = true,
-        .strategy = { 
-            .node_strategy = NUMA_NODE_STRATEGY_DATA_PARALLEL,
-            .on_node_strategy = NUMA_ON_NODE_STRATEGY_MULTI_THREAD
-        },
-        .work_buffer_size_per_thread = 0,
-        .work_function = ggml_numa_kernel_add_execute_no_aggregation,
-        .efficiency_score = 0.99f,
-        .kernel_name = "NUMA ADD (No-Aggregation 1GB Scale)"
-    };
-    
-    cache[COMPLEXITY_GIGANTIC_2GB] = (ggml_numa_cache_entry_t){
-        .valid = true,
-        .strategy = { 
-            .node_strategy = NUMA_NODE_STRATEGY_DATA_PARALLEL,
-            .on_node_strategy = NUMA_ON_NODE_STRATEGY_MULTI_THREAD
-        },
-        .work_buffer_size_per_thread = 0,
-        .work_function = ggml_numa_kernel_add_execute_no_aggregation,
-        .efficiency_score = 0.99f,
-        .kernel_name = "NUMA ADD (No-Aggregation 2GB Scale)"
-    };
-    
-    cache[COMPLEXITY_GIGANTIC_4GB] = (ggml_numa_cache_entry_t){
-        .valid = true,
-        .strategy = { 
-            .node_strategy = NUMA_NODE_STRATEGY_DATA_PARALLEL,
-            .on_node_strategy = NUMA_ON_NODE_STRATEGY_MULTI_THREAD
-        },
-        .work_buffer_size_per_thread = 0,
-        .work_function = ggml_numa_kernel_add_execute_no_aggregation,
-        .efficiency_score = 0.99f,
-        .kernel_name = "NUMA ADD (No-Aggregation 4GB Scale)"
-    };
-    
-    cache[COMPLEXITY_GIGANTIC_8GB] = (ggml_numa_cache_entry_t){
-        .valid = true,
-        .strategy = { 
-            .node_strategy = NUMA_NODE_STRATEGY_DATA_PARALLEL,
-            .on_node_strategy = NUMA_ON_NODE_STRATEGY_MULTI_THREAD
-        },
-        .work_buffer_size_per_thread = 0,
-        .work_function = ggml_numa_kernel_add_execute_no_aggregation,
-        .efficiency_score = 0.99f,
-        .kernel_name = "NUMA ADD (No-Aggregation 8GB Scale)"
-    };
-    
-    cache[COMPLEXITY_GIGANTIC_16GB] = (ggml_numa_cache_entry_t){
-        .valid = true,
-        .strategy = { 
-            .node_strategy = NUMA_NODE_STRATEGY_DATA_PARALLEL,
-            .on_node_strategy = NUMA_ON_NODE_STRATEGY_MULTI_THREAD
-        },
-        .work_buffer_size_per_thread = 0,
-        .work_function = ggml_numa_kernel_add_execute_no_aggregation,
-        .efficiency_score = 0.99f,
-        .kernel_name = "NUMA ADD (No-Aggregation 16GB Scale)"
-    };
-    
-    // TEMPLATE NOTE: Consider adding entries for COMPLEXITY_TINY, COMPLEXITY_SMALL, 
-    // and COMPLEXITY_MEDIUM with different strategies if beneficial for your operation.
-    // For ADD, data-parallel works well for most cases, but other operations might
-    // benefit from single-node execution for smaller tensors.
-}
-
 // No-Aggregation Implementation  
 // For element-wise operations that don't require data aggregation between NUMA nodes
 // This eliminates the coordination overhead by having each node write directly to 

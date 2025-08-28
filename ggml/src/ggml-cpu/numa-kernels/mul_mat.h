@@ -62,14 +62,6 @@ void ggml_numa_vec_dot_f16_custom(int n, float * restrict s, size_t s_off,
  */
 ggml_numa_kernel_query_result_t ggml_numa_kernel_mul_mat_query(const struct ggml_tensor * tensor);
 
-/**
- * Populate cache entries for MUL_MAT operation across all complexity levels
- * (Legacy compatibility function for backward compatibility during transition)
- * 
- * @param cache_entries Array of cache entries to populate (COMPLEXITY_COUNT elements)
- */
-void ggml_numa_kernel_mul_mat_populate_cache(ggml_numa_cache_entry_t cache_entries[COMPLEXITY_COUNT]);
-
 #ifdef __cplusplus
 }
 #endif

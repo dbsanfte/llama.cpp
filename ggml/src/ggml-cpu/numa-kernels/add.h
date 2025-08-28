@@ -44,9 +44,6 @@ enum ggml_status ggml_numa_kernel_add_execute_no_aggregation(void * work_context
 // Debug and performance functions  
 enum ggml_status ggml_numa_kernel_add_debug_data_locality(const struct ggml_tensor * tensor);
 
-// Cache population function for registry (legacy compatibility)
-void ggml_numa_kernel_add_populate_cache(void * cache_array);
-
 #ifdef __cplusplus
 }
 #endif

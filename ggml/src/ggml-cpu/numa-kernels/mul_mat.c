@@ -864,26 +864,3 @@ ggml_numa_kernel_query_result_t ggml_numa_kernel_mul_mat_query(const struct ggml
     
     return result;
 }
-
-// ============================================================================
-// Legacy Cache Population for Backward Compatibility
-// ============================================================================
-
-void ggml_numa_kernel_mul_mat_populate_cache(ggml_numa_cache_entry_t cache_entries[COMPLEXITY_COUNT]) {
-    NUMA_LOG_DEBUG("Populating MUL_MAT NUMA cache entries (legacy compatibility)");
-    
-    // CRITICAL: Disable legacy cache to force use of query-based validation
-    // The legacy cache bypasses our type validation in the query function.
-    // All cache entries are set to invalid to prevent fallback execution.
-    
-    for (int i = 0; i < COMPLEXITY_COUNT; i++) {
-        cache_entries[i] = (ggml_numa_cache_entry_t){
-            .valid = false,
-            .strategy = { .node_strategy = NUMA_NODE_STRATEGY_SINGLE, .on_node_strategy = NUMA_ON_NODE_STRATEGY_SINGLE_THREAD },
-            .work_buffer_size_per_thread = 0,
-            .work_function = NULL,
-            .efficiency_score = 0.0f,
-            .kernel_name = "MUL_MAT Cache Disabled"
-        };
-    }
-}
