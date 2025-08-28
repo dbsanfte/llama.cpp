@@ -165,6 +165,10 @@
 #include "../ggml-impl.h"
 #include "../vec.h"
 
+// External declarations from ggml-cpu.c and ggml.c
+extern const struct ggml_type_traits_cpu * ggml_get_type_traits_cpu(enum ggml_type type);
+extern const struct ggml_type_traits * ggml_get_type_traits(enum ggml_type type);
+
 #ifndef MIN
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
 #endif
@@ -565,13 +569,60 @@ enum ggml_status ggml_numa_kernel_add_execute_optimized(void * work_context,
  * @return       true if kernel can handle this tensor, false otherwise
  */
 bool ggml_numa_kernel_add_supports_optimized(const struct ggml_tensor * tensor) {
-    return tensor && 
-           tensor->op == GGML_OP_ADD &&
-           tensor->src[0] && 
-           tensor->src[1] &&
-           tensor->type == GGML_TYPE_F32 &&
-           tensor->src[0]->type == GGML_TYPE_F32 &&
-           tensor->src[1]->type == GGML_TYPE_F32;
+    if (!tensor || tensor->op != GGML_OP_ADD || !tensor->src[0] || !tensor->src[1]) {
+        return false;
+    }
+    
+    const struct ggml_tensor * src0 = tensor->src[0];
+    const struct ggml_tensor * src1 = tensor->src[1];
+    const enum ggml_type dst_type = tensor->type;
+    const enum ggml_type src0_type = src0->type;
+    const enum ggml_type src1_type = src1->type;
+    
+    // Support all the same type combinations as the reference implementation
+    
+    // Non-quantized types (same as binary_op in binary-ops.cpp)
+    if ((src0_type == GGML_TYPE_F32  && src1_type == GGML_TYPE_F32  && dst_type == GGML_TYPE_F32) ||  // all f32
+        (src0_type == GGML_TYPE_F16  && src1_type == GGML_TYPE_F16  && dst_type == GGML_TYPE_F16) ||  // all f16
+        (src0_type == GGML_TYPE_BF16 && src1_type == GGML_TYPE_BF16 && dst_type == GGML_TYPE_BF16) || // all bf16
+        (src0_type == GGML_TYPE_BF16 && src1_type == GGML_TYPE_F32  && dst_type == GGML_TYPE_BF16) ||
+        (src0_type == GGML_TYPE_BF16 && src1_type == GGML_TYPE_F32  && dst_type == GGML_TYPE_F32) ||
+        (src0_type == GGML_TYPE_F16  && src1_type == GGML_TYPE_F32  && dst_type == GGML_TYPE_F16) ||
+        (src0_type == GGML_TYPE_F16  && src1_type == GGML_TYPE_F32  && dst_type == GGML_TYPE_F32)) {
+        return true;
+    }
+    
+    // Quantized types (same as ggml_compute_forward_add_q_f32)
+    if (src1_type == GGML_TYPE_F32 && dst_type == GGML_TYPE_F32) {
+        switch (src0_type) {
+            case GGML_TYPE_Q4_0:
+            case GGML_TYPE_Q4_1:
+            case GGML_TYPE_Q5_0:
+            case GGML_TYPE_Q5_1:
+            case GGML_TYPE_Q8_0:
+            case GGML_TYPE_Q2_K:
+            case GGML_TYPE_Q3_K:
+            case GGML_TYPE_Q4_K:
+            case GGML_TYPE_Q5_K:
+            case GGML_TYPE_Q6_K:
+            case GGML_TYPE_TQ1_0:
+            case GGML_TYPE_TQ2_0:
+            case GGML_TYPE_IQ2_XXS:
+            case GGML_TYPE_IQ2_XS:
+            case GGML_TYPE_IQ3_XXS:
+            case GGML_TYPE_IQ1_S:
+            case GGML_TYPE_IQ1_M:
+            case GGML_TYPE_IQ4_NL:
+            case GGML_TYPE_IQ4_XS:
+            case GGML_TYPE_IQ3_S:
+            case GGML_TYPE_IQ2_S:
+                return true;
+            default:
+                break;
+        }
+    }
+    
+    return false;
 }
 
 // ============================================================================
@@ -898,12 +949,10 @@ enum ggml_status ggml_numa_kernel_add_execute_no_aggregation(void * work_context
     // Extract tensor parameters
     const struct ggml_tensor * src0 = tensor->src[0];
     const struct ggml_tensor * src1 = tensor->src[1];
+    const enum ggml_type src0_type = src0->type;
+    const enum ggml_type src1_type = src1->type;
+    const enum ggml_type dst_type = tensor->type;
     const int64_t total_elements = ggml_nelements(tensor);
-    
-    // Get NUMA-local data pointers
-    const float * src0_data = (const float *)tensor_data(src0);
-    const float * src1_data = (const float *)tensor_data(src1);
-    float * dst_data = (float *)tensor_data(tensor);
     
     // Read NUMA context
     extern __thread bool ggml_numa_is_data_parallel_execution;
@@ -915,9 +964,8 @@ enum ggml_status ggml_numa_kernel_add_execute_no_aggregation(void * work_context
                            ggml_numa_total_nodes_for_data_parallel : 1;
     const bool is_data_parallel = ggml_numa_is_data_parallel_execution;
     
-    // OPTIMIZATION: Ultra-minimal thread count to reduce synchronization overhead
-    // For large tensors, fewer threads with larger chunks is more efficient
-    const int optimal_threads_per_node = 8;  // Reduced from 16 to 8
+    // Optimal thread count to reduce synchronization overhead
+    const int optimal_threads_per_node = 8;
     const int thread_id = params->ith % optimal_threads_per_node;
     const int num_threads = MIN(params->nth, optimal_threads_per_node);
     
@@ -926,30 +974,25 @@ enum ggml_status ggml_numa_kernel_add_execute_no_aggregation(void * work_context
         return GGML_STATUS_SUCCESS;
     }
     
-    NUMA_LOG_DEBUG("NUMA Node %d, Thread %d/%d NO-AGGREGATION kernel (data_parallel=%d, total_nodes=%d, total_elements=%ld)", 
-                   current_node, thread_id, num_threads, is_data_parallel, total_nodes, total_elements);
+    NUMA_LOG_DEBUG("NUMA Node %d, Thread %d TYPE-AWARE kernel (src0=%s, src1=%s, dst=%s, data_parallel=%d)", 
+                   current_node, thread_id, ggml_type_name(src0_type), ggml_type_name(src1_type), 
+                   ggml_type_name(dst_type), is_data_parallel);
     
-    // Calculate optimized data slice with larger chunks for reduced overhead
+    // Calculate data slice with larger chunks for reduced overhead
     int64_t numa_start, numa_end;
     
     if (is_data_parallel && total_nodes > 1) {
-        // DATA-PARALLEL MODE: Each node handles its slice, writes directly to final tensor
+        // DATA-PARALLEL MODE: Each node handles its slice
         const int64_t elements_per_node = total_elements / total_nodes;
         numa_start = current_node * elements_per_node;
         numa_end = (current_node == total_nodes - 1) ? total_elements : numa_start + elements_per_node;
-        
-        NUMA_LOG_DEBUG("NUMA Node %d NO-AGGREGATION slice [%ld, %ld) = %ld elements (direct write)", 
-                       current_node, numa_start, numa_end, numa_end - numa_start);
     } else {
         // SINGLE-NODE MODE: Process entire tensor
         numa_start = 0;
         numa_end = total_elements;
-        
-        NUMA_LOG_DEBUG("NUMA Node %d NO-AGGREGATION processing entire tensor (%ld elements)", 
-                       current_node, total_elements);
     }
     
-    // Divide this node's slice among threads with larger chunks
+    // Divide this node's slice among threads
     const int64_t elements_in_slice = numa_end - numa_start;
     const int64_t elements_per_thread = (elements_in_slice + num_threads - 1) / num_threads;
     const int64_t thread_start = numa_start + thread_id * elements_per_thread;
@@ -961,36 +1004,161 @@ enum ggml_status ggml_numa_kernel_add_execute_no_aggregation(void * work_context
         return GGML_STATUS_SUCCESS;
     }
     
-    NUMA_LOG_DEBUG("NUMA Node %d, Thread %d NO-AGGREGATION processing [%ld, %ld) = %zu elements", 
-                   current_node, thread_id, thread_start, thread_end, thread_elements);
+    // Get NUMA-local data pointers
+    const void * src0_data = tensor_data(src0);
+    const void * src1_data = tensor_data(src1);
+    void * dst_data = tensor_data(tensor);
     
-    // Direct in-place SIMD operation - no coordination needed
-    // Each node writes directly to its final tensor location
-    const int64_t src1_elements = ggml_nelements(src1);
+    // Handle different type combinations following the same pattern as reference implementation
     
-    if (src1_elements == 1) {
-        // Scalar broadcasting - direct write to final tensor
-        const float scalar = src1_data[0];
-        for (size_t i = 0; i < thread_elements; ++i) {
-            dst_data[thread_start + i] = src0_data[thread_start + i] + scalar;
+    // NON-QUANTIZED TYPES (matching binary_op template in binary-ops.cpp)
+    if (src0_type == GGML_TYPE_F32 && src1_type == GGML_TYPE_F32 && dst_type == GGML_TYPE_F32) {
+        // All F32 - direct SIMD operation
+        const float * s0 = (const float *)src0_data;
+        const float * s1 = (const float *)src1_data;
+        float * d = (float *)dst_data;
+        
+        ggml_vec_add_f32(thread_elements, d + thread_start, s0 + thread_start, s1 + thread_start);
+        
+    } else if (src0_type == GGML_TYPE_F16 && src1_type == GGML_TYPE_F16 && dst_type == GGML_TYPE_F16) {
+        // All F16 - element-wise with type conversion
+        const ggml_fp16_t * s0 = (const ggml_fp16_t *)src0_data;
+        const ggml_fp16_t * s1 = (const ggml_fp16_t *)src1_data;
+        ggml_fp16_t * d = (ggml_fp16_t *)dst_data;
+        
+        for (int64_t i = thread_start; i < thread_end; ++i) {
+            d[i] = ggml_fp32_to_fp16(ggml_fp16_to_fp32(s0[i]) + ggml_fp16_to_fp32(s1[i]));
         }
         
-    } else if (src1_elements == total_elements) {
-        // Element-wise operation - direct SIMD write to final tensor
-        ggml_vec_add_f32(thread_elements, 
-                        dst_data + thread_start, 
-                        src0_data + thread_start, 
-                        src1_data + thread_start);
+    } else if (src0_type == GGML_TYPE_BF16 && src1_type == GGML_TYPE_BF16 && dst_type == GGML_TYPE_BF16) {
+        // All BF16 - element-wise with type conversion
+        const ggml_bf16_t * s0 = (const ggml_bf16_t *)src0_data;
+        const ggml_bf16_t * s1 = (const ggml_bf16_t *)src1_data;
+        ggml_bf16_t * d = (ggml_bf16_t *)dst_data;
+        
+        for (int64_t i = thread_start; i < thread_end; ++i) {
+            d[i] = ggml_fp32_to_bf16(ggml_bf16_to_fp32(s0[i]) + ggml_bf16_to_fp32(s1[i]));
+        }
+        
+    } else if (src0_type == GGML_TYPE_F16 && src1_type == GGML_TYPE_F32 && dst_type == GGML_TYPE_F32) {
+        // F16 + F32 → F32
+        const ggml_fp16_t * s0 = (const ggml_fp16_t *)src0_data;
+        const float * s1 = (const float *)src1_data;
+        float * d = (float *)dst_data;
+        
+        for (int64_t i = thread_start; i < thread_end; ++i) {
+            d[i] = ggml_fp16_to_fp32(s0[i]) + s1[i];
+        }
+        
+    } else if (src0_type == GGML_TYPE_F16 && src1_type == GGML_TYPE_F32 && dst_type == GGML_TYPE_F16) {
+        // F16 + F32 → F16
+        const ggml_fp16_t * s0 = (const ggml_fp16_t *)src0_data;
+        const float * s1 = (const float *)src1_data;
+        ggml_fp16_t * d = (ggml_fp16_t *)dst_data;
+        
+        for (int64_t i = thread_start; i < thread_end; ++i) {
+            d[i] = ggml_fp32_to_fp16(ggml_fp16_to_fp32(s0[i]) + s1[i]);
+        }
+        
+    } else if (src0_type == GGML_TYPE_BF16 && src1_type == GGML_TYPE_F32 && dst_type == GGML_TYPE_F32) {
+        // BF16 + F32 → F32
+        const ggml_bf16_t * s0 = (const ggml_bf16_t *)src0_data;
+        const float * s1 = (const float *)src1_data;
+        float * d = (float *)dst_data;
+        
+        for (int64_t i = thread_start; i < thread_end; ++i) {
+            d[i] = ggml_bf16_to_fp32(s0[i]) + s1[i];
+        }
+        
+    } else if (src0_type == GGML_TYPE_BF16 && src1_type == GGML_TYPE_F32 && dst_type == GGML_TYPE_BF16) {
+        // BF16 + F32 → BF16
+        const ggml_bf16_t * s0 = (const ggml_bf16_t *)src0_data;
+        const float * s1 = (const float *)src1_data;
+        ggml_bf16_t * d = (ggml_bf16_t *)dst_data;
+        
+        for (int64_t i = thread_start; i < thread_end; ++i) {
+            d[i] = ggml_fp32_to_bf16(ggml_bf16_to_fp32(s0[i]) + s1[i]);
+        }
+        
+    } else if (ggml_is_quantized(src0_type) && src1_type == GGML_TYPE_F32 && dst_type == GGML_TYPE_F32) {
+        // QUANTIZED TYPES (matching ggml_compute_forward_add_q_f32 logic)
+        // Process row-wise like the reference implementation
+        
+        const struct ggml_tensor * src0_tensor = src0;
+        const struct ggml_tensor * src1_tensor = src1;
+        
+        const int64_t ne0 = src0_tensor->ne[0];
+        const int64_t ne1 = src0_tensor->ne[1];
+        const int64_t ne2 = src0_tensor->ne[2];
+        const int64_t ne3 = src0_tensor->ne[3];
+        
+        const size_t nb00 = src0_tensor->nb[0];
+        const size_t nb01 = src0_tensor->nb[1];
+        const size_t nb02 = src0_tensor->nb[2];
+        const size_t nb03 = src0_tensor->nb[3];
+        
+        const size_t nb10 = src1_tensor->nb[0];
+        const size_t nb11 = src1_tensor->nb[1];
+        const size_t nb12 = src1_tensor->nb[2];
+        const size_t nb13 = src1_tensor->nb[3];
+        
+        const int64_t nr = ne1 * ne2 * ne3;  // total number of rows
+        
+        // Get quantization functions
+        const ggml_to_float_t dequantize_row_q = ggml_get_type_traits(src0_type)->to_float;
+        const ggml_from_float_t quantize_row_q = ggml_get_type_traits_cpu(dst_type)->from_float;
+        
+        if (!dequantize_row_q) {
+            NUMA_LOG_DEBUG("No dequantization function for type %s", ggml_type_name(src0_type));
+            return GGML_STATUS_FAILED;
+        }
+        
+        // Calculate which rows this thread should process
+        const int64_t rows_per_thread = (nr + num_threads - 1) / num_threads;
+        const int64_t row_start = thread_id * rows_per_thread;
+        const int64_t row_end = MIN(row_start + rows_per_thread, nr);
+        
+        // Allocate workspace for dequantized data
+        float * wdata = (float *)malloc(ne0 * sizeof(float));
+        if (!wdata) {
+            return GGML_STATUS_FAILED;
+        }
+        
+        for (int64_t row = row_start; row < row_end; ++row) {
+            // Calculate row indices
+            const int64_t i03 = row / (ne2 * ne1);
+            const int64_t i02 = (row - i03 * ne2 * ne1) / ne1;
+            const int64_t i01 = row - i03 * ne2 * ne1 - i02 * ne1;
+            
+            // Get row pointers
+            const void * src0_row = (const void *)((const char *)src0_data + i01*nb01 + i02*nb02 + i03*nb03);
+            const float * src1_row = (const float *)((const char *)src1_data + i01*nb11 + i02*nb12 + i03*nb13);
+            void * dst_row = (void *)((char *)dst_data + i01*tensor->nb[1] + i02*tensor->nb[2] + i03*tensor->nb[3]);
+            
+            // Dequantize src0 row to workspace
+            dequantize_row_q(src0_row, wdata, ne0);
+            
+            // Add src1 row
+            ggml_vec_acc_f32(ne0, wdata, src1_row);
+            
+            // Quantize result to dst row (or copy if no quantization needed)
+            if (quantize_row_q) {
+                quantize_row_q(wdata, dst_row, ne0);
+            } else {
+                memcpy(dst_row, wdata, ne0 * sizeof(float));
+            }
+        }
+        
+        free(wdata);
         
     } else {
-        // Complex broadcasting - direct write to final tensor
-        for (int64_t i = thread_start; i < thread_end; ++i) {
-            const int64_t src1_idx = i % src1_elements;
-            dst_data[i] = src0_data[i] + src1_data[src1_idx];
-        }
+        // Unsupported type combination
+        NUMA_LOG_DEBUG("Unsupported type combination: src0=%s, src1=%s, dst=%s", 
+                       ggml_type_name(src0_type), ggml_type_name(src1_type), ggml_type_name(dst_type));
+        return GGML_STATUS_FAILED;
     }
     
-    NUMA_LOG_DEBUG("NUMA Node %d, Thread %d NO-AGGREGATION completed (%zu elements written directly)", 
+    NUMA_LOG_DEBUG("NUMA Node %d, Thread %d TYPE-AWARE completed (%zu elements processed)", 
                    current_node, thread_id, thread_elements);
     
     return GGML_STATUS_SUCCESS;

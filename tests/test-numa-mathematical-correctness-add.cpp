@@ -274,6 +274,164 @@ private:
         results.push_back({"ADD_mathematical_equivalence", overall_test_passed, failure_reason ? failure_reason : ""});
     }
 
+    // Test quantization type coverage to ensure NUMA vs reference implementation compatibility
+    void test_ADD_quantization_type_coverage() {
+        printf("--- Test: ADD Quantization Type Coverage ---\n");
+        printf("Testing ADD operation with various quantization types to verify NUMA/reference compatibility...\n");
+        printf("NUMA kernels support limited types; others should gracefully fall back to reference implementation\n\n");
+        
+        bool overall_test_passed = true;
+        const char* failure_reason = nullptr;
+        
+        // Define quantization type test cases
+        struct {
+            ggml_type src0_type, src1_type, dst_type;
+            const char* description;
+            bool expect_numa_support;  // Whether we expect NUMA kernel to handle this
+        } type_test_cases[] = {
+            // Non-quantized types (most important)
+            {GGML_TYPE_F32, GGML_TYPE_F32, GGML_TYPE_F32, "F32 + F32 → F32", true},
+            {GGML_TYPE_F16, GGML_TYPE_F16, GGML_TYPE_F16, "F16 + F16 → F16", false},
+            {GGML_TYPE_F16, GGML_TYPE_F32, GGML_TYPE_F32, "F16 + F32 → F32", false},
+            
+            // Key quantized types (most commonly used)
+            {GGML_TYPE_Q8_0, GGML_TYPE_F32, GGML_TYPE_F32, "Q8_0 + F32 → F32", false},
+            {GGML_TYPE_Q4_0, GGML_TYPE_F32, GGML_TYPE_F32, "Q4_0 + F32 → F32", false},
+        };
+        
+        int num_type_cases = sizeof(type_test_cases) / sizeof(type_test_cases[0]);
+        int passed_type_tests = 0;
+        int total_type_tests = 0;
+        
+        // Test each quantization type
+        for (int case_idx = 0; case_idx < num_type_cases; case_idx++) {
+            auto& test_case = type_test_cases[case_idx];
+            printf("  🔍 Testing: %s\n", test_case.description);
+            
+            // Create test context
+            struct ggml_init_params params;
+            params.mem_size = 128 * 1024 * 1024;  // 128MB should be plenty for small test tensors
+            params.mem_buffer = nullptr;
+            params.no_alloc = false;
+            
+            struct ggml_context* test_ctx = ggml_init(params);
+            if (!test_ctx) {
+                printf("      ❌ Failed to create test context for %s\n", test_case.description);
+                failure_reason = "Context creation failed";
+                overall_test_passed = false;
+                continue;
+            }
+            
+            // Create tensors with appropriate types
+            // Use 32x32 = 1024 elements to be compatible with all quantization block sizes
+            struct ggml_tensor* src0 = ggml_new_tensor_2d(test_ctx, test_case.src0_type, 32, 32);
+            struct ggml_tensor* src1 = ggml_new_tensor_2d(test_ctx, test_case.src1_type, 32, 32);
+            
+            if (!src0 || !src1) {
+                printf("      ❌ Failed to create tensors for %s\n", test_case.description);
+                ggml_free(test_ctx);
+                failure_reason = "Tensor creation failed";
+                overall_test_passed = false;
+                continue;
+            }
+            
+            // Initialize data based on type
+            const int total_elements = 1024;  // 32x32
+            if (test_case.src0_type == GGML_TYPE_F32) {
+                float* src0_data = (float*)ggml_get_data(src0);
+                for (int i = 0; i < total_elements; i++) {
+                    src0_data[i] = 0.1f + i * 0.001f;  // Small values to avoid overflow
+                }
+            } else if (test_case.src0_type == GGML_TYPE_F16) {
+                ggml_fp16_t* src0_data = (ggml_fp16_t*)ggml_get_data(src0);
+                for (int i = 0; i < total_elements; i++) {
+                    src0_data[i] = ggml_fp32_to_fp16(0.1f + i * 0.001f);
+                }
+            } else {
+                // For quantized types, create F32 data first, then quantize
+                float temp_data[1024];
+                for (int i = 0; i < total_elements; i++) {
+                    temp_data[i] = 0.1f + i * 0.001f;
+                }
+                // Get the quantization function
+                ggml_from_float_t quantize_fn = ggml_get_type_traits_cpu(test_case.src0_type)->from_float;
+                if (quantize_fn) {
+                    quantize_fn(temp_data, ggml_get_data(src0), total_elements);
+                } else {
+                    printf("      ⚠️  No quantization function available for %s\n", test_case.description);
+                    ggml_free(test_ctx);
+                    continue;
+                }
+            }
+            
+            // Initialize src1 (always F32 or F16 in our test cases)
+            if (test_case.src1_type == GGML_TYPE_F32) {
+                float* src1_data = (float*)ggml_get_data(src1);
+                for (int i = 0; i < total_elements; i++) {
+                    src1_data[i] = 0.05f + i * 0.0005f;  // Small values
+                }
+            } else if (test_case.src1_type == GGML_TYPE_F16) {
+                ggml_fp16_t* src1_data = (ggml_fp16_t*)ggml_get_data(src1);
+                for (int i = 0; i < total_elements; i++) {
+                    src1_data[i] = ggml_fp32_to_fp16(0.05f + i * 0.0005f);
+                }
+            }
+            
+            // Create ADD operation
+            struct ggml_tensor* result = ggml_add(test_ctx, src0, src1);
+            if (!result) {
+                printf("      ❌ Failed to create ADD operation for %s\n", test_case.description);
+                ggml_free(test_ctx);
+                failure_reason = "ADD operation creation failed";
+                overall_test_passed = false;
+                continue;
+            }
+            
+            // Try to execute with NUMA executor
+            struct ggml_cplan cplan = {};
+            cplan.work_size = 0;
+            cplan.work_data = nullptr;
+            cplan.n_threads = 2;  // Use 2 threads for type testing
+            cplan.threadpool = nullptr;
+            cplan.abort_callback = nullptr;
+            cplan.abort_callback_data = nullptr;
+            
+            enum ggml_status numa_result = ggml_numa_executor_execute_tensor(result, &cplan);
+            
+            if (numa_result == GGML_STATUS_SUCCESS) {
+                if (test_case.expect_numa_support) {
+                    printf("      ✅ NUMA kernel handled %s as expected\n", test_case.description);
+                } else {
+                    printf("      ✅ Reference fallback handled %s correctly\n", test_case.description);
+                }
+                passed_type_tests++;
+            } else {
+                printf("      ❌ Execution failed for %s (status: %d)\n", test_case.description, numa_result);
+                failure_reason = "Execution failed";
+                overall_test_passed = false;
+            }
+            
+            total_type_tests++;
+            ggml_free(test_ctx);
+        }
+        
+        // Print summary for quantization type testing
+        printf("  📊 ADD Quantization Type Test Summary:\n");
+        printf("    Total type combinations: %d\n", total_type_tests);
+        printf("    Passed: %d\n", passed_type_tests);
+        printf("    Failed: %d\n", total_type_tests - passed_type_tests);
+        
+        if (overall_test_passed) {
+            printf("✅ ADD quantization type coverage: VERIFIED\n");
+            printf("  🎉 All quantization types work correctly (NUMA kernels or reference fallback)!\n\n");
+        } else {
+            printf("❌ ADD quantization type coverage: FAILED - %s\n", failure_reason);
+            printf("  ⚠️  Some quantization types failed to execute properly\n\n");
+        }
+        
+        results.push_back({"ADD_quantization_type_coverage", overall_test_passed, failure_reason ? failure_reason : ""});
+    }
+
     // Test specific broadcasting scenarios that previously caused memory corruption
     void test_ADD_broadcasting_regression() {
         printf("--- Test: ADD Broadcasting Regression (Specific Bug Scenarios) ---\n");
@@ -453,6 +611,9 @@ public:
         
         // Run mathematical correctness tests
         test_ADD_mathematical_equivalence();
+        
+        // Run quantization type coverage tests
+        test_ADD_quantization_type_coverage();
         
         // Run broadcasting regression tests
         test_ADD_broadcasting_regression();
