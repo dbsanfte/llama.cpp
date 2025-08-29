@@ -757,8 +757,8 @@ bool ggml_numa_simple_coordinator_init(struct ggml_threadpool_params * tpp) {
     
     // Initialize performance measurement system
     ggml_numa_perf_init();
-    // Performance instrumentation respects GGML_NUMA_DEBUG environment variable
-    // No need to explicitly enable - it's controlled by debug settings in perf_init()
+    // Performance instrumentation respects GGML_NUMA_PERF environment variable
+    // No need to explicitly enable - it's controlled by GGML_NUMA_PERF settings in perf_init()
     
 #ifdef GGML_NUMA_MIRROR
     if (numa_available() < 0) {

@@ -3,7 +3,7 @@
  * 
  * Performance-optimized NUMA utilities for llama.cpp with zero-overhead design:
  * - Debug logging controlled by GGML_NUMA_DEBUG (zero overhead when disabled)
- * - Performance timing controlled by g_numa_perf_enabled (zero overhead when disabled)
+ * - Performance timing controlled by GGML_NUMA_PERF (zero overhead when disabled)
  * - Debug assertions compile to no-op in release builds (zero overhead with NDEBUG)
  * - Legacy assertions remain always-on for critical safety checks
  * 
@@ -129,6 +129,8 @@ typedef ggml_numa_kernel_registration_info_t (*ggml_numa_kernel_register_fn_t)(v
  * Environment variable-controlled debug logging system
  * Set GGML_NUMA_DEBUG=1 to enable debug output
  * Set GGML_NUMA_DEBUG=2 for verbose debug output
+ * 
+ * Separate from performance measurements (use GGML_NUMA_PERF for that)
  */
 static inline int ggml_numa_debug_enabled(void) {
     static int debug_level = -1;
@@ -137,6 +139,20 @@ static inline int ggml_numa_debug_enabled(void) {
         debug_level = env ? atoi(env) : 0;
     }
     return debug_level;
+}
+
+/**
+ * Environment variable-controlled performance measurement system
+ * Set GGML_NUMA_PERF=1 to enable performance measurements
+ * Set GGML_NUMA_PERF=2 for detailed performance logging
+ */
+static inline int ggml_numa_perf_enabled(void) {
+    static int perf_level = -1;
+    if (perf_level == -1) {
+        const char *env = getenv("GGML_NUMA_PERF");
+        perf_level = env ? atoi(env) : 0;
+    }
+    return perf_level;
 }
 
 /**

@@ -113,10 +113,10 @@ bool ggml_numa_perf_init(void) {
         // Initialize statistics
         memset(g_perf_stats, 0, sizeof(g_perf_stats));
         
-        // Enable performance measurement only when debug environment variable is set
-        // This eliminates performance overhead and output clutter in production
-        g_numa_perf_enabled = (ggml_numa_debug_enabled() >= 1);
-        g_numa_perf_detailed_logging = (ggml_numa_debug_enabled() >= 2);  // Verbose mode only
+        // Enable performance measurement with GGML_NUMA_PERF environment variable
+        // This provides clean performance data independent from debug logging
+        g_numa_perf_enabled = (ggml_numa_perf_enabled() >= 1);
+        g_numa_perf_detailed_logging = (ggml_numa_perf_enabled() >= 2);  // Detailed mode
         
         g_perf_initialized = true;
         NUMA_LOG_DEBUG("NUMA Performance instrumentation initialized (enabled=%s, detailed=%s)",

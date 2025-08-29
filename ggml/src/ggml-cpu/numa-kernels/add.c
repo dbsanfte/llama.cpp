@@ -282,23 +282,17 @@ enum ggml_status ggml_numa_kernel_add_execute_low_overhead(void * work_context,
         NUMA_LOG_DEBUG("ADD Node %d: Using local tensor data at %p", current_node, dst_data);
     }
     
-    // OPTIMIZATION: Limit thread count to reduce contention and synchronization overhead
-    // Testing shows 16 threads per node is optimal balance of parallelism vs overhead
-    const int optimal_threads_per_node = 16;
-    const int thread_id = params->ith % optimal_threads_per_node;
-    const int num_threads = MIN(params->nth, optimal_threads_per_node);
-    
-    // Skip execution if this thread is beyond our optimal count
-    if (params->ith >= optimal_threads_per_node) {
-        return GGML_STATUS_SUCCESS;
-    }
+    // OPTIMIZATION: Use actual thread count from coordinator instead of artificial limitation
+    // The coordinator determines the optimal thread count based on the execution strategy
+    const int thread_id = params->ith;
+    const int num_threads = params->nth;
     
     NUMA_LOG_DEBUG("NUMA Node %d, Thread %d/%d kernel start (data_parallel=%d, total_nodes=%d, total_elements=%ld)", 
                    current_node, thread_id, num_threads, is_data_parallel, total_nodes, total_elements);
     NUMA_LOG_DEBUG("NUMA Node %d memory pointers: src0=%p, src1=%p, dst=%p", 
                    current_node, src0_data, src1_data, dst_data);
     
-    // Calculate optimized data slice
+    // Calculate optimized data slice with single-thread detection
     int64_t numa_start, numa_end;
     
     if (is_data_parallel && total_nodes > 1) {
@@ -313,13 +307,22 @@ enum ggml_status ggml_numa_kernel_add_execute_low_overhead(void * work_context,
         const int64_t node_start = current_node * elements_per_node + MIN(current_node, total_elements % total_nodes);
         const int64_t node_end = MIN(node_start + adjusted_elements, total_elements);
         
-        // Divide node slice among threads
-        const int64_t elements_per_thread = (node_end - node_start + num_threads - 1) / num_threads;
-        numa_start = node_start + thread_id * elements_per_thread;
-        numa_end = MIN(numa_start + elements_per_thread, node_end);
-        
-        NUMA_LOG_DEBUG("NUMA Node %d, Thread %d processing slice: [%ld, %ld) (%ld elements) from node range [%ld, %ld)", 
-                       current_node, thread_id, numa_start, numa_end, numa_end - numa_start, node_start, node_end);
+        // CRITICAL FIX: Only thread 0 executes (coordinator uses 56-thread pools but only thread 0 runs)
+        if (thread_id == 0) {
+            // Only thread 0 executes - process entire node range for efficiency
+            numa_start = node_start;
+            numa_end = node_end;
+            NUMA_LOG_DEBUG("NUMA Node %d, Thread %d processing FULL NODE RANGE: [%ld, %ld) (%ld elements) - single thread execution", 
+                           current_node, thread_id, numa_start, numa_end, numa_end - numa_start);
+        } else {
+            // Multi-thread mode - calculate thread-specific slice within node (should not happen currently)
+            const int64_t elements_per_thread = (node_end - node_start + num_threads - 1) / num_threads;
+            numa_start = node_start + thread_id * elements_per_thread;
+            numa_end = MIN(numa_start + elements_per_thread, node_end);
+            
+            NUMA_LOG_DEBUG("NUMA Node %d, Thread %d processing slice: [%ld, %ld) (%ld elements) from node range [%ld, %ld)", 
+                           current_node, thread_id, numa_start, numa_end, numa_end - numa_start, node_start, node_end);
+        }
     } else {
         // SINGLE-NODE MODE
         const int64_t elements_per_thread = (total_elements + num_threads - 1) / num_threads;
@@ -410,7 +413,18 @@ enum ggml_status ggml_numa_kernel_add_execute_optimized(void * work_context,
     // DO NOT use tensor->data directly - it may point to wrong NUMA node
     const float * src0_data = (const float *)tensor_data(src0);
     const float * src1_data = (const float *)tensor_data(src1);
-    float * dst_data = (float *)tensor_data(tensor);
+    
+    // For kernels with GGML_NUMA_AGGREGATION_NONE policy, write directly to shared result tensor
+    // This eliminates the need for data aggregation across NUMA nodes
+    extern __thread void * ggml_numa_shared_result_tensor_data;
+    float * dst_data;
+    if (ggml_numa_shared_result_tensor_data != NULL) {
+        // Use shared result tensor memory - eliminates aggregation overhead
+        dst_data = (float *)ggml_numa_shared_result_tensor_data;
+    } else {
+        // Fallback to local tensor data for compatibility
+        dst_data = (float *)tensor_data(tensor);
+    }
     
     // TEMPLATE STEP 4: Read thread-local NUMA context from coordinator
     // These variables are set by the coordinator before kernel execution
@@ -433,6 +447,16 @@ enum ggml_status ggml_numa_kernel_add_execute_optimized(void * work_context,
     NUMA_LOG_DEBUG("NUMA Node %d memory pointers: src0=%p, src1=%p, dst=%p", 
                    current_node, src0_data, src1_data, dst_data);
     
+    // NUMA OPTIMIZATION: In data-parallel mode, ensure we're using shared tensor data
+    // This eliminates the need for complex aggregation logic at the end
+    if (is_data_parallel && ggml_numa_shared_result_tensor_data) {
+        dst_data = (float *)ggml_numa_shared_result_tensor_data;
+        NUMA_LOG_DEBUG("NUMA Node %d: Using shared tensor data at %p (no aggregation needed)", 
+                       current_node, dst_data);
+    } else {
+        NUMA_LOG_DEBUG("NUMA Node %d: Using local tensor data at %p", current_node, dst_data);
+    }
+    
     // TEMPLATE STEP 6: Calculate data slice for this thread/node combination
     // This is the core of NUMA data-parallel processing
     int64_t numa_start, numa_end;
@@ -450,13 +474,22 @@ enum ggml_status ggml_numa_kernel_add_execute_optimized(void * work_context,
                                  total_elements : 
                                  node_start + elements_per_node;
         
-        // Now divide this node's slice among its threads
-        const int64_t elements_per_thread = (node_end - node_start + num_threads - 1) / num_threads;
-        numa_start = node_start + thread_id * elements_per_thread;
-        numa_end = MIN(numa_start + elements_per_thread, node_end);
-        
-        NUMA_LOG_DEBUG("NUMA Node %d, Thread %d processing slice: [%ld, %ld) (%ld elements) from node range [%ld, %ld)", 
-                       current_node, thread_id, numa_start, numa_end, numa_end - numa_start, node_start, node_end);
+        // CRITICAL FIX: Only thread 0 executes (coordinator uses 56-thread pools but only thread 0 runs)
+        if (thread_id == 0) {
+            // Only thread 0 executes - process entire node range for efficiency
+            numa_start = node_start;
+            numa_end = node_end;
+            NUMA_LOG_DEBUG("NUMA Node %d, Thread %d processing FULL NODE RANGE: [%ld, %ld) (%ld elements) - single thread execution", 
+                           current_node, thread_id, numa_start, numa_end, numa_end - numa_start);
+        } else {
+            // Multi-thread mode - calculate thread-specific slice within node (should not happen currently)
+            const int64_t elements_per_thread = (node_end - node_start + num_threads - 1) / num_threads;
+            numa_start = node_start + thread_id * elements_per_thread;
+            numa_end = MIN(numa_start + elements_per_thread, node_end);
+            
+            NUMA_LOG_DEBUG("NUMA Node %d, Thread %d processing slice: [%ld, %ld) (%ld elements) from node range [%ld, %ld)", 
+                           current_node, thread_id, numa_start, numa_end, numa_end - numa_start, node_start, node_end);
+        }
     } else {
         // TEMPLATE PATTERN B: SINGLE-NODE MODE
         // All threads process slices of the entire tensor (no NUMA slicing)
