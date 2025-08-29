@@ -25,6 +25,13 @@ extern "C" {
 enum ggml_status ggml_numa_kernel_mul_mat_execute(void * work_context, struct ggml_compute_params * params);
 
 /**
+ * Kernel registration function - provides strategy arrays and function pointers
+ * 
+ * @return Registration info containing strategies and function pointers for MUL_MAT
+ */
+ggml_numa_kernel_registration_info_t ggml_numa_kernel_mul_mat_register(void);
+
+/**
  * Calculate the exact work buffer size needed for MUL_MAT operation
  * 
  * This function analyzes the tensor types and dimensions to determine

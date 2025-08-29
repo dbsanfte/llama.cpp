@@ -53,12 +53,73 @@ typedef enum {
 } ggml_numa_on_node_strategy_t;
 
 /**
- * Combined execution strategy - combines node distribution and on-node execution
+ * Combined execution strategy - combines node distribution and on/node execution
  */
 typedef struct {
     ggml_numa_node_strategy_t node_strategy;      // How to distribute across nodes
     ggml_numa_on_node_strategy_t on_node_strategy; // How to execute within each node
 } ggml_numa_execution_strategy_t;
+
+// ============================================================================
+// NUMA Strategy Cache System (O(1) Hash Table Performance)
+// ============================================================================
+
+/**
+ * Strategy threshold array indices (by convention)
+ * Each kernel provides a simple array with element count thresholds
+ */
+typedef enum {
+    NUMA_STRATEGY_IDX_SINGLE_SINGLE = 0,   // Single node, single thread threshold
+    NUMA_STRATEGY_IDX_SINGLE_MULTI = 1,    // Single node, multi-thread threshold
+    NUMA_STRATEGY_IDX_COUNT = 2             // Above both thresholds = data-parallel
+} ggml_numa_strategy_idx_t;
+
+/**
+ * Kernel strategy array - provided by each kernel at registration
+ * Simple threshold array for O(1) strategy selection
+ */
+typedef struct {
+    size_t thresholds[NUMA_STRATEGY_IDX_COUNT];  // Element count thresholds
+    bool valid;                                   // True if thresholds are provided
+} ggml_numa_kernel_strategy_array_t;
+
+/**
+ * Aggregation function pointers for each strategy
+ * Kernels provide these at registration time
+ */
+typedef struct {
+    // Function pointer for single-node, single-thread aggregation
+    enum ggml_status (*single_single_fn)(void * work_context, int numa_node, 
+                                        struct ggml_tensor * tensor, struct ggml_cplan * cplan);
+    
+    // Function pointer for single-node, multi-thread aggregation  
+    enum ggml_status (*single_multi_fn)(void * work_context, int numa_node,
+                                      struct ggml_tensor * tensor, struct ggml_cplan * cplan);
+    
+    // Function pointer for data-parallel aggregation
+    enum ggml_status (*data_parallel_fn)(void * work_context, int numa_node,
+                                        struct ggml_tensor * tensor, struct ggml_cplan * cplan);
+                                        
+    bool valid;  // True if function pointers are provided
+} ggml_numa_kernel_aggregation_funcs_t;
+
+/**
+ * Kernel registration info returned by each kernel's registration function
+ * This allows each kernel to define its own strategies and function pointers
+ */
+typedef struct {
+    enum ggml_op op_type;                                     // Operation type this kernel handles
+    ggml_numa_kernel_strategy_array_t strategy_array;        // Strategy thresholds 
+    ggml_numa_kernel_aggregation_funcs_t agg_funcs;          // Function pointers
+    const char * kernel_name;                                // Human-readable name
+    bool supported;                                           // Whether kernel is available
+} ggml_numa_kernel_registration_info_t;
+
+/**
+ * Function pointer type for kernel registration functions
+ * Each kernel provides a function of this type to register itself
+ */
+typedef ggml_numa_kernel_registration_info_t (*ggml_numa_kernel_register_fn_t)(void);
 
 // ============================================================================
 // NUMA Logging Macros (Simplified versions without ggml-impl dependency)
@@ -243,6 +304,76 @@ static inline int ggml_numa_debug_enabled(void) {
 // ============================================================================
 // NUMA Utility Macros
 // ============================================================================
+
+/**
+ * Fast strategy selection from threshold array (O(1) performance)
+ * Given element count, returns the appropriate execution strategy
+ */
+static inline ggml_numa_execution_strategy_t numa_select_strategy_fast(
+    const ggml_numa_kernel_strategy_array_t * strategy_array,
+    size_t element_count) {
+    
+    ggml_numa_execution_strategy_t result;
+    
+    if (!strategy_array || !strategy_array->valid) {
+        // Default fallback: single node, multi-thread for safety
+        result.node_strategy = NUMA_NODE_STRATEGY_SINGLE;
+        result.on_node_strategy = NUMA_ON_NODE_STRATEGY_MULTI_THREAD;
+        return result;
+    }
+    
+    // O(1) threshold comparison for strategy selection
+    if (element_count <= strategy_array->thresholds[NUMA_STRATEGY_IDX_SINGLE_SINGLE]) {
+        result.node_strategy = NUMA_NODE_STRATEGY_SINGLE;
+        result.on_node_strategy = NUMA_ON_NODE_STRATEGY_SINGLE_THREAD;
+    } else if (element_count <= strategy_array->thresholds[NUMA_STRATEGY_IDX_SINGLE_MULTI]) {
+        result.node_strategy = NUMA_NODE_STRATEGY_SINGLE;
+        result.on_node_strategy = NUMA_ON_NODE_STRATEGY_MULTI_THREAD;
+    } else {
+        // Above both thresholds: use data-parallel strategy
+        result.node_strategy = NUMA_NODE_STRATEGY_DATA_PARALLEL;
+        result.on_node_strategy = NUMA_ON_NODE_STRATEGY_MULTI_THREAD;
+    }
+    
+    return result;
+}
+
+/**
+ * Get aggregation function pointer based on selected strategy (O(1) performance)
+ */
+static inline enum ggml_status (*numa_get_aggregation_func_fast(
+    const ggml_numa_kernel_aggregation_funcs_t * agg_funcs,
+    const ggml_numa_execution_strategy_t * strategy))(void *, int, struct ggml_tensor *, struct ggml_cplan *) {
+    
+    if (!agg_funcs || !agg_funcs->valid || !strategy) {
+        return NULL;
+    }
+    
+    // O(1) function pointer selection based on strategy
+    if (strategy->node_strategy == NUMA_NODE_STRATEGY_SINGLE) {
+        if (strategy->on_node_strategy == NUMA_ON_NODE_STRATEGY_SINGLE_THREAD) {
+            return agg_funcs->single_single_fn;
+        } else {
+            return agg_funcs->single_multi_fn;
+        }
+    } else {
+        return agg_funcs->data_parallel_fn;
+    }
+}
+
+/**
+ * Simple hash function for ggml_op to array index conversion
+ * Uses operation type directly as hash (enum values are sequential)
+ */
+static inline size_t numa_op_hash(enum ggml_op op) {
+    return (size_t)op;
+}
+
+/**
+ * Maximum supported operation type for hash table sizing
+ * Should be updated if new operations are added
+ */
+#define NUMA_OP_HASH_TABLE_SIZE 128
 
 /**
  * Safe pointer check with logging

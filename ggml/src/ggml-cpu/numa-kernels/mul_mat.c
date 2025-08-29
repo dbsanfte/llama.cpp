@@ -56,6 +56,7 @@
 #include "numa-kernels.h"
 #include "../ggml-numa-shared.h"
 #include "../ggml-numa-simple-coordinator.h"
+#include "../ggml-numa-perf.h"  // Performance instrumentation
 #include "../ggml-cpu-impl.h"
 #include "../ggml-impl.h"
 
@@ -144,6 +145,11 @@ static inline void get_thread_row_slice(int64_t total_rows,
 enum ggml_status ggml_numa_kernel_mul_mat_execute(void * work_context, 
                                                   struct ggml_compute_params * params) {
     struct ggml_tensor * dst = (struct ggml_tensor *)work_context;
+    
+    // PERFORMANCE: Start timing the kernel execution
+    extern __thread int ggml_current_numa_node;
+    const size_t tensor_size = ggml_nelements(dst) * sizeof(float);
+    NUMA_PERF_START(NUMA_PERF_KERNEL_NUMA_EXEC, "MUL_MAT", "kernel_execute", ggml_current_numa_node, tensor_size, params->nth);
     
     // =============================================================================
     // Input Validation & Setup
@@ -493,6 +499,10 @@ enum ggml_status ggml_numa_kernel_mul_mat_execute(void * work_context,
     
     // Main computation loop using cache-friendly block tiling
     // This follows the exact pattern from the reference implementation
+    
+    // PERFORMANCE: Start timing the core computation phase
+    NUMA_PERF_START(NUMA_PERF_KERNEL_NUMA_EXEC, "MUL_MAT", "computation_loop", current_node, tensor_size, num_threads);
+    
     int total_operations = 0;
     
     // Outer loop: process column blocks
@@ -592,7 +602,13 @@ enum ggml_status ggml_numa_kernel_mul_mat_execute(void * work_context,
     
     NUMA_LOG_DEBUG("MUL_MAT Node %d, Thread %d: COMPLETED %d operations", current_node, thread_id, total_operations);
     
+    // PERFORMANCE: End timing the core computation phase
+    NUMA_PERF_END();
+    
 cleanup:
+    // PERFORMANCE: End timing the overall kernel execution
+    NUMA_PERF_END();
+    
     // No explicit cleanup needed - work buffer is managed by NUMA coordinator
     // Memory allocations are handled at a higher level for efficiency
     return GGML_STATUS_SUCCESS;
@@ -692,17 +708,18 @@ static const ggml_mul_mat_strategy_threshold_t MUL_MAT_THRESHOLDS[] = {
         .kernel_name = "NUMA MUL_MAT (Single/Multi)"
     },
     
-    // Medium matrices: start using data-parallel for memory bandwidth
+    // EXPERIMENTAL: Raise thresholds much higher to test overhead hypothesis
+    // Medium matrices: keep on single node much longer
     {
-        .element_threshold = 262144,  // 16K - 256K elements
-        .strategy = { .node_strategy = NUMA_NODE_STRATEGY_DATA_PARALLEL, .on_node_strategy = NUMA_ON_NODE_STRATEGY_MULTI_THREAD },
+        .element_threshold = 16777216,  // 16K - 16M elements (raised from 256K!)
+        .strategy = { .node_strategy = NUMA_NODE_STRATEGY_SINGLE, .on_node_strategy = NUMA_ON_NODE_STRATEGY_MULTI_THREAD },
         .efficiency_score = 0.93f,
-        .kernel_name = "NUMA MUL_MAT (Data-Parallel/Multi)"
+        .kernel_name = "NUMA MUL_MAT (Single/Multi-Large)"
     },
     
-    // Large matrices: data-parallel with optimal memory utilization
+    // Large matrices: only use data-parallel for very large operations
     {
-        .element_threshold = 4194304,  // 256K - 4M elements
+        .element_threshold = 67108864,  // 16M - 64M elements (raised from 4M!)
         .strategy = { .node_strategy = NUMA_NODE_STRATEGY_DATA_PARALLEL, .on_node_strategy = NUMA_ON_NODE_STRATEGY_MULTI_THREAD },
         .efficiency_score = 0.95f,
         .kernel_name = "NUMA MUL_MAT (Data-Parallel/Large)"
@@ -745,10 +762,14 @@ static const ggml_mul_mat_strategy_threshold_t MUL_MAT_THRESHOLDS[] = {
  * @return Query result with optimal strategy, or unsupported result if not applicable
  */
 ggml_numa_kernel_query_result_t ggml_numa_kernel_mul_mat_query(const struct ggml_tensor * tensor) {
+    // PERFORMANCE: Start timing the query operation
+    NUMA_PERF_START(NUMA_PERF_EXECUTOR_QUERY, "MUL_MAT", "query_phase", -1, 0, 0);
+    
     ggml_numa_kernel_query_result_t result = { .supported = false };
     
     // Validate this is a MUL_MAT operation
     if (!tensor || tensor->op != GGML_OP_MUL_MAT) {
+        NUMA_PERF_END();
         return result;
     }
     
@@ -801,5 +822,40 @@ ggml_numa_kernel_query_result_t ggml_numa_kernel_mul_mat_query(const struct ggml
     NUMA_LOG_DEBUG("MUL_MAT query: ACCEPTING - %zu elements -> %s (efficiency: %.2f, buffer: %zu bytes)", 
                    total_elements, result.kernel_name, result.efficiency_score, work_buffer_size);
     
+    // PERFORMANCE: End timing the query operation
+    NUMA_PERF_END();
+    
     return result;
+}
+
+// ============================================================================
+// Kernel Registration Function
+// ============================================================================
+
+/**
+ * Register MUL_MAT kernel with strategy arrays and function pointers
+ * This function provides the strategy thresholds and function pointers
+ * that the registry will use for O(1) lookups.
+ */
+ggml_numa_kernel_registration_info_t ggml_numa_kernel_mul_mat_register(void) {
+    ggml_numa_kernel_registration_info_t info = {0};
+    
+    info.op_type = GGML_OP_MUL_MAT;
+    info.supported = true;
+    info.kernel_name = "NUMA MUL_MAT Kernel";
+    
+    // Strategy thresholds for MUL_MAT operations  
+    info.strategy_array.thresholds[NUMA_STRATEGY_IDX_SINGLE_SINGLE] = 512;       // Single thread below 512 elements
+    info.strategy_array.thresholds[NUMA_STRATEGY_IDX_SINGLE_MULTI] = 131072;     // Multi-thread below 128K elements
+    // Above 128K elements: data-parallel strategy
+    info.strategy_array.valid = true;
+    
+    // Function pointers for different strategies
+    // MUL_MAT kernel handles all strategies within the same function
+    info.agg_funcs.single_single_fn = ggml_numa_kernel_mul_mat_execute;
+    info.agg_funcs.single_multi_fn = ggml_numa_kernel_mul_mat_execute;
+    info.agg_funcs.data_parallel_fn = ggml_numa_kernel_mul_mat_execute;
+    info.agg_funcs.valid = true;
+    
+    return info;
 }

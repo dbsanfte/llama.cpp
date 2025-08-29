@@ -1008,3 +1008,34 @@ enum ggml_status ggml_numa_kernel_add_execute_no_aggregation(void * work_context
     
     return GGML_STATUS_SUCCESS;
 }
+
+// ============================================================================
+// Kernel Registration Function
+// ============================================================================
+
+/**
+ * Register ADD kernel with strategy arrays and function pointers
+ * This function provides the strategy thresholds and function pointers
+ * that the registry will use for O(1) lookups.
+ */
+ggml_numa_kernel_registration_info_t ggml_numa_kernel_add_register(void) {
+    ggml_numa_kernel_registration_info_t info = {0};
+    
+    info.op_type = GGML_OP_ADD;
+    info.supported = true;
+    info.kernel_name = "NUMA ADD Kernel";
+    
+    // Strategy thresholds for ADD operations
+    info.strategy_array.thresholds[NUMA_STRATEGY_IDX_SINGLE_SINGLE] = 1024;      // Single thread below 1K elements
+    info.strategy_array.thresholds[NUMA_STRATEGY_IDX_SINGLE_MULTI] = 262144;     // Multi-thread below 256K elements
+    // Above 256K elements: data-parallel strategy
+    info.strategy_array.valid = true;
+    
+    // Function pointers for different strategies
+    info.agg_funcs.single_single_fn = ggml_numa_kernel_add_execute_low_overhead;
+    info.agg_funcs.single_multi_fn = ggml_numa_kernel_add_execute_low_overhead;
+    info.agg_funcs.data_parallel_fn = ggml_numa_kernel_add_execute_no_aggregation;
+    info.agg_funcs.valid = true;
+    
+    return info;
+}

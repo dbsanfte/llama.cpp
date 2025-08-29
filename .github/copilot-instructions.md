@@ -8,7 +8,7 @@ This is a fork of llama.cpp with **NUMA-aware execution architecture** for optim
 
 - **NUMA Kernel Registry** - `ggml/src/ggml-cpu/numa-kernels/` - O(1) cache database with pre-computed strategies
 - **NUMA Executor** - `ggml/src/ggml-cpu/ggml-numa-executor.c` - Strategy engine and work orchestration
-- **NUMA Coordinator** - `ggml/src/ggml-cpu/ggml-numa-coordinator.c` - Resource management and work distribution
+- **NUMA Coordinator** - `ggml/src/ggml-cpu/ggml-numa-simple-coordinator.c` - Resource management and work distribution
 - **Dev Container** - Ubuntu 24.04 with pre-installed dependencies
 
 **Goal**: Provide lightning-fast NUMA-aware execution for all operations through intelligent strategy selection and optimal resource utilization. 
@@ -336,7 +336,7 @@ tensor_dims = {cube_root, cube_root, cube_root, 1}; // Balanced 3D tensor
 ```
 
 ### NUMA Memory Management
-- **Files**: `ggml-numa-coordinator.c`, `ggml-cpu-numa-buffer.cpp`, `ggml.h`
+- **Files**: `ggml-numa-simple-coordinator.c`, `ggml-cpu-numa-buffer.cpp`, `ggml.h`
 - **NUMA mirroring**: Use `tensor_data()`/`tensor_set_data()` for NUMA-aware access
 - **Memory allocation**: Always use `numa_alloc_onnode()` for local allocation
 - **Thread mapping**: Each threadpool assigned to its own NUMA node
@@ -420,10 +420,11 @@ NUMA_LOG_VERBOSE("Detailed debug info: %f\n", detail);
 
 ### Essential Files
 ```
-ggml/src/ggml-cpu/numa-kernels/numa-kernels.c     # Kernel registry with O(1) cache
+ggml/src/ggml-cpu/numa-kernels/numa-kernels.c     # Kernel registry
 ggml/src/ggml-cpu/ggml-numa-executor.c            # Strategy engine and orchestration
-ggml/src/ggml-cpu/ggml-numa-coordinator.c         # Resource management
+ggml/src/ggml-cpu/ggml-numa-simple-coordinator.c  # Threadpool and NUMA management
 ggml/src/ggml-cpu/ggml-numa-shared.h              # Debug control and shared utilities
+ggml/src/ggml-cpu/ggml-numa-perf.c                # Performance instrumentation framework
 ggml/src/ggml-cpu/ggml-cpu.c                      # Mathematical kernels (reference)
 tests/test-numa-mathematical-correctness-*.cpp    # Correctness tests
 tests/run-numa-performance-tests.sh               # Performance test orchestrator

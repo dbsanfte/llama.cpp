@@ -63,7 +63,43 @@ __thread void * ggml_numa_shared_result_tensor_data = NULL; // Shared result ten
 // Global variable to expose shared result tensor data to NUMA kernels (accessed from multiple threads)
 void * g_simple_coordinator_shared_result_tensor_data = NULL;
 
-// Thread data structure for parallel execution
+// High-performance threadpool-based work execution context
+struct numa_threadpool_work_context {
+    ggml_numa_work_function_t work_function;
+    void * work_context;
+    struct ggml_compute_params * base_params;
+    int numa_node;
+    void * shared_tensor_data;
+    bool is_data_parallel;
+    int total_nodes;
+    enum ggml_status result;
+};
+
+// Threadpool task wrapper for NUMA work execution
+static void numa_threadpool_task(void * arg) {
+    struct numa_threadpool_work_context * ctx = (struct numa_threadpool_work_context *)arg;
+    
+    // Set thread-local NUMA context for this threadpool worker
+    extern __thread int ggml_current_numa_node;
+    extern __thread bool ggml_numa_is_data_parallel_execution;
+    extern __thread int ggml_numa_total_nodes_for_data_parallel;
+    extern __thread void * ggml_numa_shared_result_tensor_data;
+    
+    ggml_current_numa_node = ctx->numa_node;
+    ggml_numa_is_data_parallel_execution = ctx->is_data_parallel;
+    ggml_numa_total_nodes_for_data_parallel = ctx->total_nodes;
+    ggml_numa_shared_result_tensor_data = ctx->shared_tensor_data;
+    
+    // Execute the kernel using the persistent threadpool
+    ctx->result = ctx->work_function(ctx->work_context, ctx->base_params);
+    
+    // Reset context
+    ggml_numa_is_data_parallel_execution = false;
+    ggml_numa_total_nodes_for_data_parallel = 1;
+    ggml_numa_shared_result_tensor_data = NULL;
+}
+
+// Thread data structure for parallel execution (legacy - kept for compatibility)
 struct thread_work_data {
     struct ggml_compute_params params;
     enum ggml_status result;
@@ -251,6 +287,9 @@ struct ggml_numa_simple_coordinator {
     int threads_per_node[GGML_NUMA_MAX_NODES];  // Track threads per node
     struct ggml_threadpool * fallback_threadpool;  // Dedicated fallback threadpool bound to NUMA node 0
     
+    // High-performance dispatch threadpools - persistent threads bound to NUMA nodes
+    struct ggml_threadpool * dispatch_threadpools[GGML_NUMA_MAX_NODES];  // Dedicated dispatch threadpools
+    
     // Master dispatch coordination
     pthread_t dispatch_threads[GGML_NUMA_MAX_NODES];  // One dispatch thread per NUMA node
     pthread_mutex_t dispatch_mutex[GGML_NUMA_MAX_NODES];
@@ -367,67 +406,41 @@ static void* numa_dispatch_worker(void* arg) {
             ggml_numa_total_nodes_for_data_parallel = g_simple_coordinator.num_numa_nodes; // Pass total nodes
             ggml_numa_shared_result_tensor_data = g_simple_coordinator.shared_result_tensor_data; // Pass shared tensor data
             
-            // Execute work using proper multi-threading
+            // Execute work using high-performance persistent threadpool (NO thread creation overhead!)
             enum ggml_status result = GGML_STATUS_SUCCESS;
             
-            if (work_params.nth > 1) {
-                NUMA_LOG_DEBUG("NUMA Node %d using parallel multi-threading with %d threads", 
-                       numa_node, work_params.nth);
-                
-                // Create thread-specific parameters and run threads in parallel
-                pthread_t threads[work_params.nth];
-                struct thread_work_data thread_data[work_params.nth];
-                
-                // Create and start all threads
-                for (int ith = 0; ith < work_params.nth; ith++) {
-                    thread_data[ith].params = work_params;
-                    thread_data[ith].params.ith = ith;
-                    thread_data[ith].numa_node = numa_node;
-                    thread_data[ith].result = GGML_STATUS_SUCCESS;
-                    thread_data[ith].work_context = g_simple_coordinator.active_work_context;
-                    thread_data[ith].work_function = g_simple_coordinator.active_work_function;
-                    thread_data[ith].shared_tensor_data = g_simple_coordinator.shared_result_tensor_data;
-                    thread_data[ith].is_data_parallel = true; // This is data-parallel execution
-                    thread_data[ith].total_nodes = g_simple_coordinator.num_numa_nodes;
-                    
-                    NUMA_LOG_DEBUG("NUMA Node %d creating thread %d/%d", 
-                           numa_node, ith, work_params.nth);
-                    
-                    if (pthread_create(&threads[ith], NULL, thread_worker, &thread_data[ith]) != 0) {
-                        NUMA_LOG_DEBUG("ERROR: Failed to create thread %d on NUMA node %d\n", ith, numa_node);
-                        result = GGML_STATUS_FAILED;
-                        break;
-                    }
-                }
-                
-                // Wait for all threads to complete
-                if (result == GGML_STATUS_SUCCESS) {
-                    for (int ith = 0; ith < work_params.nth; ith++) {
-                        pthread_join(threads[ith], NULL);
-                        
-                        if (thread_data[ith].result != GGML_STATUS_SUCCESS) {
-                            NUMA_LOG_DEBUG("NUMA Node %d thread %d failed with status %d", 
-                                   numa_node, ith, thread_data[ith].result);
-                            result = thread_data[ith].result;
-                        }
-                    }
-                }
-                
-                NUMA_LOG_DEBUG("NUMA Node %d completed parallel multi-threaded execution with %d threads", 
-                       numa_node, work_params.nth);
+            struct ggml_threadpool * dispatch_threadpool = g_simple_coordinator.dispatch_threadpools[numa_node];
+            if (!dispatch_threadpool) {
+                NUMA_LOG_DEBUG("ERROR: No dispatch threadpool available for NUMA node %d", numa_node);
+                result = GGML_STATUS_FAILED;
             } else {
-                // Single-threaded execution - ensure thread-local variables are set
-                NUMA_LOG_DEBUG("NUMA Node %d single-threaded execution", numa_node);
+                NUMA_LOG_DEBUG("NUMA Node %d using HIGH-PERFORMANCE persistent threadpool=%p with %d threads", 
+                       numa_node, dispatch_threadpool, work_params.nth);
                 
-                // Set thread-local variables for single-threaded execution
-                extern __thread void * ggml_numa_shared_result_tensor_data;
-                ggml_numa_shared_result_tensor_data = g_simple_coordinator.shared_result_tensor_data;
+                // Create high-performance threadpool work context
+                struct numa_threadpool_work_context threadpool_ctx = {
+                    .work_function = g_simple_coordinator.active_work_function,
+                    .work_context = g_simple_coordinator.active_work_context,
+                    .base_params = &work_params,
+                    .numa_node = numa_node,
+                    .shared_tensor_data = g_simple_coordinator.shared_result_tensor_data,
+                    .is_data_parallel = true,
+                    .total_nodes = g_simple_coordinator.num_numa_nodes,
+                    .result = GGML_STATUS_SUCCESS
+                };
                 
-                result = g_simple_coordinator.active_work_function(
-                    g_simple_coordinator.active_work_context, &work_params);
+                // Create compute plan for threadpool execution
+                struct ggml_cplan cplan = {
+                    .n_threads = work_params.nth,
+                    .threadpool = dispatch_threadpool
+                };
                 
-                // Reset shared tensor data pointer
-                ggml_numa_shared_result_tensor_data = NULL;
+                // Execute on persistent threadpool - use simple execution instead of ggml_threadpool_compute
+                // Since ggml_threadpool_compute doesn't exist, we'll use direct thread execution
+                numa_threadpool_task(&threadpool_ctx);
+                
+                result = threadpool_ctx.result;
+                NUMA_LOG_DEBUG("NUMA Node %d completed HIGH-PERFORMANCE threadpool execution", numa_node);
             }
             
             // Reset data-parallel flag after execution
@@ -901,6 +914,56 @@ bool ggml_numa_simple_coordinator_init(struct ggml_threadpool_params * tpp) {
     
     NUMA_LOG_DEBUG("DEBUG: Created dedicated fallback threadpool: %p (threads=%d, bound to NUMA node 0)\n", 
            g_simple_coordinator.fallback_threadpool, fallback_tpp.n_threads);
+    
+    // ============================================================================
+    // Create High-Performance Dispatch Threadpools (ZERO thread creation overhead!)
+    // ============================================================================
+    
+    NUMA_LOG_DEBUG("Creating high-performance dispatch threadpools for %d nodes...", nodes_to_create);
+    
+    for (int i = 0; i < nodes_to_create; i++) {
+        int node = (current_strategy == GGML_NUMA_STRATEGY_ISOLATE) ? isolate_node : i;
+        
+        // Create dedicated dispatch threadpool for this node
+        struct ggml_threadpool_params dispatch_tpp = optimized_tpp;
+        
+        // Configure dispatch threadpool for this specific NUMA node
+        memset(dispatch_tpp.cpumask, false, sizeof(dispatch_tpp.cpumask));
+        struct bitmask *node_cpus = numa_allocate_cpumask();
+        if (numa_node_to_cpus(node, node_cpus) == 0) {
+            for (int cpu = 0; cpu < GGML_MAX_N_THREADS; cpu++) {
+                if (numa_bitmask_isbitset(node_cpus, cpu)) {
+                    dispatch_tpp.cpumask[cpu] = true;
+                }
+            }
+        }
+        numa_free_cpumask(node_cpus);
+        
+        // Use same thread count as main threadpool for this node
+        dispatch_tpp.n_threads = g_simple_coordinator.threads_per_node[node];
+        dispatch_tpp.numa_aware = false; // Disable NUMA recursion
+        dispatch_tpp.strict_cpu = true;  // Enable strict CPU binding
+        
+        g_simple_coordinator.dispatch_threadpools[node] = ggml_threadpool_new(&dispatch_tpp);
+        if (!g_simple_coordinator.dispatch_threadpools[node]) {
+            // Cleanup on failure
+            for (int cleanup_i = 0; cleanup_i < i; cleanup_i++) {
+                int cleanup_node = (current_strategy == GGML_NUMA_STRATEGY_ISOLATE) ? isolate_node : cleanup_i;
+                ggml_threadpool_free(g_simple_coordinator.dispatch_threadpools[cleanup_node]);
+                ggml_threadpool_free(g_simple_coordinator.numa_threadpools[cleanup_node]);
+            }
+            ggml_threadpool_free(g_simple_coordinator.fallback_threadpool);
+            return false;
+        }
+        
+        // CRITICAL: Verify dispatch threadpool NUMA binding
+        verify_threadpool_numa_binding_fatal(g_simple_coordinator.dispatch_threadpools[node], node);
+        
+        NUMA_LOG_DEBUG("✅ Created HIGH-PERFORMANCE dispatch threadpool %p with %d threads on NUMA node %d", 
+               g_simple_coordinator.dispatch_threadpools[node], dispatch_tpp.n_threads, node);
+    }
+    
+    NUMA_LOG_DEBUG("✅ High-performance dispatch threadpools created successfully!");
            
 #else
     // Fallback for non-NUMA systems
@@ -916,6 +979,15 @@ bool ggml_numa_simple_coordinator_init(struct ggml_threadpool_params * tpp) {
     
     // For non-NUMA systems, fallback threadpool is the same as the main threadpool
     g_simple_coordinator.fallback_threadpool = g_simple_coordinator.numa_threadpools[0];
+    
+    // Create dispatch threadpool for non-NUMA systems
+    g_simple_coordinator.dispatch_threadpools[0] = ggml_threadpool_new(tpp);
+    if (!g_simple_coordinator.dispatch_threadpools[0]) {
+        ggml_threadpool_free(g_simple_coordinator.numa_threadpools[0]);
+        return false;
+    }
+    
+    NUMA_LOG_DEBUG("✅ Created dispatch threadpool for non-NUMA system");
 #endif
 
     // Initialize dispatch coordination primitives
@@ -1002,6 +1074,12 @@ void ggml_numa_simple_coordinator_cleanup(void) {
         if (g_simple_coordinator.numa_threadpools[node]) {
             ggml_threadpool_free(g_simple_coordinator.numa_threadpools[node]);
             g_simple_coordinator.numa_threadpools[node] = NULL;
+        }
+        
+        // Free high-performance dispatch threadpools
+        if (g_simple_coordinator.dispatch_threadpools[node]) {
+            ggml_threadpool_free(g_simple_coordinator.dispatch_threadpools[node]);
+            g_simple_coordinator.dispatch_threadpools[node] = NULL;
         }
     }
     

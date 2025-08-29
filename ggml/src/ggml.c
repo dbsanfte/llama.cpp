@@ -403,10 +403,14 @@ bool ggml_numa_should_dispatch(void) {
         return numa_dispatch_override_value && g_numa_state.initialized;
     }
     
-    // Enable dispatcher for NUMA mirror strategy on multi-node systems
+    // Enable dispatcher for all NUMA strategies on multi-node systems
+    // ISOLATE strategies can benefit from optimized dispatch coordination
+    // MIRROR strategies definitely need dispatch for cross-node coordination
     return g_numa_state.initialized && 
            g_numa_state.numa_enabled &&
-           g_numa_state.strategy == GGML_NUMA_STRATEGY_MIRROR;
+           (g_numa_state.strategy == GGML_NUMA_STRATEGY_MIRROR ||
+            g_numa_state.strategy == GGML_NUMA_STRATEGY_ISOLATE ||
+            g_numa_state.strategy == GGML_NUMA_STRATEGY_DISABLED); // Even disabled can benefit from optimized coordinator
 }
 
 // Functions to control fallback recursion prevention

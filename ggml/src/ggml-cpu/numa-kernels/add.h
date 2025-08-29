@@ -20,6 +20,9 @@ size_t ggml_numa_kernel_add_get_work_buffer_size(const struct ggml_tensor * tens
 float ggml_numa_kernel_add_get_efficiency_score(const struct ggml_tensor * tensor);
 const char * ggml_numa_kernel_add_get_name(const struct ggml_tensor * tensor);
 
+// Kernel registration function - provides strategy arrays and function pointers
+ggml_numa_kernel_registration_info_t ggml_numa_kernel_add_register(void);
+
 /**
  * Query ADD kernel for optimal strategy based on tensor characteristics
  * 
