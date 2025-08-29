@@ -790,6 +790,16 @@ ggml_numa_kernel_query_result_t ggml_numa_kernel_mul_mat_query(const struct ggml
         return result;
     }
     
+    // PERFORMANCE OPTIMIZATION: Reject operations requiring expensive F32->quantized conversion
+    // For Q8_0 × F32 operations, fallback to reference implementation which is faster
+    const enum ggml_type vec_dot_type = type_traits->vec_dot_type;
+    if (src1->type != vec_dot_type && src1->type == GGML_TYPE_F32) {
+        NUMA_LOG_DEBUG("MUL_MAT query: REJECTING - avoiding expensive F32->%d conversion (src0_type=%d, src1_type=%d)", 
+                       vec_dot_type, src0->type, src1->type);
+        result.supported = false;
+        return result;
+    }
+    
     // Calculate total elements in result tensor
     const size_t total_elements = ggml_nelements(tensor);
     
