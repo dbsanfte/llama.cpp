@@ -4,6 +4,8 @@
 
 The `run-numa-tests.sh` script is a comprehensive test runner for all NUMA-related tests in the llama.cpp project. It executes all NUMA tests sequentially and provides detailed reporting.
 
+Additionally, the `run-numa-integration-test.sh` script provides a standalone integration test that validates end-to-end NUMA functionality with a real llama-server instance.
+
 ## Usage
 
 From the project root directory:
@@ -11,10 +13,33 @@ From the project root directory:
 ```bash
 # Make executable (if not already)
 chmod +x tests/run-numa-tests.sh
+chmod +x tests/run-numa-integration-test.sh
 
-# Run all NUMA tests
+# Run all NUMA tests (including integration test with --numa mirror at the end)
 ./tests/run-numa-tests.sh
+
+# Run only the integration test separately
+./tests/run-numa-integration-test.sh
+
+# Run integration test with specific NUMA mode
+./tests/run-numa-integration-test.sh --numa mirror
+./tests/run-numa-integration-test.sh --numa distribute
+./tests/run-numa-integration-test.sh --numa isolate
+
+# Run with verbose output
+./tests/run-numa-tests.sh --verbose
+./tests/run-numa-integration-test.sh --verbose --numa mirror
 ```
+
+### Integration Test
+
+The standalone integration test (`run-numa-integration-test.sh`) can be run independently and provides:
+- **Configurable NUMA testing**: Supports `--numa <mode>` option (mirror, distribute, isolate)
+- **Non-NUMA testing**: Can run without NUMA options for baseline testing
+- **Real-world validation**: Tests actual llama-server with specified configuration
+- **Model download**: Automatically downloads a small test model if needed
+- **End-to-end testing**: Validates complete inference pipeline from HTTP API to model response
+- **Deterministic testing**: Uses fixed parameters to ensure reproducible results
 
 ## Features
 

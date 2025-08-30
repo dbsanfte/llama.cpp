@@ -273,14 +273,48 @@ GGML_NUMA_DEBUG=2 ./build/bin/llama-server -m model.gguf --numa mirror
 
 # Ultra-detailed troubleshooting - trace level with individual operations
 GGML_NUMA_DEBUG=3 ./build/bin/llama-server -m model.gguf --numa mirror
+
+# Integration testing with debug output
+GGML_NUMA_DEBUG=1 ./tests/run-numa-integration-test.sh --verbose --numa mirror
+
+# Performance testing with debug
+GGML_NUMA_DEBUG=2 ./tests/run-numa-performance-tests.sh --operation=ADD
+```
 ```
 
 ### Quick Model Validation
+
+**Automated Integration Test (Recommended)**
 ```bash
-# Download test model
+# Run the automated integration test with NUMA mirror mode
+./tests/run-numa-integration-test.sh --numa mirror
+
+# Run with debug output for troubleshooting
+GGML_NUMA_DEBUG=1 ./tests/run-numa-integration-test.sh --verbose --numa mirror
+
+# Test different NUMA modes
+./tests/run-numa-integration-test.sh --numa distribute
+./tests/run-numa-integration-test.sh --numa isolate
+
+# Run without NUMA for baseline comparison
+./tests/run-numa-integration-test.sh
+```
+
+The integration test automatically:
+- Downloads the test model if needed
+- Starts llama-server with proper configuration
+- Passes through all environment variables (GGML_NUMA_DEBUG, GGML_LOG_DEBUG, etc.)
+- Waits for server and model loading
+- Sends a test prompt and validates response
+- Cleans up server processes
+- Reports success/failure with clear messages
+
+**Manual Process (For Advanced Debugging)**
+```bash
+# Download test model (if needed)
 wget -c -O ./.devcontainer/qwen2.5-0.5b-instruct-q8_0.gguf https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF/resolve/main/qwen2.5-0.5b-instruct-q8_0.gguf
 
-# Test with NUMA in forced mirror mode in full coordinator run:
+# Manual test with NUMA mirror mode:
 ./build/bin/llama-server -m ./.devcontainer/qwen2.5-0.5b-instruct-q8_0.gguf --host 0.0.0.0 --numa mirror --port 8080 &
 
 while ! curl --fail --silent http://localhost:8080/; do sleep 1; done
@@ -289,7 +323,7 @@ curl -X POST http://localhost:8080/v1/chat/completions -H "Content-Type: applica
 
 # (Check the JSON response looks sane with a proper model response, not garbage)
 
-# Kill the coordinator once done:
+# Kill the server once done:
 ps aux | grep llama-server | grep -v grep | awk '{print $2}' | xargs kill -9
 ```
 
@@ -431,8 +465,14 @@ gdb --batch --ex "file ./build/bin/program" --ex "core-file ./core" --ex "bt" --
 # Test core components
 cmake --build build --target test-numa-mathematical-correctness-add
 
-# Run comprehensive performance test suite
+# Run comprehensive test suite (includes integration test at end)
+./tests/run-numa-tests.sh
+
+# Run performance tests
 ./tests/run-numa-performance-tests.sh --operation=ADD --quick
+
+# Run integration test separately
+./tests/run-numa-integration-test.sh --numa mirror
 ```
 
 ### Test Template Usage
@@ -519,6 +559,7 @@ docs/numa-architecture.md                         # Architecture documentation
 - [ ] Add to CMake and verify builds successfully
 - [ ] Verify core architecture builds: `cmake --build build --target ggml-cpu llama`
 - [ ] Add the new test to `tests/run-numa-tests.sh` and verify it and the entire suite passes
+- [ ] Run integration test to validate real-world functionality: `./tests/run-numa-integration-test.sh --numa mirror`
 
 
 ### Performance Commands
@@ -529,6 +570,9 @@ cmake --build build --target ggml-cpu llama common  # Core validation
 
 # Run GB-scale performance tests
 ./tests/run-numa-performance-tests.sh --operation=OPERATION
+
+# Run integration test with real model
+./tests/run-numa-integration-test.sh --numa mirror
 ```
 
 ## Changelog
