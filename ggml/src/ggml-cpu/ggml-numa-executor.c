@@ -372,7 +372,6 @@ enum ggml_status ggml_numa_executor_fallback_to_cpu(struct ggml_tensor * tensor,
     size_t needed_work_size = ggml_numa_calculate_work_size(tensor, cplan->n_threads);
     
     void * work_data = NULL;
-    bool allocated_work_buffer = false;
     
     // Check if existing work buffer is sufficient
     if (cplan->work_data && cplan->work_size >= needed_work_size) {
@@ -380,30 +379,12 @@ enum ggml_status ggml_numa_executor_fallback_to_cpu(struct ggml_tensor * tensor,
         GGML_LOG_DEBUG("NUMA Fallback: Using existing work buffer (%zu bytes >= %zu needed)\n", 
                        cplan->work_size, needed_work_size);
     } else if (needed_work_size > 0) {
-        // Allocate NUMA-aware work buffer on node 0
-        #ifdef __linux__
-        if (numa_available() >= 0) {
-            work_data = numa_alloc_onnode(needed_work_size, 0);
-            if (work_data) {
-                // Initialize pages to ensure proper NUMA placement
-                memset(work_data, 0, needed_work_size);
-                allocated_work_buffer = true;
-                GGML_LOG_DEBUG("NUMA Fallback: Allocated %zu bytes work buffer on NUMA node 0\n", needed_work_size);
-            }
-        }
-        #endif
-        
-        // Fall back to regular malloc if NUMA allocation failed
-        if (!work_data) {
-            work_data = malloc(needed_work_size);
-            if (work_data) {
-                allocated_work_buffer = true;
-                GGML_LOG_DEBUG("NUMA Fallback: Allocated %zu bytes work buffer with malloc\n", needed_work_size);
-            }
-        }
-        
-        if (!work_data) {
-            GGML_LOG_ERROR("NUMA Fallback: Failed to allocate %zu bytes work buffer\n", needed_work_size);
+        // Use persistent fallback work buffer from coordinator (auto-growing)
+        work_data = ggml_numa_simple_coordinator_get_fallback_work_buffer(needed_work_size);
+        if (work_data) {
+            GGML_LOG_DEBUG("NUMA Fallback: Using persistent work buffer (%zu bytes, grew if needed)\n", needed_work_size);
+        } else {
+            GGML_LOG_ERROR("NUMA Fallback: Failed to get persistent work buffer (%zu bytes)\n", needed_work_size);
             ggml_numa_set_fallback_flag(false);
             return GGML_STATUS_FAILED;
         }
@@ -469,37 +450,10 @@ enum ggml_status ggml_numa_executor_fallback_to_cpu(struct ggml_tensor * tensor,
     // Check result
     if (result != GGML_STATUS_SUCCESS) {
         GGML_LOG_ERROR("NUMA Fallback: Graph computation failed with status %d\n", result);
-        // Clean up allocated work buffer
-        if (allocated_work_buffer && work_data) {
-            #ifdef __linux__
-            if (numa_available() >= 0) {
-                numa_free(work_data, needed_work_size);
-                GGML_LOG_DEBUG("NUMA Fallback: Freed NUMA work buffer\n");
-            } else
-            #endif
-            {
-                free(work_data);
-                GGML_LOG_DEBUG("NUMA Fallback: Freed malloc work buffer\n");
-            }
-        }
         NUMA_PERF_END();
         return GGML_STATUS_FAILED;
     }
-    
-    // Clean up allocated work buffer
-    if (allocated_work_buffer && work_data) {
-        #ifdef __linux__
-        if (numa_available() >= 0) {
-            numa_free(work_data, needed_work_size);
-            GGML_LOG_DEBUG("NUMA Fallback: Freed NUMA work buffer\n");
-        } else
-        #endif
-        {
-            free(work_data);
-            GGML_LOG_DEBUG("NUMA Fallback: Freed malloc work buffer\n");
-        }
-    }
-    
+
     GGML_LOG_DEBUG("NUMA Fallback: Operation %s completed successfully\n", op_name);
     NUMA_PERF_END();
     return GGML_STATUS_SUCCESS;

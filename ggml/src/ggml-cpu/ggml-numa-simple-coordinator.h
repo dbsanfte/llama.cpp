@@ -88,6 +88,19 @@ struct ggml_threadpool * ggml_numa_simple_coordinator_get_fallback_threadpool(vo
 int ggml_numa_simple_coordinator_get_fallback_thread_count(void);
 
 /**
+ * Get or allocate persistent fallback work buffer with auto-growing capability
+ * @param needed_size Required buffer size in bytes
+ * @return Pointer to fallback work buffer, or NULL on failure
+ */
+void * ggml_numa_simple_coordinator_get_fallback_work_buffer(size_t needed_size);
+
+/**
+ * Get current fallback work buffer size
+ * @return Current buffer size in bytes, or 0 if not allocated
+ */
+size_t ggml_numa_simple_coordinator_get_fallback_work_buffer_size(void);
+
+/**
  * NUMA thread binding validation (hard failure)
  * @param expected_node Expected NUMA node (-1 to skip validation)
  * @param thread_type Description of thread type for error messages

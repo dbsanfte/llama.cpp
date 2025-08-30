@@ -1331,6 +1331,42 @@ int ggml_numa_simple_coordinator_get_fallback_thread_count(void) {
     return ggml_threadpool_get_n_threads(g_simple_coordinator.fallback_threadpool);
 }
 
+// Get or allocate fallback work buffer with auto-growing capability
+void * ggml_numa_simple_coordinator_get_fallback_work_buffer(size_t needed_size) {
+    if (!g_simple_coordinator.initialized) {
+        return NULL;
+    }
+    
+    // Auto-grow the fallback work buffer if needed
+    if (needed_size > 0 && g_simple_coordinator.fallback_work_buffer_size < needed_size) {
+        if (g_simple_coordinator.fallback_work_buffer) {
+            numa_free(g_simple_coordinator.fallback_work_buffer, 
+                     g_simple_coordinator.fallback_work_buffer_size);
+        }
+        
+        g_simple_coordinator.fallback_work_buffer = numa_alloc_onnode(needed_size, 0);
+        if (g_simple_coordinator.fallback_work_buffer) {
+            // Initialize pages to ensure proper NUMA placement
+            memset(g_simple_coordinator.fallback_work_buffer, 0, needed_size);
+            g_simple_coordinator.fallback_work_buffer_size = needed_size;
+            NUMA_LOG_DEBUG("Auto-grew fallback work buffer to %zu bytes on NUMA node 0", needed_size);
+        } else {
+            NUMA_LOG_DEBUG("ERROR: Failed to auto-grow fallback work buffer to %zu bytes\n", needed_size);
+            g_simple_coordinator.fallback_work_buffer_size = 0;
+            return NULL;
+        }
+    }
+    
+    return g_simple_coordinator.fallback_work_buffer;
+}
+
+size_t ggml_numa_simple_coordinator_get_fallback_work_buffer_size(void) {
+    if (!g_simple_coordinator.initialized) {
+        return 0;
+    }
+    return g_simple_coordinator.fallback_work_buffer_size;
+}
+
 // Public wrapper for thread binding assertion
 void ggml_numa_simple_coordinator_assert_thread_binding(int expected_node, const char* thread_type, int thread_id) {
     if (expected_node >= 0) {  // Only validate if expected_node is specified
