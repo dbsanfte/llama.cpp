@@ -230,8 +230,8 @@ enum ggml_status ggml_numa_kernels_init(void) {
     // Register MUL kernel
     NUMA_REGISTER_KERNEL(mul);
 
-    // Register CPY kernel
-    //NUMA_REGISTER_KERNEL(cpy);
+    // Register CPY kernel - DISABLED due to memory corruption issues
+    // NUMA_REGISTER_KERNEL(cpy);
 
     // Register MUL_MAT kernel
     NUMA_REGISTER_KERNEL(mul_mat);

@@ -470,53 +470,6 @@ static void* numa_dispatch_worker(void* arg) {
 // Data Aggregation for Data-Parallel Execution
 // ============================================================================
 
-// Ensure tensor has NUMA copies for data-parallel execution
-static enum ggml_status ensure_numa_tensor_copies(struct ggml_tensor * tensor) {
-    if (!tensor || !ggml_numa_should_mirror()) {
-        return GGML_STATUS_SUCCESS;
-    }
-    
-    extern int ggml_numa_node_count(void);
-    int numa_nodes = ggml_numa_node_count();
-    size_t tensor_size = ggml_nbytes(tensor);
-    
-    // Check if all NUMA nodes currently point to the same data (lazy mirroring state)
-    void * original_data = tensor->__data[0];
-    bool needs_mirroring = false;
-    
-    for (int i = 1; i < numa_nodes && i < GGML_NUMA_MAX_NODES; i++) {
-        if (tensor->__data[i] != original_data) {
-            needs_mirroring = false; // Already has separate copies
-            break;
-        }
-        needs_mirroring = true; // All nodes point to same data
-    }
-    
-    if (!needs_mirroring || !original_data) {
-        return GGML_STATUS_SUCCESS; // Already mirrored or no data
-    }
-    
-    // Create NUMA copies for data-parallel execution
-    for (int i = 0; i < numa_nodes && i < GGML_NUMA_MAX_NODES; i++) {
-        void * numa_data = ggml_numa_aligned_malloc_on_node(tensor_size, i, NULL);
-        if (numa_data) {
-            memcpy(numa_data, original_data, tensor_size);
-            tensor->__data[i] = numa_data;
-        } else {
-            // Failed to allocate, clean up and fall back to shared data
-            for (int j = 0; j < i; j++) {
-                if (tensor->__data[j] != original_data) {
-                    ggml_numa_aligned_free(tensor->__data[j], NULL);
-                }
-                tensor->__data[j] = original_data;
-            }
-            return GGML_STATUS_FAILED;
-        }
-    }
-    
-    return GGML_STATUS_SUCCESS;
-}
-
 // NUMA-aware work buffer management
 static bool allocate_numa_work_buffers(size_t work_size) {
     if (work_size == 0) return true;
@@ -1175,28 +1128,9 @@ enum ggml_status ggml_numa_simple_coordinator_execute_data_parallel(
         return GGML_STATUS_FAILED;
     }
 
-    // CRITICAL: Ensure input tensors have NUMA copies for data-parallel execution
     // work_context is the tensor being processed
     struct ggml_tensor * tensor = (struct ggml_tensor *)work_context;
-    if (tensor) {
-        // Ensure input tensors have NUMA copies
-        if (tensor->src[0] && ensure_numa_tensor_copies(tensor->src[0]) != GGML_STATUS_SUCCESS) {
-            NUMA_LOG_DEBUG("ERROR: Failed to create NUMA copies for src[0] tensor\n");
-            NUMA_PERF_END();
-            return GGML_STATUS_FAILED;
-        }
-        if (tensor->src[1] && ensure_numa_tensor_copies(tensor->src[1]) != GGML_STATUS_SUCCESS) {
-            NUMA_LOG_DEBUG("ERROR: Failed to create NUMA copies for src[1] tensor\n");
-            NUMA_PERF_END();
-            return GGML_STATUS_FAILED;
-        }
-        // Ensure destination tensor has NUMA copies
-        if (ensure_numa_tensor_copies(tensor) != GGML_STATUS_SUCCESS) {
-            NUMA_LOG_DEBUG("ERROR: Failed to create NUMA copies for destination tensor\n");
-            NUMA_PERF_END();
-            return GGML_STATUS_FAILED;
-        }
-    }
+    GGML_UNUSED(tensor); // Tensor copying is handled at model loading time in llama-mmap.cpp
 
     // Allocate NUMA-local work buffers if needed  
     if (work_size > 0 && !allocate_numa_work_buffers(work_size)) {
