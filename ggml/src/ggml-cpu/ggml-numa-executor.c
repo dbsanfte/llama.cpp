@@ -411,15 +411,17 @@ enum ggml_status ggml_numa_executor_fallback_to_cpu(struct ggml_tensor * tensor,
 
     // Get fallback threadpool - try dedicated fallback threadpool first, then cplan threadpool
     struct ggml_threadpool * fallback_threadpool = NULL;
-    int fallback_thread_count = cplan->n_threads; // Use original plan's thread count
+    int fallback_thread_count = cplan->n_threads; // Default to original plan's thread count
     
     // Try to get the dedicated fallback threadpool from coordinator
     fallback_threadpool = ggml_numa_simple_coordinator_get_fallback_threadpool();
     if (fallback_threadpool) {
-        // CRITICAL FIX: Respect the original graph plan's thread count instead of using the fallback threadpool's default
-        // This ensures mathematical equivalence between NUMA and non-NUMA execution paths
+        // CRITICAL FIX: Use the fallback threadpool's actual thread count instead of the original plan's thread count
+        // The fallback threadpool is bound to NUMA node 0 and only has that node's threads available
+        fallback_thread_count = ggml_numa_simple_coordinator_get_fallback_thread_count();
+        
         GGML_LOG_DEBUG("🔧 Using dedicated fallback threadpool: %p (bound to NUMA node 0)\n", (void*)fallback_threadpool);
-        GGML_LOG_DEBUG("📊 Fallback Execution: threads=%d (respecting plan), threadpool=%p (disposable=true)\n", 
+        GGML_LOG_DEBUG("📊 Fallback Execution: threads=%d (fallback capacity), threadpool=%p (disposable=false)\n", 
                        fallback_thread_count, (void*)fallback_threadpool);
     } else if (cplan->threadpool) {
         fallback_threadpool = cplan->threadpool;

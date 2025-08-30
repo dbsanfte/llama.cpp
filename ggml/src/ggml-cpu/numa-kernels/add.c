@@ -312,7 +312,7 @@ enum ggml_status ggml_numa_kernel_add_execute_low_overhead(void * work_context,
             // Only thread 0 executes - process entire node range for efficiency
             numa_start = node_start;
             numa_end = node_end;
-            NUMA_LOG_DEBUG("NUMA Node %d, Thread %d processing FULL NODE RANGE: [%ld, %ld) (%ld elements) - single thread execution", 
+            NUMA_LOG_TRACE("NUMA Node %d, Thread %d processing FULL NODE RANGE: [%ld, %ld) (%ld elements) - single thread execution", 
                            current_node, thread_id, numa_start, numa_end, numa_end - numa_start);
         } else {
             // Multi-thread mode - calculate thread-specific slice within node (should not happen currently)
@@ -320,7 +320,7 @@ enum ggml_status ggml_numa_kernel_add_execute_low_overhead(void * work_context,
             numa_start = node_start + thread_id * elements_per_thread;
             numa_end = MIN(numa_start + elements_per_thread, node_end);
             
-            NUMA_LOG_DEBUG("NUMA Node %d, Thread %d processing slice: [%ld, %ld) (%ld elements) from node range [%ld, %ld)", 
+            NUMA_LOG_TRACE("NUMA Node %d, Thread %d processing slice: [%ld, %ld) (%ld elements) from node range [%ld, %ld)", 
                            current_node, thread_id, numa_start, numa_end, numa_end - numa_start, node_start, node_end);
         }
     } else {
@@ -329,7 +329,7 @@ enum ggml_status ggml_numa_kernel_add_execute_low_overhead(void * work_context,
         numa_start = thread_id * elements_per_thread;
         numa_end = MIN(numa_start + elements_per_thread, total_elements);
         
-        NUMA_LOG_DEBUG("NUMA Node %d, Thread %d processing tensor slice: [%ld, %ld) (%ld elements)", 
+        NUMA_LOG_TRACE("NUMA Node %d, Thread %d processing tensor slice: [%ld, %ld) (%ld elements)", 
                        current_node, thread_id, numa_start, numa_end, numa_end - numa_start);
     }
     
@@ -479,7 +479,7 @@ enum ggml_status ggml_numa_kernel_add_execute_optimized(void * work_context,
             // Only thread 0 executes - process entire node range for efficiency
             numa_start = node_start;
             numa_end = node_end;
-            NUMA_LOG_DEBUG("NUMA Node %d, Thread %d processing FULL NODE RANGE: [%ld, %ld) (%ld elements) - single thread execution", 
+            NUMA_LOG_TRACE("NUMA Node %d, Thread %d processing FULL NODE RANGE: [%ld, %ld) (%ld elements) - single thread execution", 
                            current_node, thread_id, numa_start, numa_end, numa_end - numa_start);
         } else {
             // Multi-thread mode - calculate thread-specific slice within node (should not happen currently)
@@ -487,7 +487,7 @@ enum ggml_status ggml_numa_kernel_add_execute_optimized(void * work_context,
             numa_start = node_start + thread_id * elements_per_thread;
             numa_end = MIN(numa_start + elements_per_thread, node_end);
             
-            NUMA_LOG_DEBUG("NUMA Node %d, Thread %d processing slice: [%ld, %ld) (%ld elements) from node range [%ld, %ld)", 
+            NUMA_LOG_TRACE("NUMA Node %d, Thread %d processing slice: [%ld, %ld) (%ld elements) from node range [%ld, %ld)", 
                            current_node, thread_id, numa_start, numa_end, numa_end - numa_start, node_start, node_end);
         }
     } else {
@@ -499,7 +499,7 @@ enum ggml_status ggml_numa_kernel_add_execute_optimized(void * work_context,
         numa_start = thread_id * elements_per_thread;
         numa_end = MIN(numa_start + elements_per_thread, total_elements);
         
-        NUMA_LOG_DEBUG("NUMA Node %d, Thread %d processing tensor slice: [%ld, %ld) (%ld elements)", 
+        NUMA_LOG_TRACE("NUMA Node %d, Thread %d processing tensor slice: [%ld, %ld) (%ld elements)", 
                        current_node, thread_id, numa_start, numa_end, numa_end - numa_start);
     }
     
@@ -1064,11 +1064,17 @@ ggml_numa_kernel_registration_info_t ggml_numa_kernel_add_register(void) {
     // Above 256K elements: data-parallel strategy
     info.strategy_array.valid = true;
     
-    // Function pointers for different strategies
-    info.agg_funcs.single_single_fn = ggml_numa_kernel_add_execute_low_overhead;
-    info.agg_funcs.single_multi_fn = ggml_numa_kernel_add_execute_low_overhead;
-    info.agg_funcs.data_parallel_fn = ggml_numa_kernel_add_execute_no_aggregation;
-    info.agg_funcs.valid = true;
+    // Function pointers for different strategies - using work_funcs not agg_funcs
+    info.work_funcs.single_single_fn = ggml_numa_kernel_add_execute_low_overhead;
+    info.work_funcs.single_multi_fn = ggml_numa_kernel_add_execute_low_overhead;
+    info.work_funcs.data_parallel_fn = ggml_numa_kernel_add_execute_no_aggregation;
+    info.work_funcs.valid = true;
+    
+    // ADD doesn't need aggregation functions (no result aggregation needed)
+    info.agg_funcs.single_single_fn = NULL;
+    info.agg_funcs.single_multi_fn = NULL;
+    info.agg_funcs.data_parallel_fn = NULL;
+    info.agg_funcs.valid = false;
     
     return info;
 }

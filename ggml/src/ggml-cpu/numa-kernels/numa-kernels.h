@@ -27,12 +27,13 @@ struct ggml_cplan;
 
 /**
  * Hash table entry for strategy cache
- * Maps operation type to strategy threshold array
+ * Maps operation type to strategy threshold array and function pointers
  */
 typedef struct {
     enum ggml_op op_type;                                // Operation type (hash key)
     ggml_numa_kernel_strategy_array_t strategy_array;   // Threshold array
-    ggml_numa_kernel_aggregation_funcs_t agg_funcs;     // Function pointers
+    ggml_numa_kernel_work_funcs_t work_funcs;           // Work function pointers
+    ggml_numa_kernel_aggregation_funcs_t agg_funcs;     // Aggregation function pointers (optional)
     bool initialized;                                    // True if entry is valid
 } ggml_numa_strategy_cache_entry_t;
 
@@ -53,6 +54,7 @@ typedef struct {
 enum ggml_status ggml_numa_register_kernel_strategy(
     enum ggml_op op_type,
     const ggml_numa_kernel_strategy_array_t * strategy_array,
+    const ggml_numa_kernel_work_funcs_t * work_funcs,
     const ggml_numa_kernel_aggregation_funcs_t * agg_funcs
 );
 
@@ -71,13 +73,13 @@ const ggml_numa_execution_strategy_t * ggml_numa_lookup_strategy_fast(
 );
 
 /**
- * O(1) aggregation function lookup - ultra-fast hash table access
- * Returns function pointer for aggregation based on operation and strategy
+ * O(1) work function lookup - ultra-fast hash table access
+ * Returns function pointer for execution based on operation and strategy
  */
-enum ggml_status (*ggml_numa_lookup_aggregation_fast(
+ggml_numa_work_function_t ggml_numa_lookup_work_function_fast(
     enum ggml_op op_type,
     const ggml_numa_execution_strategy_t * strategy
-))(void *, int, struct ggml_tensor *, struct ggml_cplan *);
+);
 
 /**
  * NUMA aggregation policy for kernels
@@ -175,6 +177,38 @@ numa_strategy_cache_stats_t ggml_numa_kernels_get_strategy_stats(void);
  * Clear all strategy caches (for testing)
  */
 void ggml_numa_kernels_clear_strategy_cache(void);
+
+/**
+ * NUMA_REGISTER_KERNEL - Macro to simplify kernel registration
+ * 
+ * This macro eliminates code duplication when registering NUMA kernels.
+ * It handles the registration pattern, error checking, and debug logging.
+ * 
+ * @param kname - The kernel name (e.g., add, mul, cpy)
+ * 
+ * Usage example:
+ *   NUMA_REGISTER_KERNEL(add);
+ *   NUMA_REGISTER_KERNEL(mul);
+ * 
+ * The macro expects:
+ * - Function: ggml_numa_kernel_{kname}_register()
+ * - Returns: ggml_numa_kernel_registration_info_t with supported flag
+ */
+#define NUMA_REGISTER_KERNEL(kname) do { \
+    ggml_numa_kernel_registration_info_t kname##_info = ggml_numa_kernel_##kname##_register(); \
+    if (kname##_info.supported) { \
+        enum ggml_status kname##_result = ggml_numa_register_kernel_strategy( \
+            kname##_info.op_type, &kname##_info.strategy_array, \
+            &kname##_info.work_funcs, &kname##_info.agg_funcs); \
+        if (kname##_result != GGML_STATUS_SUCCESS) { \
+            NUMA_LOG_ERROR("Failed to register " #kname " kernel strategy"); \
+            return kname##_result; \
+        } \
+        NUMA_LOG_DEBUG("✅ Registered %s (thresholds: %zu/%zu)", kname##_info.kernel_name, \
+                      kname##_info.strategy_array.thresholds[NUMA_STRATEGY_IDX_SINGLE_SINGLE], \
+                      kname##_info.strategy_array.thresholds[NUMA_STRATEGY_IDX_SINGLE_MULTI]); \
+    } \
+} while(0)
 
 #ifdef __cplusplus
 }

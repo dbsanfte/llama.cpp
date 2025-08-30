@@ -330,21 +330,21 @@ enum ggml_status ggml_numa_kernel_mul_mat_execute(void * work_context,
                     // Destination: converted data in work buffer with proper layout
                     void * dst_row = work_buffer + i13*nbw3 + i12*nbw2 + i11*nbw1;
                     
-                    // DEBUG: Log conversion details for first few rows
+                    // DEBUG: Log conversion details for first few rows (TRACE level)
                     if (i13 == 0 && i12 == 0 && i11 < 3) {
-                        NUMA_LOG_DEBUG("MUL_MAT Node %d: Converting F32->Q8_0 row[%ld]: src_ptr=%p, dst_ptr=%p", 
+                        NUMA_LOG_TRACE("MUL_MAT Node %d: Converting F32->Q8_0 row[%ld]: src_ptr=%p, dst_ptr=%p", 
                                        current_node, i11, src1_row, dst_row);
-                        NUMA_LOG_DEBUG("MUL_MAT Node %d: F32 row[%ld] samples: {%.3f,%.3f,%.3f,%.3f,%.3f}", 
+                        NUMA_LOG_TRACE("MUL_MAT Node %d: F32 row[%ld] samples: {%.3f,%.3f,%.3f,%.3f,%.3f}", 
                                        current_node, i11, src1_row[0], src1_row[1], src1_row[2], src1_row[3], src1_row[4]);
                     }
                     
                     // Perform the actual conversion (e.g., F32 -> Q8_0)
                     from_float(src1_row, dst_row, ne10);
                     
-                    // DEBUG: Log converted values for verification
+                    // DEBUG: Log converted values for verification (TRACE level)
                     if (i13 == 0 && i12 == 0 && i11 < 3) {
                         const uint8_t* q8_data = (const uint8_t*)dst_row;
-                        NUMA_LOG_DEBUG("MUL_MAT Node %d: Q8_0 row[%ld] first bytes: {%02x,%02x,%02x,%02x,%02x}", 
+                        NUMA_LOG_TRACE("MUL_MAT Node %d: Q8_0 row[%ld] first bytes: {%02x,%02x,%02x,%02x,%02x}", 
                                        current_node, i11, q8_data[0], q8_data[1], q8_data[2], q8_data[3], q8_data[4]);
                     }
                 }
@@ -453,7 +453,7 @@ enum ggml_status ggml_numa_kernel_mul_mat_execute(void * work_context,
         ir1_start = 0;
         ir1_end = nr1;
         
-        NUMA_LOG_DEBUG("MUL_MAT Node %d, Thread %d: Data-parallel row split - node_rows=[%ld,%ld), thread_rows=[%ld,%ld), final=[%ld,%ld)", 
+        NUMA_LOG_VERBOSE("MUL_MAT Node %d, Thread %d: Data-parallel row split - node_rows=[%ld,%ld), thread_rows=[%ld,%ld), final=[%ld,%ld)", 
                        current_node, thread_id, node_row_start, node_row_end, thread_row_start, thread_row_end, ir0_start, ir0_end);
         
     } else {
@@ -860,12 +860,18 @@ ggml_numa_kernel_registration_info_t ggml_numa_kernel_mul_mat_register(void) {
     // Above 128K elements: data-parallel strategy
     info.strategy_array.valid = true;
     
-    // Function pointers for different strategies
+    // Function pointers for different strategies - using work_funcs not agg_funcs
     // MUL_MAT kernel handles all strategies within the same function
-    info.agg_funcs.single_single_fn = ggml_numa_kernel_mul_mat_execute;
-    info.agg_funcs.single_multi_fn = ggml_numa_kernel_mul_mat_execute;
-    info.agg_funcs.data_parallel_fn = ggml_numa_kernel_mul_mat_execute;
-    info.agg_funcs.valid = true;
+    info.work_funcs.single_single_fn = ggml_numa_kernel_mul_mat_execute;
+    info.work_funcs.single_multi_fn = ggml_numa_kernel_mul_mat_execute;
+    info.work_funcs.data_parallel_fn = ggml_numa_kernel_mul_mat_execute;
+    info.work_funcs.valid = true;
+    
+    // MUL_MAT doesn't need aggregation functions (no result aggregation needed)
+    info.agg_funcs.single_single_fn = NULL;
+    info.agg_funcs.single_multi_fn = NULL;
+    info.agg_funcs.data_parallel_fn = NULL;
+    info.agg_funcs.valid = false;
     
     return info;
 }

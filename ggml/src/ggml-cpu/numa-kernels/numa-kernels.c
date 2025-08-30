@@ -14,7 +14,9 @@
 
 #include "numa-kernels.h"
 #include "add.h"
+#include "mul.h"
 #include "mul_mat.h"
+#include "cpy.h"
 #include "../ggml-impl.h"
 
 // ============================================================================
@@ -38,7 +40,7 @@ enum ggml_status ggml_numa_init_strategy_cache(void) {
         g_strategy_cache.entries[i].initialized = false;
         g_strategy_cache.entries[i].op_type = GGML_OP_NONE;
         g_strategy_cache.entries[i].strategy_array.valid = false;
-        g_strategy_cache.entries[i].agg_funcs.valid = false;
+        g_strategy_cache.entries[i].work_funcs.valid = false;
     }
     
     g_strategy_cache.num_registered_ops = 0;
@@ -49,12 +51,13 @@ enum ggml_status ggml_numa_init_strategy_cache(void) {
 }
 
 /**
- * Register kernel strategy and aggregation functions in hash table
- * O(1) insertion with direct hash table access
+ * Register a kernel strategy with the cache system
+ * Called by each kernel at startup to provide threshold arrays and function pointers
  */
 enum ggml_status ggml_numa_register_kernel_strategy(
     enum ggml_op op_type,
     const ggml_numa_kernel_strategy_array_t * strategy_array,
+    const ggml_numa_kernel_work_funcs_t * work_funcs,
     const ggml_numa_kernel_aggregation_funcs_t * agg_funcs) {
     
     if (!g_strategy_cache.cache_initialized) {
@@ -77,7 +80,7 @@ enum ggml_status ggml_numa_register_kernel_strategy(
         NUMA_LOG_WARN("Operation %d already registered, overwriting", (int)op_type);
     }
     
-    // Store strategy array and aggregation functions
+    // Store strategy array and function pointers
     ggml_numa_strategy_cache_entry_t * entry = &g_strategy_cache.entries[hash_idx];
     entry->op_type = op_type;
     entry->initialized = true;
@@ -86,6 +89,12 @@ enum ggml_status ggml_numa_register_kernel_strategy(
         entry->strategy_array = *strategy_array;
     } else {
         entry->strategy_array.valid = false;
+    }
+    
+    if (work_funcs && work_funcs->valid) {
+        entry->work_funcs = *work_funcs;
+    } else {
+        entry->work_funcs.valid = false;
     }
     
     if (agg_funcs && agg_funcs->valid) {
@@ -163,6 +172,33 @@ enum ggml_status (*ggml_numa_lookup_aggregation_fast(
     return numa_get_aggregation_func_fast(&entry->agg_funcs, strategy);
 }
 
+/**
+ * O(1) work function lookup - ultra-fast hash table access
+ * Returns work function pointer for execution based on operation and strategy
+ */
+ggml_numa_work_function_t ggml_numa_lookup_work_function_fast(
+    enum ggml_op op_type,
+    const ggml_numa_execution_strategy_t * strategy) {
+    
+    if (!g_strategy_cache.cache_initialized || !strategy) {
+        return NULL;
+    }
+    
+    // O(1) hash table lookup
+    size_t hash_idx = numa_op_hash(op_type);
+    if (hash_idx >= NUMA_OP_HASH_TABLE_SIZE) {
+        return NULL;
+    }
+    
+    const ggml_numa_strategy_cache_entry_t * entry = &g_strategy_cache.entries[hash_idx];
+    if (!entry->initialized || !entry->work_funcs.valid) {
+        return NULL;
+    }
+    
+    // O(1) function pointer selection using inline strategy lookup
+    return numa_get_work_func_fast(&entry->work_funcs, strategy);
+}
+
 // ============================================================================
 // Kernel Initialization System
 // ============================================================================
@@ -189,41 +225,22 @@ enum ggml_status ggml_numa_kernels_init(void) {
     // This allows kernels to define their own strategies and function pointers
     
     // Register ADD kernel
-    ggml_numa_kernel_registration_info_t add_info = ggml_numa_kernel_add_register();
-    if (add_info.supported) {
-        enum ggml_status add_result = ggml_numa_register_kernel_strategy(
-            add_info.op_type, &add_info.strategy_array, &add_info.agg_funcs);
-        if (add_result != GGML_STATUS_SUCCESS) {
-            NUMA_LOG_ERROR("Failed to register ADD kernel strategy");
-            return add_result;
-        }
-        NUMA_LOG_DEBUG("✅ Registered %s (thresholds: %zu/%zu)", add_info.kernel_name,
-                      add_info.strategy_array.thresholds[NUMA_STRATEGY_IDX_SINGLE_SINGLE],
-                      add_info.strategy_array.thresholds[NUMA_STRATEGY_IDX_SINGLE_MULTI]);
-    }
+    NUMA_REGISTER_KERNEL(add);
     
+    // Register MUL kernel
+    //NUMA_REGISTER_KERNEL(mul);
+
+    // Register CPY kernel
+    //NUMA_REGISTER_KERNEL(cpy);
+
     // Register MUL_MAT kernel
-    ggml_numa_kernel_registration_info_t mul_mat_info = ggml_numa_kernel_mul_mat_register();
-    if (mul_mat_info.supported) {
-        enum ggml_status mul_mat_result = ggml_numa_register_kernel_strategy(
-            mul_mat_info.op_type, &mul_mat_info.strategy_array, &mul_mat_info.agg_funcs);
-        if (mul_mat_result != GGML_STATUS_SUCCESS) {
-            NUMA_LOG_ERROR("Failed to register MUL_MAT kernel strategy");
-            return mul_mat_result;
-        }
-        NUMA_LOG_DEBUG("✅ Registered %s (thresholds: %zu/%zu)", mul_mat_info.kernel_name,
-                      mul_mat_info.strategy_array.thresholds[NUMA_STRATEGY_IDX_SINGLE_SINGLE],
-                      mul_mat_info.strategy_array.thresholds[NUMA_STRATEGY_IDX_SINGLE_MULTI]);
-    }
+    NUMA_REGISTER_KERNEL(mul_mat);
     
     g_numa_kernels_initialized = true;
     
     NUMA_LOG_DEBUG("✅ NUMA Kernels initialized with O(1) hash table strategy system");
-    NUMA_LOG_DEBUG("   Registered operations: ADD (thresholds: %zuK/%zuK), MUL_MAT (thresholds: %zu/%zuK)",
-                  add_info.strategy_array.thresholds[NUMA_STRATEGY_IDX_SINGLE_SINGLE] / 1024,
-                  add_info.strategy_array.thresholds[NUMA_STRATEGY_IDX_SINGLE_MULTI] / 1024,
-                  mul_mat_info.strategy_array.thresholds[NUMA_STRATEGY_IDX_SINGLE_SINGLE],
-                  mul_mat_info.strategy_array.thresholds[NUMA_STRATEGY_IDX_SINGLE_MULTI] / 1024);
+    NUMA_LOG_DEBUG("   Registered %zu operations using simplified macro registration", 
+                  g_strategy_cache.num_registered_ops);
     
     return GGML_STATUS_SUCCESS;
 }
@@ -300,7 +317,8 @@ ggml_numa_kernel_query_result_t ggml_numa_kernels_strategy_lookup(const struct g
             break;
     }
     
-    // Get aggregation function pointer using O(1) lookup
+    // Get function pointers using O(1) lookups
+    result.work_function = ggml_numa_lookup_work_function_fast(tensor->op, strategy);
     result.aggregation_function = ggml_numa_lookup_aggregation_fast(tensor->op, strategy);
     
     NUMA_LOG_DEBUG("O(1) Strategy lookup: op=%d, elements=%zu, strategy=%s/%s, efficiency=%.2f", 
@@ -325,6 +343,7 @@ void ggml_numa_kernels_cleanup(void) {
         g_strategy_cache.entries[i].initialized = false;
         g_strategy_cache.entries[i].op_type = GGML_OP_NONE;
         g_strategy_cache.entries[i].strategy_array.valid = false;
+        g_strategy_cache.entries[i].work_funcs.valid = false;
         g_strategy_cache.entries[i].agg_funcs.valid = false;
     }
     
@@ -360,6 +379,12 @@ ggml_numa_kernel_query_result_t ggml_numa_kernels_query(const struct ggml_tensor
     switch (tensor->op) {
         case GGML_OP_ADD:
             return ggml_numa_kernel_add_query(tensor);
+            
+        case GGML_OP_MUL:
+            return ggml_numa_kernel_mul_query(tensor);
+            
+        case GGML_OP_CPY:
+            return ggml_numa_kernel_cpy_query(tensor);
             
         case GGML_OP_MUL_MAT:
             return ggml_numa_kernel_mul_mat_query(tensor);

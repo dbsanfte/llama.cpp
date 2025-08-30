@@ -4,7 +4,42 @@ This document provides instructions for AI assistants working on the llama.cpp p
 
 ## 🎯 Project Overview
 
-This is a fork of llama.cpp with **NUMA-aware execution architecture** for optimal CPU threading and memory allocation on multi-socket systems:
+This is a fork of llama.cpp with **NUMA-aware execution architecture** for optimal CPU thread### Pattern: Element-wise Operations (ADD, MUL, etc.)
+```c
+// Registry pattern - threshold-based strategy selection
+ggml_numa_kernel_registration_info_t info = {
+    .op_type = GGML_OP_ADD,
+    .strategy_array = {
+        .thresholds = {1024, 262144},  // 1K and 256K element thresholds
+        .valid = true
+    },
+    .work_funcs = {
+        .single_single_fn = ggml_numa_kernel_add_low_overhead_execute,
+        .single_multi_fn = ggml_numa_kernel_add_low_overhead_execute, 
+        .data_parallel_fn = ggml_numa_kernel_add_no_aggregation_execute,
+        .valid = true
+    },
+    .agg_funcs = {
+        .valid = false  // Element-wise operations don't need aggregation
+    },
+    .kernel_name = "NUMA ADD Kernel",
+    .supported = true
+};
+
+// Data slicing for NUMA parallelism
+size_t total_elements = ggml_nelements(tensor);
+size_t numa_start = 0, numa_end = total_elements;
+
+if (ggml_numa_is_data_parallel_execution) {
+    size_t elements_per_node = total_elements / ggml_numa_total_nodes;
+    numa_start = ggml_current_numa_node * elements_per_node;
+    numa_end = (ggml_current_numa_node == ggml_numa_total_nodes - 1) ? 
+               total_elements : numa_start + elements_per_node;
+}
+
+// SIMD operation on NUMA slice
+ggml_vec_add_f32(numa_end - numa_start, dst + numa_start, src0 + numa_start, src1 + numa_start);
+```ory allocation on multi-socket systems:
 
 - **NUMA Kernel Registry** - `ggml/src/ggml-cpu/numa-kernels/` - O(1) cache database with pre-computed strategies
 - **NUMA Executor** - `ggml/src/ggml-cpu/ggml-numa-executor.c` - Strategy engine and work orchestration
@@ -75,11 +110,11 @@ enum ggml_status ggml_numa_kernel_your_operation_execute(void * work_context, st
     NUMA_ASSERT(tensor != nullptr, "Tensor cannot be null");
     NUMA_ASSERT(params != nullptr, "Compute params cannot be null");
     
-    // 2. Extract tensor data and parameters using shared memory approach
+    // 2. Extract tensor data using shared memory approach
     const float * src0 = (const float *)tensor_data(tensor->src[0]);
     const float * src1 = (const float *)tensor->src[1] ? (const float *)tensor_data(tensor->src[1]) : NULL;
     
-    // For GGML_NUMA_AGGREGATION_NONE policy, write directly to shared result tensor
+    // Use shared result tensor memory for direct writes (eliminates aggregation)
     extern __thread void * ggml_numa_shared_result_tensor_data;
     float * dst;
     if (ggml_numa_shared_result_tensor_data != NULL) {
@@ -90,8 +125,26 @@ enum ggml_status ggml_numa_kernel_your_operation_execute(void * work_context, st
         dst = (float *)tensor_data(tensor);
     }
     
-    // 3. Use SIMD operations for performance
-    ggml_vec_add_f32(ggml_nelements(tensor), dst, src0, src1);
+    // 3. Get NUMA execution context
+    extern __thread int ggml_current_numa_node;
+    extern __thread int ggml_numa_total_nodes; 
+    extern __thread bool ggml_numa_is_data_parallel_execution;
+    
+    // 4. Calculate NUMA data slice for data-parallel execution
+    size_t total_elements = ggml_nelements(tensor);
+    size_t numa_start = 0, numa_end = total_elements;
+    
+    if (ggml_numa_is_data_parallel_execution) {
+        size_t elements_per_node = total_elements / ggml_numa_total_nodes;
+        numa_start = ggml_current_numa_node * elements_per_node;
+        numa_end = (ggml_current_numa_node == ggml_numa_total_nodes - 1) ? 
+                   total_elements : numa_start + elements_per_node;
+    }
+    
+    // 5. Use SIMD operations for performance (on NUMA slice)
+    ggml_vec_add_f32(numa_end - numa_start, dst + numa_start, src0 + numa_start, src1 + numa_start);
+    
+    NUMA_LOG_TRACE("Processed elements %zu-%zu on NUMA node %d", numa_start, numa_end, ggml_current_numa_node);
     
     return GGML_STATUS_SUCCESS;
 }
@@ -99,46 +152,35 @@ enum ggml_status ggml_numa_kernel_your_operation_execute(void * work_context, st
 
 **Registry Integration:**
 ```c
-// Add to numa-kernels.c cache population
-static void populate_your_operation_cache_entries(void) {
-    // TINY: < 1K elements
-    g_numa_cache[GGML_OP_YOUR_OPERATION][COMPLEXITY_TINY] = (ggml_numa_kernel_cache_entry_t){
-        .valid = true,
-        .strategy = { .node_strategy = NUMA_NODE_STRATEGY_SINGLE, 
-                     .on_node_strategy = NUMA_ON_NODE_STRATEGY_SINGLE_THREAD },
-        .work_buffer_size_per_thread = 0,
-        .work_function = ggml_numa_kernel_your_operation_execute,
-        .aggregation_policy = GGML_NUMA_AGGREGATION_NONE,  // No aggregation needed
-        .aggregation_function = NULL,
-        .efficiency_score = 0.95f,
-        .kernel_name = "NUMA Your Operation (Single/Single)"
+// Add to numa-kernels.c registration function
+void ggml_numa_register_your_operation_kernels(void) {
+    ggml_numa_kernel_registration_info_t info = {
+        .op_type = GGML_OP_YOUR_OPERATION,
+        .strategy_array = {
+            .thresholds = {1024, 262144},  // 1K and 256K element thresholds
+            .valid = true
+        },
+        .work_funcs = {
+            .single_single_fn = ggml_numa_kernel_your_operation_execute,
+            .single_multi_fn = ggml_numa_kernel_your_operation_execute,
+            .data_parallel_fn = ggml_numa_kernel_your_operation_execute,
+            .valid = true
+        },
+        .agg_funcs = {
+            .valid = false  // Most operations don't need aggregation
+        },
+        .kernel_name = "NUMA Your Operation Kernel",
+        .supported = true
     };
     
-    // LARGE: 256K - 4M elements  
-    g_numa_cache[GGML_OP_YOUR_OPERATION][COMPLEXITY_LARGE] = (ggml_numa_kernel_cache_entry_t){
-        .valid = true,
-        .strategy = { .node_strategy = NUMA_NODE_STRATEGY_DATA_PARALLEL,
-                     .on_node_strategy = NUMA_ON_NODE_STRATEGY_MULTI_THREAD },
-        .work_buffer_size_per_thread = 0,  // Shared memory approach eliminates buffers
-        .work_function = ggml_numa_kernel_your_operation_execute,
-        .aggregation_policy = GGML_NUMA_AGGREGATION_NONE,  // Direct shared memory writes
-        .aggregation_function = NULL,
-        .efficiency_score = 0.95f,
-        .kernel_name = "NUMA Your Operation (Data-Parallel Shared Memory)"
-    };
-    
-    // For operations needing custom aggregation (rare)
-    g_numa_cache[GGML_OP_YOUR_OPERATION][COMPLEXITY_CUSTOM] = (ggml_numa_kernel_cache_entry_t){
-        .valid = true,
-        .strategy = { .node_strategy = NUMA_NODE_STRATEGY_DATA_PARALLEL,
-                     .on_node_strategy = NUMA_ON_NODE_STRATEGY_MULTI_THREAD },
-        .work_buffer_size_per_thread = 0,
-        .work_function = ggml_numa_kernel_your_operation_execute,
-        .aggregation_policy = GGML_NUMA_AGGREGATION_CUSTOM,  // Kernel provides aggregation
-        .aggregation_function = ggml_numa_kernel_your_operation_aggregate,
-        .efficiency_score = 0.90f,
-        .kernel_name = "NUMA Your Operation (Custom Aggregation)"
-    };
+    ggml_numa_register_kernel_strategy(info.op_type, &info.strategy_array, 
+                                       &info.work_funcs, &info.agg_funcs);
+}
+
+// Call in ggml_numa_kernels_init()
+void ggml_numa_kernels_init(void) {
+    // ... existing registrations ...
+    ggml_numa_register_your_operation_kernels();
 }
 ```
 
@@ -157,25 +199,24 @@ cp tests/test-numa-mathematical-correctness-template.cpp tests/test-numa-mathema
 ## 🏗️ Current Architecture Status
 
 **✅ Implemented Components:**
-- **NUMA Kernel Registry** - O(1) cache with complexity-based pre-computation
-- **NUMA Executor** - Strategy engine with query-dispatch pattern
-- **NUMA Coordinator** - Resource management and work distribution (cleaned of legacy cruft)
+- **NUMA Kernel Registry** - O(1) hash table with threshold-based strategy selection
+- **NUMA Executor** - Strategy engine with registry query-dispatch pattern  
+- **NUMA Coordinator** - Resource management and work distribution
 
 **✅ Supported Operations:**
 - **ADD** - Element-wise addition with SIMD optimization and shared memory approach
+- **MUL** - Element-wise multiplication with optimized data-parallel execution
 - **MUL_MAT** - Matrix multiplication with chunk-based work distribution and type-specific SIMD operations
+- **CPY** - Copy operations with type conversion and contiguous/strided access patterns
 
 **🚀 Performance Characteristics:**
-- **O(1) Strategy Lookups** - Pre-computed cache eliminates runtime overhead
+- **O(1) Strategy Lookups** - Hash table-based registry eliminates search overhead
+- **Threshold-Based Selection** - Simple element count thresholds for optimal strategy choice
 - **NUMA-Aware Scheduling** - Optimal thread and memory placement
-- **Cache-Optimized Execution** - Reduced memory bandwidth contention
-- **Simplified Aggregation** - Two-mode system: shared memory writes or custom kernel functions
-- **Direct Memory Access** - Eliminates expensive data copying between NUMA nodes
-- **Cache-Optimized Execution** - Reduced memory bandwidth contention
-- **No-Aggregation Optimization** - 62% performance improvement for large tensors
-- **GB-Scale Tensor Support** - Optimized handling of 1GB-16GB tensors
-- **Extended Complexity Classification** - 10 complexity levels from TINY to GIGANTIC_16GB
-- **Graceful Fallback** - Automatic fallback to CPU implementation when beneficial
+- **Shared Memory Optimization** - Direct memory writes eliminate aggregation overhead for most operations
+- **3-Level Debug System** - Clean output at levels 1-2, detailed tracing at level 3
+- **Work Function Architecture** - Clean separation between computation (work functions) and result combination (aggregation functions)
+- **Registry-Based Scalability** - Easy addition of new kernels with consistent patterns
 
 ## 🏗️ Build Environment & Commands
 
@@ -205,6 +246,9 @@ export GGML_NUMA_DEBUG=1
 
 # Enable verbose debug messages - shows additional internal details
 export GGML_NUMA_DEBUG=2
+
+# Enable trace debug messages - very detailed, includes individual operations
+export GGML_NUMA_DEBUG=3
 ```
 
 **Debug Message Categories:**
@@ -212,6 +256,7 @@ export GGML_NUMA_DEBUG=2
 - **Coordinator Debug**: Thread management, NUMA binding verification, dispatch decisions
 - **Kernel Debug**: Mathematical operation details, data slicing, SIMD optimizations
 - **Memory Debug**: NUMA allocation successes, memory mirroring operations
+- **Trace Debug**: Very detailed per-operation logging, individual tensor rows, thread work distribution
 
 **Performance Impact**: When `GGML_NUMA_DEBUG` is unset or 0, all debug output is completely disabled, eliminating printf overhead during inference loops.
 
@@ -225,6 +270,9 @@ GGML_NUMA_DEBUG=1 ./build/bin/llama-bench -m model.gguf --numa mirror
 
 # Detailed troubleshooting - verbose internal details
 GGML_NUMA_DEBUG=2 ./build/bin/llama-server -m model.gguf --numa mirror
+
+# Ultra-detailed troubleshooting - trace level with individual operations
+GGML_NUMA_DEBUG=3 ./build/bin/llama-server -m model.gguf --numa mirror
 ```
 
 ### Quick Model Validation
@@ -266,6 +314,27 @@ ggml_vec_add_f32(numa_end - numa_start, dst + numa_start, src0 + numa_start, src
 
 **Pattern: Reduction Operations (RMS_NORM, SOFT_MAX, etc.)**
 ```c
+// Registry pattern - may need aggregation for reductions
+ggml_numa_kernel_registration_info_t info = {
+    .op_type = GGML_OP_RMS_NORM,
+    .strategy_array = {
+        .thresholds = {1024, 65536},  // Smaller thresholds for reductions
+        .valid = true
+    },
+    .work_funcs = {
+        .single_single_fn = ggml_numa_kernel_rms_norm_execute,
+        .single_multi_fn = ggml_numa_kernel_rms_norm_execute,
+        .data_parallel_fn = ggml_numa_kernel_rms_norm_execute,
+        .valid = true
+    },
+    .agg_funcs = {
+        .aggregation_fn = ggml_numa_kernel_rms_norm_aggregate,  // Custom aggregation
+        .valid = true
+    },
+    .kernel_name = "NUMA RMS_NORM Kernel",
+    .supported = true
+};
+
 // Row-wise processing with NUMA distribution
 for (int row = numa_start_row; row < numa_end_row; row++) {
     float* row_data = (float*)((char*)src + row * src->nb[1]);
@@ -371,9 +440,14 @@ cmake --build build --target test-numa-mathematical-correctness-add
 # Copy template for new operations
 cp tests/test-numa-mathematical-correctness-template.cpp tests/test-numa-mathematical-correctness-OPERATION.cpp
 
-# Features: Multi-dimensional testing, multi-threading validation, exact mathematical comparison
+# Features: 3-part test structure with comprehensive quantization coverage
+# 1. Mathematical equivalence testing (multi-dimensional tensors, multi-threading validation)  
+# 2. Quantization type coverage (Q8_0, Q4_0, Q5_0, F16, F32 - prevents silent model failures)
+# 3. Regression testing (operation-specific edge cases and previous bug scenarios)
 # Always add tests to CMakeLists.txt and verify builds successfully
 ```
+
+**Critical**: ALL mathematical correctness tests MUST include comprehensive quantization type coverage. Missing quantization testing can lead to silent model inference failures in production. The template enforces this requirement with detailed TODOs and examples.
 
 ## 💡 AI Agent Guidelines
 

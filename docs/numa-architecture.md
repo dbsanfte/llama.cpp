@@ -25,58 +25,100 @@ The architecture consists of three main components working together:
 **Location**: `ggml/src/ggml-cpu/numa-kernels/`
 
 ### Purpose
-The NUMA Kernel Registry acts as a high-performance database that the executor queries to determine optimal execution strategies. It provides lightning-fast O(1) cache lookups with complexity-based pre-computation.
+The NUMA Kernel Registry acts as a high-performance database that the executor queries to determine optimal execution strategies. It provides lightning-fast O(1) hash table lookups with threshold-based strategy selection and supports both work functions and aggregation functions.
 
 ### Key Features
-- **O(1) Cache Lookups**: Pre-computed strategies eliminate runtime decision overhead
-- **Complexity-Based Optimization**: 5 complexity classes (TINY/SMALL/MEDIUM/LARGE/HUGE)
-- **Strategy Database**: Pre-computed execution strategies, buffer sizes, and work functions
+- **O(1) Hash Table Lookups**: Direct operation type mapping eliminates search overhead
+- **Threshold-Based Strategy Selection**: Simple element count thresholds for optimal strategy choice
+- **Dual Function Support**: Both work functions (execution) and aggregation functions (result combination)
+- **Strategy Database**: Pre-computed execution strategies, buffer sizes, and function pointers
 - **Centralized Management**: Single source of truth for all NUMA kernel information
 
-### Core Interface
+### Architecture Overview
 
-#### `ggml_numa_kernel_query_result_t`
+The registry uses a hash table approach where each operation type maps directly to strategy information:
+
+```c
+// Hash table entry for O(1) lookups
+typedef struct {
+    enum ggml_op op_type;                                // Operation type (hash key)
+    ggml_numa_kernel_strategy_array_t strategy_array;   // Threshold array
+    ggml_numa_kernel_work_funcs_t work_funcs;           // Work function pointers
+    ggml_numa_kernel_aggregation_funcs_t agg_funcs;     // Aggregation function pointers
+    bool initialized;                                    // True if entry is valid
+} ggml_numa_strategy_cache_entry_t;
+```
+
+### Function Type Architecture
+
+The registry supports two types of functions with different purposes:
+
+#### Work Functions (`ggml_numa_work_function_t`)
+Used for actual computation execution on individual NUMA nodes:
+```c
+typedef enum ggml_status (*ggml_numa_work_function_t)(
+    void * work_context,                    // Function-specific context data
+    struct ggml_compute_params * params     // Compute parameters (threads, buffer, etc.)
+);
+```
+
+#### Aggregation Functions (Optional)
+Used for combining results from multiple NUMA nodes when needed:
+```c
+typedef enum ggml_status (*ggml_numa_aggregation_function_t)(
+    struct ggml_tensor * tensor,     // The tensor to aggregate
+    int num_nodes,                   // Number of NUMA nodes that participated
+    void * user_data                 // Optional user data pointer
+);
+```
+
+### Strategy Selection
+
+Each kernel provides simple threshold arrays for O(1) strategy selection:
+
 ```c
 typedef struct {
-    bool supported;                                    // Whether operation is supported
-    ggml_numa_execution_strategy_t strategy;          // Recommended execution strategy
-    size_t work_buffer_size_per_thread;              // Required compute buffer size per thread
-    ggml_numa_work_function_t work_function;         // Function pointer for coordinator execution
-    float efficiency_score;                           // Efficiency estimate (0.0-1.0)
-    const char * kernel_name;                         // Human-readable kernel name
-} ggml_numa_kernel_query_result_t;
-```
+    size_t thresholds[NUMA_STRATEGY_IDX_COUNT];  // Element count thresholds
+    bool valid;                                   // True if thresholds are provided
+} ggml_numa_kernel_strategy_array_t;
 
-#### Primary Interface
-```c
-ggml_numa_kernel_query_result_t ggml_numa_kernels_query(const struct ggml_tensor * tensor);
-```
-
-### Implementation Details
-
-The registry uses a 2D cache array `g_numa_cache[GGML_OP_COUNT][COMPLEXITY_COUNT]` for O(1) lookups:
-
-```c
-// Cache structure for O(1 lookups
-static ggml_numa_kernel_cache_entry_t g_numa_cache[GGML_OP_COUNT][COMPLEXITY_COUNT];
-
-// Complexity classification for cache indexing
+// Strategy indices
 typedef enum {
-    COMPLEXITY_TINY = 0,    // < 32K elements  
-    COMPLEXITY_SMALL,       // 32K - 1M elements
-    COMPLEXITY_MEDIUM,      // 1M - 16M elements
-    COMPLEXITY_LARGE,       // 16M - 256M elements
-    COMPLEXITY_HUGE,        // > 256M elements
-    COMPLEXITY_COUNT
-} ggml_numa_complexity_class_t;
+    NUMA_STRATEGY_IDX_SINGLE_SINGLE = 0,   // Single node, single thread threshold
+    NUMA_STRATEGY_IDX_SINGLE_MULTI = 1,    // Single node, multi-thread threshold
+    NUMA_STRATEGY_IDX_COUNT = 2             // Above both thresholds = data-parallel
+} ggml_numa_strategy_idx_t;
 ```
 
-### Supported Operations
+### Registration Process
 
-Currently implemented NUMA kernels:
-- **ADD**: Element-wise addition with SIMD optimization
-- **RMS_NORM**: Root mean square normalization with data-parallel execution
-- **MUL_MAT**: Matrix multiplication with specialized chunking strategies
+Kernels register themselves at startup by providing threshold arrays and function pointers:
+
+```c
+// Kernel provides registration info
+ggml_numa_kernel_registration_info_t info = {
+    .op_type = GGML_OP_ADD,
+    .strategy_array = {
+        .thresholds = {1024, 262144},  // 1K and 256K element thresholds
+        .valid = true
+    },
+    .work_funcs = {
+        .single_single_fn = ggml_numa_kernel_add_low_overhead_execute,
+        .single_multi_fn = ggml_numa_kernel_add_low_overhead_execute,
+        .data_parallel_fn = ggml_numa_kernel_add_no_aggregation_execute,
+        .valid = true
+    },
+    .agg_funcs = {
+        .valid = false  // ADD doesn't need aggregation
+    },
+    .kernel_name = "NUMA ADD Kernel",
+    .supported = true
+};
+
+// Registry stores this information in hash table
+ggml_numa_register_kernel_strategy(info.op_type, &info.strategy_array, 
+                                   &info.work_funcs, &info.agg_funcs);
+```
 
 ---
 
@@ -85,55 +127,104 @@ Currently implemented NUMA kernels:
 **Location**: `ggml/src/ggml-cpu/ggml-numa-executor.c`
 
 ### Purpose
-The NUMA Executor serves as the strategy engine that analyzes operations, queries the kernel registry, and orchestrates work submission to the coordinator. It replaces the old dispatcher architecture with a cleaner, more efficient design.
+The NUMA Executor acts as the central orchestrator that queries the registry for execution strategies and coordinates with the coordinator for optimal execution.
 
-### Key Features
-- **Strategy Selection**: Intelligent choice between NUMA and CPU fallback execution
-- **Registry Integration**: Direct querying of kernel registry for execution decisions
-- **Clean Architecture**: Simplified interface replacing legacy dispatcher complexity
-- **Fallback Handling**: Seamless fallback to standard CPU implementation when needed
-
-### Core Interface
-
-#### Primary Execution Functions
-```c
-// Execute single tensor operation
-enum ggml_status ggml_numa_executor_execute_tensor(
-    struct ggml_tensor * tensor,
-    struct ggml_cplan * cplan);
-
-// Execute complete compute graph
-enum ggml_status ggml_numa_executor_execute_graph(
-    struct ggml_cgraph * cgraph, 
-    struct ggml_cplan * cplan);
-
-// Fallback to CPU implementation
-enum ggml_status ggml_numa_executor_fallback_to_cpu(
-    struct ggml_tensor * tensor, 
-    struct ggml_cplan * cplan);
-```
-
-### Execution Logic
+### Core Workflow
 
 ```c
-enum ggml_status ggml_numa_executor_execute_tensor(struct ggml_tensor * tensor, struct ggml_cplan * cplan) {
-    // 1. Query the kernel registry for execution information
-    ggml_numa_kernel_query_result_t query_result = ggml_numa_kernels_query(tensor);
+bool ggml_numa_available(enum ggml_op op) {
+    // O(1) hash table lookup to check kernel support
+    return ggml_numa_kernels_is_supported(op);
+}
+
+bool ggml_numa_compute_forward(struct ggml_compute_params * params, struct ggml_tensor * tensor) {
+    // 1. Query registry for optimal strategy (O(1) lookup)
+    ggml_numa_kernel_query_result_t query_result = ggml_numa_kernels_query_strategy(tensor);
     
-    // 2. Check if NUMA kernel is available and beneficial
     if (!query_result.supported) {
-        return ggml_numa_executor_fallback_to_cpu(tensor, cplan);
+        return false;  // Fall back to CPU implementation
     }
     
-    // 3. Execute via NUMA coordinator with strategy and work function
-    return ggml_numa_coordinator_execute_work(
-        tensor, 
-        cplan, 
+    // 2. Execute using coordinator with work function
+    bool success = ggml_numa_simple_coordinator_compute_forward(
+        params, tensor, 
         query_result.strategy,
         query_result.work_function,
+        query_result.aggregation_function,  // May be NULL
         query_result.work_buffer_size_per_thread
     );
+    
+    return success;
 }
+```
+
+### Query Interface
+
+The executor uses the registry's simple threshold-based query system:
+
+```c
+ggml_numa_kernel_query_result_t ggml_numa_kernels_query_strategy(const struct ggml_tensor * tensor) {
+    ggml_numa_kernel_query_result_t result = {0};
+    
+    // 1. O(1) hash table lookup by operation type
+    enum ggml_op op_type = tensor->op;
+    ggml_numa_strategy_cache_entry_t * cache_entry = &g_strategy_cache[op_type];
+    
+    if (!cache_entry->initialized) {
+        result.supported = false;
+        return result;
+    }
+    
+    // 2. Simple threshold comparison for strategy selection
+    size_t total_elements = ggml_nelements(tensor);
+    ggml_numa_strategy_idx_t strategy_idx;
+    
+    if (total_elements < cache_entry->strategy_array.thresholds[NUMA_STRATEGY_IDX_SINGLE_SINGLE]) {
+        strategy_idx = NUMA_STRATEGY_IDX_SINGLE_SINGLE;
+    } else if (total_elements < cache_entry->strategy_array.thresholds[NUMA_STRATEGY_IDX_SINGLE_MULTI]) {
+        strategy_idx = NUMA_STRATEGY_IDX_SINGLE_MULTI;
+    } else {
+        strategy_idx = NUMA_STRATEGY_IDX_DATA_PARALLEL;
+    }
+    
+    // 3. Return strategy and work function
+    result.supported = true;
+    result.strategy = idx_to_strategy[strategy_idx];
+    result.work_function = get_work_function(cache_entry, strategy_idx);
+    result.aggregation_function = get_aggregation_function(cache_entry, strategy_idx);
+    
+    return result;
+}
+```
+
+### Integration with Coordinator
+
+The executor provides the coordinator with:
+- **Execution Strategy**: NUMA node placement and threading decisions
+- **Work Function**: What to execute on each NUMA node
+- **Aggregation Function**: How to combine results (if needed)
+- **Buffer Requirements**: Memory allocation needs per thread
+
+### Strategy Mapping
+
+The executor maps simple indices to full strategies:
+
+```c
+static const ggml_numa_execution_strategy_t idx_to_strategy[] = {
+    [NUMA_STRATEGY_IDX_SINGLE_SINGLE] = {
+        .node_strategy = NUMA_NODE_STRATEGY_SINGLE,
+        .on_node_strategy = NUMA_ON_NODE_STRATEGY_SINGLE_THREAD
+    },
+    [NUMA_STRATEGY_IDX_SINGLE_MULTI] = {
+        .node_strategy = NUMA_NODE_STRATEGY_SINGLE, 
+        .on_node_strategy = NUMA_ON_NODE_STRATEGY_MULTI_THREAD
+    },
+    [NUMA_STRATEGY_IDX_DATA_PARALLEL] = {
+        .node_strategy = NUMA_NODE_STRATEGY_DATA_PARALLEL,
+        .on_node_strategy = NUMA_ON_NODE_STRATEGY_MULTI_THREAD
+    }
+};
+```
 ```
 
 ---
@@ -177,14 +268,59 @@ typedef struct {
 } ggml_numa_execution_strategy_t;
 ```
 
-### Core Interface
+### Work Function Execution
 
-#### Primary Execution Function
+The coordinator executes work functions provided by the registry on each NUMA node:
+
+```c
+bool ggml_numa_simple_coordinator_compute_forward(
+    struct ggml_compute_params * params,
+    struct ggml_tensor * tensor,
+    ggml_numa_execution_strategy_t strategy,
+    ggml_numa_work_function_t work_function,        // Provided by registry
+    ggml_numa_aggregation_function_t agg_function,  // May be NULL
+    size_t work_buffer_size_per_thread
+) {
+    // 1. Set up thread-local context for kernels
+    setup_numa_thread_context(tensor, strategy);
+    
+    // 2. Distribute work across NUMA nodes
+    if (strategy.node_strategy == NUMA_NODE_STRATEGY_SINGLE) {
+        execute_on_single_node(work_function, tensor, params);
+    } else {
+        execute_data_parallel(work_function, tensor, params);
+    }
+    
+    // 3. Aggregate results if aggregation function provided
+    if (agg_function != NULL) {
+        agg_function(tensor, num_participating_nodes, NULL);
+    }
+    
+    return true;
+}
+```
+
+### Work Function Interface
+
+Work functions are the actual computation kernels that execute on NUMA nodes:
+
 ```c
 typedef enum ggml_status (*ggml_numa_work_function_t)(
-    void * work_context,                    // Function-specific context data
+    void * work_context,                    // Tensor being processed
     struct ggml_compute_params * params     // Compute parameters (threads, buffer, etc.)
 );
+```
+
+### Thread-Local Context Setup
+
+The coordinator provides kernels with NUMA-aware execution context:
+
+```c
+// Thread-local variables available to all kernels
+extern __thread void * ggml_numa_shared_result_tensor_data;  // Shared memory for direct writes
+extern __thread bool ggml_numa_is_data_parallel_execution;   // True if data-parallel mode
+extern __thread int ggml_current_numa_node;                  // Current NUMA node ID
+extern __thread int ggml_numa_total_nodes;                   // Total participating nodes
 ```
 
 ### Data Aggregation Architecture
@@ -340,16 +476,153 @@ if (result.supported) {
 
 ### Adding New NUMA Kernels
 
-1. **Implement Work Function**: Create kernel implementation in `numa-kernels/` directory
-2. **Register in Cache**: Add entries to registry cache in `numa-kernels.c`
-3. **Add Tests**: Create mathematical correctness tests
-4. **Benchmark**: Validate performance improvements
+#### 1. Implement Work Function
+
+Create kernel implementation in `numa-kernels/` directory following the work function signature:
+
+```c
+// Example: numa-kernels/your_operation.c
+enum ggml_status ggml_numa_kernel_your_operation_execute(void * work_context, struct ggml_compute_params * params) {
+    struct ggml_tensor * tensor = (struct ggml_tensor *)work_context;
+    
+    // 1. Validate inputs
+    NUMA_ASSERT(tensor != nullptr, "Tensor cannot be null");
+    NUMA_ASSERT(params != nullptr, "Compute params cannot be null");
+    
+    // 2. Extract tensor data using shared memory approach
+    const float * src0 = (const float *)tensor_data(tensor->src[0]);
+    
+    extern __thread void * ggml_numa_shared_result_tensor_data;
+    float * dst;
+    if (ggml_numa_shared_result_tensor_data != NULL) {
+        // Use shared result tensor memory - eliminates aggregation overhead
+        dst = (float *)ggml_numa_shared_result_tensor_data;
+    } else {
+        // Fallback to local tensor data for compatibility
+        dst = (float *)tensor_data(tensor);
+    }
+    
+    // 3. Use SIMD operations for performance
+    ggml_vec_your_operation_f32(ggml_nelements(tensor), dst, src0);
+    
+    return GGML_STATUS_SUCCESS;
+}
+```
+
+#### 2. Register with Registry
+
+Add kernel registration in `numa-kernels.c`:
+
+```c
+// Add to kernel registration function
+void ggml_numa_register_your_operation_kernels(void) {
+    ggml_numa_kernel_registration_info_t info = {
+        .op_type = GGML_OP_YOUR_OPERATION,
+        .strategy_array = {
+            .thresholds = {1024, 262144},  // 1K and 256K element thresholds
+            .valid = true
+        },
+        .work_funcs = {
+            .single_single_fn = ggml_numa_kernel_your_operation_execute,
+            .single_multi_fn = ggml_numa_kernel_your_operation_execute,
+            .data_parallel_fn = ggml_numa_kernel_your_operation_execute,
+            .valid = true
+        },
+        .agg_funcs = {
+            .valid = false  // Most operations don't need aggregation
+        },
+        .kernel_name = "NUMA Your Operation Kernel",
+        .supported = true
+    };
+    
+    ggml_numa_register_kernel_strategy(info.op_type, &info.strategy_array, 
+                                       &info.work_funcs, &info.agg_funcs);
+}
+
+// Call registration function in ggml_numa_kernels_init()
+void ggml_numa_kernels_init(void) {
+    // ... existing registrations ...
+    ggml_numa_register_your_operation_kernels();
+}
+```
+
+#### 3. Add Mathematical Correctness Tests
+
+Create comprehensive tests using the template:
+
+```bash
+cp tests/test-numa-mathematical-correctness-template.cpp tests/test-numa-mathematical-correctness-your_operation.cpp
+```
+
+#### 4. Add to Build System
+
+Update `CMakeLists.txt` to include the new test and kernel files.
+
+### Registry Architecture Patterns
+
+#### Work Functions vs Aggregation Functions
+
+- **Work Functions**: Execute computation on individual NUMA nodes
+  - Used for all kernels (required)
+  - Signature: `enum ggml_status (*)(void * work_context, struct ggml_compute_params * params)`
+  - Purpose: Perform actual mathematical operations
+
+- **Aggregation Functions**: Combine results from multiple NUMA nodes  
+  - Used only when needed (optional)
+  - Signature: `enum ggml_status (*)(struct ggml_tensor *, int num_nodes, void * user_data)`
+  - Purpose: Combine partial results from data-parallel execution
+
+#### Shared Memory Optimization
+
+For most operations, use the shared memory approach to eliminate aggregation overhead:
+
+```c
+// Check for shared result tensor memory
+extern __thread void * ggml_numa_shared_result_tensor_data;
+if (ggml_numa_shared_result_tensor_data != NULL) {
+    // Write directly to shared memory - no aggregation needed
+    dst = (float *)ggml_numa_shared_result_tensor_data;
+} else {
+    // Fallback for compatibility
+    dst = (float *)tensor_data(tensor);
+}
+```
+
+#### Threshold-Based Strategy Selection
+
+Use simple element count thresholds for strategy selection:
+
+```c
+.strategy_array = {
+    .thresholds = {
+        1024,     // Below this: single node, single thread
+        262144    // Below this: single node, multi-thread
+                  // Above this: data-parallel across nodes
+    },
+    .valid = true
+}
+```
 
 ### SIMD Optimization Requirements
 
-- **Always use SIMD**: Replace scalar operations with `ggml_vec_*` functions
-- **Mathematical Equivalence**: SIMD operations must produce identical results
+- **Always use SIMD**: Replace scalar operations with `ggml_vec_*` functions from `ggml/src/ggml-cpu/vec.h`
+- **Common SIMD functions**: `ggml_vec_add_f32()`, `ggml_vec_dot_f32()`, `ggml_vec_scale_f32()`, `ggml_vec_cpy_f32()`
+- **Mathematical Equivalence**: SIMD operations must produce identical results to scalar reference
 - **Performance Validation**: Benchmark against scalar reference implementation
+
+### Debug Logging
+
+Use the 3-level debug system for development and troubleshooting:
+
+```c
+// Include debug header
+#include "ggml-numa-shared.h"
+
+// Use appropriate debug level
+NUMA_LOG_DEBUG("Strategy selection: %s", strategy_name);      // Level 1: Basic decisions
+NUMA_LOG_VERBOSE("Thread allocation: %d threads", count);     // Level 2: Detailed info  
+NUMA_LOG_TRACE("Processing element %d", element_idx);         // Level 3: Per-operation details
+```
 
 ### Error Handling
 

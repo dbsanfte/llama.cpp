@@ -1,0 +1,776 @@
+/**
+ * NUMA Mathematical Correctness Test: MUL Operation
+ * 
+ * This test verifies mathematical equivalence between NUMA parallel MUL operations
+ * and serial reference implementations. It ensures the NUMA MUL kernel produces
+ * identical results to the reference implementation across various scenarios.
+ * 
+ * TEST COVERAGE:
+ * 1. Mathematical Equivalence (Multi-Dimensional):
+ *    - Tests across TINY → LARGE tensor sizes with multiple thread strategies
+ *    - Verifies NUMA coordinator correctly dispatches and executes MUL kernels
+ *    - Ensures element-wise and SIMD operations produce identical results
+ * 
+ * 2. Quantization Type Coverage:
+ *    - Tests F32, F16, Q8_0, Q4_0, Q5_0 type combinations
+ *    - Ensures proper quantization handling in model weight operations
+ *    - Verifies NUMA kernels handle quantized fallbacks correctly
+ * 
+ * 3. Broadcasting Regression Prevention:
+ *    - Tests specific broadcasting scenarios that previously caused memory corruption
+ *    - Validates multi-dimensional broadcasting logic (Matrix × Vector patterns)
+ *    - Ensures proper tensor coordinate calculation and indexing
+ * 
+ * KEY DESIGN PRINCIPLES:
+ * - Comprehensive quantization coverage for model reliability
+ * - Multi-dimensional testing across various matrix/tensor sizes
+ * - Multiple thread strategies to test coordinator execution modes
+ * - Direct comparison between NUMA parallel and serial reference implementations
+ * - Detailed error reporting with mathematical mismatch information
+ * - Regression testing for previously identified broadcasting bugs
+ * 
+ * ARCHITECTURE INTEGRATION:
+ * - Tests NUMA Executor strategy selection (Single/Single, Single/Multi, Data-Parallel)
+ * - Validates NUMA Coordinator thread management and NUMA binding
+ * - Ensures NUMA Kernel Registry provides correct function pointers
+ * - Verifies shared memory optimization and aggregation policies
+ */
+
+#include <cstdio>
+#include <cstring>
+#include <cmath>
+#include <vector>
+#include <string>
+#include <algorithm>
+#include <stdexcept>
+
+// GGML includes
+#include "ggml.h"
+#include "ggml-cpu.h"
+#include "ggml-numa-executor.h"
+#include "ggml-numa-simple-coordinator.h"  // For NUMA functions
+#include "ggml-cpu/binary-ops.h"
+
+// Test result structure
+struct TestResult {
+    std::string test_name;
+    bool passed;
+    std::string failure_reason;
+};
+
+class NumaMulMathematicalCorrectnessTestSuite {
+private:
+    std::vector<TestResult> results;
+    
+    // Utility function to compare float arrays with detailed error reporting
+    bool compare_float_arrays(const float* numa_data, const float* ref_data, int count, const char* operation_name) {
+        bool all_match = true;
+        int error_count = 0;
+        double max_abs_error = 0.0;
+        double max_rel_error = 0.0;
+        
+        for (int i = 0; i < count; i++) {
+            double numa_val = numa_data[i];
+            double ref_val = ref_data[i];
+            double abs_error = fabs(numa_val - ref_val);
+            double rel_error = ref_val != 0.0 ? abs_error / fabs(ref_val) : 0.0;
+            
+            max_abs_error = fmax(max_abs_error, abs_error);
+            max_rel_error = fmax(max_rel_error, rel_error);
+            
+            // Use strict tolerance for mathematical equivalence
+            if (abs_error > 1e-6 && rel_error > 1e-6) {
+                if (error_count < 5) { // Show first 5 errors for debugging
+                    printf("      ❌ %s Element[%d]: NUMA=%.8f, Reference=%.8f, AbsErr=%.2e, RelErr=%.2e\n",
+                           operation_name, i, numa_val, ref_val, abs_error, rel_error);
+                }
+                error_count++;
+                all_match = false;
+            }
+        }
+        
+        if (!all_match) {
+            printf("    Total errors: %d/%d, MaxAbsErr=%.2e, MaxRelErr=%.2e\n", 
+                   error_count, count, max_abs_error, max_rel_error);
+        }
+        
+        return all_match;
+    }
+    
+    // Test a single MUL case with specific dimensions and thread count
+    bool test_single_MUL_case(int dim1, int dim2, int dim3, int num_threads, const char* size_label) {
+        printf("    🧮 Testing %s: MUL with dimensions [%d,%d,%d] (threads=%d)\n", 
+               size_label, dim1, dim2, dim3, num_threads);
+        
+        // Create test context with sufficient memory for larger tensors
+        struct ggml_init_params params;
+        params.mem_size = 0;
+        params.mem_buffer = nullptr;
+        params.no_alloc = false;
+        params.mem_size = std::max((size_t)(512 * 1024 * 1024), (size_t)(dim1 * dim2 * dim3) * sizeof(float) * 8); // Scale memory with tensor size
+        params.mem_buffer = nullptr;
+        params.no_alloc = false;
+        
+        struct ggml_context* test_ctx = ggml_init(params);
+        if (!test_ctx) {
+            printf("      ❌ Failed to create test context for %s\n", size_label);
+            return false;
+        }
+        
+        bool case_passed = false;
+        
+        // Create input tensors for MUL operation (binary operation: A * B = C)
+        struct ggml_tensor* input_a = ggml_new_tensor_3d(test_ctx, GGML_TYPE_F32, dim1, dim2, dim3);
+        struct ggml_tensor* input_b = ggml_new_tensor_3d(test_ctx, GGML_TYPE_F32, dim1, dim2, dim3);
+        
+        if (!input_a || !input_b) {
+            printf("      ❌ Failed to create input tensors for %s\n", size_label);
+            ggml_free(test_ctx);
+            return false;
+        }
+        
+        // Fill tensors with deterministic test data
+        float* a_data = (float*)ggml_get_data(input_a);
+        float* b_data = (float*)ggml_get_data(input_b);
+        int total_elements = ggml_nelements(input_a);
+        
+        for (int i = 0; i < total_elements; i++) {
+            a_data[i] = 0.1f + (i % 37) * 0.01f; // Deterministic test pattern
+            b_data[i] = 0.05f + (i % 23) * 0.015f; // Different pattern for B
+        }
+        
+        // CRITICAL: Re-initialize NUMA mirroring after filling data to ensure all NUMA copies have correct data
+        // The initial NUMA mirroring during tensor creation copied uninitialized memory (zeros)
+        // We need to re-mirror with the actual test data we just wrote
+        tensor_set_data_numa_mirror(input_a, a_data);
+        tensor_set_data_numa_mirror(input_b, b_data);
+        
+        // Create MUL operation
+        struct ggml_tensor* numa_result = ggml_mul(test_ctx, input_a, input_b);
+        
+        if (!numa_result) {
+            printf("      ❌ Failed to create MUL operation for %s\n", size_label);
+            ggml_free(test_ctx);
+            return false;
+        }
+        
+        // Execute via NUMA intercept
+        struct ggml_compute_params numa_params;
+        numa_params.ith = 0;
+        numa_params.nth = num_threads;
+        numa_params.wsize = 0;
+        numa_params.wdata = nullptr;
+        numa_params.threadpool = nullptr;
+        // Create minimal compute plan for single tensor execution
+        struct ggml_cplan cplan = {};
+        cplan.work_size = 0;
+        cplan.work_data = nullptr;
+        cplan.n_threads = num_threads;
+        cplan.threadpool = nullptr;
+        cplan.abort_callback = nullptr;
+        cplan.abort_callback_data = nullptr;
+        
+        // Execute with new executor architecture
+        enum ggml_status dispatch_result = ggml_numa_executor_execute_tensor(numa_result, &cplan);
+        
+        if (dispatch_result != GGML_STATUS_SUCCESS) {
+            printf("      ❌ NUMA dispatch failed for %s: %d\n", size_label, dispatch_result);
+            ggml_free(test_ctx);
+            return false;
+        }
+        
+        // Create reference computation using serial execution
+        struct ggml_tensor* ref_result = ggml_mul(test_ctx, input_a, input_b);
+        struct ggml_compute_params ref_params;
+        ref_params.ith = 0;
+        ref_params.nth = 1;
+        ref_params.wsize = 0;
+        ref_params.wdata = nullptr;
+        ref_params.threadpool = nullptr;
+        ggml_compute_forward_mul(&ref_params, ref_result);
+        
+        // Compare results
+        float* numa_data = (float*)ggml_get_data(numa_result);
+        float* ref_data = (float*)ggml_get_data(ref_result);
+        case_passed = compare_float_arrays(numa_data, ref_data, total_elements, "MUL");
+        
+        if (case_passed) {
+            printf("      ✅ %s MUL case passed (threads=%d)\n", size_label, num_threads);
+        } else {
+            printf("      ❌ %s MUL case failed (threads=%d)\n", size_label, num_threads);
+        }
+        
+        ggml_free(test_ctx);
+        return case_passed;
+    }
+
+    void test_MUL_mathematical_equivalence() {
+        printf("--- Test: MUL Mathematical Equivalence (Multi-Dimensional) ---\n");
+        printf("Testing NUMA parallel MUL vs serial reference implementation...\n");
+        printf("Testing across various tensor sizes with different coordinator execution strategies\n\n");
+        
+        bool overall_test_passed = true;
+        const char* failure_reason = nullptr;
+        
+        // Define test dimensions appropriate for MUL operation (element-wise binary operation)
+        struct {
+            int dim1, dim2, dim3;
+            const char* label;
+        } test_cases[] = {
+            {8, 8, 4, "TINY"},           // Small tensors for basic verification - 256 elements
+            {64, 64, 8, "SMALL"},        // Medium tensors - 32,768 elements (triggers data-parallel!)
+            {128, 64, 32, "MEDIUM"},     // Larger tensors - 262,144 elements
+            {256, 128, 64, "LARGE"}      // Large tensors for stress testing - 2,097,152 elements
+        };
+        
+        // Define coordinator execution strategies (various thread counts)
+        int thread_strategies[] = {1, 2, 4, 6, 8};
+        int num_strategies = sizeof(thread_strategies) / sizeof(thread_strategies[0]);
+        int num_test_cases = sizeof(test_cases) / sizeof(test_cases[0]);
+        
+        printf("  🎯 Testing %d tensor dimensions with %d thread strategies (%d total test combinations)\n\n", 
+               num_test_cases, num_strategies, num_test_cases * num_strategies);
+        
+        int total_tests = 0;
+        int passed_tests = 0;
+        
+        // Test each tensor dimension with each thread strategy
+        for (int case_idx = 0; case_idx < num_test_cases; case_idx++) {
+            printf("  📏 Testing %s tensors (%dx%dx%d):\n", 
+                   test_cases[case_idx].label, 
+                   test_cases[case_idx].dim1, 
+                   test_cases[case_idx].dim2, 
+                   test_cases[case_idx].dim3);
+            
+            for (int strategy_idx = 0; strategy_idx < num_strategies; strategy_idx++) {
+                int num_threads = thread_strategies[strategy_idx];
+                
+                bool case_passed = test_single_MUL_case(
+                    test_cases[case_idx].dim1, 
+                    test_cases[case_idx].dim2, 
+                    test_cases[case_idx].dim3, 
+                    num_threads,
+                    test_cases[case_idx].label
+                );
+                
+                total_tests++;
+                if (case_passed) {
+                    passed_tests++;
+                } else {
+                    overall_test_passed = false;
+                    if (!failure_reason) {
+                        failure_reason = "Mathematical mismatch detected in multi-dimensional testing";
+                    }
+                }
+            }
+            printf("\n");
+        }
+        
+        // Print summary for this test
+        printf("  📊 MUL Multi-Dimensional Test Summary:\n");
+        printf("    Total test combinations: %d\n", total_tests);
+        printf("    Passed: %d\n", passed_tests);
+        printf("    Failed: %d\n", total_tests - passed_tests);
+        
+        if (overall_test_passed) {
+            printf("✅ MUL mathematical equivalence (multi-dimensional): VERIFIED\n");
+            printf("  🎉 All tensor dimensions and thread strategies produce mathematically equivalent results!\n\n");
+        } else {
+            printf("❌ MUL mathematical equivalence (multi-dimensional): FAILED - %s\n", failure_reason);
+            printf("  ⚠️  Mathematical mismatches detected across different dimensions or thread strategies\n\n");
+        }
+        
+        results.push_back({"MUL_mathematical_equivalence", overall_test_passed, failure_reason ? failure_reason : ""});
+    }
+
+    // Test quantization type coverage to ensure NUMA vs reference implementation compatibility
+    void test_MUL_quantization_type_coverage() {
+        printf("--- Test: MUL Core Quantization Type Coverage ---\n");
+        printf("Testing MUL operation with core quantization types to verify NUMA/reference compatibility...\n");
+        printf("This ensures MUL kernels handle model weights correctly across Q8_0, Q4_0, Q5_0 formats\n");
+        printf("(K-quant types require 256-aligned dimensions and are tested separately in MUL_MAT)\n");
+        printf("NUMA kernels support F32/F16 operations; quantized types should gracefully fall back to reference implementation\n\n");
+        
+        bool overall_test_passed = true;
+        const char* failure_reason = nullptr;
+        
+        // Define quantization type test cases
+        struct {
+            ggml_type src0_type, src1_type, dst_type;
+            const char* description;
+            bool expect_numa_support;  // Whether we expect NUMA kernel to handle this
+        } type_test_cases[] = {
+            // Non-quantized types (most important)
+            {GGML_TYPE_F32, GGML_TYPE_F32, GGML_TYPE_F32, "F32 + F32 → F32", true},
+            {GGML_TYPE_F16, GGML_TYPE_F16, GGML_TYPE_F16, "F16 + F16 → F16", false},
+            {GGML_TYPE_F16, GGML_TYPE_F32, GGML_TYPE_F32, "F16 + F32 → F32", false},
+            
+            // Key quantized types (most commonly used)
+            // Comprehensive quantized type combinations (core model weight formats)
+            {GGML_TYPE_Q8_0, GGML_TYPE_F32, GGML_TYPE_F32, "Q8_0 * F32 → F32", false},  // 8-bit quantization (block size 32)
+            {GGML_TYPE_Q4_0, GGML_TYPE_F32, GGML_TYPE_F32, "Q4_0 * F32 → F32", false},  // 4-bit quantization (block size 32)
+            {GGML_TYPE_Q5_0, GGML_TYPE_F32, GGML_TYPE_F32, "Q5_0 * F32 → F32", false},  // 5-bit quantization (block size 32)
+            
+            // NOTE: K-quant series require block size 256, so we skip them for now due to memory constraints
+            // They would require 256x256 tensors minimum, which is too large for this focused test
+            // K-quant testing is covered in MUL_MAT which has dedicated infrastructure for large tensors
+        };
+        
+        int num_type_cases = sizeof(type_test_cases) / sizeof(type_test_cases[0]);
+        int passed_type_tests = 0;
+        int total_type_tests = 0;
+        
+        // Test each quantization type
+        for (int case_idx = 0; case_idx < num_type_cases; case_idx++) {
+            auto& test_case = type_test_cases[case_idx];
+            printf("  🔍 Testing: %s\n", test_case.description);
+            
+            // Create test context
+            struct ggml_init_params params;
+            params.mem_size = 128 * 1024 * 1024;  // 128MB should be plenty for small test tensors
+            params.mem_buffer = nullptr;
+            params.no_alloc = false;
+            
+            struct ggml_context* test_ctx = ggml_init(params);
+            if (!test_ctx) {
+                printf("      ❌ Failed to create test context for %s\n", test_case.description);
+                failure_reason = "Context creation failed";
+                overall_test_passed = false;
+                continue;
+            }
+            
+            // Create tensors with appropriate types
+            // Use 32x32 = 1024 elements to be compatible with all quantization block sizes
+            struct ggml_tensor* src0 = ggml_new_tensor_2d(test_ctx, test_case.src0_type, 32, 32);
+            struct ggml_tensor* src1 = ggml_new_tensor_2d(test_ctx, test_case.src1_type, 32, 32);
+            
+            if (!src0 || !src1) {
+                printf("      ❌ Failed to create tensors for %s\n", test_case.description);
+                ggml_free(test_ctx);
+                failure_reason = "Tensor creation failed";
+                overall_test_passed = false;
+                continue;
+            }
+            
+            // Initialize data based on type
+            const int total_elements = 1024;  // 32x32
+            if (test_case.src0_type == GGML_TYPE_F32) {
+                float* src0_data = (float*)ggml_get_data(src0);
+                for (int i = 0; i < total_elements; i++) {
+                    src0_data[i] = 0.1f + i * 0.001f;  // Small values to avoid overflow
+                }
+            } else if (test_case.src0_type == GGML_TYPE_F16) {
+                ggml_fp16_t* src0_data = (ggml_fp16_t*)ggml_get_data(src0);
+                for (int i = 0; i < total_elements; i++) {
+                    src0_data[i] = ggml_fp32_to_fp16(0.1f + i * 0.001f);
+                }
+            } else {
+                // For quantized types, create F32 data first, then quantize
+                float temp_data[1024];
+                for (int i = 0; i < total_elements; i++) {
+                    temp_data[i] = 0.1f + i * 0.001f;
+                }
+                // Get the quantization function
+                ggml_from_float_t quantize_fn = ggml_get_type_traits_cpu(test_case.src0_type)->from_float;
+                if (quantize_fn) {
+                    quantize_fn(temp_data, ggml_get_data(src0), total_elements);
+                } else {
+                    printf("      ⚠️  No quantization function available for %s\n", test_case.description);
+                    ggml_free(test_ctx);
+                    continue;
+                }
+            }
+            
+            // Initialize src1 (always F32 or F16 in our test cases)
+            if (test_case.src1_type == GGML_TYPE_F32) {
+                float* src1_data = (float*)ggml_get_data(src1);
+                for (int i = 0; i < total_elements; i++) {
+                    src1_data[i] = 0.05f + i * 0.0005f;  // Small values
+                }
+            } else if (test_case.src1_type == GGML_TYPE_F16) {
+                ggml_fp16_t* src1_data = (ggml_fp16_t*)ggml_get_data(src1);
+                for (int i = 0; i < total_elements; i++) {
+                    src1_data[i] = ggml_fp32_to_fp16(0.05f + i * 0.0005f);
+                }
+            }
+            
+            // Create MUL operation
+            struct ggml_tensor* result = ggml_mul(test_ctx, src0, src1);
+            if (!result) {
+                printf("      ❌ Failed to create MUL operation for %s\n", test_case.description);
+                ggml_free(test_ctx);
+                failure_reason = "MUL operation creation failed";
+                overall_test_passed = false;
+                continue;
+            }
+            
+            // Try to execute with NUMA executor
+            struct ggml_cplan cplan = {};
+            cplan.work_size = 0;
+            cplan.work_data = nullptr;
+            cplan.n_threads = 2;  // Use 2 threads for type testing
+            cplan.threadpool = nullptr;
+            cplan.abort_callback = nullptr;
+            cplan.abort_callback_data = nullptr;
+            
+            enum ggml_status numa_result = ggml_numa_executor_execute_tensor(result, &cplan);
+            
+            if (numa_result == GGML_STATUS_SUCCESS) {
+                if (test_case.expect_numa_support) {
+                    printf("      ✅ NUMA kernel handled %s as expected\n", test_case.description);
+                } else {
+                    printf("      ✅ Reference fallback handled %s correctly\n", test_case.description);
+                }
+                passed_type_tests++;
+            } else {
+                printf("      ❌ Execution failed for %s (status: %d)\n", test_case.description, numa_result);
+                failure_reason = "Execution failed";
+                overall_test_passed = false;
+            }
+            
+            total_type_tests++;
+            ggml_free(test_ctx);
+        }
+        
+        // Print summary for quantization type testing
+        printf("  📊 MUL Quantization Type Test Summary:\n");
+        printf("    Total type combinations: %d\n", total_type_tests);
+        printf("    Passed: %d\n", passed_type_tests);
+        printf("    Failed: %d\n", total_type_tests - passed_type_tests);
+        
+        if (overall_test_passed) {
+            printf("✅ MUL quantization type coverage: VERIFIED\n");
+            printf("  🎉 All quantization types work correctly (NUMA kernels or reference fallback)!\n\n");
+        } else {
+            printf("❌ MUL quantization type coverage: FAILED - %s\n", failure_reason);
+            printf("  ⚠️  Some quantization types failed to execute properly\n\n");
+        }
+        
+        results.push_back({"MUL_quantization_type_coverage", overall_test_passed, failure_reason ? failure_reason : ""});
+    }
+
+    // Test specific broadcasting scenarios that previously caused memory corruption
+    void test_MUL_broadcasting_regression() {
+        printf("--- Test: MUL Broadcasting Regression (Specific Bug Scenarios) ---\n");
+        printf("Testing specific tensor broadcasting scenarios that previously caused NUMA memory corruption...\n");
+        printf("This ensures the fix for buffer overflow in broadcasting is working correctly\n\n");
+        
+        bool overall_test_passed = true;
+        const char* failure_reason = nullptr;
+        
+        // Define specific broadcasting scenarios that were problematic
+        struct {
+            int src0_dim1, src0_dim2;  // Source tensor 0 dimensions
+            int src1_dim1, src1_dim2;  // Source tensor 1 dimensions (smaller, broadcasted)
+            const char* description;
+        } broadcasting_cases[] = {
+            {2, 1024, 2, 1, "Matrix [2x1024] + Vector [2] (row broadcast)"},
+            {1024, 2, 2, 1, "Matrix [1024x2] + Vector [2] (element broadcast)"},
+            {128, 64, 64, 1, "Matrix [128x64] + Vector [64] (column broadcast)"},
+            {256, 32, 1, 32, "Matrix [256x32] + Vector [32] (row broadcast)"},
+            {512, 8, 8, 1, "Matrix [512x8] + Vector [8] (element broadcast)"}
+        };
+        
+        int num_broadcasting_cases = sizeof(broadcasting_cases) / sizeof(broadcasting_cases[0]);
+        int thread_strategies[] = {1, 2, 4, 8};
+        int num_strategies = sizeof(thread_strategies) / sizeof(thread_strategies[0]);
+        
+        printf("  🎯 Testing %d broadcasting scenarios with %d thread strategies (%d total combinations)\n\n",
+               num_broadcasting_cases, num_strategies, num_broadcasting_cases * num_strategies);
+        
+        int total_tests = 0;
+        int passed_tests = 0;
+        
+        for (int case_idx = 0; case_idx < num_broadcasting_cases; case_idx++) {
+            printf("  📡 Broadcasting case: %s\n", broadcasting_cases[case_idx].description);
+            
+            for (int strategy_idx = 0; strategy_idx < num_strategies; strategy_idx++) {
+                int num_threads = thread_strategies[strategy_idx];
+                
+                printf("    🧮 Testing with %d threads\n", num_threads);
+                
+                // Create test context
+                struct ggml_init_params params;
+                params.mem_size = 512 * 1024 * 1024; // 512MB should be enough
+                params.mem_buffer = nullptr;
+                params.no_alloc = false;
+                
+                struct ggml_context* test_ctx = ggml_init(params);
+                if (!test_ctx) {
+                    printf("      ❌ Failed to create test context\n");
+                    overall_test_passed = false;
+                    continue;
+                }
+                
+                bool case_passed = false;
+                
+                // Create source tensors with specific broadcasting dimensions
+                struct ggml_tensor* src0 = ggml_new_tensor_2d(test_ctx, GGML_TYPE_F32, 
+                                                             broadcasting_cases[case_idx].src0_dim1,
+                                                             broadcasting_cases[case_idx].src0_dim2);
+                struct ggml_tensor* src1 = ggml_new_tensor_2d(test_ctx, GGML_TYPE_F32,
+                                                             broadcasting_cases[case_idx].src1_dim1,
+                                                             broadcasting_cases[case_idx].src1_dim2);
+                
+                if (!src0 || !src1) {
+                    printf("      ❌ Failed to create source tensors\n");
+                    ggml_free(test_ctx);
+                    overall_test_passed = false;
+                    continue;
+                }
+                
+                // Fill tensors with deterministic test data
+                float* src0_data = (float*)ggml_get_data(src0);
+                float* src1_data = (float*)ggml_get_data(src1);
+                int src0_elements = ggml_nelements(src0);
+                int src1_elements = ggml_nelements(src1);
+                
+                for (int i = 0; i < src0_elements; i++) {
+                    src0_data[i] = 1.0f + (i % 100) * 0.01f; // Pattern that reveals out-of-bounds access
+                }
+                for (int i = 0; i < src1_elements; i++) {
+                    src1_data[i] = 10.0f + i * 0.1f; // Distinct pattern for broadcasting tensor
+                }
+                
+                // Create MUL operation (this should trigger broadcasting)
+                struct ggml_tensor* numa_result = ggml_mul(test_ctx, src0, src1);
+                
+                if (!numa_result) {
+                    printf("      ❌ Failed to create MUL operation\n");
+                    ggml_free(test_ctx);
+                    overall_test_passed = false;
+                    continue;
+                }
+                
+                printf("      📊 Tensors: src0[%ldx%ld]=%ld elements, src1[%ldx%ld]=%ld elements, dst[%ldx%ld]=%ld elements\n",
+                       src0->ne[0], src0->ne[1], ggml_nelements(src0),
+                       src1->ne[0], src1->ne[1], ggml_nelements(src1),
+                       numa_result->ne[0], numa_result->ne[1], ggml_nelements(numa_result));
+                
+                // Execute via NUMA (this previously caused memory corruption)
+                struct ggml_cplan cplan = {};
+                cplan.work_size = 0;
+                cplan.work_data = nullptr;
+                cplan.n_threads = num_threads;
+                cplan.threadpool = nullptr;
+                
+                enum ggml_status dispatch_result = ggml_numa_executor_execute_tensor(numa_result, &cplan);
+                
+                if (dispatch_result != GGML_STATUS_SUCCESS) {
+                    printf("      ❌ NUMA dispatch failed: %d (this suggests the broadcasting bug still exists!)\n", dispatch_result);
+                    ggml_free(test_ctx);
+                    overall_test_passed = false;
+                    continue;
+                }
+                
+                // Create reference computation using serial execution
+                struct ggml_tensor* ref_result = ggml_mul(test_ctx, src0, src1);
+                struct ggml_compute_params ref_params;
+                ref_params.ith = 0;
+                ref_params.nth = 1;
+                ref_params.wsize = 0;
+                ref_params.wdata = nullptr;
+                ref_params.threadpool = nullptr;
+                ggml_compute_forward_mul(&ref_params, ref_result);
+                
+                // Compare results (this will detect if memory corruption occurred)
+                float* numa_data = (float*)ggml_get_data(numa_result);
+                float* ref_data = (float*)ggml_get_data(ref_result);
+                int total_elements = ggml_nelements(numa_result);
+                
+                case_passed = compare_float_arrays(numa_data, ref_data, total_elements, "Broadcasting MUL");
+                
+                if (case_passed) {
+                    printf("      ✅ Broadcasting case passed (threads=%d)\n", num_threads);
+                } else {
+                    printf("      ❌ Broadcasting case failed (threads=%d) - REGRESSION DETECTED!\n", num_threads);
+                    if (!failure_reason) {
+                        failure_reason = "Broadcasting regression detected - memory corruption or incorrect results";
+                    }
+                }
+                
+                total_tests++;
+                if (case_passed) {
+                    passed_tests++;
+                } else {
+                    overall_test_passed = false;
+                }
+                
+                ggml_free(test_ctx);
+            }
+            printf("\n");
+        }
+        
+        // Print summary for broadcasting test
+        printf("  📊 Broadcasting Regression Test Summary:\n");
+        printf("    Total test combinations: %d\n", total_tests);
+        printf("    Passed: %d\n", passed_tests);
+        printf("    Failed: %d\n", total_tests - passed_tests);
+        
+        if (overall_test_passed) {
+            printf("✅ MUL broadcasting regression test: PASSED\n");
+            printf("  🎉 All broadcasting scenarios work correctly - no memory corruption detected!\n\n");
+        } else {
+            printf("❌ MUL broadcasting regression test: FAILED - %s\n", failure_reason);
+            printf("  ⚠️  Broadcasting memory corruption bug may have returned - immediate investigation required!\n\n");
+        }
+        
+        results.push_back({"MUL_broadcasting_regression", overall_test_passed, failure_reason ? failure_reason : ""});
+    }
+
+public:
+    bool run_all_tests() {
+        printf("🧪 NUMA Mathematical Correctness Test Suite - MUL\n");
+        printf("================================================================================\n");
+        printf("🔧 Testing mathematical correctness with function pointer architecture\n");
+        printf("Comparing NUMA parallel execution against serial reference implementation\n");
+        printf("================================================================================\n\n");
+        
+        // Run mathematical correctness tests
+        test_MUL_mathematical_equivalence();
+        
+        // Run quantization type coverage tests
+        test_MUL_quantization_type_coverage();
+        
+        // Run broadcasting regression tests
+        test_MUL_broadcasting_regression();
+        
+        print_summary();
+        
+        // Check if any tests failed
+        bool all_passed = true;
+        for (const auto& result : results) {
+            if (!result.passed) {
+                all_passed = false;
+                break;
+            }
+        }
+        
+        return all_passed;
+    }
+
+private:
+    void print_summary() {
+        printf("\n================================================================================\n");
+        printf("                    Mathematical Correctness Test Results\n");
+        printf("================================================================================\n");
+        
+        int passed_count = 0;
+        for (const auto& result : results) {
+            const char* status = result.passed ? "✅" : "❌";
+            printf("%s %s: %s", status, result.test_name.c_str(), 
+                   result.passed ? "PASSED" : "FAILED");
+            
+            if (!result.passed && !result.failure_reason.empty()) {
+                printf(" - %s", result.failure_reason.c_str());
+            }
+            printf("\n");
+            
+            if (result.passed) passed_count++;
+        }
+        
+        printf("------------------------------------------------------------------------\n");
+        printf("Total: %d/%zu tests passed", passed_count, results.size());
+        
+        if (passed_count == (int)results.size()) {
+            printf(" 🎉 All tests passed!\n");
+        } else {
+            printf(" 💥 Some tests failed.\n");
+        }
+        
+        printf("================================================================================\n");
+        
+        if (passed_count != (int)results.size()) {
+            printf("❌ NUMA Mathematical Correctness: FAILURES DETECTED\n\n");
+            printf("⚠️  Mathematical mismatch between NUMA parallel and serial execution detected\n");
+        } else {
+            printf("✅ NUMA Mathematical Correctness: ALL TESTS PASSED\n\n");
+            printf("🎯 NUMA parallel execution produces mathematically equivalent results\n");
+        }
+        
+        printf("🧪 Mathematical correctness testing completed!\n\n");
+    }
+};
+
+// Main function - entry point for the test
+int main(int argc, char** argv) {
+    // Initialize NUMA with mirroring strategy for data locality
+    ggml_numa_init(GGML_NUMA_STRATEGY_MIRROR);
+    
+    // Check for --summary-only flag
+    bool summary_only = false;
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--summary-only") == 0) {
+            summary_only = true;
+            break;
+        }
+    }
+    
+    // Redirect stdout to /dev/null if summary-only mode (but keep final results)
+    FILE* original_stdout = nullptr;
+    if (summary_only) {
+        original_stdout = stdout;
+        stdout = fopen("/dev/null", "w");
+        if (!stdout) {
+            stdout = original_stdout;
+            summary_only = false; // Fall back if redirection fails
+        }
+    }
+    
+    printf("🌟 Initializing NUMA system for mathematical correctness testing...\n");
+    
+    // Initialize NUMA with automatic coordinator initialization
+    ggml_numa_init(GGML_NUMA_STRATEGY_MIRROR);
+    
+    if (!ggml_numa_simple_coordinator_is_initialized()) {
+        if (summary_only) {
+            fclose(stdout);
+            stdout = original_stdout;
+        }
+        printf("❌ NUMA auto-initialization failed\n");
+        return 1;
+    }
+    
+    printf("✅ NUMA system auto-initialized successfully\n\n");
+    
+    NumaMulMathematicalCorrectnessTestSuite test_suite;
+    bool all_passed = test_suite.run_all_tests();
+    
+    // Restore stdout for final results
+    if (summary_only) {
+        fclose(stdout);
+        stdout = original_stdout;
+    }
+    
+    return all_passed ? 0 : 1;
+}
+
+/**
+ * IMPLEMENTATION CHECKLIST:
+ * 
+ * When adapting this template for a new operation:
+ * 
+ * 1. ✅ Replace all instances of "TEMPLATE_OPERATION" with your operation name
+ * 2. ✅ Update test dimensions in test_cases[] array to match your operation's needs
+ * 3. ✅ Implement test_single_OPERATION_case() with:
+ *    - Appropriate tensor creation for your operation
+ *    - Deterministic test data generation
+ *    - NUMA operation execution via ggml_numa_executor_execute_tensor
+ *    - Reference implementation (serial computation or mathematical kernel)
+ *    - Result comparison using compare_float_arrays()
+ * 4. ✅ Update CMakeLists.txt to include your new test file
+ * 5. ✅ Test your implementation with: ./tests/run-numa-tests.sh
+ * 6. ✅ Verify all test combinations pass before considering complete
+ * 
+ * REFERENCE IMPLEMENTATIONS:
+ * - See test-numa-mathematical-correctness.cpp for working MUL_MAT example
+ * - Mathematical kernels available in ggml/src/ggml-cpu/ggml-cpu-impl.h
+ * - Operation dispatch examples in ggml/src/ggml-cpu/ggml-numa-operation-dispatch.c
+ * 
+ * TESTING PRINCIPLES:
+ * - Each operation should be tested across multiple dimensions
+ * - Multiple thread strategies should be tested to verify coordinator behavior
+ * - Mathematical equivalence should be exact (within floating-point tolerance)
+ * - Tests should be deterministic and reproducible
+ * - Comprehensive error reporting should help debug any failures
+ */

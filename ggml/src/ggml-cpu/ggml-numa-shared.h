@@ -84,8 +84,26 @@ typedef struct {
 } ggml_numa_kernel_strategy_array_t;
 
 /**
- * Aggregation function pointers for each strategy
+ * Work function pointers for each strategy
  * Kernels provide these at registration time
+ * These match the ggml_numa_work_function_t signature expected by the coordinator
+ */
+typedef struct {
+    // Function pointer for single-node, single-thread execution
+    ggml_numa_work_function_t single_single_fn;
+    
+    // Function pointer for single-node, multi-thread execution  
+    ggml_numa_work_function_t single_multi_fn;
+    
+    // Function pointer for data-parallel execution
+    ggml_numa_work_function_t data_parallel_fn;
+                                        
+    bool valid;  // True if function pointers are provided
+} ggml_numa_kernel_work_funcs_t;
+
+/**
+ * Aggregation function pointers for each strategy
+ * Kernels provide these at registration time for operations that need result aggregation
  */
 typedef struct {
     // Function pointer for single-node, single-thread aggregation
@@ -110,7 +128,8 @@ typedef struct {
 typedef struct {
     enum ggml_op op_type;                                     // Operation type this kernel handles
     ggml_numa_kernel_strategy_array_t strategy_array;        // Strategy thresholds 
-    ggml_numa_kernel_aggregation_funcs_t agg_funcs;          // Function pointers
+    ggml_numa_kernel_work_funcs_t work_funcs;                // Work function pointers
+    ggml_numa_kernel_aggregation_funcs_t agg_funcs;          // Aggregation function pointers (optional)
     const char * kernel_name;                                // Human-readable name
     bool supported;                                           // Whether kernel is available
 } ggml_numa_kernel_registration_info_t;
@@ -129,6 +148,7 @@ typedef ggml_numa_kernel_registration_info_t (*ggml_numa_kernel_register_fn_t)(v
  * Environment variable-controlled debug logging system
  * Set GGML_NUMA_DEBUG=1 to enable debug output
  * Set GGML_NUMA_DEBUG=2 for verbose debug output
+ * Set GGML_NUMA_DEBUG=3 for trace debug output (very detailed, includes individual operations)
  * 
  * Separate from performance measurements (use GGML_NUMA_PERF for that)
  */
@@ -175,6 +195,16 @@ static inline int ggml_numa_perf_enabled(void) {
     } } while(0)
 
 /**
+ * Trace debug logging (only with GGML_NUMA_DEBUG=3 or higher)
+ * Used for very detailed internal operations like individual tensor rows
+ */
+#define NUMA_COORD_LOG_TRACE(numa_node, ...) \
+    do { if (ggml_numa_debug_enabled() >= 3) { \
+        fprintf(stderr, "NUMA[%d] TRACE: " __VA_ARGS__, (int)(numa_node)); \
+        fprintf(stderr, "\n"); \
+    } } while(0)
+
+/**
  * Info logging with NUMA node context
  */
 #define NUMA_COORD_LOG_INFO(numa_node, ...) \
@@ -207,6 +237,16 @@ static inline int ggml_numa_perf_enabled(void) {
 #define NUMA_LOG_VERBOSE(...) \
     do { if (ggml_numa_debug_enabled() >= 2) { \
         fprintf(stderr, "NUMA VERBOSE: " __VA_ARGS__); \
+        fprintf(stderr, "\n"); \
+    } } while(0)
+
+/**
+ * Trace logging (only with GGML_NUMA_DEBUG=3 or higher)
+ * Used for very detailed internal operations like individual tensor rows
+ */
+#define NUMA_LOG_TRACE(...) \
+    do { if (ggml_numa_debug_enabled() >= 3) { \
+        fprintf(stderr, "NUMA TRACE: " __VA_ARGS__); \
         fprintf(stderr, "\n"); \
     } } while(0)
 
@@ -352,6 +392,29 @@ static inline ggml_numa_execution_strategy_t numa_select_strategy_fast(
     }
     
     return result;
+}
+
+/**
+ * Get work function pointer based on selected strategy (O(1) performance)
+ */
+static inline ggml_numa_work_function_t numa_get_work_func_fast(
+    const ggml_numa_kernel_work_funcs_t * work_funcs,
+    const ggml_numa_execution_strategy_t * strategy) {
+    
+    if (!work_funcs || !work_funcs->valid || !strategy) {
+        return NULL;
+    }
+    
+    // O(1) function pointer selection based on strategy
+    if (strategy->node_strategy == NUMA_NODE_STRATEGY_SINGLE) {
+        if (strategy->on_node_strategy == NUMA_ON_NODE_STRATEGY_SINGLE_THREAD) {
+            return work_funcs->single_single_fn;
+        } else {
+            return work_funcs->single_multi_fn;
+        }
+    } else {
+        return work_funcs->data_parallel_fn;
+    }
 }
 
 /**
