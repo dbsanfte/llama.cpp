@@ -228,7 +228,7 @@ enum ggml_status ggml_numa_kernels_init(void) {
     NUMA_REGISTER_KERNEL(add);
     
     // Register MUL kernel
-    //NUMA_REGISTER_KERNEL(mul);
+    NUMA_REGISTER_KERNEL(mul);
 
     // Register CPY kernel
     //NUMA_REGISTER_KERNEL(cpy);
@@ -292,13 +292,20 @@ ggml_numa_kernel_query_result_t ggml_numa_kernels_strategy_lookup(const struct g
         NUMA_LOG_DEBUG("No strategy found for op %s", ggml_op_name(tensor->op));
         return default_result;
     }
-    
-    // Create optimized result based on strategy
+
+    // Get function pointers using O(1) lookups
+    void * work_func = ggml_numa_lookup_work_function_fast(tensor->op, strategy);
+    if (!work_func) {
+        NUMA_LOG_DEBUG("No work function found for op %s", ggml_op_name(tensor->op));
+        return default_result;
+    }
+
+    // Create optimized result based on strategy (only if we have valid functions)
     ggml_numa_kernel_query_result_t result = default_result;
     result.supported = true;
     result.strategy = *strategy;
-    
-    switch (tensor->op) {
+    result.work_function = work_func;
+    result.aggregation_function = ggml_numa_lookup_aggregation_fast(tensor->op, strategy);    switch (tensor->op) {
         case GGML_OP_ADD:
             result.kernel_name = "NUMA ADD (O(1) Fast-Lookup)";
             result.efficiency_score = 0.99f;
@@ -316,10 +323,6 @@ ggml_numa_kernel_query_result_t ggml_numa_kernels_strategy_lookup(const struct g
             result.efficiency_score = 0.8f;
             break;
     }
-    
-    // Get function pointers using O(1) lookups
-    result.work_function = ggml_numa_lookup_work_function_fast(tensor->op, strategy);
-    result.aggregation_function = ggml_numa_lookup_aggregation_fast(tensor->op, strategy);
     
     NUMA_LOG_DEBUG("O(1) Strategy lookup: op=%d, elements=%zu, strategy=%s/%s, efficiency=%.2f", 
                   (int)tensor->op, total_elements,

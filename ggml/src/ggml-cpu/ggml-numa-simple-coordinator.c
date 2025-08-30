@@ -430,8 +430,9 @@ static void* numa_dispatch_worker(void* arg) {
                 };
                 
                 // Create compute plan for threadpool execution
+                // Use the actual threadpool thread count for this NUMA node, not the original requested count
                 struct ggml_cplan cplan = {
-                    .n_threads = work_params.nth,
+                    .n_threads = g_simple_coordinator.threads_per_node[numa_node],
                     .threadpool = dispatch_threadpool
                 };
                 
@@ -891,10 +892,12 @@ bool ggml_numa_simple_coordinator_init(struct ggml_threadpool_params * tpp) {
     numa_free_cpumask(fallback_cpus);
     
     // Use appropriate thread count for fallback execution
+    // IMPORTANT: Fallback threadpool must support full backend thread count to avoid mismatches
     if (current_strategy == GGML_NUMA_STRATEGY_ISOLATE) {
         fallback_tpp.n_threads = g_simple_coordinator.threads_per_node[isolate_node];
     } else {
-        fallback_tpp.n_threads = g_simple_coordinator.threads_per_node[0];
+        // Use total system threads to support backend requests (e.g., 112 threads)
+        fallback_tpp.n_threads = optimized_tpp.n_threads; // This is the full system thread count
     }
     fallback_tpp.numa_aware = false; // Disable NUMA recursion
     fallback_tpp.strict_cpu = true;  // Enable strict CPU binding
@@ -1388,10 +1391,10 @@ struct ggml_threadpool * ggml_numa_simple_coordinator_get_fallback_threadpool(vo
 }
 
 int ggml_numa_simple_coordinator_get_fallback_thread_count(void) {
-    if (!g_simple_coordinator.initialized) {
+    if (!g_simple_coordinator.initialized || !g_simple_coordinator.fallback_threadpool) {
         return 1;
     }
-    return g_simple_coordinator.threads_per_node[0];
+    return ggml_threadpool_get_n_threads(g_simple_coordinator.fallback_threadpool);
 }
 
 // Public wrapper for thread binding assertion

@@ -2616,6 +2616,13 @@ void ggml_threadpool_free(struct ggml_threadpool* threadpool) {
     ggml_aligned_free(threadpool, sizeof(struct ggml_threadpool));
 }
 
+int ggml_threadpool_get_n_threads(struct ggml_threadpool * threadpool) {
+    if (!threadpool) {
+        return 1;
+    }
+    return threadpool->n_threads_max;
+}
+
 #ifndef GGML_USE_OPENMP
 // pause/resume must be called under mutex
 static void ggml_threadpool_pause_locked(struct ggml_threadpool * threadpool) {
@@ -3130,6 +3137,16 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
         GGML_LOG_INFO("🔄 Fallback Path: Processing computation graph with %d nodes, %d threads, threadpool=%p\n", 
                       cgraph->n_nodes, cplan->n_threads, (void*)cplan->threadpool);
         test_track_fallback_execution(); // Track fallback path was taken
+        
+        // Fix thread count for fallback execution to match available threadpool capacity
+        // This applies whether cplan->threadpool is set or will be set later
+        extern int ggml_numa_simple_coordinator_get_fallback_thread_count(void);
+        int fallback_threads = ggml_numa_simple_coordinator_get_fallback_thread_count();
+        if (cplan->n_threads > fallback_threads) {
+            GGML_LOG_INFO("🔧 NUMA Fallback: Limiting requested threads (%d) to fallback threadpool capacity (%d)\n", 
+                          cplan->n_threads, fallback_threads);
+            cplan->n_threads = fallback_threads;
+        }
     }
 #endif
 
