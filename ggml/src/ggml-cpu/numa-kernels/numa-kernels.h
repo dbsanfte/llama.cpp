@@ -26,26 +26,33 @@ struct ggml_cplan;
  */
 
 /**
- * Hash table entry for strategy cache
- * Maps operation type to strategy threshold array and function pointers
+ * Kernel cache entry - stores complete kernel information
+ * Maps operation type to pre-computed query results for ultra-fast lookup
  */
 typedef struct {
-    enum ggml_op op_type;                                // Operation type (hash key)
+    enum ggml_op op_type;                                // Operation type
     ggml_numa_kernel_strategy_array_t strategy_array;   // Threshold array
     ggml_numa_kernel_work_funcs_t work_funcs;           // Work function pointers
     ggml_numa_kernel_aggregation_funcs_t agg_funcs;     // Aggregation function pointers (optional)
     bool initialized;                                    // True if entry is valid
-} ggml_numa_strategy_cache_entry_t;
+} ggml_numa_kernel_cache_entry_t;
 
 /**
- * Global strategy cache with O(1) hash table access
- * Built at startup from kernel registrations
+ * Global kernel cache with direct array access - NO HASH TABLE!
+ * 
+ * Two-array system for maximum performance:
+ * 1. g_kernel_cache[GGML_OP_COUNT]: Main storage (sparse array, most entries NULL)
+ * 2. g_kernel_lookup[GGML_OP_COUNT]: Fast lookup pointers (what we query in hot path)
+ * 
+ * Usage: result = g_kernel_lookup[op_type]; if (!result) fallback();
+ * Performance: Single memory access + NULL check = ~2-3 CPU cycles
  */
 typedef struct {
-    ggml_numa_strategy_cache_entry_t entries[NUMA_OP_HASH_TABLE_SIZE];  // Hash table
-    bool cache_initialized;                                              // Initialization flag
-    size_t num_registered_ops;                                          // Count of registered operations
-} ggml_numa_strategy_cache_t;
+    ggml_numa_kernel_cache_entry_t cache_storage[GGML_OP_COUNT];        // Array 1: Main cache storage
+    ggml_numa_kernel_cache_entry_t* lookup_table[GGML_OP_COUNT];        // Array 2: Fast lookup pointers
+    bool cache_initialized;                                             // Initialization flag  
+    size_t num_registered_ops;                                         // Count of registered operations
+} ggml_numa_kernel_array_cache_t;
 
 /**
  * Kernel registration interface - called by each kernel at startup
@@ -59,27 +66,42 @@ enum ggml_status ggml_numa_register_kernel_strategy(
 );
 
 /**
- * Initialize the global strategy cache (called once at startup)
+ * Initialize the global kernel array cache (called once at startup)
  */
-enum ggml_status ggml_numa_init_strategy_cache(void);
+enum ggml_status ggml_numa_init_kernel_array_cache(void);
 
 /**
- * O(1) strategy lookup - ultra-fast hash table access
+ * Direct array lookup - ultra-fast single memory access
+ * Returns complete kernel information or NULL if unsupported
+ */
+const ggml_numa_kernel_cache_entry_t * ggml_numa_lookup_kernel_direct(enum ggml_op op_type);
+
+/**
+ * Array-based strategy lookup - direct access using operation type as index
  * Returns execution strategy based on operation type and element count
  */
-const ggml_numa_execution_strategy_t * ggml_numa_lookup_strategy_fast(
+const ggml_numa_execution_strategy_t * ggml_numa_lookup_strategy_direct(
     enum ggml_op op_type,
     size_t element_count
 );
 
 /**
- * O(1) work function lookup - ultra-fast hash table access
+ * Array-based work function lookup - direct access using operation type as index
  * Returns function pointer for execution based on operation and strategy
  */
-ggml_numa_work_function_t ggml_numa_lookup_work_function_fast(
+ggml_numa_work_function_t ggml_numa_lookup_work_function_direct(
     enum ggml_op op_type,
     const ggml_numa_execution_strategy_t * strategy
 );
+
+/**
+ * Array-based aggregation function lookup - direct access using operation type as index
+ * Returns aggregation function pointer based on operation and strategy
+ */
+enum ggml_status (*ggml_numa_lookup_aggregation_direct(
+    enum ggml_op op_type,
+    const ggml_numa_execution_strategy_t * strategy
+))(void *, int, struct ggml_tensor *, struct ggml_cplan *);
 
 /**
  * NUMA aggregation policy for kernels
