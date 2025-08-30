@@ -67,11 +67,13 @@ typedef struct {
 /**
  * Strategy threshold array indices (by convention)
  * Each kernel provides a simple array with element count thresholds
+ * Extended for testing with custom threshold points
  */
 typedef enum {
     NUMA_STRATEGY_IDX_SINGLE_SINGLE = 0,   // Single node, single thread threshold
     NUMA_STRATEGY_IDX_SINGLE_MULTI = 1,    // Single node, multi-thread threshold
-    NUMA_STRATEGY_IDX_COUNT = 2             // Above both thresholds = data-parallel
+    NUMA_STRATEGY_IDX_DATA_PARALLEL = 2,   // Data-parallel threshold (for testing)
+    NUMA_STRATEGY_IDX_COUNT = 3             // Total number of threshold indices
 } ggml_numa_strategy_idx_t;
 
 /**
@@ -378,15 +380,19 @@ static inline ggml_numa_execution_strategy_t numa_select_strategy_fast(
         return result;
     }
     
-    // O(1) threshold comparison for strategy selection
+    // O(1) threshold comparison for strategy selection with 3-level support
     if (element_count <= strategy_array->thresholds[NUMA_STRATEGY_IDX_SINGLE_SINGLE]) {
         result.node_strategy = NUMA_NODE_STRATEGY_SINGLE;
         result.on_node_strategy = NUMA_ON_NODE_STRATEGY_SINGLE_THREAD;
     } else if (element_count <= strategy_array->thresholds[NUMA_STRATEGY_IDX_SINGLE_MULTI]) {
         result.node_strategy = NUMA_NODE_STRATEGY_SINGLE;
         result.on_node_strategy = NUMA_ON_NODE_STRATEGY_MULTI_THREAD;
+    } else if (element_count <= strategy_array->thresholds[NUMA_STRATEGY_IDX_DATA_PARALLEL]) {
+        // Third threshold: data-parallel with controlled size
+        result.node_strategy = NUMA_NODE_STRATEGY_DATA_PARALLEL;
+        result.on_node_strategy = NUMA_ON_NODE_STRATEGY_MULTI_THREAD;
     } else {
-        // Above both thresholds: use data-parallel strategy
+        // Above all thresholds: use data-parallel strategy (large)
         result.node_strategy = NUMA_NODE_STRATEGY_DATA_PARALLEL;
         result.on_node_strategy = NUMA_ON_NODE_STRATEGY_MULTI_THREAD;
     }

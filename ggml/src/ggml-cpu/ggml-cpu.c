@@ -1696,6 +1696,19 @@ static void ggml_compute_forward_mul_mat_id(
 
 /////////////////////////////////
 
+// NUMA Fallback NOOP function for performance testing
+static void ggml_compute_forward_numa_fallback_noop(
+    const struct ggml_compute_params * params,
+    struct ggml_tensor * dst) {
+    
+    GGML_UNUSED(params);
+    GGML_UNUSED(dst);
+    
+    // This is a NOOP function for performance testing
+    // It does nothing and returns immediately
+    return;
+}
+
 // Main compute function - made public for NUMA executor fallback
 void ggml_compute_forward(struct ggml_compute_params * params, struct ggml_tensor * tensor) {
     GGML_ASSERT(params);
@@ -2093,6 +2106,16 @@ void ggml_compute_forward(struct ggml_compute_params * params, struct ggml_tenso
             {
                 // nop
             } break;
+        case GGML_OP_NUMA_FALLBACK_NOOP:
+            {
+                ggml_compute_forward_numa_fallback_noop(params, tensor);
+            } break;
+        case GGML_OP_NUMA_NOOP:
+            {
+                // This should be handled by NUMA executor, but add fallback
+                // In case NUMA executor is disabled or fails
+                // Just do nothing (NOOP)
+            } break;
         case GGML_OP_COUNT:
             {
                 GGML_ABORT("fatal error");
@@ -2340,6 +2363,14 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
                 n_tasks = n_threads;
             } break;
         case GGML_OP_NONE:
+            {
+                n_tasks = 1;
+            } break;
+        case GGML_OP_NUMA_FALLBACK_NOOP:
+            {
+                n_tasks = 1;
+            } break;
+        case GGML_OP_NUMA_NOOP:
             {
                 n_tasks = 1;
             } break;
@@ -2829,6 +2860,14 @@ struct ggml_cplan ggml_graph_plan(
                 case GGML_OP_CROSS_ENTROPY_LOSS:
                     {
                         cur = ggml_type_size(node->type)*(n_tasks + node->src[0]->ne[0]*n_tasks);
+                    } break;
+                case GGML_OP_NUMA_FALLBACK_NOOP:
+                    {
+                        cur = 0; // NOOP requires no work buffer
+                    } break;
+                case GGML_OP_NUMA_NOOP:
+                    {
+                        cur = 0; // NOOP requires no work buffer
                     } break;
                 case GGML_OP_COUNT:
                     {

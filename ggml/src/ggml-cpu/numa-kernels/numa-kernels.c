@@ -18,6 +18,7 @@
 #include "mul.h"
 #include "mul_mat.h"
 #include "cpy.h"
+#include "noop.h"
 #include "../ggml-impl.h"
 
 // ============================================================================
@@ -234,6 +235,9 @@ enum ggml_status ggml_numa_kernels_init(void) {
 
     // Register MUL_MAT kernel
     NUMA_REGISTER_KERNEL(mul_mat);
+    
+    // Register NOOP kernel for performance testing
+    ggml_numa_register_noop_kernels();
     
     g_numa_kernels_initialized = true;
     

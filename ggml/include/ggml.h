@@ -544,6 +544,10 @@ extern "C" {
 
         GGML_OP_GLU,
 
+        // Testing operations for NUMA performance measurement
+        GGML_OP_NUMA_NOOP,          // NUMA kernel system NOOP for performance testing
+        GGML_OP_NUMA_FALLBACK_NOOP, // Fallback system NOOP for performance testing
+
         GGML_OP_COUNT,
     };
 
