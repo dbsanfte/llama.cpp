@@ -9,21 +9,290 @@
 
 #include "ggml-numa-executor.h"
 #include "ggml-numa-simple-coordinator.h"
-#include "ggml-numa-simple-coordinator.h"  // For fallback threadpool functions
 #include "ggml-cpu-impl.h"
-#include "ggml-impl.h"
-#include "ggml-cpu.h"  // For ggml_compute_forward_* function declarations and NUMA strategy functions
-#include "ops.h"       // For actual ggml_compute_forward_* declarations
+#include "ops.h"
+#include "binary-ops.h"  // For ggml_compute_forward_mul, sub, div
+#include "unary-ops.h"   // For unary operations
 #include "ggml-numa-perf.h"  // Performance instrumentation
 
 #ifdef __linux__
-#include <numa.h>
-#include <numaif.h>
+#define _GNU_SOURCE  // For sched_getcpu
 #include <sched.h>
 #endif
 
-#include <stdatomic.h>
-#include <stdbool.h>
+// Direct kernel dispatch implementation - calls compute functions directly without graph overhead
+enum ggml_status ggml_numa_executor_call_direct_kernel(struct ggml_tensor * tensor, struct ggml_compute_params * params) {
+    if (!tensor || !params) {
+        return GGML_STATUS_FAILED;
+    }
+    
+    GGML_LOG_DEBUG("Direct Kernel: Dispatching operation %s directly\n", ggml_op_name(tensor->op));
+    
+    // Direct kernel dispatch based on operation type - no temporary graph overhead
+    switch (tensor->op) {
+        case GGML_OP_DUP:
+            ggml_compute_forward_dup(params, tensor);
+            break;
+        case GGML_OP_ADD:
+            ggml_compute_forward_add(params, tensor);
+            break;
+        case GGML_OP_ADD1:
+            ggml_compute_forward_add1(params, tensor);
+            break;
+        case GGML_OP_ACC:
+            ggml_compute_forward_acc(params, tensor);
+            break;
+        case GGML_OP_SUB:
+            ggml_compute_forward_sub(params, tensor);
+            break;
+        case GGML_OP_MUL:
+            ggml_compute_forward_mul(params, tensor);
+            break;
+        case GGML_OP_DIV:
+            ggml_compute_forward_div(params, tensor);
+            break;
+        case GGML_OP_SQR:
+            ggml_compute_forward_sqr(params, tensor);
+            break;
+        case GGML_OP_SQRT:
+            ggml_compute_forward_sqrt(params, tensor);
+            break;
+        case GGML_OP_LOG:
+            ggml_compute_forward_log(params, tensor);
+            break;
+        case GGML_OP_SIN:
+            ggml_compute_forward_sin(params, tensor);
+            break;
+        case GGML_OP_COS:
+            ggml_compute_forward_cos(params, tensor);
+            break;
+        case GGML_OP_SUM:
+            ggml_compute_forward_sum(params, tensor);
+            break;
+        case GGML_OP_SUM_ROWS:
+            ggml_compute_forward_sum_rows(params, tensor);
+            break;
+        case GGML_OP_MEAN:
+            ggml_compute_forward_mean(params, tensor);
+            break;
+        case GGML_OP_ARGMAX:
+            ggml_compute_forward_argmax(params, tensor);
+            break;
+        case GGML_OP_COUNT_EQUAL:
+            ggml_compute_forward_count_equal(params, tensor);
+            break;
+        case GGML_OP_REPEAT:
+            ggml_compute_forward_repeat(params, tensor);
+            break;
+        case GGML_OP_REPEAT_BACK:
+            ggml_compute_forward_repeat_back(params, tensor);
+            break;
+        case GGML_OP_CONCAT:
+            ggml_compute_forward_concat(params, tensor);
+            break;
+        case GGML_OP_SILU_BACK:
+            ggml_compute_forward_silu_back(params, tensor);
+            break;
+        case GGML_OP_NORM:
+            ggml_compute_forward_norm(params, tensor);
+            break;
+        case GGML_OP_RMS_NORM:
+            ggml_compute_forward_rms_norm(params, tensor);
+            break;
+        case GGML_OP_RMS_NORM_BACK:
+            ggml_compute_forward_rms_norm_back(params, tensor);
+            break;
+        case GGML_OP_GROUP_NORM:
+            ggml_compute_forward_group_norm(params, tensor);
+            break;
+        case GGML_OP_L2_NORM:
+            ggml_compute_forward_l2_norm(params, tensor);
+            break;
+        case GGML_OP_OUT_PROD:
+            ggml_compute_forward_out_prod(params, tensor);
+            break;
+        case GGML_OP_SCALE:
+            ggml_compute_forward_scale(params, tensor);
+            break;
+        case GGML_OP_SET:
+            ggml_compute_forward_set(params, tensor);
+            break;
+        case GGML_OP_CPY:
+            ggml_compute_forward_cpy(params, tensor);
+            break;
+        case GGML_OP_CONT:
+            ggml_compute_forward_cont(params, tensor);
+            break;
+        case GGML_OP_RESHAPE:
+            ggml_compute_forward_reshape(params, tensor);
+            break;
+        case GGML_OP_VIEW:
+            ggml_compute_forward_view(params, tensor);
+            break;
+        case GGML_OP_PERMUTE:
+            ggml_compute_forward_permute(params, tensor);
+            break;
+        case GGML_OP_TRANSPOSE:
+            ggml_compute_forward_transpose(params, tensor);
+            break;
+        case GGML_OP_GET_ROWS:
+            ggml_compute_forward_get_rows(params, tensor);
+            break;
+        case GGML_OP_GET_ROWS_BACK:
+            ggml_compute_forward_get_rows_back(params, tensor);
+            break;
+        case GGML_OP_SET_ROWS:
+            ggml_compute_forward_set_rows(params, tensor);
+            break;
+        case GGML_OP_DIAG:
+            ggml_compute_forward_diag(params, tensor);
+            break;
+        case GGML_OP_DIAG_MASK_INF:
+            ggml_compute_forward_diag_mask_inf(params, tensor);
+            break;
+        case GGML_OP_DIAG_MASK_ZERO:
+            ggml_compute_forward_diag_mask_zero(params, tensor);
+            break;
+        case GGML_OP_SOFT_MAX:
+            ggml_compute_forward_soft_max(params, tensor);
+            break;
+        case GGML_OP_SOFT_MAX_BACK:
+            ggml_compute_forward_soft_max_ext_back(params, tensor);
+            break;
+        case GGML_OP_ROPE:
+            ggml_compute_forward_rope(params, tensor);
+            break;
+        case GGML_OP_ROPE_BACK:
+            ggml_compute_forward_rope_back(params, tensor);
+            break;
+        case GGML_OP_CLAMP:
+            ggml_compute_forward_clamp(params, tensor);
+            break;
+        case GGML_OP_CONV_TRANSPOSE_1D:
+            ggml_compute_forward_conv_transpose_1d(params, tensor);
+            break;
+        case GGML_OP_IM2COL:
+            ggml_compute_forward_im2col(params, tensor);
+            break;
+        case GGML_OP_IM2COL_BACK:
+            ggml_compute_forward_im2col_back_f32(params, tensor);
+            break;
+        case GGML_OP_CONV_2D:
+            ggml_compute_forward_conv_2d(params, tensor);
+            break;
+        case GGML_OP_CONV_2D_DW:
+            ggml_compute_forward_conv_2d_dw(params, tensor);
+            break;
+        case GGML_OP_CONV_TRANSPOSE_2D:
+            ggml_compute_forward_conv_transpose_2d(params, tensor);
+            break;
+        case GGML_OP_POOL_1D:
+            ggml_compute_forward_pool_1d(params, tensor);
+            break;
+        case GGML_OP_POOL_2D:
+            ggml_compute_forward_pool_2d(params, tensor);
+            break;
+        case GGML_OP_POOL_2D_BACK:
+            ggml_compute_forward_pool_2d_back(params, tensor);
+            break;
+        case GGML_OP_UPSCALE:
+            ggml_compute_forward_upscale(params, tensor);
+            break;
+        case GGML_OP_PAD:
+            ggml_compute_forward_pad(params, tensor);
+            break;
+        case GGML_OP_PAD_REFLECT_1D:
+            ggml_compute_forward_pad_reflect_1d(params, tensor);
+            break;
+        case GGML_OP_ROLL:
+            ggml_compute_forward_roll(params, tensor);
+            break;
+        case GGML_OP_ARANGE:
+            ggml_compute_forward_arange(params, tensor);
+            break;
+        case GGML_OP_TIMESTEP_EMBEDDING:
+            ggml_compute_forward_timestep_embedding(params, tensor);
+            break;
+        case GGML_OP_ARGSORT:
+            ggml_compute_forward_argsort(params, tensor);
+            break;
+        case GGML_OP_LEAKY_RELU:
+            ggml_compute_forward_leaky_relu(params, tensor);
+            break;
+        case GGML_OP_FLASH_ATTN_EXT:
+            ggml_compute_forward_flash_attn_ext(params, tensor->src[0], tensor->src[1], tensor->src[2], tensor->src[3], tensor);
+            break;
+        case GGML_OP_FLASH_ATTN_BACK:
+            ggml_compute_forward_flash_attn_back(params, false, tensor);
+            break;
+        case GGML_OP_SSM_CONV:
+            ggml_compute_forward_ssm_conv(params, tensor);
+            break;
+        case GGML_OP_SSM_SCAN:
+            ggml_compute_forward_ssm_scan(params, tensor);
+            break;
+        case GGML_OP_WIN_PART:
+            ggml_compute_forward_win_part(params, tensor);
+            break;
+        case GGML_OP_WIN_UNPART:
+            ggml_compute_forward_win_unpart(params, tensor);
+            break;
+        case GGML_OP_UNARY:
+            ggml_compute_forward_unary(params, tensor);
+            break;
+        case GGML_OP_GLU:
+            ggml_compute_forward_glu(params, tensor);
+            break;
+        case GGML_OP_GET_REL_POS:
+            ggml_compute_forward_get_rel_pos(params, tensor);
+            break;
+        case GGML_OP_ADD_REL_POS:
+            ggml_compute_forward_add_rel_pos(params, tensor);
+            break;
+        case GGML_OP_RWKV_WKV6:
+            ggml_compute_forward_rwkv_wkv6(params, tensor);
+            break;
+        case GGML_OP_RWKV_WKV7:
+            ggml_compute_forward_rwkv_wkv7(params, tensor);
+            break;
+        case GGML_OP_MAP_CUSTOM1:
+            ggml_compute_forward_map_custom1(params, tensor);
+            break;
+        case GGML_OP_MAP_CUSTOM2:
+            ggml_compute_forward_map_custom2(params, tensor);
+            break;
+        case GGML_OP_MAP_CUSTOM3:
+            ggml_compute_forward_map_custom3(params, tensor);
+            break;
+        case GGML_OP_CROSS_ENTROPY_LOSS:
+            ggml_compute_forward_cross_entropy_loss(params, tensor);
+            break;
+        case GGML_OP_CROSS_ENTROPY_LOSS_BACK:
+            ggml_compute_forward_cross_entropy_loss_back(params, tensor);
+            break;
+        case GGML_OP_OPT_STEP_ADAMW:
+            ggml_compute_forward_opt_step_adamw(params, tensor);
+            break;
+        case GGML_OP_MUL_MAT:
+            ggml_compute_forward_mul_mat(params, tensor);
+            break;
+        case GGML_OP_MUL_MAT_ID:
+            // For MUL_MAT_ID, fall back to legacy approach since it's complex
+            GGML_LOG_DEBUG("Direct Kernel: MUL_MAT_ID not supported in direct dispatch, falling back to legacy");
+            return GGML_STATUS_FAILED;
+            break;
+        case GGML_OP_NONE:
+            // No operation
+            break;
+        default:
+            GGML_LOG_ERROR("Direct Kernel: Unsupported operation %s (%d), falling back to legacy approach", 
+                          ggml_op_name(tensor->op), tensor->op);
+            return GGML_STATUS_FAILED;
+    }
+    
+    GGML_LOG_DEBUG("Direct Kernel: Operation %s completed successfully", ggml_op_name(tensor->op));
+    return GGML_STATUS_SUCCESS;
+}
 
 // Kernel headers - using the new query interface
 #include "numa-kernels/numa-kernels.h"  // New centralized query interface
@@ -144,9 +413,9 @@ enum ggml_status ggml_numa_executor_execute_tensor(struct ggml_tensor * tensor, 
            query_result.supported ? query_result.kernel_name : "N/A");
     
     if (!query_result.supported) {
-        GGML_LOG_DEBUG("NUMA Executor: Operation %s not supported by NUMA kernels, falling back to CPU\n", 
+        GGML_LOG_DEBUG("NUMA Executor: Operation %s not supported by NUMA kernels, using direct kernel dispatch\n", 
                       op_name);
-        enum ggml_status result = ggml_numa_executor_fallback_to_cpu(tensor, cplan);
+        enum ggml_status result = ggml_numa_executor_direct_kernel_dispatch(tensor, cplan);
         NUMA_PERF_END();
         return result;
     }
@@ -176,9 +445,9 @@ enum ggml_status ggml_numa_executor_execute_tensor(struct ggml_tensor * tensor, 
         
         if (!ggml_numa_simple_coordinator_init(&tpp)) {
             NUMA_PERF_END();
-            GGML_LOG_DEBUG("NUMA Executor: Failed to initialize simple coordinator, falling back to CPU for %s\n", 
+            GGML_LOG_DEBUG("NUMA Executor: Failed to initialize simple coordinator, using direct kernel dispatch for %s\n", 
                            op_name);
-            enum ggml_status result = ggml_numa_executor_fallback_to_cpu(tensor, cplan);
+            enum ggml_status result = ggml_numa_executor_direct_kernel_dispatch(tensor, cplan);
             NUMA_PERF_END();
             return result;
         }
@@ -353,7 +622,8 @@ static size_t ggml_numa_calculate_work_size(struct ggml_tensor * tensor, int n_t
     return work_size;
 }
 
-enum ggml_status ggml_numa_executor_fallback_to_cpu(struct ggml_tensor * tensor, struct ggml_cplan * cplan) {
+// Direct kernel dispatch function - eliminates temporary graph overhead
+enum ggml_status ggml_numa_executor_direct_kernel_dispatch(struct ggml_tensor * tensor, struct ggml_cplan * cplan) {
     if (!tensor || !cplan) {
         return GGML_STATUS_FAILED;
     }
@@ -361,9 +631,9 @@ enum ggml_status ggml_numa_executor_fallback_to_cpu(struct ggml_tensor * tensor,
     const char* op_name = ggml_op_name(tensor->op);
     size_t tensor_size = ggml_nbytes(tensor);
     
-    NUMA_PERF_START(NUMA_PERF_EXECUTOR_FALLBACK, op_name, "cpu_fallback", -1, tensor_size, cplan->n_threads);
+    NUMA_PERF_START(NUMA_PERF_EXECUTOR_FALLBACK, op_name, "direct_kernel_dispatch", -1, tensor_size, cplan->n_threads);
     
-    GGML_LOG_DEBUG("NUMA Fallback: Starting fallback for operation %s\n", op_name);
+    GGML_LOG_DEBUG("NUMA Direct Kernel Dispatch: Starting for operation %s\n", op_name);
     
     // Set flag to disable NUMA dispatch during this call (prevents infinite recursion)
     ggml_numa_set_fallback_flag(true);
@@ -376,15 +646,105 @@ enum ggml_status ggml_numa_executor_fallback_to_cpu(struct ggml_tensor * tensor,
     // Check if existing work buffer is sufficient
     if (cplan->work_data && cplan->work_size >= needed_work_size) {
         work_data = cplan->work_data;
-        GGML_LOG_DEBUG("NUMA Fallback: Using existing work buffer (%zu bytes >= %zu needed)\n", 
+        GGML_LOG_DEBUG("NUMA Direct Kernel: Using existing work buffer (%zu bytes >= %zu needed)\n", 
                        cplan->work_size, needed_work_size);
     } else if (needed_work_size > 0) {
         // Use persistent fallback work buffer from coordinator (auto-growing)
         work_data = ggml_numa_simple_coordinator_get_fallback_work_buffer(needed_work_size);
         if (work_data) {
-            GGML_LOG_DEBUG("NUMA Fallback: Using persistent work buffer (%zu bytes, grew if needed)\n", needed_work_size);
+            GGML_LOG_DEBUG("NUMA Direct Kernel: Using persistent work buffer (%zu bytes, grew if needed)\n", needed_work_size);
         } else {
-            GGML_LOG_ERROR("NUMA Fallback: Failed to get persistent work buffer (%zu bytes)\n", needed_work_size);
+            GGML_LOG_ERROR("NUMA Direct Kernel: Failed to get persistent work buffer (%zu bytes)\n", needed_work_size);
+            ggml_numa_set_fallback_flag(false);
+            return GGML_STATUS_FAILED;
+        }
+    }
+
+    // Get fallback threadpool for optimal thread binding
+    struct ggml_threadpool * fallback_threadpool = NULL;
+    int fallback_thread_count = cplan->n_threads; // Default to original plan's thread count
+    
+    // Try to get the dedicated fallback threadpool from coordinator
+    fallback_threadpool = ggml_numa_simple_coordinator_get_fallback_threadpool();
+    if (fallback_threadpool) {
+        // Use the fallback threadpool's actual thread count for optimal NUMA binding
+        fallback_thread_count = ggml_numa_simple_coordinator_get_fallback_thread_count();
+        
+        GGML_LOG_DEBUG("🚀 Using dedicated fallback threadpool: %p (bound to NUMA node 0)\n", (void*)fallback_threadpool);
+        GGML_LOG_DEBUG("📊 Direct Kernel Execution: threads=%d (fallback capacity), threadpool=%p\n", 
+                       fallback_thread_count, (void*)fallback_threadpool);
+    } else if (cplan->threadpool) {
+        fallback_threadpool = cplan->threadpool;
+        GGML_LOG_DEBUG("NUMA Direct Kernel: Using existing threadpool with %d thread(s)\n", fallback_thread_count);
+    } else {
+        GGML_LOG_DEBUG("NUMA Direct Kernel: No threadpool available, using single-threaded execution\n");
+        fallback_thread_count = 1;
+    }
+    
+    // Set up compute params for direct kernel execution - simplified for single threaded
+    struct ggml_compute_params params = {
+        .ith = 0,
+        .nth = 1,  // Single-threaded direct execution
+        .wsize = needed_work_size,
+        .wdata = work_data,
+        .threadpool = NULL  // No threadpool needed for direct execution
+    };
+    
+    GGML_LOG_INFO("🚀 NUMA Direct Kernel Dispatch: Executing operation %s (work_size=%zu, single-threaded)\n", 
+                   ggml_op_name(tensor->op), needed_work_size);
+    
+    // OPTIMIZATION: Direct kernel dispatch - call the operation's compute function directly
+    // This eliminates temporary graph creation, temporary compute plan creation, and graph computation pipeline overhead
+    enum ggml_status result = ggml_numa_executor_call_direct_kernel(tensor, &params);
+    
+    // Clear flag after computation
+    ggml_numa_set_fallback_flag(false);
+    
+    // Check result
+    if (result != GGML_STATUS_SUCCESS) {
+        GGML_LOG_ERROR("NUMA Direct Kernel Dispatch: Kernel execution failed with status %d\n", result);
+        NUMA_PERF_END();
+        return GGML_STATUS_FAILED;
+    }
+
+    GGML_LOG_DEBUG("NUMA Direct Kernel Dispatch: Operation %s completed successfully\n", op_name);
+    NUMA_PERF_END();
+    return GGML_STATUS_SUCCESS;
+}
+
+// Legacy fallback function - kept for compatibility but should be replaced by direct kernel dispatch
+enum ggml_status ggml_numa_executor_fallback_to_cpu(struct ggml_tensor * tensor, struct ggml_cplan * cplan) {
+    if (!tensor || !cplan) {
+        return GGML_STATUS_FAILED;
+    }
+    
+    const char* op_name = ggml_op_name(tensor->op);
+    size_t tensor_size = ggml_nbytes(tensor);
+    
+    NUMA_PERF_START(NUMA_PERF_EXECUTOR_FALLBACK, op_name, "cpu_fallback_legacy", -1, tensor_size, cplan->n_threads);
+    
+    GGML_LOG_DEBUG("NUMA Fallback (Legacy): Starting fallback for operation %s\n", op_name);
+    
+    // Set flag to disable NUMA dispatch during this call (prevents infinite recursion)
+    ggml_numa_set_fallback_flag(true);
+    
+    // Calculate work buffer size needed for this specific operation
+    size_t needed_work_size = ggml_numa_calculate_work_size(tensor, cplan->n_threads);
+    
+    void * work_data = NULL;
+    
+    // Check if existing work buffer is sufficient
+    if (cplan->work_data && cplan->work_size >= needed_work_size) {
+        work_data = cplan->work_data;
+        GGML_LOG_DEBUG("NUMA Fallback (Legacy): Using existing work buffer (%zu bytes >= %zu needed)\n", 
+                       cplan->work_size, needed_work_size);
+    } else if (needed_work_size > 0) {
+        // Use persistent fallback work buffer from coordinator (auto-growing)
+        work_data = ggml_numa_simple_coordinator_get_fallback_work_buffer(needed_work_size);
+        if (work_data) {
+            GGML_LOG_DEBUG("NUMA Fallback (Legacy): Using persistent work buffer (%zu bytes, grew if needed)\n", needed_work_size);
+        } else {
+            GGML_LOG_ERROR("NUMA Fallback (Legacy): Failed to get persistent work buffer (%zu bytes)\n", needed_work_size);
             ggml_numa_set_fallback_flag(false);
             return GGML_STATUS_FAILED;
         }
@@ -402,13 +762,13 @@ enum ggml_status ggml_numa_executor_fallback_to_cpu(struct ggml_tensor * tensor,
         fallback_thread_count = ggml_numa_simple_coordinator_get_fallback_thread_count();
         
         GGML_LOG_DEBUG("🔧 Using dedicated fallback threadpool: %p (bound to NUMA node 0)\n", (void*)fallback_threadpool);
-        GGML_LOG_DEBUG("📊 Fallback Execution: threads=%d (fallback capacity), threadpool=%p (disposable=false)\n", 
+        GGML_LOG_DEBUG("📊 Fallback Execution (Legacy): threads=%d (fallback capacity), threadpool=%p (disposable=false)\n", 
                        fallback_thread_count, (void*)fallback_threadpool);
     } else if (cplan->threadpool) {
         fallback_threadpool = cplan->threadpool;
-        GGML_LOG_DEBUG("NUMA Fallback: Using existing threadpool with %d thread(s)\n", fallback_thread_count);
+        GGML_LOG_DEBUG("NUMA Fallback (Legacy): Using existing threadpool with %d thread(s)\n", fallback_thread_count);
     } else {
-        GGML_LOG_DEBUG("NUMA Fallback: No threadpool available, using single-threaded execution\n");
+        GGML_LOG_DEBUG("NUMA Fallback (Legacy): No threadpool available, using single-threaded execution\n");
         fallback_thread_count = 1;
     }
     
@@ -421,10 +781,10 @@ enum ggml_status ggml_numa_executor_fallback_to_cpu(struct ggml_tensor * tensor,
         .threadpool = fallback_threadpool  // Use dedicated fallback threadpool
     };
     
-    GGML_LOG_INFO("🔧 NUMA Fallback: Executing operation %s (work_size=%zu, fallback_threads=%d, params.nth=%d, threadpool=%p)\n", 
+    GGML_LOG_INFO("🔧 NUMA Fallback (Legacy): Executing operation %s (work_size=%zu, fallback_threads=%d, params.nth=%d, threadpool=%p)\n", 
                    ggml_op_name(tensor->op), needed_work_size, fallback_thread_count, params.nth, (void*)fallback_threadpool);
     
-    // CRITICAL FIX: Use ggml_graph_compute instead of ggml_compute_forward to properly activate all worker threads
+    // LEGACY APPROACH: Use ggml_graph_compute with temporary graph (high overhead)
     // Create a temporary single-node graph for this operation
     struct ggml_cgraph temp_graph = {0};
     temp_graph.nodes = &tensor;

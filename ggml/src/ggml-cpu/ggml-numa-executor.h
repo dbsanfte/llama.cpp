@@ -10,6 +10,7 @@
 #include "ggml.h"
 #include "../ggml-impl.h"
 #include "ggml-cpu.h"  // For complete ggml_cplan definition
+#include "ggml-cpu-impl.h"  // For ggml_compute_params definition
 
 #ifdef __cplusplus
 extern "C" {
@@ -67,8 +68,30 @@ enum ggml_status ggml_numa_executor_execute_tensor(
 enum ggml_status ggml_numa_executor_execute_graph(struct ggml_cgraph * cgraph, struct ggml_cplan * cplan);
 
 /**
- * Fallback to standard CPU implementation for unsupported operations
- * This calls ggml-cpu.c functions directly to avoid infinite recursion
+ * Direct kernel dispatch for maximum performance - OPTIMIZED VERSION
+ * Calls compute functions directly without temporary graph creation overhead
+ * This eliminates the performance bottlenecks in the fallback system
+ * 
+ * @param tensor The operation tensor
+ * @param cplan The compute plan
+ * @return GGML_STATUS_SUCCESS on success, error code on failure
+ */
+enum ggml_status ggml_numa_executor_direct_kernel_dispatch(struct ggml_tensor * tensor, struct ggml_cplan * cplan);
+
+/**
+ * Call the direct kernel compute function for a given tensor operation
+ * Internal helper function for direct kernel dispatch
+ * 
+ * @param tensor The operation tensor
+ * @param params The compute parameters
+ * @return GGML_STATUS_SUCCESS on success, error code on failure
+ */
+enum ggml_status ggml_numa_executor_call_direct_kernel(struct ggml_tensor * tensor, struct ggml_compute_params * params);
+
+/**
+ * Fallback to standard CPU implementation for unsupported operations - LEGACY VERSION
+ * This calls ggml-cpu.c functions via temporary graph (high overhead)
+ * Should be replaced by direct kernel dispatch for better performance
  * 
  * @param tensor The operation tensor
  * @param cplan The compute plan

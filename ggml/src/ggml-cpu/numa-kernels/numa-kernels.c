@@ -225,16 +225,16 @@ enum ggml_status ggml_numa_kernels_init(void) {
     // This allows kernels to define their own strategies and function pointers
     
     // Register ADD kernel
-    NUMA_REGISTER_KERNEL(add);
+    //NUMA_REGISTER_KERNEL(add);
     
     // Register MUL kernel
-    NUMA_REGISTER_KERNEL(mul);
+    //NUMA_REGISTER_KERNEL(mul);
 
     // Register CPY kernel - DISABLED due to memory corruption issues
     // NUMA_REGISTER_KERNEL(cpy);
 
     // Register MUL_MAT kernel
-    NUMA_REGISTER_KERNEL(mul_mat);
+    //NUMA_REGISTER_KERNEL(mul_mat);
     
     // Register NOOP kernel for performance testing
     ggml_numa_register_noop_kernels();
