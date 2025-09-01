@@ -373,16 +373,41 @@ static void* numa_dispatch_worker(void* arg) {
             NUMA_LOG_DEBUG("NUMA Node %d executing kernel via THREADPOOL with %d threads", 
                           numa_node, g_simple_coordinator.threads_per_node[numa_node]);
             
-            // Use threadpool execution to utilize all threads per node
-            // Create a single-node computation graph for this work
-            struct ggml_context * temp_ctx = NULL;
-            struct ggml_cgraph * temp_graph = NULL;
+            // For data-parallel execution, call the NUMA kernel directly to avoid
+            // race conditions from running ggml_graph_compute on multiple nodes simultaneously
             struct ggml_tensor * tensor = (struct ggml_tensor *)g_simple_coordinator.active_work_context;
             
-            if (tensor) {
+            if (tensor && ggml_numa_is_data_parallel_execution) {
+                // Direct NUMA kernel execution for data-parallel operations
+                NUMA_LOG_DEBUG("NUMA Node %d: Direct kernel execution for data-parallel operation", numa_node);
+                
+                // Create compute params for the kernel
+                struct ggml_compute_params compute_params = {
+                    .ith = 0,  // Use thread 0 for each NUMA node (coordinator pattern)
+                    .nth = 1,  // Single thread per node for data-parallel operations
+                    .wdata = work_params.wdata,
+                    .wsize = work_params.wsize
+                };
+                
+                // Call the NUMA work function directly
+                result = g_simple_coordinator.active_work_function(
+                    g_simple_coordinator.active_work_context, 
+                    &compute_params
+                );
+                
+                NUMA_LOG_DEBUG("NUMA Node %d: Direct kernel execution completed with status %d", numa_node, result);
+                
+            } else if (tensor) {
+                // Use threadpool execution for single-node operations
+                // Create a single-node computation graph for this work
+                struct ggml_context * temp_ctx = NULL;
+                struct ggml_cgraph * temp_graph = NULL;
+                
                 // Create temporary context for graph execution
+                // Need sufficient space for graph metadata + nodes + hash tables
+                // Default graph size (2048) needs ~80KB + overhead = 128KB for safety
                 struct ggml_init_params init_params = {
-                    .mem_size = 1024,  // Small buffer for graph metadata
+                    .mem_size = 128 * 1024,  // 128KB buffer for graph metadata and nodes
                     .mem_buffer = NULL,
                     .no_alloc = true   // Don't allocate tensor data
                 };
@@ -419,8 +444,8 @@ static void* numa_dispatch_worker(void* arg) {
                     ggml_free(temp_ctx);
                 }
             } else {
-                NUMA_LOG_DEBUG("NUMA Node %d: No tensor context, using direct kernel execution", numa_node);
-                // Direct kernel execution for non-tensor work
+                NUMA_LOG_DEBUG("NUMA Node %d: No tensor context, falling back to direct function call", numa_node);
+                // Fallback for non-tensor operations
                 result = g_simple_coordinator.active_work_function(
                     g_simple_coordinator.active_work_context, 
                     &work_params
