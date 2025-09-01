@@ -238,8 +238,9 @@ enum ggml_status ggml_numa_kernels_init(void) {
     // Register CPY kernel - DISABLED due to memory corruption issues
     //NUMA_REGISTER_KERNEL(cpy);
 
+    // Enable MUL_MAT kernel for matrix multiplication
     // Register MUL_MAT kernel
-    //NUMA_REGISTER_KERNEL(mul_mat);
+    NUMA_REGISTER_KERNEL(mul_mat);
     
     // Register RMS_NORM kernel
     //ggml_numa_register_rms_norm_kernels();
