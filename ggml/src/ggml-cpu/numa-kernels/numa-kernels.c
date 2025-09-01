@@ -21,6 +21,7 @@
 #include "rms_norm.h"
 #include "rope.h"
 #include "permute.h"
+#include "glu.h"
 #include "noop.h"
 #include "../ggml-impl.h"
 
@@ -255,6 +256,9 @@ enum ggml_status ggml_numa_kernels_init(void) {
     // Register PERMUTE kernel for tensor dimension permutation
     NUMA_REGISTER_KERNEL(permute);
     
+    // Register GLU kernel for gated linear unit operations
+    NUMA_REGISTER_KERNEL(glu);
+    
     // Register NOOP kernel for performance testing
     //ggml_numa_register_noop_kernels();
     
@@ -416,6 +420,9 @@ ggml_numa_kernel_query_result_t ggml_numa_kernels_query(const struct ggml_tensor
             
         case GGML_OP_PERMUTE:
             return ggml_numa_kernel_permute_query(tensor);
+            
+        case GGML_OP_GLU:
+            return ggml_numa_kernel_glu_query(tensor);
             
         default:
             // Operation not supported by NUMA kernels

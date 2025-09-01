@@ -51,6 +51,8 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
         ggml-cpu/numa-kernels/rope.h
         ggml-cpu/numa-kernels/permute.c
         ggml-cpu/numa-kernels/permute.h
+        ggml-cpu/numa-kernels/glu.c
+        ggml-cpu/numa-kernels/glu.h
         ggml-cpu/numa-kernels/noop.c
         ggml-cpu/numa-kernels/noop.h
         ggml-work-item.c
