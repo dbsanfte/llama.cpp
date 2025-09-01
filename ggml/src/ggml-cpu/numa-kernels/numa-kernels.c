@@ -18,6 +18,7 @@
 #include "mul.h"
 #include "mul_mat.h"
 #include "cpy.h"
+#include "rms_norm.h"
 #include "noop.h"
 #include "../ggml-impl.h"
 
@@ -236,6 +237,9 @@ enum ggml_status ggml_numa_kernels_init(void) {
     // Register MUL_MAT kernel
     NUMA_REGISTER_KERNEL(mul_mat);
     
+    // Register RMS_NORM kernel
+    ggml_numa_register_rms_norm_kernels();
+    
     // Register NOOP kernel for performance testing
     ggml_numa_register_noop_kernels();
     
@@ -391,6 +395,9 @@ ggml_numa_kernel_query_result_t ggml_numa_kernels_query(const struct ggml_tensor
             
         case GGML_OP_MUL_MAT:
             return ggml_numa_kernel_mul_mat_query(tensor);
+            
+        case GGML_OP_RMS_NORM:
+            return ggml_numa_kernel_rms_norm_query(tensor);
             
         default:
             // Operation not supported by NUMA kernels

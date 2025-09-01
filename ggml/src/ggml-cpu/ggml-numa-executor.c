@@ -681,17 +681,19 @@ enum ggml_status ggml_numa_executor_direct_kernel_dispatch(struct ggml_tensor * 
         fallback_thread_count = 1;
     }
     
-    // Set up compute params for direct kernel execution - simplified for single threaded
+    // Set up compute params for direct kernel execution - use full threadpool capacity
     struct ggml_compute_params params = {
         .ith = 0,
-        .nth = 1,  // Single-threaded direct execution
+        //.nth = fallback_thread_count,  // Use full threadpool capacity
+        .nth = 1, // TODO: Single-threaded for now, multithreaded has issues
         .wsize = needed_work_size,
         .wdata = work_data,
-        .threadpool = NULL  // No threadpool needed for direct execution
+        .threadpool = NULL // TODO: Use temporary threadpool for now
+        //.threadpool = fallback_threadpool  // Use the fallback threadpool for optimal NUMA binding
     };
     
-    GGML_LOG_INFO("🚀 NUMA Direct Kernel Dispatch: Executing operation %s (work_size=%zu, single-threaded)\n", 
-                   ggml_op_name(tensor->op), needed_work_size);
+    GGML_LOG_INFO("🚀 NUMA Direct Kernel Dispatch: Executing operation %s (work_size=%zu, threads=%d, threadpool=%p)\n", 
+                   ggml_op_name(tensor->op), needed_work_size, fallback_thread_count, (void*)fallback_threadpool);
     
     // OPTIMIZATION: Direct kernel dispatch - call the operation's compute function directly
     // This eliminates temporary graph creation, temporary compute plan creation, and graph computation pipeline overhead
