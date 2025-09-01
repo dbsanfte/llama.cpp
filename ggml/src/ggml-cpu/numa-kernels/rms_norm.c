@@ -382,6 +382,13 @@ ggml_numa_kernel_query_result_t ggml_numa_kernel_rms_norm_query(const struct ggm
         return result;
     }
     
+    // Check if this kernel is actually registered and supported
+    if (!ggml_numa_is_kernel_supported(GGML_OP_RMS_NORM)) {
+        NUMA_LOG_DEBUG("RMS_NORM kernel not supported - registration disabled");
+        result.supported = false;
+        return result;
+    }
+    
     // Calculate tensor characteristics
     const int64_t ne00 = src0->ne[0];  // Row size
     const int64_t total_rows = src0->ne[1] * src0->ne[2] * src0->ne[3];
@@ -462,7 +469,7 @@ void ggml_numa_register_rms_norm_kernels(void) {
     
     // Register with the NUMA kernel registry
     ggml_numa_register_kernel_strategy(info.op_type, &info.strategy_array, 
-                                       &info.work_funcs, &info.agg_funcs);
+                                       &info.work_funcs, &info.agg_funcs, info.supported);
     
     NUMA_LOG_DEBUG("Registered RMS_NORM NUMA kernel with thresholds [%zu, %zu]", 
                    info.strategy_array.thresholds[0], info.strategy_array.thresholds[1]);

@@ -173,6 +173,13 @@ ggml_numa_kernel_query_result_t ggml_numa_kernel_glu_query(const struct ggml_ten
     const int nr = ggml_nrows(tensor->src[0]);
     const size_t total_elements = (size_t)nc * nr;
     
+    // Check if this kernel is actually registered and supported
+    if (!ggml_numa_is_kernel_supported(GGML_OP_GLU)) {
+        NUMA_LOG_DEBUG("GLU kernel not supported - registration disabled");
+        result.supported = false;
+        return result;
+    }
+    
     // GLU operations are memory-bound with moderate computational cost
     // Strategy selection based on element count thresholds
     

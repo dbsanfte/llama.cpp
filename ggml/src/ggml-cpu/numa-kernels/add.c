@@ -808,6 +808,13 @@ ggml_numa_kernel_query_result_t ggml_numa_kernel_add_query(const struct ggml_ten
         }
     }
     
+    // Check if this kernel is actually registered and supported
+    if (!ggml_numa_is_kernel_supported(GGML_OP_ADD)) {
+        NUMA_LOG_DEBUG("ADD kernel not supported - registration disabled");
+        result.supported = false;
+        return result;
+    }
+    
     // Build successful query result
     result.supported = true;
     result.strategy = selected_strategy->strategy;

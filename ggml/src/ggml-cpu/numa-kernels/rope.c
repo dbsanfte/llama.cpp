@@ -446,6 +446,13 @@ ggml_numa_kernel_query_result_t ggml_numa_kernel_rope_query(const struct ggml_te
     const int64_t ne2 = tensor->src[0]->ne[2];  // batch size
     const size_t total_elements = (size_t)ne0 * ne1 * ne2;
     
+    // Check if this kernel is actually registered and supported
+    if (!ggml_numa_is_kernel_supported(GGML_OP_ROPE)) {
+        NUMA_LOG_DEBUG("ROPE kernel not supported - registration disabled");
+        result.supported = false;
+        return result;
+    }
+    
     // ROPE operations are compute-intensive with trigonometric calculations
     // Strategy selection based on element count thresholds
     

@@ -34,6 +34,7 @@ typedef struct {
     ggml_numa_kernel_strategy_array_t strategy_array;           // Strategy thresholds for fast lookup
     ggml_numa_kernel_work_funcs_t work_funcs;                   // Work function pointers
     ggml_numa_kernel_aggregation_funcs_t agg_funcs;             // Aggregation function pointers (optional)
+    bool supported;                                              // Whether kernel is enabled/supported
 } ggml_numa_kernel_cache_entry_t;
 
 /**
@@ -61,7 +62,8 @@ enum ggml_status ggml_numa_register_kernel_strategy(
     enum ggml_op op_type, 
     const ggml_numa_kernel_strategy_array_t * strategy_array,
     const ggml_numa_kernel_work_funcs_t * work_funcs,
-    const ggml_numa_kernel_aggregation_funcs_t * agg_funcs);
+    const ggml_numa_kernel_aggregation_funcs_t * agg_funcs,
+    bool supported);
 
 /**
  * Initialize the global kernel array cache (called once at startup)
@@ -73,6 +75,12 @@ enum ggml_status ggml_numa_init_kernel_array_cache(void);
  * Returns complete kernel information or NULL if unsupported
  */
 const ggml_numa_kernel_cache_entry_t * ggml_numa_lookup_kernel_direct(enum ggml_op op_type);
+
+/**
+ * Check if a kernel is registered and supported
+ * Returns true if the kernel is available for use, false otherwise
+ */
+bool ggml_numa_is_kernel_supported(enum ggml_op op_type);
 
 /**
  * Array-based strategy lookup - direct access using operation type as index
@@ -236,17 +244,19 @@ bool ggml_numa_apply_kernel_force_strategy(ggml_numa_kernel_query_result_t * res
  */
 #define NUMA_REGISTER_KERNEL(kname) do { \
     ggml_numa_kernel_registration_info_t kname##_info = ggml_numa_kernel_##kname##_register(); \
+    enum ggml_status kname##_result = ggml_numa_register_kernel_strategy( \
+        kname##_info.op_type, &kname##_info.strategy_array, \
+        &kname##_info.work_funcs, &kname##_info.agg_funcs, kname##_info.supported); \
+    if (kname##_result != GGML_STATUS_SUCCESS) { \
+        NUMA_LOG_ERROR("Failed to register " #kname " kernel strategy"); \
+        return kname##_result; \
+    } \
     if (kname##_info.supported) { \
-        enum ggml_status kname##_result = ggml_numa_register_kernel_strategy( \
-            kname##_info.op_type, &kname##_info.strategy_array, \
-            &kname##_info.work_funcs, &kname##_info.agg_funcs); \
-        if (kname##_result != GGML_STATUS_SUCCESS) { \
-            NUMA_LOG_ERROR("Failed to register " #kname " kernel strategy"); \
-            return kname##_result; \
-        } \
         NUMA_LOG_DEBUG("✅ Registered %s (thresholds: %zu/%zu)", kname##_info.kernel_name, \
                       kname##_info.strategy_array.thresholds[NUMA_STRATEGY_IDX_SINGLE_SINGLE], \
                       kname##_info.strategy_array.thresholds[NUMA_STRATEGY_IDX_SINGLE_MULTI]); \
+    } else { \
+        NUMA_LOG_DEBUG("🚫 Disabled %s (marked as unsupported)", kname##_info.kernel_name); \
     } \
 } while(0)
 

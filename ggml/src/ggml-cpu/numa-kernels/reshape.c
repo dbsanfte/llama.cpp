@@ -108,6 +108,13 @@ ggml_numa_kernel_query_result_t ggml_numa_kernel_reshape_query(const struct ggml
     // Calculate total elements for strategy selection
     const size_t total_elements = ggml_nelements(tensor);
     
+    // Check if this kernel is actually registered and supported
+    if (!ggml_numa_is_kernel_supported(GGML_OP_RESHAPE)) {
+        NUMA_LOG_DEBUG("RESHAPE kernel not supported - registration disabled");
+        result.supported = false;
+        return result;
+    }
+    
     // RESHAPE is always supported regardless of tensor configuration
     result.supported = true;
     result.work_buffer_size_per_thread = 0; // No work buffer needed

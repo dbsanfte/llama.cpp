@@ -819,6 +819,13 @@ ggml_numa_kernel_query_result_t ggml_numa_kernel_mul_mat_query(const struct ggml
     // The NUMA kernel handles Q8_0 × F32, Q4_0 × F32, etc. operations efficiently
     NUMA_LOG_DEBUG("MUL_MAT query: ACCEPTING - src0_type=%d, src1_type=%d", src0->type, src1->type);
     
+    // Check if this kernel is actually registered and supported
+    if (!ggml_numa_is_kernel_supported(GGML_OP_MUL_MAT)) {
+        NUMA_LOG_DEBUG("MUL_MAT kernel not supported - registration disabled");
+        result.supported = false;
+        return result;
+    }
+    
     // Calculate total elements in result tensor
     const size_t total_elements = ggml_nelements(tensor);
     

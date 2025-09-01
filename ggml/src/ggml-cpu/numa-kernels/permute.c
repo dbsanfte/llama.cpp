@@ -190,6 +190,13 @@ ggml_numa_kernel_query_result_t ggml_numa_kernel_permute_query(const struct ggml
     // Calculate total number of elements
     const int64_t total_elements = ggml_nelements(tensor);
     
+    // Check if this kernel is actually registered and supported
+    if (!ggml_numa_is_kernel_supported(GGML_OP_PERMUTE)) {
+        NUMA_LOG_DEBUG("PERMUTE kernel not supported - registration disabled");
+        result.supported = false;
+        return result;
+    }
+    
     // Define thresholds for different strategies
     const int64_t single_thread_threshold = 1024;      // 1K elements
     const int64_t multi_thread_threshold = 262144;     // 256K elements

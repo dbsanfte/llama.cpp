@@ -63,7 +63,8 @@ enum ggml_status ggml_numa_register_kernel_strategy(
     enum ggml_op op_type, 
     const ggml_numa_kernel_strategy_array_t * strategy_array,
     const ggml_numa_kernel_work_funcs_t * work_funcs,
-    const ggml_numa_kernel_aggregation_funcs_t * agg_funcs) {    if (!g_kernel_array_cache.cache_initialized) {
+    const ggml_numa_kernel_aggregation_funcs_t * agg_funcs,
+    bool supported) {    if (!g_kernel_array_cache.cache_initialized) {
         enum ggml_status init_result = ggml_numa_init_kernel_array_cache();
         if (init_result != GGML_STATUS_SUCCESS) {
             return init_result;
@@ -85,6 +86,7 @@ enum ggml_status ggml_numa_register_kernel_strategy(
     // Store in Array 1: Main cache storage
     ggml_numa_kernel_cache_entry_t * entry = &g_kernel_array_cache.cache_storage[op_type];
     entry->op_type = op_type;
+    entry->supported = supported;  // Store the supported flag
     
     if (strategy_array && strategy_array->valid) {
         entry->strategy_array = *strategy_array;
@@ -105,12 +107,34 @@ enum ggml_status ggml_numa_register_kernel_strategy(
     }
     
     // Set Array 2: Fast lookup pointer (this is what we query in inference!)
-    g_kernel_array_cache.lookup_table[op_type] = entry;
+    // Only set lookup pointer if kernel is supported
+    if (supported) {
+        g_kernel_array_cache.lookup_table[op_type] = entry;
+    } else {
+        g_kernel_array_cache.lookup_table[op_type] = NULL;  // Disabled kernel
+        NUMA_LOG_DEBUG("🚫 Kernel for operation %d is disabled", (int)op_type);
+    }
     
     g_kernel_array_cache.num_registered_ops++;
     
     NUMA_LOG_DEBUG("✅ Registered kernel strategy for operation %d (direct array access)", (int)op_type);
     return GGML_STATUS_SUCCESS;
+}
+
+/**
+ * Check if a kernel is registered and supported
+ */
+bool ggml_numa_is_kernel_supported(enum ggml_op op_type) {
+    if (!g_kernel_array_cache.cache_initialized) {
+        return false;
+    }
+    
+    if (op_type >= GGML_OP_COUNT) {
+        return false;
+    }
+    
+    // Check if there's a valid lookup entry (only set for supported kernels)
+    return g_kernel_array_cache.lookup_table[op_type] != NULL;
 }
 
 /**

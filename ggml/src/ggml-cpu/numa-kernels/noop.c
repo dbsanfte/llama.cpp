@@ -184,7 +184,7 @@ void ggml_numa_register_noop_kernels(void) {
     
     // Register with direct array cache system
     ggml_numa_register_kernel_strategy(info.op_type, &info.strategy_array, 
-                                       &info.work_funcs, &info.agg_funcs);
+                                       &info.work_funcs, &info.agg_funcs, info.supported);
     
     NUMA_LOG_DEBUG("✅ Registered NUMA NOOP Kernel (for performance testing)");
 }
