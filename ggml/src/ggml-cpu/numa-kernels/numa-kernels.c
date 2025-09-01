@@ -225,23 +225,26 @@ enum ggml_status ggml_numa_kernels_init(void) {
     // Register each kernel using their own registration functions
     // This allows kernels to define their own strategies and function pointers
     
+    // TEMPORARILY DISABLED: All NUMA kernel registrations disabled to fix threading model
+    // We need to fix coordinator threading before re-enabling kernels
+    
     // Register ADD kernel
-    NUMA_REGISTER_KERNEL(add);
+    //NUMA_REGISTER_KERNEL(add);
     
     // Register MUL kernel
-    NUMA_REGISTER_KERNEL(mul);
+    //NUMA_REGISTER_KERNEL(mul);
 
     // Register CPY kernel - DISABLED due to memory corruption issues
     //NUMA_REGISTER_KERNEL(cpy);
 
     // Register MUL_MAT kernel
-    NUMA_REGISTER_KERNEL(mul_mat);
+    //NUMA_REGISTER_KERNEL(mul_mat);
     
     // Register RMS_NORM kernel
-    ggml_numa_register_rms_norm_kernels();
+    //ggml_numa_register_rms_norm_kernels();
     
     // Register NOOP kernel for performance testing
-    ggml_numa_register_noop_kernels();
+    //ggml_numa_register_noop_kernels();
     
     g_numa_kernels_initialized = true;
     
