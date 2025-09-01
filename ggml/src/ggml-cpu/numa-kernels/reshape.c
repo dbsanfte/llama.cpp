@@ -133,10 +133,19 @@ ggml_numa_kernel_query_result_t ggml_numa_kernel_reshape_query(const struct ggml
         result.strategy.on_node_strategy = NUMA_ON_NODE_STRATEGY_MULTI_THREAD;
     }
     
-    NUMA_LOG_DEBUG("RESHAPE Query: %zu elements, strategy=%s, kernel=%s, efficiency=%.2f",
+    // Apply force strategy override if environment variable is set
+    // Note: RESHAPE is no-op, so all functions point to the same implementation
+    bool strategy_overridden = ggml_numa_apply_kernel_force_strategy(&result, "RESHAPE",
+        (ggml_numa_work_function_t)ggml_numa_kernel_reshape_execute, // single-single
+        (ggml_numa_work_function_t)ggml_numa_kernel_reshape_execute, // single-multi  
+        (ggml_numa_work_function_t)ggml_numa_kernel_reshape_execute  // data-parallel
+    );
+    
+    NUMA_LOG_DEBUG("RESHAPE Query: %zu elements, strategy=%s, kernel=%s, efficiency=%.2f%s",
                    total_elements, 
                    result.strategy.node_strategy == NUMA_NODE_STRATEGY_SINGLE ? "single-node" : "data-parallel",
-                   result.kernel_name, result.efficiency_score);
+                   result.kernel_name, result.efficiency_score,
+                   strategy_overridden ? " [STRATEGY OVERRIDDEN]" : "");
     
     return result;
 }

@@ -848,6 +848,12 @@ ggml_numa_kernel_query_result_t ggml_numa_kernel_mul_mat_query(const struct ggml
     result.aggregation_function = NULL;
     result.aggregation_user_data = NULL;
     
+    // Apply force strategy override if set
+    ggml_numa_apply_kernel_force_strategy(&result, "MUL_MAT", 
+                                          ggml_numa_kernel_mul_mat_execute, 
+                                          ggml_numa_kernel_mul_mat_execute,
+                                          ggml_numa_kernel_mul_mat_execute);
+    
     NUMA_LOG_DEBUG("MUL_MAT query: ACCEPTING - %zu elements -> %s (efficiency: %.2f, buffer: %zu bytes)", 
                    total_elements, result.kernel_name, result.efficiency_score, work_buffer_size);
     

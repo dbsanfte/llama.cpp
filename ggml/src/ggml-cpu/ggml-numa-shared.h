@@ -526,3 +526,35 @@ static inline size_t numa_op_hash(enum ggml_op op) {
 
 #define NUMA_MEM_LOG_BUFFER(name, size, numa_node) \
     NUMA_COORD_LOG_DEBUG(numa_node, "Buffer %s: %zu bytes", (name), (size_t)(size))
+
+// ============================================================================
+// NUMA Force Strategy System (Testing and Integration)
+// ============================================================================
+
+/**
+ * Force strategy modes for comprehensive testing
+ * Controlled by NUMA_FORCE_STRATEGY environment variable
+ */
+typedef enum {
+    NUMA_FORCE_STRATEGY_DISABLED = 0,     // Normal threshold-based selection (default)
+    NUMA_FORCE_STRATEGY_SINGLE_SINGLE = 1, // Force single-node, single-thread
+    NUMA_FORCE_STRATEGY_SINGLE_MULTI = 2,  // Force single-node, multi-thread
+    NUMA_FORCE_STRATEGY_DATA_PARALLEL = 3  // Force data-parallel, multi-thread
+} ggml_numa_force_strategy_t;
+
+/**
+ * Get current force strategy mode from environment variable
+ * Checks NUMA_FORCE_STRATEGY environment variable on first call, caches result
+ * 
+ * @return Force strategy mode (0 = disabled, 1-3 = force specific strategy)
+ */
+ggml_numa_force_strategy_t ggml_numa_get_force_strategy(void);
+
+/**
+ * Apply force strategy override to execution strategy
+ * If force strategy is enabled, overrides the provided strategy regardless of thresholds
+ * 
+ * @param strategy Pointer to strategy structure to potentially override
+ * @return true if strategy was overridden, false if unchanged
+ */
+bool ggml_numa_apply_force_strategy_override(ggml_numa_execution_strategy_t * strategy);

@@ -816,15 +816,23 @@ ggml_numa_kernel_query_result_t ggml_numa_kernel_add_query(const struct ggml_ten
     result.efficiency_score = selected_strategy->efficiency_score;
     result.kernel_name = selected_strategy->kernel_name;
     
+    // Apply force strategy override if environment variable is set
+    bool strategy_overridden = ggml_numa_apply_kernel_force_strategy(&result, "ADD",
+        ggml_numa_kernel_add_execute_optimized,      // single-single function
+        ggml_numa_kernel_add_execute_optimized,      // single-multi function  
+        ggml_numa_kernel_add_execute_no_aggregation  // data-parallel function
+    );
+    
     // Set aggregation policy based on the selected work function
-    if (selected_strategy->work_function == ggml_numa_kernel_add_execute_no_aggregation) {
+    if (result.work_function == ggml_numa_kernel_add_execute_no_aggregation) {
         result.aggregation_policy = GGML_NUMA_AGGREGATION_NONE;
     } else {
         result.aggregation_policy = GGML_NUMA_AGGREGATION_NONE; // Traditional ADD kernels will now need custom aggregation if needed
     }
     
-    NUMA_LOG_DEBUG("ADD query: %zu elements -> %s (efficiency: %.2f)", 
-                   total_elements, result.kernel_name, result.efficiency_score);
+    NUMA_LOG_DEBUG("ADD query: %zu elements -> %s (efficiency: %.2f)%s", 
+                   total_elements, result.kernel_name, result.efficiency_score,
+                   strategy_overridden ? " [STRATEGY OVERRIDDEN]" : "");
     
     return result;
 }

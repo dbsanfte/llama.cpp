@@ -311,21 +311,43 @@ main() {
     # Run integration test only if all individual tests passed
     if [ $FAILED_TESTS -eq 0 ]; then
         echo ""
-        echo -e "${BLUE}🔗 All NUMA tests passed! Running integration test...${NC}"
+        echo -e "${BLUE}🔗 All NUMA tests passed! Running comprehensive integration tests...${NC}"
         
-        # Use the standalone integration test script with NUMA mirror mode
-        if [ "$VERBOSE_MODE" = true ]; then
-            "$SCRIPT_DIR/run-numa-integration-test.sh" --verbose --numa mirror
-        else
-            "$SCRIPT_DIR/run-numa-integration-test.sh" --numa mirror
-        fi
-        integration_exit_code=$?
+        # Test all execution strategies with force strategy environment variable
+        local force_strategies=(1 2 3)
+        local strategy_names=("Single-Thread/Single-Node" "Multi-Thread/Single-Node" "Multi-Thread/Multi-Node")
+        local integration_failures=0
         
-        if [ $integration_exit_code -eq 0 ]; then
-            echo -e "${GREEN}🎉 Integration test passed! NUMA system fully validated.${NC}"
+        for i in "${!force_strategies[@]}"; do
+            local force_value="${force_strategies[$i]}"
+            local strategy_name="${strategy_names[$i]}"
+            
+            echo ""
+            echo -e "${CYAN}🧪 Testing Strategy ${force_value}: ${strategy_name}${NC}"
+            
+            # Set the force strategy environment variable and run integration test
+            if [ "$VERBOSE_MODE" = true ]; then
+                NUMA_FORCE_STRATEGY="$force_value" "$SCRIPT_DIR/run-numa-integration-test.sh" --verbose --numa mirror
+            else
+                NUMA_FORCE_STRATEGY="$force_value" "$SCRIPT_DIR/run-numa-integration-test.sh" --numa mirror
+            fi
+            local exit_code=$?
+            
+            if [ $exit_code -eq 0 ]; then
+                echo -e "${GREEN}✅ Strategy ${force_value} (${strategy_name}) passed${NC}"
+            else
+                echo -e "${RED}❌ Strategy ${force_value} (${strategy_name}) failed${NC}"
+                integration_failures=$((integration_failures + 1))
+            fi
+        done
+        
+        # Final integration test results
+        echo ""
+        if [ $integration_failures -eq 0 ]; then
+            echo -e "${GREEN}🎉 All integration tests passed! NUMA system fully validated across all execution strategies.${NC}"
             exit 0
         else
-            echo -e "${RED}❌ Integration test failed!${NC}"
+            echo -e "${RED}❌ ${integration_failures} integration test(s) failed!${NC}"
             exit 1
         fi
     else

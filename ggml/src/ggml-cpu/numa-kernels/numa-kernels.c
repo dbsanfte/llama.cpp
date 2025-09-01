@@ -441,3 +441,53 @@ ggml_numa_kernel_query_result_t ggml_numa_kernels_query(const struct ggml_tensor
     NUMA_LOG_DEBUG("NUMA Query: Operation %s not supported", ggml_op_name(tensor->op));
     return result;
 }
+
+// ============================================================================
+// Force Strategy Helper Function
+// ============================================================================
+
+bool ggml_numa_apply_kernel_force_strategy(ggml_numa_kernel_query_result_t * result,
+                                           const char * op_name,
+                                           ggml_numa_work_function_t single_single_fn,
+                                           ggml_numa_work_function_t single_multi_fn,
+                                           ggml_numa_work_function_t data_parallel_fn) {
+    if (!result) {
+        NUMA_LOG_ERROR("Cannot apply force strategy: result pointer is NULL");
+        return false;
+    }
+    
+    // Apply force strategy override to execution strategy
+    bool strategy_overridden = ggml_numa_apply_force_strategy_override(&result->strategy);
+    
+    if (strategy_overridden) {
+        // Update work function and kernel name based on overridden strategy
+        if (result->strategy.node_strategy == NUMA_NODE_STRATEGY_SINGLE) {
+            if (result->strategy.on_node_strategy == NUMA_ON_NODE_STRATEGY_SINGLE_THREAD) {
+                if (single_single_fn) {
+                    result->work_function = single_single_fn;
+                    result->kernel_name = "NUMA (Forced Single/Single)";
+                }
+            } else {
+                if (single_multi_fn) {
+                    result->work_function = single_multi_fn;
+                    result->kernel_name = "NUMA (Forced Single/Multi)";
+                }
+            }
+        } else {
+            // Data parallel strategy
+            if (data_parallel_fn) {
+                result->work_function = data_parallel_fn;
+                result->kernel_name = "NUMA (Forced Data-Parallel)";
+            }
+        }
+        
+        // Add operation name to kernel name for clarity
+        static char kernel_name_buffer[256];
+        snprintf(kernel_name_buffer, sizeof(kernel_name_buffer), "%s %s", op_name, result->kernel_name);
+        result->kernel_name = kernel_name_buffer;
+        
+        NUMA_LOG_DEBUG("%s: Strategy overridden by NUMA_FORCE_STRATEGY", op_name);
+    }
+    
+    return strategy_overridden;
+}

@@ -199,6 +199,26 @@ numa_strategy_cache_stats_t ggml_numa_kernels_get_strategy_stats(void);
 void ggml_numa_kernels_clear_strategy_cache(void);
 
 /**
+ * Apply force strategy override to query result
+ * 
+ * This helper function applies NUMA_FORCE_STRATEGY environment variable
+ * overrides to kernel query results. It should be called by all kernel
+ * query functions after normal strategy selection.
+ * 
+ * @param result Pointer to query result to potentially override
+ * @param op_name Operation name for logging purposes
+ * @param single_single_fn Function pointer for single-node, single-thread execution
+ * @param single_multi_fn Function pointer for single-node, multi-thread execution  
+ * @param data_parallel_fn Function pointer for data-parallel execution
+ * @return true if strategy was overridden, false if unchanged
+ */
+bool ggml_numa_apply_kernel_force_strategy(ggml_numa_kernel_query_result_t * result,
+                                           const char * op_name,
+                                           ggml_numa_work_function_t single_single_fn,
+                                           ggml_numa_work_function_t single_multi_fn,
+                                           ggml_numa_work_function_t data_parallel_fn);
+
+/**
  * NUMA_REGISTER_KERNEL - Macro to simplify kernel registration
  * 
  * This macro eliminates code duplication when registering NUMA kernels.

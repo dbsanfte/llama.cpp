@@ -202,6 +202,12 @@ ggml_numa_kernel_query_result_t ggml_numa_kernel_glu_query(const struct ggml_ten
     
     result.strategy = strategy;
     
+    // Apply force strategy override if set
+    ggml_numa_apply_kernel_force_strategy(&result, "GLU", 
+                                          ggml_numa_kernel_glu_execute, 
+                                          ggml_numa_kernel_glu_execute,
+                                          ggml_numa_kernel_glu_execute);
+    
     NUMA_LOG_TRACE("GLU query: elements=%zu, node_strategy=%d, on_node_strategy=%d, efficiency=%.2f\n",
                    total_elements, result.strategy.node_strategy, result.strategy.on_node_strategy, (double)result.efficiency_score);
     

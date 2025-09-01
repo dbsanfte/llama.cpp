@@ -572,11 +572,19 @@ ggml_numa_kernel_query_result_t ggml_numa_kernel_mul_query(const struct ggml_ten
     result.efficiency_score = selected_strategy->efficiency_score;
     result.kernel_name = selected_strategy->kernel_name;
     
+    // Apply force strategy override if environment variable is set
+    bool strategy_overridden = ggml_numa_apply_kernel_force_strategy(&result, "MUL",
+        ggml_numa_kernel_mul_execute_low_overhead,   // single-single function
+        ggml_numa_kernel_mul_execute_low_overhead,   // single-multi function  
+        ggml_numa_kernel_mul_execute_no_aggregation  // data-parallel function
+    );
+    
     // Set aggregation policy - MUL uses no-aggregation shared memory approach
     result.aggregation_policy = GGML_NUMA_AGGREGATION_NONE;
     
-    NUMA_LOG_DEBUG("MUL query: %zu elements -> %s (efficiency: %.2f)", 
-                   total_elements, result.kernel_name, result.efficiency_score);
+    NUMA_LOG_DEBUG("MUL query: %zu elements -> %s (efficiency: %.2f)%s", 
+                   total_elements, result.kernel_name, result.efficiency_score,
+                   strategy_overridden ? " [STRATEGY OVERRIDDEN]" : "");
     
     return result;
 }

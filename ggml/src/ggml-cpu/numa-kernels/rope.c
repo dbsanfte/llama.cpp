@@ -476,6 +476,12 @@ ggml_numa_kernel_query_result_t ggml_numa_kernel_rope_query(const struct ggml_te
     
     result.strategy = strategy;
     
+    // Apply force strategy override if set
+    ggml_numa_apply_kernel_force_strategy(&result, "ROPE", 
+                                          ggml_numa_kernel_rope_execute, 
+                                          ggml_numa_kernel_rope_execute,
+                                          ggml_numa_kernel_rope_execute);
+    
     NUMA_LOG_TRACE("ROPE query: elements=%zu, strategy=node:%d/thread:%d, efficiency=%.2f", 
                    total_elements, strategy.node_strategy, strategy.on_node_strategy, result.efficiency_score);
     

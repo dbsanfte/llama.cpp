@@ -218,6 +218,12 @@ ggml_numa_kernel_query_result_t ggml_numa_kernel_permute_query(const struct ggml
     
     result.strategy = strategy;
     
+    // Apply force strategy override if set
+    ggml_numa_apply_kernel_force_strategy(&result, "PERMUTE", 
+                                          ggml_numa_kernel_permute_execute, 
+                                          ggml_numa_kernel_permute_execute,
+                                          ggml_numa_kernel_permute_execute);
+    
     return result;
 }
 

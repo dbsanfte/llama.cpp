@@ -421,6 +421,12 @@ ggml_numa_kernel_query_result_t ggml_numa_kernel_rms_norm_query(const struct ggm
     result.aggregation_function = NULL;
     result.aggregation_user_data = NULL;
     
+    // Apply force strategy override if set
+    ggml_numa_apply_kernel_force_strategy(&result, "RMS_NORM", 
+                                          ggml_numa_kernel_rms_norm_execute, 
+                                          ggml_numa_kernel_rms_norm_execute,
+                                          ggml_numa_kernel_rms_norm_execute);
+    
     NUMA_LOG_DEBUG("RMS_NORM query: Selected strategy %s for tensor with %zu elements, %ld rows, efficiency=%.2f",
                    result.kernel_name, total_elements, total_rows, result.efficiency_score);
     

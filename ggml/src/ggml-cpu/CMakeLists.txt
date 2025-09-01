@@ -26,6 +26,7 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
         ggml-cpu/ggml-cpu.cpp
         # New NUMA Architecture
         ggml-cpu/ggml-numa-shared.h
+        ggml-cpu/ggml-numa-shared.c
         ggml-cpu/ggml-numa-simple-coordinator.c
         ggml-cpu/ggml-numa-simple-coordinator.h
         ggml-cpu/ggml-numa-cpu-backend.c
