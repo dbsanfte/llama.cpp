@@ -19,6 +19,7 @@
 #include "mul_mat.h"
 #include "cpy.h"
 #include "rms_norm.h"
+#include "rope.h"
 #include "noop.h"
 #include "../ggml-impl.h"
 
@@ -245,6 +246,10 @@ enum ggml_status ggml_numa_kernels_init(void) {
     // Enable RMS_NORM kernel for normalization operations
     // Register RMS_NORM kernel
     NUMA_REGISTER_KERNEL(rms_norm);
+    
+    // Enable ROPE kernel for rotary position embeddings
+    // Register ROPE kernel
+    NUMA_REGISTER_KERNEL(rope);
     
     // Register NOOP kernel for performance testing
     //ggml_numa_register_noop_kernels();
