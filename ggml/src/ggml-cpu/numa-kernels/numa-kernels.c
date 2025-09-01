@@ -231,9 +231,9 @@ enum ggml_status ggml_numa_kernels_init(void) {
     // Enable ADD kernel for multi-threaded data-parallel testing
     NUMA_REGISTER_KERNEL(add);
     
-    // Keep other kernels disabled for now
+    // Enable MUL kernel for testing
     // Register MUL kernel
-    //NUMA_REGISTER_KERNEL(mul);
+    NUMA_REGISTER_KERNEL(mul);
 
     // Register CPY kernel - DISABLED due to memory corruption issues
     //NUMA_REGISTER_KERNEL(cpy);
