@@ -77,7 +77,8 @@ grep -r "GGML_OP_YOUR_OPERATION" ggml/src/ggml-cpu/
 
 **Operation suitability:**
 - ✅ **Excellent**: Element-wise ops (ADD, MUL, GLU) - independent computations, linear memory access
-- ⚠️ **Complex**: Matrix ops (MUL_MAT), reductions (SOFT_MAX, RMS_NORM) - need specialized splitting
+- ⚠️ **Complex**: Matrix ops (MUL_MAT), reductions (RMS_NORM) - need specialized splitting
+- 🔧 **View Operations**: RESHAPE, PERMUTE - metadata-only, minimal computation
 - ❌ **Poor**: Global synchronization, complex dependencies
 
 **🚀 SIMD Optimization Requirements:**
@@ -108,6 +109,12 @@ Choose the appropriate template based on operation characteristics:
 - **Pattern**: Row-wise/column-wise processing, potential aggregation
 - **Characteristics**: Multi-pass algorithms, cache-optimized access patterns
 - **NUMA Strategy**: Dimension-aware parallelization with optional aggregation
+
+**🔹 View Operations Template**: `numa-kernels/reshape.c`
+- **Use for**: RESHAPE, PERMUTE, VIEW, TRANSPOSE and similar metadata-only operations
+- **Pattern**: No-op execution, metadata transformation only
+- **Characteristics**: Zero computational overhead, single-node execution
+- **NUMA Strategy**: `NUMA_NODE_STRATEGY_SINGLE` with `NUMA_ON_NODE_STRATEGY_SINGLE_THREAD`
 
 **Critical NUMA Data Slicing Pattern:**
 ```c
@@ -246,8 +253,12 @@ cp tests/test-numa-mathematical-correctness-template.cpp tests/test-numa-mathema
 **✅ Supported Operations:**
 - **ADD** - Element-wise addition with SIMD optimization and shared memory approach
 - **MUL** - Element-wise multiplication with optimized data-parallel execution
-- **MUL_MAT** - Matrix multiplication with chunk-based work distribution and type-specific SIMD operations
+- **GLU** - Gated Linear Unit activation with specialized SIMD patterns
+- **ROPE** - Rotary Position Embedding with complex mathematical transformations
+- **PERMUTE** - Tensor axis permutation for view operations (no-op pattern)
 - **RMS_NORM** - Root mean square normalization with row-wise NUMA distribution (critical for transformers)
+- **MUL_MAT** - Matrix multiplication with chunk-based work distribution and type-specific SIMD operations
+- **RESHAPE** - Tensor shape transformation for view operations (no-op metadata-only)
 
 **🚀 Performance Characteristics:**
 - **O(1) Strategy Lookups** - Hash table-based registry eliminates search overhead
@@ -257,6 +268,13 @@ cp tests/test-numa-mathematical-correctness-template.cpp tests/test-numa-mathema
 - **3-Level Debug System** - Clean output at levels 1-2, detailed tracing at level 3
 - **Work Function Architecture** - Clean separation between computation (work functions) and result combination (aggregation functions)
 - **Registry-Based Scalability** - Easy addition of new kernels with consistent patterns
+
+**📊 Current System Status:**
+- **Total Registered Kernels**: 8 active (ADD, MUL, GLU, ROPE, PERMUTE, RMS_NORM, MUL_MAT, RESHAPE)
+- **Kernel Implementation Files**: 18 files (9 headers + 9 implementations, plus system files)
+- **Template Categories**: 4 types (Binary Element-wise, Complex, Reduction, View operations)
+- **Registry Architecture**: NUMA_REGISTER_KERNEL() macro with automatic query dispatch
+- **Test Coverage**: Mathematical correctness and performance benchmarks for all kernels
 
 ## 🏗️ Build Environment & Commands
 
@@ -590,11 +608,12 @@ docs/numa-architecture.md                         # Architecture documentation
 ggml/src/ggml-cpu/numa-kernels/add.c              # Template: Binary element-wise operations
 ggml/src/ggml-cpu/numa-kernels/mul_mat.c          # Template: Complex operations & matrix ops
 ggml/src/ggml-cpu/numa-kernels/rms_norm.c         # Template: Reduction operations & normalizations
+ggml/src/ggml-cpu/numa-kernels/reshape.c          # Template: View operations & metadata transformations
 ```
 
 ### Implementation Checklist
 - [ ] Find mathematical kernel in `ggml-cpu.c`
-- [ ] **Choose appropriate template**: Binary (add.c), Complex (mul_mat.c), or Reduction (rms_norm.c)
+- [ ] **Choose appropriate template**: Binary (add.c), Complex (mul_mat.c), Reduction (rms_norm.c), or View (reshape.c)
 - [ ] Extract pure mathematical operations (no ggml threading)
 - [ ] Replace scalar loops with SIMD `ggml_vec_*` functions
 - [ ] **Copy template and adapt** for your operation type
