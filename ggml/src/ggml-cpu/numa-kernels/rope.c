@@ -417,7 +417,70 @@ batch_loop_end:
 
 // ============================================================================
 // NUMA ROPE Kernel Registration
+//============================================================================
+// NUMA ROPE Kernel Query and Registration
 // ============================================================================
+
+/**
+ * Query ROPE kernel for optimal execution strategy based on tensor characteristics.
+ * ROPE operations involve complex trigonometric computations with cache operations,
+ * so they benefit from NUMA parallelization even with smaller tensors.
+ */
+ggml_numa_kernel_query_result_t ggml_numa_kernel_rope_query(const struct ggml_tensor * tensor) {
+    ggml_numa_kernel_query_result_t result = { .supported = false };
+    
+    // Validate this is a ROPE operation
+    if (!tensor || tensor->op != GGML_OP_ROPE) {
+        return result;
+    }
+    
+    // ROPE operations require at least one source tensor
+    if (!tensor->src[0]) {
+        NUMA_LOG_DEBUG("ROPE query: Missing source tensor");
+        return result;
+    }
+    
+    // Calculate tensor dimensions for complexity assessment
+    const int64_t ne0 = tensor->src[0]->ne[0];  // sequence length
+    const int64_t ne1 = tensor->src[0]->ne[1];  // number of heads
+    const int64_t ne2 = tensor->src[0]->ne[2];  // batch size
+    const size_t total_elements = (size_t)ne0 * ne1 * ne2;
+    
+    // ROPE operations are compute-intensive with trigonometric calculations
+    // Strategy selection based on element count thresholds
+    
+    result.supported = true;
+    // ROPE requires work buffer for cache: (ne0 + CACHE_LINE_SIZE_F32) * sizeof(float) per thread
+    result.work_buffer_size_per_thread = (ne0 + CACHE_LINE_SIZE_F32) * sizeof(float);
+    result.work_function = ggml_numa_kernel_rope_execute;
+    result.kernel_name = "NUMA ROPE Kernel";
+    result.aggregation_policy = GGML_NUMA_AGGREGATION_NONE;  // Independent batch processing, no aggregation
+    result.aggregation_function = NULL;
+    result.aggregation_user_data = NULL;
+    
+    // Select strategy based on element count thresholds (ROPE benefits from parallelization early)
+    ggml_numa_execution_strategy_t strategy = {0};
+    if (total_elements < 512) {  // 512 elements - single thread
+        strategy.node_strategy = NUMA_NODE_STRATEGY_SINGLE;
+        strategy.on_node_strategy = NUMA_ON_NODE_STRATEGY_SINGLE_THREAD;
+        result.efficiency_score = 0.90f;  // Good efficiency for small tensors
+    } else if (total_elements < 16384) {  // 16K elements - multi-thread single node
+        strategy.node_strategy = NUMA_NODE_STRATEGY_SINGLE;
+        strategy.on_node_strategy = NUMA_ON_NODE_STRATEGY_MULTI_THREAD;
+        result.efficiency_score = 0.87f;  // Good efficiency for medium tensors
+    } else {  // Above 16K elements - data-parallel strategy across NUMA nodes
+        strategy.node_strategy = NUMA_NODE_STRATEGY_DATA_PARALLEL;
+        strategy.on_node_strategy = NUMA_ON_NODE_STRATEGY_MULTI_THREAD;
+        result.efficiency_score = 0.85f;  // Excellent for large tensors with complex computations
+    }
+    
+    result.strategy = strategy;
+    
+    NUMA_LOG_TRACE("ROPE query: elements=%zu, strategy=node:%d/thread:%d, efficiency=%.2f", 
+                   total_elements, strategy.node_strategy, strategy.on_node_strategy, result.efficiency_score);
+    
+    return result;
+}
 
 ggml_numa_kernel_registration_info_t ggml_numa_kernel_rope_register(void) {
     ggml_numa_kernel_registration_info_t info = {0};

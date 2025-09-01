@@ -59,12 +59,10 @@ enum ggml_status ggml_numa_init_kernel_array_cache(void) {
  * Called by each kernel at startup to populate both storage and lookup arrays
  */
 enum ggml_status ggml_numa_register_kernel_strategy(
-    enum ggml_op op_type,
+    enum ggml_op op_type, 
     const ggml_numa_kernel_strategy_array_t * strategy_array,
     const ggml_numa_kernel_work_funcs_t * work_funcs,
-    const ggml_numa_kernel_aggregation_funcs_t * agg_funcs) {
-    
-    if (!g_kernel_array_cache.cache_initialized) {
+    const ggml_numa_kernel_aggregation_funcs_t * agg_funcs) {    if (!g_kernel_array_cache.cache_initialized) {
         enum ggml_status init_result = ggml_numa_init_kernel_array_cache();
         if (init_result != GGML_STATUS_SUCCESS) {
             return init_result;
@@ -86,7 +84,6 @@ enum ggml_status ggml_numa_register_kernel_strategy(
     // Store in Array 1: Main cache storage
     ggml_numa_kernel_cache_entry_t * entry = &g_kernel_array_cache.cache_storage[op_type];
     entry->op_type = op_type;
-    entry->initialized = true;
     
     if (strategy_array && strategy_array->valid) {
         entry->strategy_array = *strategy_array;
@@ -423,6 +420,9 @@ ggml_numa_kernel_query_result_t ggml_numa_kernels_query(const struct ggml_tensor
             
         case GGML_OP_GLU:
             return ggml_numa_kernel_glu_query(tensor);
+            
+        case GGML_OP_ROPE:
+            return ggml_numa_kernel_rope_query(tensor);
             
         default:
             // Operation not supported by NUMA kernels

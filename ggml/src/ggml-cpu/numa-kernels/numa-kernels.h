@@ -30,11 +30,10 @@ struct ggml_cplan;
  * Maps operation type to pre-computed query results for ultra-fast lookup
  */
 typedef struct {
-    enum ggml_op op_type;                                // Operation type
-    ggml_numa_kernel_strategy_array_t strategy_array;   // Threshold array
-    ggml_numa_kernel_work_funcs_t work_funcs;           // Work function pointers
-    ggml_numa_kernel_aggregation_funcs_t agg_funcs;     // Aggregation function pointers (optional)
-    bool initialized;                                    // True if entry is valid
+    enum ggml_op op_type;                                        // Operation type
+    ggml_numa_kernel_strategy_array_t strategy_array;           // Strategy thresholds for fast lookup
+    ggml_numa_kernel_work_funcs_t work_funcs;                   // Work function pointers
+    ggml_numa_kernel_aggregation_funcs_t agg_funcs;             // Aggregation function pointers (optional)
 } ggml_numa_kernel_cache_entry_t;
 
 /**
@@ -59,11 +58,10 @@ typedef struct {
  * Kernels provide simple threshold arrays and function pointers
  */
 enum ggml_status ggml_numa_register_kernel_strategy(
-    enum ggml_op op_type,
+    enum ggml_op op_type, 
     const ggml_numa_kernel_strategy_array_t * strategy_array,
     const ggml_numa_kernel_work_funcs_t * work_funcs,
-    const ggml_numa_kernel_aggregation_funcs_t * agg_funcs
-);
+    const ggml_numa_kernel_aggregation_funcs_t * agg_funcs);
 
 /**
  * Initialize the global kernel array cache (called once at startup)

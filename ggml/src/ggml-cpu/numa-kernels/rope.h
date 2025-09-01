@@ -12,7 +12,7 @@
 
 #pragma once
 
-#include "../ggml-numa-shared.h"
+#include "numa-kernels.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -27,6 +27,12 @@ extern "C" {
  * Returns registration info for the NUMA kernel registry system
  */
 ggml_numa_kernel_registration_info_t ggml_numa_kernel_rope_register(void);
+
+/**
+ * Query ROPE kernel for optimal execution strategy
+ * Returns strategy recommendation and kernel info for given tensor
+ */
+ggml_numa_kernel_query_result_t ggml_numa_kernel_rope_query(const struct ggml_tensor * tensor);
 
 // ============================================================================
 // NUMA ROPE Kernel Work Functions

@@ -18,6 +18,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 
+// Forward declarations to avoid circular dependencies
+struct ggml_tensor;
+struct ggml_cplan;
+
 // ============================================================================
 // NUMA Type Definitions
 // ============================================================================
