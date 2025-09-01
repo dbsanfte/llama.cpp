@@ -1,16 +1,42 @@
 /**
  * @file mul_mat.c
- * @brief NUMA Kernel: Matrix Multiplication (MUL_MAT)
+ * @brief NUMA Kernel Template: Complex Operations (Matrix Multiplication)
  * 
  * ============================================================================
- * NUMA KERNEL: MATRIX MULTIPLICATION (MUL_MAT)
+ * NUMA KERNEL TEMPLATE: COMPLEX OPERATIONS (MUL_MAT)
  * ============================================================================
  * 
- * This kernel implements NUMA-aware matrix multiplication using optimized
- * chunk-based processing with proper data slicing across NUMA nodes.
+ * This file serves as the CANONICAL TEMPLATE for implementing NUMA kernels 
+ * for COMPLEX OPERATIONS that require specialized parallelization strategies.
  * 
- * MATHEMATICAL OPERATION:
+ * USE THIS TEMPLATE FOR:
  * =====================
+ * ✅ Matrix operations (MUL_MAT, CONV_1D, CONV_2D)
+ * ✅ Complex transformations requiring multidimensional slicing
+ * ✅ Operations with intricate data dependencies
+ * ✅ Operations requiring specialized SIMD patterns
+ * ✅ Operations with custom aggregation requirements
+ * ✅ Operations needing chunk-based or block-based processing
+ * 
+ * DO NOT USE THIS TEMPLATE FOR:
+ * ============================
+ * ❌ Simple element-wise operations (ADD, MUL, SUB, DIV) → Use add.c template
+ * ❌ Simple reductions (SUM, MEAN) → Use rms_norm.c template  
+ * ❌ Single-pass operations → Use add.c template
+ * ❌ Operations with uniform data access patterns → Use add.c template
+ * 
+ * TEMPLATE RATIONALE:
+ * ==================
+ * Complex operations like matrix multiplication require sophisticated NUMA 
+ * parallelization strategies due to:
+ * - Non-uniform memory access patterns
+ * - Multidimensional data slicing requirements  
+ * - Cache optimization considerations
+ * - Specialized SIMD vectorization patterns
+ * - Custom work distribution algorithms
+ * 
+ * MATHEMATICAL OPERATION (MUL_MAT EXAMPLE):
+ * ========================================
  * 
  * MUL_MAT performs matrix multiplication: C = A × B
  * 
@@ -24,10 +50,11 @@
  * - ne1 == ne11 (B's columns match result columns) 
  * - ne2 == ne12 && ne3 == ne13 (batch dimensions match)
  * 
- * PARALLELIZATION STRATEGY:
- * ========================
+ * COMPLEX PARALLELIZATION STRATEGY:
+ * =================================
  * 
- * The MUL_MAT operation is parallelized along the output matrix dimensions:
+ * The MUL_MAT operation demonstrates complex parallelization along multiple
+ * dimensions with sophisticated chunk-based distribution:
  * 1. Divide output rows (ne0) across threads within each NUMA node
  * 2. For data-parallel mode, divide batch dimensions (ne1*ne2*ne3) across NUMA nodes
  * 3. Use optimized vec_dot operations for inner products

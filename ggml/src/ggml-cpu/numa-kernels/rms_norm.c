@@ -1,16 +1,42 @@
 /**
  * @file rms_norm.c
- * @brief NUMA Kernel: Root Mean Square Normalization (RMS_NORM)
+ * @brief NUMA Kernel Template: Reduction Operations (RMS Normalization)
  * 
  * ============================================================================
- * NUMA KERNEL: ROOT MEAN SQUARE NORMALIZATION (RMS_NORM)
+ * NUMA KERNEL TEMPLATE: REDUCTION OPERATIONS (RMS_NORM)
  * ============================================================================
  * 
- * This kernel implements NUMA-aware RMS normalization using optimized
- * row-wise processing with proper data slicing across NUMA nodes.
+ * This file serves as the CANONICAL TEMPLATE for implementing NUMA kernels 
+ * for REDUCTION OPERATIONS that require row-wise or dimension-wise processing.
  * 
- * MATHEMATICAL OPERATION:
+ * USE THIS TEMPLATE FOR:
  * =====================
+ * ✅ Normalization operations (RMS_NORM, LAYER_NORM, GROUP_NORM)
+ * ✅ Reduction operations (SUM, MEAN, VAR, STD)
+ * ✅ Statistical operations requiring row/column processing
+ * ✅ Operations with aggregation along specific dimensions
+ * ✅ Operations requiring two-pass algorithms (mean then variance)
+ * ✅ Softmax and other probability operations
+ * 
+ * DO NOT USE THIS TEMPLATE FOR:
+ * ============================
+ * ❌ Simple element-wise operations (ADD, MUL, SUB, DIV) → Use add.c template
+ * ❌ Complex matrix operations (MUL_MAT, CONV) → Use mul_mat.c template
+ * ❌ Operations without reduction/aggregation → Use add.c template
+ * ❌ Operations with uniform memory access → Use add.c template
+ * 
+ * TEMPLATE RATIONALE:
+ * ==================
+ * Reduction operations like RMS normalization require specialized NUMA 
+ * parallelization due to:
+ * - Row-wise or dimension-wise data processing
+ * - Statistical computation patterns (sum, mean, variance)
+ * - Multi-pass algorithms (compute statistics, then apply)
+ * - Memory access patterns optimized for cache locality
+ * - Potential need for result aggregation across NUMA nodes
+ * 
+ * MATHEMATICAL OPERATION (RMS_NORM EXAMPLE):
+ * =========================================
  * 
  * RMS_NORM performs row-wise normalization: y = x / sqrt(mean(x²) + eps)
  * 
@@ -25,8 +51,8 @@
  * - y: Output tensor (same shape as input)
  * - eps: Small constant for numerical stability (from op_params)
  * 
- * PARALLELIZATION STRATEGY:
- * ========================
+ * REDUCTION PARALLELIZATION STRATEGY:
+ * ===================================
  * 
  * The RMS_NORM operation is parallelized along the row dimension:
  * 1. Each row (ne00 elements) is processed independently
@@ -434,4 +460,36 @@ void ggml_numa_register_rms_norm_kernels(void) {
     
     NUMA_LOG_DEBUG("Registered RMS_NORM NUMA kernel with thresholds [%zu, %zu]", 
                    info.strategy_array.thresholds[0], info.strategy_array.thresholds[1]);
+}
+
+/**
+ * Register function for NUMA_REGISTER_KERNEL macro compatibility
+ * Returns registration info structure for RMS_NORM operations
+ */
+ggml_numa_kernel_registration_info_t ggml_numa_kernel_rms_norm_register(void) {
+    ggml_numa_kernel_registration_info_t info = {0};
+    
+    info.op_type = GGML_OP_RMS_NORM;
+    info.supported = true;
+    info.kernel_name = "NUMA RMS_NORM Kernel";
+    
+    // Strategy thresholds for RMS_NORM operations
+    info.strategy_array.thresholds[NUMA_STRATEGY_IDX_SINGLE_SINGLE] = 256;      // Row count threshold
+    info.strategy_array.thresholds[NUMA_STRATEGY_IDX_SINGLE_MULTI] = 65536;     // Element count threshold  
+    // Above 65K elements: data-parallel strategy
+    info.strategy_array.valid = true;
+    
+    // Function pointers for different strategies
+    info.work_funcs.single_single_fn = ggml_numa_kernel_rms_norm_execute;
+    info.work_funcs.single_multi_fn = ggml_numa_kernel_rms_norm_execute;
+    info.work_funcs.data_parallel_fn = ggml_numa_kernel_rms_norm_execute;
+    info.work_funcs.valid = true;
+    
+    // RMS_NORM doesn't need aggregation functions (no result aggregation needed)
+    info.agg_funcs.single_single_fn = NULL;
+    info.agg_funcs.single_multi_fn = NULL;
+    info.agg_funcs.data_parallel_fn = NULL;
+    info.agg_funcs.valid = false;
+    
+    return info;
 }

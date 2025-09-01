@@ -22,6 +22,9 @@ ggml_numa_kernel_query_result_t ggml_numa_kernel_rms_norm_query(const struct ggm
 // Kernel registration function
 void ggml_numa_register_rms_norm_kernels(void);
 
+// Register function for NUMA_REGISTER_KERNEL macro compatibility
+ggml_numa_kernel_registration_info_t ggml_numa_kernel_rms_norm_register(void);
+
 #ifdef __cplusplus
 }
 #endif

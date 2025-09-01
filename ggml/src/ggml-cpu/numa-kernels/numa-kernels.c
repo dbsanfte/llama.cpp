@@ -242,8 +242,9 @@ enum ggml_status ggml_numa_kernels_init(void) {
     // Register MUL_MAT kernel
     NUMA_REGISTER_KERNEL(mul_mat);
     
+    // Enable RMS_NORM kernel for normalization operations
     // Register RMS_NORM kernel
-    //ggml_numa_register_rms_norm_kernels();
+    NUMA_REGISTER_KERNEL(rms_norm);
     
     // Register NOOP kernel for performance testing
     //ggml_numa_register_noop_kernels();

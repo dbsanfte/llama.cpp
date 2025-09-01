@@ -1,14 +1,27 @@
 /**
  * @file add.c
- * @brief NUMA Kernel Template: Element-wise Addition (ADD)
+ * @brief NUMA Kernel Template: Element-wise Binary Operations (ADD)
  * 
  * ============================================================================
- * NUMA KERNEL DEVELOPMENT TEMPLATE
+ * NUMA KERNEL TEMPLATE - BINARY ELEMENT-WISE OPERATIONS
  * ============================================================================
  * 
- * This file serves as the canonical template for implementing NUMA-aware 
- * kernels in the GGML NUMA system. Use this as a reference when creating 
- * new NUMA kernels for other operations.
+ * This file serves as the CANONICAL TEMPLATE for implementing NUMA-aware 
+ * binary element-wise operations (ADD, MUL, SUB, DIV, etc.) in the GGML NUMA system.
+ * 
+ * 🎯 USE THIS TEMPLATE FOR:
+ * ========================
+ * - Binary element-wise operations: ADD, MUL, SUB, DIV
+ * - Simple mathematical operations with two input tensors
+ * - Operations that benefit from data-parallel execution
+ * - Independent computations with linear memory access patterns
+ * 
+ * ❌ DO NOT USE THIS TEMPLATE FOR:
+ * ===============================
+ * - Matrix multiplication operations (use mul_mat.c template)
+ * - Reduction operations (use rms_norm.c template)  
+ * - Complex operations requiring custom aggregation
+ * - Operations with non-linear memory access patterns
  * 
  * ARCHITECTURE OVERVIEW:
  * =====================
@@ -19,10 +32,16 @@
  * 
  * Flow: Compute Graph → Executor → Registry Query → Coordinator Dispatch → Kernel
  * 
- * PARALLELIZATION STRATEGY:
- * ========================
+ * BINARY OPERATION PARALLELIZATION STRATEGY:
+ * ==========================================
  * 
- * The NUMA system supports two primary execution modes:
+ * Binary element-wise operations are ideal for NUMA parallelization because:
+ * - Each output element depends only on corresponding input elements
+ * - No inter-element dependencies or synchronization required
+ * - Linear memory access patterns optimize cache performance
+ * - Data can be cleanly sliced across NUMA nodes
+ * 
+ * The NUMA system supports three execution strategies for binary operations:
  * 
  * 1. SINGLE-NODE EXECUTION:
  *    - All computation happens on one NUMA node

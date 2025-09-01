@@ -86,7 +86,28 @@ grep -r "GGML_OP_YOUR_OPERATION" ggml/src/ggml-cpu/
 - **Performance impact**: SIMD provides significant speedup on modern CPUs with AVX2/AVX512 support
 - **Mathematical equivalence**: SIMD operations must produce identical results to scalar reference
 
-### Step 2: Implementation
+### Step 2: Template Selection & Implementation
+
+**📚 NUMA Kernel Template System:**
+Choose the appropriate template based on operation characteristics:
+
+**🔹 Binary Element-wise Operations Template**: `numa-kernels/add.c`
+- **Use for**: ADD, MUL, SUB, DIV and similar simple element-wise operations
+- **Pattern**: Uniform memory access, simple data-parallel execution
+- **Characteristics**: Single-pass algorithms, no aggregation needed
+- **NUMA Strategy**: Direct element slicing across NUMA nodes
+
+**🔹 Complex Operations Template**: `numa-kernels/mul_mat.c`
+- **Use for**: Matrix multiplication, convolutions, complex transformations
+- **Pattern**: Multidimensional slicing, specialized SIMD patterns  
+- **Characteristics**: Non-uniform memory access, chunk-based processing
+- **NUMA Strategy**: Sophisticated work distribution algorithms
+
+**🔹 Reduction Operations Template**: `numa-kernels/rms_norm.c`
+- **Use for**: Normalization, statistical operations, dimension-wise reductions
+- **Pattern**: Row-wise/column-wise processing, potential aggregation
+- **Characteristics**: Multi-pass algorithms, cache-optimized access patterns
+- **NUMA Strategy**: Dimension-aware parallelization with optional aggregation
 
 **Critical NUMA Data Slicing Pattern:**
 ```c
@@ -102,7 +123,7 @@ size_t numa_end = (numa_node == total_numa_nodes - 1) ? total_elements : numa_st
 
 **NUMA Kernel Implementation Pattern:**
 ```c
-// Implement in numa-kernels/ directory
+// Implement in numa-kernels/ directory using appropriate template
 enum ggml_status ggml_numa_kernel_your_operation_execute(void * work_context, struct ggml_compute_params * params) {
     struct ggml_tensor * tensor = (struct ggml_tensor *)work_context;
     
@@ -152,36 +173,55 @@ enum ggml_status ggml_numa_kernel_your_operation_execute(void * work_context, st
 
 **Registry Integration:**
 ```c
-// Add to numa-kernels.c registration function
-void ggml_numa_register_your_operation_kernels(void) {
-    ggml_numa_kernel_registration_info_t info = {
-        .op_type = GGML_OP_YOUR_OPERATION,
-        .strategy_array = {
-            .thresholds = {1024, 262144},  // 1K and 256K element thresholds
-            .valid = true
-        },
-        .work_funcs = {
-            .single_single_fn = ggml_numa_kernel_your_operation_execute,
-            .single_multi_fn = ggml_numa_kernel_your_operation_execute,
-            .data_parallel_fn = ggml_numa_kernel_your_operation_execute,
-            .valid = true
-        },
-        .agg_funcs = {
-            .valid = false  // Most operations don't need aggregation
-        },
-        .kernel_name = "NUMA Your Operation Kernel",
-        .supported = true
-    };
+// Step 1: Create register function in your kernel .c file (e.g., add.c, mul.c, etc.)
+ggml_numa_kernel_registration_info_t ggml_numa_kernel_your_operation_register(void) {
+    ggml_numa_kernel_registration_info_t info = {0};
     
-    ggml_numa_register_kernel_strategy(info.op_type, &info.strategy_array, 
-                                       &info.work_funcs, &info.agg_funcs);
+    info.op_type = GGML_OP_YOUR_OPERATION;
+    info.supported = true;
+    info.kernel_name = "NUMA Your Operation Kernel";
+    
+    // Strategy thresholds for operation
+    info.strategy_array.thresholds[NUMA_STRATEGY_IDX_SINGLE_SINGLE] = 1024;      // Single thread below 1K elements
+    info.strategy_array.thresholds[NUMA_STRATEGY_IDX_SINGLE_MULTI] = 262144;     // Multi-thread below 256K elements
+    // Above 256K elements: data-parallel strategy
+    info.strategy_array.valid = true;
+    
+    // Function pointers for different strategies
+    info.work_funcs.single_single_fn = ggml_numa_kernel_your_operation_execute;
+    info.work_funcs.single_multi_fn = ggml_numa_kernel_your_operation_execute;
+    info.work_funcs.data_parallel_fn = ggml_numa_kernel_your_operation_execute;
+    info.work_funcs.valid = true;
+    
+    // Most operations don't need aggregation functions
+    info.agg_funcs.single_single_fn = NULL;
+    info.agg_funcs.single_multi_fn = NULL; 
+    info.agg_funcs.data_parallel_fn = NULL;
+    info.agg_funcs.valid = false;
+    
+    return info;
 }
 
-// Call in ggml_numa_kernels_init()
+// Step 2: Add function declaration to your kernel .h file (e.g., add.h, mul.h, etc.)
+ggml_numa_kernel_registration_info_t ggml_numa_kernel_your_operation_register(void);
+
+// Step 3: Enable in numa-kernels.c using NUMA_REGISTER_KERNEL macro (PREFERRED)
 void ggml_numa_kernels_init(void) {
-    // ... existing registrations ...
-    ggml_numa_register_your_operation_kernels();
+    // ... other kernels ...
+    
+    // ✅ PREFERRED: Use NUMA_REGISTER_KERNEL macro for consistent registration
+    NUMA_REGISTER_KERNEL(your_operation);
+    
+    // ❌ LEGACY: Do NOT use function-based registration (deprecated)
+    // ggml_numa_register_your_operation_kernels();  // OLD PATTERN - DO NOT USE
 }
+```
+
+**🚨 CRITICAL: Always use NUMA_REGISTER_KERNEL() macro**
+- **Preferred pattern**: `NUMA_REGISTER_KERNEL(kernel_name)` in `numa-kernels.c`
+- **Consistent architecture**: All kernels use the same registration mechanism
+- **Automatic validation**: Macro includes error checking and debug logging
+- **Legacy functions deprecated**: Do NOT use `ggml_numa_register_*_kernels()` functions
 ```
 
 ### Step 3: Testing
@@ -207,7 +247,7 @@ cp tests/test-numa-mathematical-correctness-template.cpp tests/test-numa-mathema
 - **ADD** - Element-wise addition with SIMD optimization and shared memory approach
 - **MUL** - Element-wise multiplication with optimized data-parallel execution
 - **MUL_MAT** - Matrix multiplication with chunk-based work distribution and type-specific SIMD operations
-- **CPY** - Copy operations with type conversion and contiguous/strided access patterns
+- **RMS_NORM** - Root mean square normalization with row-wise NUMA distribution (critical for transformers)
 
 **🚀 Performance Characteristics:**
 - **O(1) Strategy Lookups** - Hash table-based registry eliminates search overhead
@@ -514,6 +554,7 @@ cmake --build build --target ggml-cpu llama && echo "🎉 Complete!" || echo "�
 - **Registry Integration**: Add cache entries for all complexity classes
 - **Architecture Flow**: Follow Executor → Registry Query → Coordinator pattern
 - **Debug Control**: Use `GGML_NUMA_DEBUG=1` for development debugging, unset for performance testing
+- **Kernel Registration**: Always use `NUMA_REGISTER_KERNEL()` macro, never legacy function-based registration
 
 ### Debug Message Implementation
 When adding new NUMA components, always use the centralized debug control system:
@@ -544,15 +585,24 @@ tests/test-numa-mathematical-correctness-*.cpp    # Correctness tests
 tests/run-numa-performance-tests.sh               # Performance test orchestrator
 tests/test-numa-execution-modes.cpp               # Runs individual op performance tests for the Performance test orchestrator across a variety of NUMA modes
 docs/numa-architecture.md                         # Architecture documentation
+
+# NUMA Kernel Templates (Choose Based on Operation Type)
+ggml/src/ggml-cpu/numa-kernels/add.c              # Template: Binary element-wise operations
+ggml/src/ggml-cpu/numa-kernels/mul_mat.c          # Template: Complex operations & matrix ops
+ggml/src/ggml-cpu/numa-kernels/rms_norm.c         # Template: Reduction operations & normalizations
 ```
 
 ### Implementation Checklist
 - [ ] Find mathematical kernel in `ggml-cpu.c`
+- [ ] **Choose appropriate template**: Binary (add.c), Complex (mul_mat.c), or Reduction (rms_norm.c)
 - [ ] Extract pure mathematical operations (no ggml threading)
 - [ ] Replace scalar loops with SIMD `ggml_vec_*` functions
-- [ ] Implement kernel function in `numa-kernels/` directory
+- [ ] **Copy template and adapt** for your operation type
+- [ ] Implement kernel function in `numa-kernels/` directory following template patterns
 - [ ] Use shared memory setup: check `ggml_numa_shared_result_tensor_data` for direct writes
-- [ ] Add cache entries to registry with appropriate aggregation policy (NONE/CUSTOM)
+- [ ] Create `ggml_numa_kernel_{operation}_register()` function that returns registration info
+- [ ] Add function declaration to kernel header file (e.g., `add.h`, `mul.h`)
+- [ ] Enable in `numa-kernels.c` using `NUMA_REGISTER_KERNEL(operation)` macro
 - [ ] Use `NUMA_ASSERT` for validation with proper coordinator signaling
 - [ ] Use `NUMA_LOG_DEBUG` macros instead of printf for debug messages
 - [ ] Create test from template with multi-dimensional validation
