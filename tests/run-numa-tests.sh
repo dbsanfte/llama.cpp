@@ -61,6 +61,7 @@ NUMA_TESTS=(
     "test-numa-mathematical-correctness-mul_mat"
     "test-numa-mathematical-correctness-rms_norm"
     "test-numa-mathematical-correctness-rope"
+    "test-numa-mathematical-correctness-permute"
     "test-numa-data-slicing-verification"
 )
 
