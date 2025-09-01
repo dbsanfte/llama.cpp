@@ -876,15 +876,10 @@ enum ggml_status ggml_numa_kernel_add_execute_no_aggregation(void * work_context
                            ggml_numa_total_nodes_for_data_parallel : 1;
     const bool is_data_parallel = ggml_numa_is_data_parallel_execution;
     
-    // Optimal thread count to reduce synchronization overhead
-    const int optimal_threads_per_node = 8;
-    const int thread_id = params->ith % optimal_threads_per_node;
-    const int num_threads = MIN(params->nth, optimal_threads_per_node);
-    
-    // Skip execution if this thread is beyond our optimal count
-    if (params->ith >= optimal_threads_per_node) {
-        return GGML_STATUS_SUCCESS;
-    }
+    // Use actual thread count from coordinator instead of artificial limitation
+    // The coordinator determines the optimal thread count based on the execution strategy
+    const int thread_id = params->ith;
+    const int num_threads = params->nth;
     
     NUMA_LOG_DEBUG("NUMA Node %d, Thread %d TYPE-AWARE kernel (src0=%s, src1=%s, dst=%s, data_parallel=%d)", 
                    current_node, thread_id, ggml_type_name(src0_type), ggml_type_name(src1_type), 
