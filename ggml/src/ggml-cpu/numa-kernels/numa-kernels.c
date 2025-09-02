@@ -18,6 +18,7 @@
 #include "mul.h"
 #include "mul_mat.h"
 #include "cpy.h"
+#include "cont.h"
 #include "rms_norm.h"
 #include "rope.h"
 #include "permute.h"
@@ -285,6 +286,9 @@ enum ggml_status ggml_numa_kernels_init(void) {
 
     // Register CPY kernel - DISABLED due to memory corruption issues
     //NUMA_REGISTER_KERNEL(cpy);
+
+    // Register CONT kernel for tensor contiguity operations
+    NUMA_REGISTER_KERNEL(cont);
 
     // Enable MUL_MAT kernel for matrix multiplication
     // Register MUL_MAT kernel
