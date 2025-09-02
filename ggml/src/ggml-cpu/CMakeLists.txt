@@ -58,6 +58,8 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
         ggml-cpu/numa-kernels/reshape.h
         ggml-cpu/numa-kernels/view.c
         ggml-cpu/numa-kernels/view.h
+        ggml-cpu/numa-kernels/soft_max.c
+        ggml-cpu/numa-kernels/soft_max.h
         ggml-cpu/numa-kernels/noop.c
         ggml-cpu/numa-kernels/noop.h
         ggml-work-item.c

@@ -24,6 +24,7 @@
 #include "glu.h"
 #include "reshape.h"
 #include "view.h"
+#include "soft_max.h"
 #include "noop.h"
 #include "../ggml-impl.h"
 
@@ -307,6 +308,9 @@ enum ggml_status ggml_numa_kernels_init(void) {
     
     // Register VIEW kernel for tensor view operations
     NUMA_REGISTER_KERNEL(view);
+    
+    // Register SOFT_MAX kernel for softmax activation
+    NUMA_REGISTER_KERNEL(soft_max);
     
     // Register NOOP kernel for performance testing
     //ggml_numa_register_noop_kernels();
