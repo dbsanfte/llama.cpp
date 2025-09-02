@@ -19,6 +19,7 @@
 #include "mul_mat.h"
 #include "cpy.h"
 #include "cont.h"
+#include "get_rows.h"
 #include "rms_norm.h"
 #include "rope.h"
 #include "permute.h"
@@ -289,6 +290,9 @@ enum ggml_status ggml_numa_kernels_init(void) {
 
     // Register CONT kernel for tensor contiguity operations
     NUMA_REGISTER_KERNEL(cont);
+
+    // Register GET_ROWS kernel for tensor row extraction operations
+    NUMA_REGISTER_KERNEL(get_rows);
 
     // Enable MUL_MAT kernel for matrix multiplication
     // Register MUL_MAT kernel
