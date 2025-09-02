@@ -28,6 +28,8 @@
 #include <random>
 #include <regex>
 #include <optional>
+#include <set>
+#include <unistd.h>  // for sysconf
 
 // GGML includes
 #include "ggml.h"
@@ -291,7 +293,56 @@ private:
             {32, 32, 32, "Large 3D"},
         };
         
-        const std::vector<int> thread_counts = {1, 2, 4, 6, 8};
+        // Test different thread counts
+        std::vector<int> thread_counts = {1, 2, 4, 6, 8, 15, 16, 31, 32, 64, 128};
+        
+        // Add NUMA-aware thread counts based on actual hardware topology
+        std::vector<int> numa_thread_counts;
+        int num_numa_nodes = ggml_numa_simple_coordinator_get_num_nodes();
+        if (num_numa_nodes > 0) {
+            // Get total CPU count and derive threads per node
+            // Using reasonable estimates for threads per node based on typical systems
+            int total_cpus = 0;
+            #ifdef __linux__
+            // Try to get CPU count from /proc/cpuinfo or sysconf
+            total_cpus = sysconf(_SC_NPROCESSORS_CONF);
+            #endif
+            if (total_cpus <= 0) {
+                total_cpus = 16; // Conservative fallback
+            }
+            
+            int threads_per_node = total_cpus / num_numa_nodes;
+            if (threads_per_node <= 0) threads_per_node = 4; // Minimum fallback
+            
+            // Test with max threads per node for each NUMA node scenario
+            numa_thread_counts.push_back(threads_per_node);                    // Single node max
+            numa_thread_counts.push_back(num_numa_nodes * threads_per_node);   // All nodes max
+            
+            // Test with partial NUMA utilization scenarios
+            if (num_numa_nodes >= 2) {
+                numa_thread_counts.push_back(2 * threads_per_node);           // Two nodes max
+            }
+            if (num_numa_nodes >= 4) {
+                numa_thread_counts.push_back(4 * threads_per_node);           // Four nodes max
+            }
+        }
+        
+        // Combine standard and NUMA-aware thread counts, removing duplicates
+        std::set<int> all_thread_counts(thread_counts.begin(), thread_counts.end());
+        for (int numa_count : numa_thread_counts) {
+            if (numa_count > 0 && numa_count <= 256) { // Reasonable upper bound
+                all_thread_counts.insert(numa_count);
+            }
+        }
+        
+        // Convert back to vector for iteration
+        std::vector<int> final_thread_counts(all_thread_counts.begin(), all_thread_counts.end());
+        
+        printf("  🧵 Testing with %zu thread configurations", final_thread_counts.size());
+        if (num_numa_nodes > 0) {
+            printf(" (including NUMA-aware counts for %d nodes)", num_numa_nodes);
+        }
+        printf("\n");
         
         // Test different type combinations
         const std::vector<std::pair<ggml_type, ggml_type>> type_combinations = {
@@ -309,7 +360,7 @@ private:
                    ggml_type_name(type_combo.first), ggml_type_name(type_combo.second));
             
             for (const auto& test_case : test_cases) {
-                for (int num_threads : thread_counts) {
+                for (int num_threads : final_thread_counts) {
                     if (list_only) {
                         printf("    Would test: CPY %s [%d×%d×%d] with %d threads (%s->%s)\n", 
                                test_case.size_label, test_case.dim1, test_case.dim2, test_case.dim3, 
