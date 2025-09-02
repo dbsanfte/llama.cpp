@@ -32,6 +32,7 @@ while [[ $# -gt 0 ]]; do
             echo ""
             echo "NUMA Integration Test with llama-server"
             echo "Tests llama-server with a real model to ensure end-to-end functionality."
+            echo "Automatically enables NUMA debug logging for operation analysis and prioritization."
             echo ""
             echo "Options:"
             echo "  --verbose          Show detailed test output and logs"
@@ -42,17 +43,23 @@ while [[ $# -gt 0 ]]; do
             echo "Environment Variables:"
             echo "  All environment variables are passed through to llama-server, including:"
             echo "  GGML_NUMA_DEBUG   Control NUMA debug output (0=off, 1=info, 2=verbose, 3=trace)"
+            echo "                     Default: 1 (automatically enabled for operation analysis)"
             echo "  GGML_LOG_DEBUG    Control general debug logging"
             echo "  GGML_OPENMP       Control OpenMP threading behavior"
+            echo ""
+            echo "Features:"
+            echo "  📊 Operation Analysis: Automatically analyzes NUMA vs fallback operations"
+            echo "  🎯 Prioritization: Shows which operations should be implemented next"
+            echo "  📈 Usage Statistics: Displays call counts for performance optimization"
             echo ""
             echo "Examples:"
             echo "  $0                                    # Basic test without NUMA"
             echo "  $0 --numa mirror                     # Test with NUMA mirror mode"
-            echo "  GGML_NUMA_DEBUG=1 $0 --numa mirror   # Test with NUMA debug output"
+            echo "  GGML_NUMA_DEBUG=2 $0 --numa mirror   # Test with verbose NUMA debug output"
             echo ""
             echo "This test downloads a small model (if not present) and validates that"
             echo "llama-server can generate coherent responses. When --numa is specified,"
-            echo "it tests NUMA-specific functionality."
+            echo "it tests NUMA-specific functionality and provides operation analysis."
             exit 0
             ;;
         *)
@@ -119,6 +126,74 @@ check_integration_requirements() {
     echo ""
 }
 
+# Function to analyze NUMA debug logs and prioritize next operations
+analyze_numa_debug_logs() {
+    local log_file="$1"
+    
+    if [ ! -f "$log_file" ]; then
+        echo -e "${YELLOW}⚠️  No debug log file found for analysis${NC}"
+        return
+    fi
+    
+    echo ""
+    echo "========================================"
+    echo -e "${BLUE}📊 NUMA Operation Analysis${NC}"
+    echo "========================================"
+    
+    # Create temporary files for analysis
+    local numa_ops_file=$(mktemp)
+    local fallback_ops_file=$(mktemp)
+    local summary_file=$(mktemp)
+    
+    # Extract NUMA kernel executions (successful dispatches)
+    # Look for "Query result - supported=true, kernel=NUMA ADD (Single/Multi)" patterns
+    grep "Query result.*supported=true.*kernel=" "$log_file" | \
+        sed -E 's/.*kernel=(NUMA )?([A-Z_]+).*/\2/' | \
+        sort | uniq -c | sort -nr > "$numa_ops_file"
+    
+    # Extract fallback executions (operations that fell back to ggml-cpu)
+    # Look for "No kernel found for operation GET_ROWS" patterns specifically
+    grep "No kernel found for operation" "$log_file" | \
+        sed -E 's/.*No kernel found for operation ([A-Z_]+).*/\1/' | \
+        sort | uniq -c | sort -nr > "$fallback_ops_file"
+    
+    # Show NUMA-implemented operations
+    if [ -s "$numa_ops_file" ]; then
+        echo "✅ Operations using NUMA kernels:"
+        while read -r count op; do
+            printf "   %3d × %s\n" "$count" "$op"
+        done < "$numa_ops_file"
+    else
+        echo "⚠️  No NUMA kernel executions detected"
+    fi
+    
+    echo ""
+    
+    # Show fallback operations (prioritization candidates)
+    if [ -s "$fallback_ops_file" ]; then
+        echo "🎯 Operations falling back to ggml-cpu (prioritized by usage):"
+        local rank=1
+        while read -r count op; do
+            printf "   %d. %s (%d calls)\n" "$rank" "$op" "$count"
+            rank=$((rank + 1))
+        done < "$fallback_ops_file"
+        
+        echo ""
+        echo -e "${YELLOW}💡 Recommendation: Consider implementing NUMA kernels for the most frequently used fallback operations${NC}"
+        
+        # Extract top 3 candidates
+        local top_candidates=$(head -3 "$fallback_ops_file" | awk '{print $2}' | tr '\n' ', ' | sed 's/,$//')
+        if [ -n "$top_candidates" ]; then
+            echo -e "${BLUE}🚀 Top candidates for next implementation: $top_candidates${NC}"
+        fi
+    else
+        echo "🎉 All operations are using NUMA kernels (no fallbacks detected)!"
+    fi
+    
+    # Cleanup
+    rm -f "$numa_ops_file" "$fallback_ops_file" "$summary_file"
+}
+
 # Function to run integration test with llama-server
 run_integration_test() {
     echo "========================================"
@@ -134,6 +209,7 @@ run_integration_test() {
     local test_prompt="Hello!"
     local expected_response_pattern="Hello"
     local server_pid=""
+    local debug_log="/tmp/llama-server-debug.log"
     
     # Check if model exists, download if needed
     if [ ! -f "$model_path" ]; then
@@ -151,26 +227,29 @@ run_integration_test() {
         echo "    🚀 Starting llama-server without NUMA options..."
     fi
     
+    # Enable NUMA debug logging by default for operation analysis
+    # Set GGML_NUMA_DEBUG=1 if not already set to capture operation statistics
+    local numa_debug_level="${GGML_NUMA_DEBUG:-1}"
+    if [ "$numa_debug_level" != "0" ]; then
+        echo "    📊 NUMA debug logging enabled (level=$numa_debug_level) for operation analysis"
+        export GGML_NUMA_DEBUG="$numa_debug_level"
+    fi
+    
     # Show relevant environment variables in verbose mode
     if [ "$VERBOSE_MODE" = true ]; then
         echo "    📋 Environment variables that will be passed to llama-server:"
-        if [ -n "$GGML_NUMA_DEBUG" ]; then
-            echo "       GGML_NUMA_DEBUG=$GGML_NUMA_DEBUG"
-        fi
+        echo "       GGML_NUMA_DEBUG=$GGML_NUMA_DEBUG"
         if [ -n "$GGML_LOG_DEBUG" ]; then
             echo "       GGML_LOG_DEBUG=$GGML_LOG_DEBUG"
         fi
         if [ -n "$GGML_OPENMP" ]; then
             echo "       GGML_OPENMP=$GGML_OPENMP"
         fi
-        if [ -z "$GGML_NUMA_DEBUG" ] && [ -z "$GGML_LOG_DEBUG" ] && [ -z "$GGML_OPENMP" ]; then
-            echo "       (No relevant environment variables set)"
-        fi
     fi
     
     # Start llama-server in background with optional NUMA mode
     # Note: All environment variables are automatically inherited by the child process
-    "$BIN_DIR/llama-server" -m "$model_path" --host 0.0.0.0 $NUMA_OPTION --port $server_port > /tmp/llama-server.log 2>&1 &
+    "$BIN_DIR/llama-server" -m "$model_path" --host 0.0.0.0 $NUMA_OPTION --port $server_port > "$debug_log" 2>&1 &
     server_pid=$!
     
     # Function to cleanup server
@@ -202,7 +281,7 @@ run_integration_test() {
             echo -e "\n${RED}❌ Server process died during startup (PID: $server_pid)${NC}"
             if [ "$VERBOSE_MODE" = true ]; then
                 echo "Server log:"
-                cat /tmp/llama-server.log 2>/dev/null || echo "No log file found"
+                cat "$debug_log" 2>/dev/null || echo "No log file found"
             fi
             return 1
         fi
@@ -221,7 +300,7 @@ run_integration_test() {
         echo -e "${RED}❌ Server failed to start within 60 seconds${NC}"
         if [ "$VERBOSE_MODE" = true ]; then
             echo "Server log:"
-            cat /tmp/llama-server.log 2>/dev/null || echo "No log file found"
+            cat "$debug_log" 2>/dev/null || echo "No log file found"
         fi
         cleanup_server
         return 1
@@ -239,7 +318,7 @@ run_integration_test() {
             echo -e "\n${RED}❌ Server process died during model loading (PID: $server_pid)${NC}"
             if [ "$VERBOSE_MODE" = true ]; then
                 echo "Server log:"
-                cat /tmp/llama-server.log 2>/dev/null || echo "No log file found"
+                cat "$debug_log" 2>/dev/null || echo "No log file found"
             fi
             return 1
         fi
@@ -266,7 +345,7 @@ run_integration_test() {
         if [ "$VERBOSE_MODE" = true ]; then
             echo "Last response: $health_response"
             echo "Server log:"
-            tail -20 /tmp/llama-server.log 2>/dev/null || echo "No log file found"
+            tail -20 "$debug_log" 2>/dev/null || echo "No log file found"
         fi
         cleanup_server
         return 1
@@ -292,7 +371,7 @@ run_integration_test() {
         echo -e "${RED}❌ Failed to get response from server${NC}"
         if [ "$VERBOSE_MODE" = true ]; then
             echo "Server log:"
-            tail -20 /tmp/llama-server.log 2>/dev/null || echo "No log file found"
+            tail -20 "$debug_log" 2>/dev/null || echo "No log file found"
         fi
         cleanup_server
         return 1
@@ -331,6 +410,10 @@ run_integration_test() {
         else
             echo "🎯 llama-server is working correctly!"
         fi
+        
+        # Analyze NUMA debug logs for operation prioritization
+        analyze_numa_debug_logs "$debug_log"
+        
         cleanup_server
         return 0
     else
