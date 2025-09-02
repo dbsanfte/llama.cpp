@@ -248,7 +248,8 @@ cp tests/test-numa-mathematical-correctness-template.cpp tests/test-numa-mathema
 
 **Required tests:**
 - Multi-dimensional: TINY → GIGANTIC_16GB tensor sizes (now includes GB-scale support)
-- Multi-threading: 1, 2, 4, 6, 8 threads  
+- Multi-threading: 1, 2, 4, 6, 8, 15, 16, 31, 32, 64, 128 threads
+- Hardware-specific Data Parallel: Data parallel tests with all numas available on the machine using max thread counts per numa node
 - Mathematical equivalence: Exact comparison with reference
 - Add to CMake and verify with `cmake --build build --target test-numa-mathematical-correctness-YOUR_OPERATION`
 
