@@ -830,14 +830,8 @@ ggml_numa_kernel_query_result_t ggml_numa_kernel_mul_mat_query(const struct ggml
     const size_t total_elements = ggml_nelements(tensor);
     
     // Find optimal strategy using threshold search
-    const ggml_mul_mat_strategy_threshold_t * selected_strategy = &MUL_MAT_THRESHOLDS[MUL_MAT_THRESHOLD_COUNT - 1];
-    
-    for (size_t i = 0; i < MUL_MAT_THRESHOLD_COUNT; i++) {
-        if (total_elements < MUL_MAT_THRESHOLDS[i].element_threshold) {
-            selected_strategy = &MUL_MAT_THRESHOLDS[i];
-            break;
-        }
-    }
+    const ggml_mul_mat_strategy_threshold_t * selected_strategy;
+    NUMA_SELECT_STRATEGY_BY_THRESHOLD(MUL_MAT_THRESHOLDS, MUL_MAT_THRESHOLD_COUNT, total_elements, selected_strategy);
     
     // Calculate work buffer size dynamically based on tensor requirements
     const size_t work_buffer_size = ggml_numa_kernel_mul_mat_calculate_work_buffer_size(tensor);

@@ -555,14 +555,8 @@ ggml_numa_kernel_query_result_t ggml_numa_kernel_mul_query(const struct ggml_ten
     const size_t total_elements = ggml_nelements(tensor);
     
     // Find optimal strategy using threshold search
-    const ggml_mul_strategy_threshold_t * selected_strategy = &MUL_THRESHOLDS[MUL_THRESHOLD_COUNT - 1];
-    
-    for (size_t i = 0; i < MUL_THRESHOLD_COUNT; i++) {
-        if (total_elements < MUL_THRESHOLDS[i].element_threshold) {
-            selected_strategy = &MUL_THRESHOLDS[i];
-            break;
-        }
-    }
+    const ggml_mul_strategy_threshold_t * selected_strategy;
+    NUMA_SELECT_STRATEGY_BY_THRESHOLD(MUL_THRESHOLDS, MUL_THRESHOLD_COUNT, total_elements, selected_strategy);
     
     // Check if this kernel is actually registered and supported
     if (!ggml_numa_is_kernel_supported(GGML_OP_MUL)) {

@@ -247,6 +247,34 @@ bool ggml_numa_apply_kernel_force_strategy(ggml_numa_kernel_query_result_t * res
                                            ggml_numa_work_function_t data_parallel_fn);
 
 /**
+ * NUMA_SELECT_STRATEGY_BY_THRESHOLD - Macro for optimal threshold-based strategy selection
+ * 
+ * This macro implements the efficient threshold search pattern used by multiple kernels.
+ * It starts from the simplest strategy (fastest for tiny operations) and works up.
+ * 
+ * @param threshold_array - Array of threshold structures (e.g., ADD_THRESHOLDS)
+ * @param threshold_count - Number of elements in the array (e.g., ADD_THRESHOLD_COUNT)
+ * @param total_elements - Number of elements in the tensor
+ * @param selected_strategy - [OUT] Pointer to the selected strategy structure
+ * 
+ * Usage example:
+ *   const ggml_add_strategy_threshold_t * selected_strategy;
+ *   NUMA_SELECT_STRATEGY_BY_THRESHOLD(ADD_THRESHOLDS, ADD_THRESHOLD_COUNT, total_elements, selected_strategy);
+ * 
+ * Performance: O(1) for tiny operations (most common case), O(log n) worst case
+ */
+#define NUMA_SELECT_STRATEGY_BY_THRESHOLD(threshold_array, threshold_count, total_elements, selected_strategy) do { \
+    /* Start from simplest strategy (fastest for tiny operations) and work up */ \
+    selected_strategy = &threshold_array[0]; \
+    for (size_t i = 0; i < threshold_count; i++) { \
+        if (total_elements < threshold_array[i].element_threshold) { \
+            selected_strategy = &threshold_array[i]; \
+            break; \
+        } \
+    } \
+} while(0)
+
+/**
  * NUMA_REGISTER_KERNEL - Macro to simplify kernel registration
  * 
  * This macro eliminates code duplication when registering NUMA kernels.
