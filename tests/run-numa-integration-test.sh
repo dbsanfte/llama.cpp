@@ -31,7 +31,9 @@ while [[ $# -gt 0 ]]; do
             echo "Usage: $0 [--verbose] [--numa <mode>] [--help]"
             echo ""
             echo "NUMA Integration Test with llama-server"
-            echo "Tests llama-server with a real model to ensure end-to-end functionality."
+            echo "Tests llama-server with two models to ensure end-to-end functionality:"
+            echo "  1. Small model: Qwen 2.5 0.5B (Q8_0) - fast validation"
+            echo "  2. Large model: Qwen 3 32B (Q6_K) - comprehensive validation"
             echo "Automatically enables NUMA debug logging for operation analysis and prioritization."
             echo ""
             echo "Options:"
@@ -51,15 +53,16 @@ while [[ $# -gt 0 ]]; do
             echo "  📊 Operation Analysis: Automatically analyzes NUMA vs fallback operations"
             echo "  🎯 Prioritization: Shows which operations should be implemented next"
             echo "  📈 Usage Statistics: Displays call counts for performance optimization"
+            echo "  🔬 Dual Model Testing: Validates both small and large model performance"
             echo ""
             echo "Examples:"
-            echo "  $0                                    # Basic test without NUMA"
-            echo "  $0 --numa mirror                     # Test with NUMA mirror mode"
+            echo "  $0                                    # Basic test without NUMA (both models)"
+            echo "  $0 --numa mirror                     # Test with NUMA mirror mode (both models)"
             echo "  GGML_NUMA_DEBUG=2 $0 --numa mirror   # Test with verbose NUMA debug output"
             echo ""
-            echo "This test downloads a small model (if not present) and validates that"
-            echo "llama-server can generate coherent responses. When --numa is specified,"
-            echo "it tests NUMA-specific functionality and provides operation analysis."
+            echo "This test downloads models (if not present) and validates that llama-server"
+            echo "can generate coherent responses with both small and large models. When --numa"
+            echo "is specified, it tests NUMA-specific functionality and provides operation analysis."
             exit 0
             ;;
         *)
@@ -151,6 +154,11 @@ analyze_numa_debug_logs() {
         sed -E 's/.*kernel=(NUMA )?([A-Z_]+).*/\2/' | \
         sort | uniq -c | sort -nr > "$numa_ops_file"
     
+    # Extract strategy breakdown for each operation
+    local strategy_file=$(mktemp)
+    grep "Query result.*supported=true.*kernel=" "$log_file" | \
+        sed -E 's/.*kernel=(.*)/\1/' > "$strategy_file"
+    
     # Extract fallback executions (operations that fell back to ggml-cpu)
     # Look for "No kernel found for operation GET_ROWS" patterns specifically
     grep "No kernel found for operation" "$log_file" | \
@@ -161,7 +169,52 @@ analyze_numa_debug_logs() {
     if [ -s "$numa_ops_file" ]; then
         echo "✅ Operations using NUMA kernels:"
         while read -r count op; do
-            printf "   %3d × %s\n" "$count" "$op"
+            # Get strategy breakdown for this operation with more precise matching
+            local single_thread=0
+            local single_single=0
+            local single_multi=0
+            local data_parallel=0
+            local kernel_only=0
+            
+            # Handle special cases for precise matching
+            case "$op" in
+                "MUL_MAT")
+                    single_single=$(grep -c "NUMA MUL_MAT (Single/Single)" "$strategy_file" 2>/dev/null)
+                    single_multi=$(grep -c "NUMA MUL_MAT (Single/Multi)" "$strategy_file" 2>/dev/null)
+                    ;;
+                "MUL")
+                    single_single=$(grep -c "NUMA MUL (Single/Single)" "$strategy_file" 2>/dev/null)
+                    single_multi=$(grep -c "NUMA MUL (Single/Multi)" "$strategy_file" 2>/dev/null)
+                    ;;
+                "ADD")
+                    single_single=$(grep -c "NUMA ADD (Single/Single)" "$strategy_file" 2>/dev/null)
+                    single_multi=$(grep -c "NUMA ADD (Single/Multi)" "$strategy_file" 2>/dev/null)
+                    ;;
+                "RMS_NORM")
+                    single_thread=$(grep -c "RMS_NORM Single Thread" "$strategy_file" 2>/dev/null)
+                    ;;
+                *)
+                    # For other operations (RESHAPE, VIEW, PERMUTE, etc.)
+                    kernel_only=$(grep -c "NUMA ${op} Kernel" "$strategy_file" 2>/dev/null)
+                    ;;
+            esac
+            
+            # Create strategy summary
+            local strategies=""
+            [ "$single_thread" -gt 0 ] && strategies="${strategies}single_thread: ${single_thread}, "
+            [ "$single_single" -gt 0 ] && strategies="${strategies}single_single: ${single_single}, "
+            [ "$single_multi" -gt 0 ] && strategies="${strategies}single_multi: ${single_multi}, "
+            [ "$data_parallel" -gt 0 ] && strategies="${strategies}data_parallel: ${data_parallel}, "
+            [ "$kernel_only" -gt 0 ] && strategies="${strategies}kernel: ${kernel_only}, "
+            
+            # Remove trailing comma and space
+            strategies=${strategies%, }
+            
+            if [ -n "$strategies" ]; then
+                printf "   %3d × %s (%s)\n" "$count" "$op" "$strategies"
+            else
+                printf "   %3d × %s\n" "$count" "$op"
+            fi
         done < "$numa_ops_file"
     else
         echo "⚠️  No NUMA kernel executions detected"
@@ -191,35 +244,41 @@ analyze_numa_debug_logs() {
     fi
     
     # Cleanup
-    rm -f "$numa_ops_file" "$fallback_ops_file" "$summary_file"
+    rm -f "$numa_ops_file" "$fallback_ops_file" "$summary_file" "$strategy_file"
 }
 
-# Function to run integration test with llama-server
-run_integration_test() {
+# Function to test a specific model
+test_single_model() {
+    local model_name="$1"
+    local model_path="$2"
+    local model_url="$3"
+    local model_id="$4"
+    local expected_pattern="$5"
+    local test_prompt="$6"
+    
     echo "========================================"
-    if [ -n "$NUMA_OPTION" ]; then
-        echo -e "${BLUE}🧪 NUMA Integration Test with llama-server${NC}"
-    else
-        echo -e "${BLUE}🧪 Integration Test with llama-server${NC}"
-    fi
+    echo -e "${BLUE}📋 Testing model: $model_name${NC}"
     echo "========================================"
     
-    local model_path="./.devcontainer/qwen2.5-0.5b-instruct-q8_0.gguf"
-    local server_port=8080
-    local test_prompt="Hello!"
-    local expected_response_pattern="Hello"
-    local server_pid=""
-    local debug_log="/tmp/llama-server-debug.log"
-    
-    # Check if model exists, download if needed
+    # Download model if it doesn't exist
     if [ ! -f "$model_path" ]; then
-        echo "📥 Downloading test model..."
-        wget -c -O "$model_path" https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF/resolve/main/qwen2.5-0.5b-instruct-q8_0.gguf
+        echo "📥 Downloading $model_name..."
+        echo "   Source: $model_url"
+        echo "   Target: $model_path"
+        wget -c -O "$model_path" "$model_url"
         if [ $? -ne 0 ]; then
-            echo -e "${RED}❌ Failed to download test model${NC}"
+            echo -e "${RED}❌ Failed to download $model_name${NC}"
             return 1
         fi
+        echo "✅ Model downloaded successfully"
+    else
+        echo "✅ Using existing model: $model_path"
     fi
+    
+    # Generate unique debug log for this model
+    local debug_log="/tmp/llama-server-debug-$(basename "$model_path" .gguf).log"
+    local server_port=8080
+    local server_pid=""
     
     if [ -n "$NUMA_OPTION" ]; then
         echo "    🚀 Starting llama-server with NUMA option: $NUMA_OPTION..."
@@ -271,7 +330,7 @@ run_integration_test() {
     trap cleanup_server EXIT
     
     echo "⏳ Waiting for server to start..."
-    local max_attempts=60  # Increased timeout for model loading
+    local max_attempts=90  # Increased timeout for larger models
     local attempt=0
     
     # Wait for server to become available
@@ -297,7 +356,7 @@ run_integration_test() {
     echo ""
     
     if [ $attempt -eq $max_attempts ]; then
-        echo -e "${RED}❌ Server failed to start within 60 seconds${NC}"
+        echo -e "${RED}❌ Server failed to start within 90 seconds${NC}"
         if [ "$VERBOSE_MODE" = true ]; then
             echo "Server log:"
             cat "$debug_log" 2>/dev/null || echo "No log file found"
@@ -308,7 +367,7 @@ run_integration_test() {
     
     echo "⏳ Waiting for model to finish loading..."
     local model_loaded=false
-    local load_attempts=30
+    local load_attempts=60  # Increased for larger models
     local load_attempt=0
     
     # Wait for model to be fully loaded by testing API endpoint
@@ -325,7 +384,7 @@ run_integration_test() {
         
         local health_response=$(curl -s -X POST http://localhost:$server_port/v1/chat/completions \
             -H "Content-Type: application/json" \
-            -d '{"model": "qwen2.5-0.5b-instruct", "messages": [{"role": "user", "content": "test"}], "max_tokens": 1}' 2>/dev/null)
+            -d "{\"model\": \"$model_id\", \"messages\": [{\"role\": \"user\", \"content\": \"test\"}], \"max_tokens\": 1}" 2>/dev/null)
         
         # Check if we get a proper response (not 503 loading error)
         if echo "$health_response" | grep -q "choices\|content" && ! echo "$health_response" | grep -q "Loading model"; then
@@ -341,7 +400,7 @@ run_integration_test() {
     echo ""
     
     if [ "$model_loaded" = false ]; then
-        echo -e "${RED}❌ Model failed to load within 60 seconds${NC}"
+        echo -e "${RED}❌ Model failed to load within 120 seconds${NC}"
         if [ "$VERBOSE_MODE" = true ]; then
             echo "Last response: $health_response"
             echo "Server log:"
@@ -353,19 +412,19 @@ run_integration_test() {
     
     echo "🔍 Testing deterministic response generation..."
     echo "   Prompt: \"$test_prompt\""
-    echo "   Expected: Response containing \"$expected_response_pattern\""
+    echo "   Expected: Response containing \"$expected_pattern\""
     
     # Make API request with temperature=0.0 for deterministic output
     local response=$(curl -s -X POST http://localhost:$server_port/v1/chat/completions \
         -H "Content-Type: application/json" \
-        -d '{
-            "model": "qwen2.5-0.5b-instruct", 
-            "messages": [{"role": "user", "content": "'"$test_prompt"'"}], 
-            "max_tokens": 20,
-            "temperature": 0.0,
-            "top_p": 1.0,
-            "seed": 42
-        }' 2>/dev/null)
+        -d "{
+            \"model\": \"$model_id\", 
+            \"messages\": [{\"role\": \"user\", \"content\": \"$test_prompt\"}], 
+            \"max_tokens\": 20,
+            \"temperature\": 0.0,
+            \"top_p\": 1.0,
+            \"seed\": 42
+        }" 2>/dev/null)
     
     if [ $? -ne 0 ] || [ -z "$response" ]; then
         echo -e "${RED}❌ Failed to get response from server${NC}"
@@ -403,12 +462,12 @@ run_integration_test() {
     echo "💬 Generated content: \"$content\""
     
     # Check if response contains expected pattern (case-insensitive)
-    if echo "$content" | grep -i "$expected_response_pattern" >/dev/null; then
+    if echo "$content" | grep -i "$expected_pattern" >/dev/null; then
         echo -e "${GREEN}✅ Integration test PASSED: Response contains expected pattern${NC}"
         if [ -n "$NUMA_OPTION" ]; then
-            echo "🎯 NUMA-enabled llama-server is working correctly!"
+            echo "🎯 NUMA-enabled llama-server is working correctly with $model_name!"
         else
-            echo "🎯 llama-server is working correctly!"
+            echo "🎯 llama-server is working correctly with $model_name!"
         fi
         
         # Analyze NUMA debug logs for operation prioritization
@@ -418,11 +477,55 @@ run_integration_test() {
         return 0
     else
         echo -e "${RED}❌ Integration test FAILED: Response does not contain expected pattern${NC}"
-        echo "   Expected pattern: \"$expected_response_pattern\""
+        echo "   Expected pattern: \"$expected_pattern\""
         echo "   Actual content: \"$content\""
         cleanup_server
         return 1
     fi
+}
+
+# Function to run integration test with llama-server
+run_integration_test() {
+    echo "========================================"
+    if [ -n "$NUMA_OPTION" ]; then
+        echo -e "${BLUE}🧪 NUMA Integration Test with llama-server${NC}"
+    else
+        echo -e "${BLUE}🧪 Integration Test with llama-server${NC}"
+    fi
+    echo "========================================"
+    
+    # Test 1: Small model (Qwen 0.5B)
+    echo -e "${YELLOW}🔬 Test 1: Small Model Validation${NC}"
+    local small_model_name="Qwen 2.5 0.5B (Q8_0)"
+    local small_model_path="./.devcontainer/qwen2.5-0.5b-instruct-q8_0.gguf"
+    local small_model_url="https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF/resolve/main/qwen2.5-0.5b-instruct-q8_0.gguf"
+    local small_model_id="qwen2.5-0.5b-instruct"
+    local small_test_prompt="Hello!"
+    local small_expected_pattern="Hello! How can I assist you today?"
+    
+    if ! test_single_model "$small_model_name" "$small_model_path" "$small_model_url" "$small_model_id" "$small_expected_pattern" "$small_test_prompt"; then
+        echo -e "${RED}❌ Small model test failed - stopping integration test${NC}"
+        return 1
+    fi
+    
+    echo ""
+    echo -e "${YELLOW}🔬 Test 2: Large Model Validation${NC}"
+    # Test 2: Large model (Qwen 32B)
+    local large_model_name="Qwen 3 32B (Q6_K)"
+    local large_model_path="./.devcontainer/Qwen3-32B-Q6_K.gguf"
+    local large_model_url="https://huggingface.co/Qwen/Qwen3-32B-GGUF/resolve/main/Qwen3-32B-Q6_K.gguf"
+    local large_model_id="qwen3-32b"
+    local large_test_prompt="What is artificial intelligence?"
+    local large_expected_pattern="I need to figure out what artificial intelligence is"
+    
+    if ! test_single_model "$large_model_name" "$large_model_path" "$large_model_url" "$large_model_id" "$large_expected_pattern" "$large_test_prompt"; then
+        echo -e "${RED}❌ Large model test failed${NC}"
+        return 1
+    fi
+    
+    echo ""
+    echo -e "${GREEN}🎉 Both models passed validation!${NC}"
+    return 0
 }
 
 # Main function for standalone execution

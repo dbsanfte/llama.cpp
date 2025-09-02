@@ -60,6 +60,8 @@ For comprehensive architecture details, see `docs/numa-architecture.md` which co
 
 ## 🔧 NUMA Kernel Implementation Workflow
 
+NOTE: Remember to use Doxygen comments for all new files, functions and structures.
+
 ### Step 1: Analysis & Discovery
 Find the operation and locate mathematical kernels:
 ```bash
