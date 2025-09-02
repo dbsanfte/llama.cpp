@@ -25,6 +25,7 @@
 #include "reshape.h"
 #include "view.h"
 #include "soft_max.h"
+#include "transpose.h"
 #include "noop.h"
 #include "../ggml-impl.h"
 
@@ -311,6 +312,9 @@ enum ggml_status ggml_numa_kernels_init(void) {
     
     // Register SOFT_MAX kernel for softmax activation
     NUMA_REGISTER_KERNEL(soft_max);
+    
+    // Register TRANSPOSE kernel for tensor dimension swapping
+    NUMA_REGISTER_KERNEL(transpose);
     
     // Register NOOP kernel for performance testing
     //ggml_numa_register_noop_kernels();
