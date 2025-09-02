@@ -41,14 +41,14 @@ if (ggml_numa_is_data_parallel_execution) {
 ggml_vec_add_f32(numa_end - numa_start, dst + numa_start, src0 + numa_start, src1 + numa_start);
 ```ory allocation on multi-socket systems:
 
-- **NUMA Kernel Registry** - `ggml/src/ggml-cpu/numa-kernels/` - O(1) cache database with pre-computed strategies
+- **NUMA Kernel Registry** - `ggml/src/ggml-cpu/numa-kernels/` - O(1) cache database with direct function pointer dispatch
 - **NUMA Executor** - `ggml/src/ggml-cpu/ggml-numa-executor.c` - Strategy engine and work orchestration
 - **NUMA Coordinator** - `ggml/src/ggml-cpu/ggml-numa-simple-coordinator.c` - Resource management and work distribution
 - **Dev Container** - Ubuntu 24.04 with pre-installed dependencies
 
 **Goal**: Provide lightning-fast NUMA-aware execution for all operations through intelligent strategy selection and optimal resource utilization. 
 
-**Architecture Flow**: `Compute Graph → Executor → Kernel Registry Query → Coordinator Dispatch → NUMA Threadpools`
+**Architecture Flow**: `Compute Graph → Executor → Kernel Registry Direct Dispatch → Coordinator Dispatch → NUMA Threadpools`
 
 ## 📋 Architecture Documentation
 
@@ -200,6 +200,9 @@ ggml_numa_kernel_registration_info_t ggml_numa_kernel_your_operation_register(vo
     info.work_funcs.data_parallel_fn = ggml_numa_kernel_your_operation_execute;
     info.work_funcs.valid = true;
     
+    // Query function pointer - enables direct dispatch without switch statements
+    info.query_fn = (void*)ggml_numa_kernel_your_operation_query;
+    
     // Most operations don't need aggregation functions
     info.agg_funcs.single_single_fn = NULL;
     info.agg_funcs.single_multi_fn = NULL; 
@@ -209,26 +212,30 @@ ggml_numa_kernel_registration_info_t ggml_numa_kernel_your_operation_register(vo
     return info;
 }
 
-// Step 2: Add function declaration to your kernel .h file (e.g., add.h, mul.h, etc.)
+// Step 2: Add function declarations to your kernel .h file (e.g., add.h, mul.h, etc.)
 ggml_numa_kernel_registration_info_t ggml_numa_kernel_your_operation_register(void);
+ggml_numa_kernel_query_result_t ggml_numa_kernel_your_operation_query(const struct ggml_tensor * tensor);
 
-// Step 3: Enable in numa-kernels.c using NUMA_REGISTER_KERNEL macro (PREFERRED)
+// Step 3: Enable in numa-kernels.c using NUMA_REGISTER_KERNEL macro
 void ggml_numa_kernels_init(void) {
     // ... other kernels ...
     
-    // ✅ PREFERRED: Use NUMA_REGISTER_KERNEL macro for consistent registration
+    // Use NUMA_REGISTER_KERNEL macro for automatic registration with direct dispatch
     NUMA_REGISTER_KERNEL(your_operation);
-    
-    // ❌ LEGACY: Do NOT use function-based registration (deprecated)
-    // ggml_numa_register_your_operation_kernels();  // OLD PATTERN - DO NOT USE
 }
 ```
 
+**🚀 NEW ARCHITECTURE: Direct Function Pointer Dispatch**
+- **Eliminated Switch Statement**: Registry now uses direct function pointer calls for O(1) kernel query dispatch
+- **Automatic Registration**: `NUMA_REGISTER_KERNEL()` macro automatically populates query function pointers
+- **Zero Maintenance Overhead**: Adding new kernels requires NO changes to central dispatch logic
+- **Cache-Optimized Lookup**: Single array access followed by direct function call: `entry->query_fn(tensor)`
+
 **🚨 CRITICAL: Always use NUMA_REGISTER_KERNEL() macro**
-- **Preferred pattern**: `NUMA_REGISTER_KERNEL(kernel_name)` in `numa-kernels.c`
+- **Pattern**: `NUMA_REGISTER_KERNEL(kernel_name)` in `numa-kernels.c`
 - **Consistent architecture**: All kernels use the same registration mechanism
 - **Automatic validation**: Macro includes error checking and debug logging
-- **Legacy functions deprecated**: Do NOT use `ggml_numa_register_*_kernels()` functions
+- **Direct Dispatch**: Macro automatically populates function pointers
 ```
 
 ### Step 3: Testing
@@ -261,7 +268,8 @@ cp tests/test-numa-mathematical-correctness-template.cpp tests/test-numa-mathema
 - **RESHAPE** - Tensor shape transformation for view operations (no-op metadata-only)
 
 **🚀 Performance Characteristics:**
-- **O(1) Strategy Lookups** - Hash table-based registry eliminates search overhead
+- **O(1) Strategy Lookups** - Direct function pointer dispatch eliminates all search overhead
+- **Zero-Maintenance Dispatch** - No switch statements to update when adding new kernels
 - **Threshold-Based Selection** - Simple element count thresholds for optimal strategy choice
 - **NUMA-Aware Scheduling** - Optimal thread and memory placement
 - **Shared Memory Optimization** - Direct memory writes eliminate aggregation overhead for most operations
@@ -570,7 +578,7 @@ cmake --build build --target ggml-cpu llama && echo "🎉 Complete!" || echo "�
 - **Check exit codes** - tests must properly signal failures
 - **SIMD First**: Always use `ggml_vec_*` functions instead of scalar loops
 - **Registry Integration**: Add cache entries for all complexity classes
-- **Architecture Flow**: Follow Executor → Registry Query → Coordinator pattern
+- **Architecture Flow**: Follow Executor → Registry Direct Dispatch → Coordinator pattern
 - **Debug Control**: Use `GGML_NUMA_DEBUG=1` for development debugging, unset for performance testing
 - **Kernel Registration**: Always use `NUMA_REGISTER_KERNEL()` macro, never legacy function-based registration
 
@@ -620,7 +628,8 @@ ggml/src/ggml-cpu/numa-kernels/reshape.c          # Template: View operations & 
 - [ ] Implement kernel function in `numa-kernels/` directory following template patterns
 - [ ] Use shared memory setup: check `ggml_numa_shared_result_tensor_data` for direct writes
 - [ ] Create `ggml_numa_kernel_{operation}_register()` function that returns registration info
-- [ ] Add function declaration to kernel header file (e.g., `add.h`, `mul.h`)
+- [ ] Create `ggml_numa_kernel_{operation}_query()` function for strategy selection (required for direct dispatch)
+- [ ] Add function declarations to kernel header file (e.g., `add.h`, `mul.h`)
 - [ ] Enable in `numa-kernels.c` using `NUMA_REGISTER_KERNEL(operation)` macro
 - [ ] Use `NUMA_ASSERT` for validation with proper coordinator signaling
 - [ ] Use `NUMA_LOG_DEBUG` macros instead of printf for debug messages

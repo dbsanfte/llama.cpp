@@ -521,5 +521,8 @@ ggml_numa_kernel_registration_info_t ggml_numa_kernel_rope_register(void) {
     info.agg_funcs.data_parallel_fn = NULL;
     info.agg_funcs.valid = false;
     
+    // ROPE is a computational operation, not a no-op
+    info.is_noop = false;
+    
     return info;
 }

@@ -1105,5 +1105,8 @@ ggml_numa_kernel_registration_info_t ggml_numa_kernel_add_register(void) {
     info.agg_funcs.data_parallel_fn = NULL;
     info.agg_funcs.valid = false;
     
+    // ADD requires coordinator dispatch - not a no-op kernel
+    info.is_noop = false;
+    
     return info;
 }

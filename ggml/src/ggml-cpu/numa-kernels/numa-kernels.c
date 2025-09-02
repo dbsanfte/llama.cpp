@@ -23,6 +23,7 @@
 #include "permute.h"
 #include "glu.h"
 #include "reshape.h"
+#include "view.h"
 #include "noop.h"
 #include "../ggml-impl.h"
 
@@ -64,7 +65,9 @@ enum ggml_status ggml_numa_register_kernel_strategy(
     const ggml_numa_kernel_strategy_array_t * strategy_array,
     const ggml_numa_kernel_work_funcs_t * work_funcs,
     const ggml_numa_kernel_aggregation_funcs_t * agg_funcs,
-    bool supported) {    if (!g_kernel_array_cache.cache_initialized) {
+    ggml_numa_kernel_query_fn_t query_fn,
+    bool supported,
+    bool is_noop) {    if (!g_kernel_array_cache.cache_initialized) {
         enum ggml_status init_result = ggml_numa_init_kernel_array_cache();
         if (init_result != GGML_STATUS_SUCCESS) {
             return init_result;
@@ -87,6 +90,8 @@ enum ggml_status ggml_numa_register_kernel_strategy(
     ggml_numa_kernel_cache_entry_t * entry = &g_kernel_array_cache.cache_storage[op_type];
     entry->op_type = op_type;
     entry->supported = supported;  // Store the supported flag
+    entry->query_fn = query_fn;    // Store the query function pointer
+    entry->is_noop = is_noop;      // Store the no-op flag
     
     if (strategy_array && strategy_array->valid) {
         entry->strategy_array = *strategy_array;
@@ -135,6 +140,22 @@ bool ggml_numa_is_kernel_supported(enum ggml_op op_type) {
     
     // Check if there's a valid lookup entry (only set for supported kernels)
     return g_kernel_array_cache.lookup_table[op_type] != NULL;
+}
+
+/**
+ * Check if a kernel is a no-op kernel that skips coordinator dispatch
+ */
+bool ggml_numa_is_kernel_noop(enum ggml_op op_type) {
+    if (!g_kernel_array_cache.cache_initialized) {
+        return false;
+    }
+    
+    if (op_type >= GGML_OP_COUNT) {
+        return false;
+    }
+    
+    const ggml_numa_kernel_cache_entry_t * entry = g_kernel_array_cache.lookup_table[op_type];
+    return entry != NULL && entry->is_noop;
 }
 
 /**
@@ -284,6 +305,9 @@ enum ggml_status ggml_numa_kernels_init(void) {
     // Register RESHAPE kernel for tensor shape transformation
     NUMA_REGISTER_KERNEL(reshape);
     
+    // Register VIEW kernel for tensor view operations
+    NUMA_REGISTER_KERNEL(view);
+    
     // Register NOOP kernel for performance testing
     //ggml_numa_register_noop_kernels();
     
@@ -358,24 +382,10 @@ ggml_numa_kernel_query_result_t ggml_numa_kernels_strategy_lookup(const struct g
     result.work_function = work_func;
     result.aggregation_function = ggml_numa_lookup_aggregation_direct(tensor->op, strategy);
     
-    switch (tensor->op) {
-        case GGML_OP_ADD:
-            result.kernel_name = "NUMA ADD (Direct Array Lookup)";
-            result.efficiency_score = 0.99f;
-            result.aggregation_policy = GGML_NUMA_AGGREGATION_NONE;
-            break;
-            
-        case GGML_OP_MUL_MAT:
-            result.kernel_name = "NUMA MUL_MAT (Direct Array Lookup)";
-            result.efficiency_score = 0.92f;
-            result.aggregation_policy = GGML_NUMA_AGGREGATION_NONE;
-            break;
-            
-        default:
-            result.kernel_name = "NUMA Generic (Direct Array Lookup)";
-            result.efficiency_score = 0.8f;
-            break;
-    }
+    // Generic kernel information for direct array lookup
+    result.kernel_name = "NUMA Generic (Direct Array Lookup)";
+    result.efficiency_score = 0.85f;  // Conservative generic efficiency
+    result.aggregation_policy = GGML_NUMA_AGGREGATION_NONE;
     
     NUMA_LOG_DEBUG("Direct array lookup: op=%d, elements=%zu, strategy=%s/%s, efficiency=%.2f", 
                   (int)tensor->op, total_elements,
@@ -426,44 +436,16 @@ ggml_numa_kernel_query_result_t ggml_numa_kernels_query(const struct ggml_tensor
         }
     }
     
-    // Use lightning-fast strategy lookup with threshold caching
-    switch (tensor->op) {
-        case GGML_OP_ADD:
-            return ggml_numa_kernel_add_query(tensor);
-            
-        case GGML_OP_MUL:
-            return ggml_numa_kernel_mul_query(tensor);
-            
-        case GGML_OP_CPY:
-            return ggml_numa_kernel_cpy_query(tensor);
-            
-        case GGML_OP_MUL_MAT:
-            return ggml_numa_kernel_mul_mat_query(tensor);
-            
-        case GGML_OP_RMS_NORM:
-            return ggml_numa_kernel_rms_norm_query(tensor);
-            
-        case GGML_OP_PERMUTE:
-            return ggml_numa_kernel_permute_query(tensor);
-            
-        case GGML_OP_GLU:
-            return ggml_numa_kernel_glu_query(tensor);
-            
-        case GGML_OP_ROPE:
-            return ggml_numa_kernel_rope_query(tensor);
-            
-        case GGML_OP_RESHAPE:
-            return ggml_numa_kernel_reshape_query(tensor);
-            
-        default:
-            // Operation not supported by NUMA kernels
-            NUMA_LOG_DEBUG("Operation %s not supported by NUMA kernels", ggml_op_name(tensor->op));
-            break;
+    // Direct cache lookup - ultra-fast single memory access!
+    const ggml_numa_kernel_cache_entry_t * entry = ggml_numa_lookup_kernel_direct(tensor->op);
+    if (!entry || !entry->query_fn) {
+        NUMA_LOG_DEBUG("NUMA Query: No kernel found for operation %s", ggml_op_name(tensor->op));
+        return result;
     }
     
-    // If we reach here, the operation is not supported
-    NUMA_LOG_DEBUG("NUMA Query: Operation %s not supported", ggml_op_name(tensor->op));
-    return result;
+    // Call the kernel's query function directly through the cached pointer!
+    NUMA_LOG_DEBUG("NUMA Query: Calling cached query function for operation %s", ggml_op_name(tensor->op));
+    return entry->query_fn(tensor);
 }
 
 // ============================================================================

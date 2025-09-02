@@ -9,6 +9,7 @@
 
 #include "ggml-numa-executor.h"
 #include "ggml-numa-simple-coordinator.h"
+#include "numa-kernels/numa-kernels.h"  // For ggml_numa_is_kernel_noop
 #include "ggml-cpu-impl.h"
 #include "ops.h"
 #include "binary-ops.h"  // For ggml_compute_forward_mul, sub, div
@@ -418,6 +419,13 @@ enum ggml_status ggml_numa_executor_execute_tensor(struct ggml_tensor * tensor, 
         enum ggml_status result = ggml_numa_executor_direct_kernel_dispatch(tensor, cplan);
         NUMA_PERF_END();
         return result;
+    }
+    
+    // Check if this is a no-op kernel that doesn't require coordinator dispatch
+    if (ggml_numa_is_kernel_noop(tensor->op)) {
+        NUMA_LOG_DEBUG("DEBUG: NUMA Executor: Operation %s is a no-op kernel, skipping coordinator dispatch\n", op_name);
+        NUMA_PERF_END();
+        return GGML_STATUS_SUCCESS;
     }
     
     GGML_LOG_DEBUG("NUMA Executor: %s kernel selected for %s (efficiency=%.2f, strategy=%s, buffer=%zu bytes/thread)\n",

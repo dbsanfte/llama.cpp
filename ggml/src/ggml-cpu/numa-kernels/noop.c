@@ -75,14 +75,15 @@ enum ggml_status ggml_numa_kernel_noop_execute(void * work_context,
  * - >1024 elements: Multi-node, data-parallel (large)
  * 
  * @param tensor Target tensor for strategy selection
- * @param total_elements Element count for strategy thresholds
  * @return Kernel query result with strategy and efficiency metrics
  */
 ggml_numa_kernel_query_result_t ggml_numa_kernel_noop_query(
-    const struct ggml_tensor * tensor,
-    size_t total_elements) {
+    const struct ggml_tensor * tensor) {
     
     NUMA_ASSERT(tensor != NULL, "Tensor cannot be null");
+    
+    // Calculate total elements from tensor
+    size_t total_elements = ggml_nelements(tensor);
     
     ggml_numa_kernel_query_result_t result = { .supported = false };
     
@@ -179,12 +180,13 @@ void ggml_numa_register_noop_kernels(void) {
             .valid = false  // NOOP requires no aggregation
         },
         .kernel_name = "NUMA NOOP Kernel",
-        .supported = true
+        .supported = true,
+        .is_noop = true  // NOOP kernel - skip coordinator dispatch overhead
     };
     
     // Register with direct array cache system
     ggml_numa_register_kernel_strategy(info.op_type, &info.strategy_array, 
-                                       &info.work_funcs, &info.agg_funcs, info.supported);
+                                       &info.work_funcs, &info.agg_funcs, ggml_numa_kernel_noop_query, info.supported, info.is_noop);
     
     NUMA_LOG_DEBUG("✅ Registered NUMA NOOP Kernel (for performance testing)");
 }

@@ -464,12 +464,13 @@ void ggml_numa_register_rms_norm_kernels(void) {
             .valid = false  // No aggregation needed for RMS_NORM
         },
         .kernel_name = "NUMA RMS_NORM Kernel",
-        .supported = true
+        .supported = true,
+        .is_noop = false  // RMS_NORM requires coordinator dispatch - not a no-op kernel
     };
     
     // Register with the NUMA kernel registry
     ggml_numa_register_kernel_strategy(info.op_type, &info.strategy_array, 
-                                       &info.work_funcs, &info.agg_funcs, info.supported);
+                                       &info.work_funcs, &info.agg_funcs, ggml_numa_kernel_rms_norm_query, info.supported, info.is_noop);
     
     NUMA_LOG_DEBUG("Registered RMS_NORM NUMA kernel with thresholds [%zu, %zu]", 
                    info.strategy_array.thresholds[0], info.strategy_array.thresholds[1]);
@@ -503,6 +504,9 @@ ggml_numa_kernel_registration_info_t ggml_numa_kernel_rms_norm_register(void) {
     info.agg_funcs.single_multi_fn = NULL;
     info.agg_funcs.data_parallel_fn = NULL;
     info.agg_funcs.valid = false;
+    
+    // RMS_NORM is a computational operation, not a no-op
+    info.is_noop = false;
     
     return info;
 }

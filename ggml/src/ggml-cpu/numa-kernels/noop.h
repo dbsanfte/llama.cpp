@@ -1,6 +1,6 @@
 /**
  * @file noop.h
- * @brief NUMA NOOP Kernel - Performance Testing Operation
+ * @brief NUMA NOOP Kernel - Performance Testing Kernel
  *
  * This file implements a NUMA-aware NOOP (No Operation) kernel specifically designed
  * for performance testing and benchmarking the NUMA kernel dispatch system.
@@ -36,6 +36,20 @@
 #include "numa-kernels.h"
 #include "../ggml-numa-shared.h"
 
+/**
+ * Query function for NUMA NOOP kernel strategy selection  
+ * 
+ * Returns strategy recommendations for NOOP operations with custom thresholds
+ * for performance testing different execution strategies. Since NOOP requires
+ * no computation, all strategies are equally efficient.
+ * 
+ * @param tensor Target tensor (used for strategy consistency)
+ * @return Kernel query result with strategy recommendation
+ */
+ggml_numa_kernel_query_result_t ggml_numa_kernel_noop_query(
+    const struct ggml_tensor * tensor
+);
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -52,21 +66,6 @@ extern "C" {
  */
 enum ggml_status ggml_numa_kernel_noop_execute(void * work_context, 
                                                 struct ggml_compute_params * params);
-
-/**
- * @brief Query function for NUMA NOOP kernel strategy selection
- * 
- * Returns optimal strategy for NOOP operations. Since NOOP requires no computation,
- * all strategies are equally efficient.
- * 
- * @param tensor Target tensor (used for strategy consistency)
- * @param total_elements Element count (for strategy selection patterns)
- * @return Kernel query result with strategy recommendation
- */
-ggml_numa_kernel_query_result_t ggml_numa_kernel_noop_query(
-    const struct ggml_tensor * tensor,
-    size_t total_elements
-);
 
 /**
  * @brief Calculate work buffer size for NOOP operations

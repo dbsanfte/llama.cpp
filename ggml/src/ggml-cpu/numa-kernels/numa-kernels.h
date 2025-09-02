@@ -25,6 +25,16 @@ struct ggml_cplan;
  * The cache manager builds hash tables at startup for O(1) lookups.
  */
 
+// Forward declaration for query result type  
+struct ggml_tensor;  // Ensure struct ggml_tensor is declared
+typedef struct ggml_numa_kernel_query_result_s ggml_numa_kernel_query_result_t;
+
+/**
+ * Query function pointer type for kernels
+ * Each kernel provides a query function of this type
+ */
+typedef ggml_numa_kernel_query_result_t (*ggml_numa_kernel_query_fn_t)(const struct ggml_tensor * tensor);
+
 /**
  * Kernel cache entry - stores complete kernel information
  * Maps operation type to pre-computed query results for ultra-fast lookup
@@ -34,7 +44,9 @@ typedef struct {
     ggml_numa_kernel_strategy_array_t strategy_array;           // Strategy thresholds for fast lookup
     ggml_numa_kernel_work_funcs_t work_funcs;                   // Work function pointers
     ggml_numa_kernel_aggregation_funcs_t agg_funcs;             // Aggregation function pointers (optional)
+    ggml_numa_kernel_query_fn_t query_fn;                       // Query function pointer for direct cache calls
     bool supported;                                              // Whether kernel is enabled/supported
+    bool is_noop;                                                // Skip coordinator dispatch for no-op kernels
 } ggml_numa_kernel_cache_entry_t;
 
 /**
@@ -63,7 +75,9 @@ enum ggml_status ggml_numa_register_kernel_strategy(
     const ggml_numa_kernel_strategy_array_t * strategy_array,
     const ggml_numa_kernel_work_funcs_t * work_funcs,
     const ggml_numa_kernel_aggregation_funcs_t * agg_funcs,
-    bool supported);
+    ggml_numa_kernel_query_fn_t query_fn,
+    bool supported,
+    bool is_noop);
 
 /**
  * Initialize the global kernel array cache (called once at startup)
@@ -81,6 +95,12 @@ const ggml_numa_kernel_cache_entry_t * ggml_numa_lookup_kernel_direct(enum ggml_
  * Returns true if the kernel is available for use, false otherwise
  */
 bool ggml_numa_is_kernel_supported(enum ggml_op op_type);
+
+/**
+ * Check if a kernel is a no-op kernel that skips coordinator dispatch
+ * Returns true if the kernel is flagged as no-op, false otherwise
+ */
+bool ggml_numa_is_kernel_noop(enum ggml_op op_type);
 
 /**
  * Array-based strategy lookup - direct access using operation type as index
@@ -140,7 +160,7 @@ typedef enum ggml_status (*ggml_numa_aggregation_function_t)(
  * This is the primary interface between the registry and executor.
  * Both cache and threshold-based queries return this structure.
  */
-typedef struct {
+typedef struct ggml_numa_kernel_query_result_s {
     bool supported;                                    // Whether this operation is supported
     ggml_numa_execution_strategy_t strategy;          // Recommended execution strategy
     size_t work_buffer_size_per_thread;              // Required compute buffer size per thread
@@ -240,21 +260,24 @@ bool ggml_numa_apply_kernel_force_strategy(ggml_numa_kernel_query_result_t * res
  * 
  * The macro expects:
  * - Function: ggml_numa_kernel_{kname}_register()
+ * - Function: ggml_numa_kernel_{kname}_query()
  * - Returns: ggml_numa_kernel_registration_info_t with supported flag
  */
 #define NUMA_REGISTER_KERNEL(kname) do { \
     ggml_numa_kernel_registration_info_t kname##_info = ggml_numa_kernel_##kname##_register(); \
+    ggml_numa_kernel_query_fn_t kname##_query_fn = ggml_numa_kernel_##kname##_query; \
     enum ggml_status kname##_result = ggml_numa_register_kernel_strategy( \
         kname##_info.op_type, &kname##_info.strategy_array, \
-        &kname##_info.work_funcs, &kname##_info.agg_funcs, kname##_info.supported); \
+        &kname##_info.work_funcs, &kname##_info.agg_funcs, kname##_query_fn, kname##_info.supported, kname##_info.is_noop); \
     if (kname##_result != GGML_STATUS_SUCCESS) { \
         NUMA_LOG_ERROR("Failed to register " #kname " kernel strategy"); \
         return kname##_result; \
     } \
     if (kname##_info.supported) { \
-        NUMA_LOG_DEBUG("✅ Registered %s (thresholds: %zu/%zu)", kname##_info.kernel_name, \
+        NUMA_LOG_DEBUG("✅ Registered %s (thresholds: %zu/%zu%s)", kname##_info.kernel_name, \
                       kname##_info.strategy_array.thresholds[NUMA_STRATEGY_IDX_SINGLE_SINGLE], \
-                      kname##_info.strategy_array.thresholds[NUMA_STRATEGY_IDX_SINGLE_MULTI]); \
+                      kname##_info.strategy_array.thresholds[NUMA_STRATEGY_IDX_SINGLE_MULTI], \
+                      kname##_info.is_noop ? ", no-op" : ""); \
     } else { \
         NUMA_LOG_DEBUG("🚫 Disabled %s (marked as unsupported)", kname##_info.kernel_name); \
     } \
