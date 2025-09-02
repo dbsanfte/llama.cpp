@@ -285,8 +285,8 @@ enum ggml_status ggml_numa_kernels_init(void) {
     // Register MUL kernel
     NUMA_REGISTER_KERNEL(mul);
 
-    // Register CPY kernel - DISABLED due to memory corruption issues
-    //NUMA_REGISTER_KERNEL(cpy);
+    // Register CPY kernel - Re-enabled with corrected implementation
+    NUMA_REGISTER_KERNEL(cpy);
 
     // Register CONT kernel for tensor contiguity operations
     NUMA_REGISTER_KERNEL(cont);

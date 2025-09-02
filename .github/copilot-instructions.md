@@ -157,7 +157,7 @@ enum ggml_status ggml_numa_kernel_your_operation_execute(void * work_context, st
     
     // 3. Get NUMA execution context
     extern __thread int ggml_current_numa_node;
-    extern __thread int ggml_numa_total_nodes; 
+    extern __thread int ggml_numa_total_nodes_for_data_parallel; 
     extern __thread bool ggml_numa_is_data_parallel_execution;
     
     // 4. Calculate NUMA data slice for data-parallel execution
