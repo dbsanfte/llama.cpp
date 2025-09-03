@@ -60,6 +60,10 @@ enum ggml_status ggml_numa_kernel_view_execute(void * work_context,
     extern __thread int ggml_current_numa_node;
     extern __thread bool ggml_numa_is_data_parallel_execution;
     
+    // Log execution strategy for integration test parsing
+    // VIEW operations are always single-thread for optimal no-op performance
+    NUMA_LOG_STRATEGY_SINGLE_SINGLE("VIEW");
+    
     NUMA_LOG_TRACE("NUMA VIEW kernel executing on node %d (data_parallel=%s) - tensor: %s",
                    ggml_current_numa_node, 
                    ggml_numa_is_data_parallel_execution ? "true" : "false",
@@ -114,6 +118,14 @@ ggml_numa_kernel_query_result_t ggml_numa_kernel_view_query(const struct ggml_te
         return result;
     }
     
+    // Get cache entry for this operation
+    const ggml_numa_kernel_cache_entry_t * cache_entry = ggml_numa_lookup_kernel_direct(GGML_OP_VIEW);
+    if (!cache_entry || !cache_entry->strategy_array.valid) {
+        NUMA_LOG_DEBUG("VIEW cache entry not found or invalid - falling back to unsupported");
+        result.supported = false;
+        return result;
+    }
+    
     // VIEW is always supported regardless of tensor configuration
     result.supported = true;
     result.work_buffer_size_per_thread = 0; // No work buffer needed
@@ -124,10 +136,12 @@ ggml_numa_kernel_query_result_t ggml_numa_kernel_view_query(const struct ggml_te
     result.aggregation_function = NULL;
     result.aggregation_user_data = NULL;
     
-    // Strategy selection: Always use single-node, single-thread for no-op operations
-    // This minimizes resource overhead since there's no computation to parallelize
-    result.strategy.node_strategy = NUMA_NODE_STRATEGY_SINGLE;
-    result.strategy.on_node_strategy = NUMA_ON_NODE_STRATEGY_SINGLE_THREAD;
+    // Use shared macro for unified strategy selection  
+    // VIEW always uses single-node, single-thread due to no-op nature (thresholds set to SIZE_MAX)
+    ggml_numa_execution_strategy_t selected_strategy;
+    NUMA_SELECT_STRATEGY_FROM_CACHE(cache_entry, total_elements, selected_strategy);
+    
+    result.strategy = selected_strategy;
     
     // Apply force strategy override if environment variable is set
     // Note: VIEW is no-op, so all functions point to the same implementation

@@ -118,6 +118,16 @@ enum ggml_status ggml_numa_kernel_rms_norm_execute(void * work_context, struct g
     
     struct ggml_tensor * dst = (struct ggml_tensor *)work_context;
     
+    // Log execution strategy in standardized format for integration test parsing
+    extern __thread bool ggml_numa_is_data_parallel_execution;
+    if (ggml_numa_is_data_parallel_execution) {
+        NUMA_LOG_STRATEGY_DATA_PARALLEL("RMS_NORM");
+    } else if (params->nth > 1) {
+        NUMA_LOG_STRATEGY_SINGLE_MULTI("RMS_NORM");
+    } else {
+        NUMA_LOG_STRATEGY_SINGLE_SINGLE("RMS_NORM");
+    }
+    
     // =============================================================================
     // Input Validation & Setup
     // =============================================================================
@@ -389,35 +399,39 @@ ggml_numa_kernel_query_result_t ggml_numa_kernel_rms_norm_query(const struct ggm
         return result;
     }
     
+    // Get cache entry for this operation
+    const ggml_numa_kernel_cache_entry_t * cache_entry = ggml_numa_lookup_kernel_direct(GGML_OP_RMS_NORM);
+    if (!cache_entry || !cache_entry->strategy_array.valid) {
+        NUMA_LOG_DEBUG("RMS_NORM cache entry not found or invalid - falling back to unsupported");
+        result.supported = false;
+        return result;
+    }
+    
     // Calculate tensor characteristics
     const int64_t ne00 = src0->ne[0];  // Row size
     const int64_t total_rows = src0->ne[1] * src0->ne[2] * src0->ne[3];
     const size_t total_elements = ggml_nelements(src0);
     
-    // Strategy selection based on complexity and row count
-    ggml_numa_execution_strategy_t strategy = {0};
+    // Use shared macro for unified strategy selection
+    // RMS_NORM uses total_rows for strategy decisions (stored in cache thresholds)
+    ggml_numa_execution_strategy_t selected_strategy;
+    NUMA_SELECT_STRATEGY_FROM_CACHE(cache_entry, total_rows, selected_strategy);
     
-    if (total_rows < 16) {
-        // Very few rows: single-threaded execution
-        strategy.node_strategy = NUMA_NODE_STRATEGY_SINGLE;
-        strategy.on_node_strategy = NUMA_ON_NODE_STRATEGY_SINGLE_THREAD;
+    // Set efficiency scores and kernel name based on selected strategy
+    if (selected_strategy.node_strategy == NUMA_NODE_STRATEGY_SINGLE && 
+        selected_strategy.on_node_strategy == NUMA_ON_NODE_STRATEGY_SINGLE_THREAD) {
         result.efficiency_score = 0.6f;
         result.kernel_name = "RMS_NORM Single Thread";
-        
-    } else if (total_rows < 256 || total_elements < 65536) {
-        // Moderate number of rows: single-node multi-threaded
-        strategy.node_strategy = NUMA_NODE_STRATEGY_SINGLE;
-        strategy.on_node_strategy = NUMA_ON_NODE_STRATEGY_MULTI_THREAD;
+    } else if (selected_strategy.node_strategy == NUMA_NODE_STRATEGY_SINGLE && 
+               selected_strategy.on_node_strategy == NUMA_ON_NODE_STRATEGY_MULTI_THREAD) {
         result.efficiency_score = 0.8f;
         result.kernel_name = "RMS_NORM Single Node";
-        
     } else {
-        // Many rows: data-parallel across NUMA nodes
-        strategy.node_strategy = NUMA_NODE_STRATEGY_DATA_PARALLEL;
-        strategy.on_node_strategy = NUMA_ON_NODE_STRATEGY_MULTI_THREAD;
         result.efficiency_score = 0.95f;
         result.kernel_name = "RMS_NORM Data Parallel";
     }
+    
+    ggml_numa_execution_strategy_t strategy = selected_strategy;
     
     // Fill in the result
     result.supported = true;
@@ -488,9 +502,9 @@ ggml_numa_kernel_registration_info_t ggml_numa_kernel_rms_norm_register(void) {
     info.kernel_name = "NUMA RMS_NORM Kernel";
     
     // Strategy thresholds for RMS_NORM operations
-    info.strategy_array.thresholds[NUMA_STRATEGY_IDX_SINGLE_SINGLE] = 256;      // Row count threshold
-    info.strategy_array.thresholds[NUMA_STRATEGY_IDX_SINGLE_MULTI] = 65536;     // Element count threshold  
-    // Above 65K elements: data-parallel strategy
+    info.strategy_array.thresholds[NUMA_STRATEGY_IDX_SINGLE_SINGLE] = 128;      // Single-thread strategy
+    info.strategy_array.thresholds[NUMA_STRATEGY_IDX_SINGLE_MULTI] = 1024;     // Multi-thread strategy
+    // Above this: data-parallel strategy
     info.strategy_array.valid = true;
     
     // Function pointers for different strategies

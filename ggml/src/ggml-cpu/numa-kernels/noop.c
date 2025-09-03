@@ -24,6 +24,8 @@
 
 #include "noop.h"
 #include "../ggml-numa-shared.h"
+#include "../ggml-cpu-impl.h"
+#include "../ggml-impl.h"
 #include "numa-kernels.h"
 
 /**
@@ -51,6 +53,16 @@ enum ggml_status ggml_numa_kernel_noop_execute(void * work_context,
     // Get NUMA execution context for logging consistency
     extern __thread int ggml_current_numa_node;
     extern __thread bool ggml_numa_is_data_parallel_execution;
+    
+    // Log execution strategy for integration test parsing
+    // NOOP uses various strategies for performance testing
+    if (ggml_numa_is_data_parallel_execution) {
+        NUMA_LOG_STRATEGY_DATA_PARALLEL("NOOP");
+    } else if (params->nth > 1) {
+        NUMA_LOG_STRATEGY_SINGLE_MULTI("NOOP");
+    } else {
+        NUMA_LOG_STRATEGY_SINGLE_SINGLE("NOOP");
+    }
     
     NUMA_LOG_TRACE("NUMA NOOP kernel executing on node %d (data_parallel=%s)",
                    ggml_current_numa_node, 

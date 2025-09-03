@@ -261,6 +261,10 @@ static bool g_numa_kernels_initialized = false;
  * Called once at system startup
  */
 enum ggml_status ggml_numa_kernels_init(void) {
+    // FORCED DEBUG: Always log NUMA kernels initialization
+    NUMA_LOG_DEBUG("NUMA kernels initialization called, already_initialized=%s", 
+                   g_numa_kernels_initialized ? "YES" : "NO");
+    
     if (g_numa_kernels_initialized) {
         return GGML_STATUS_SUCCESS;  // Already initialized
     }
@@ -296,7 +300,9 @@ enum ggml_status ggml_numa_kernels_init(void) {
 
     // Enable MUL_MAT kernel for matrix multiplication
     // Register MUL_MAT kernel
+    NUMA_LOG_DEBUG("Registering MUL_MAT kernel...");
     NUMA_REGISTER_KERNEL(mul_mat);
+    NUMA_LOG_DEBUG("MUL_MAT kernel registration completed");
     
     // Enable RMS_NORM kernel for normalization operations
     // Register RMS_NORM kernel

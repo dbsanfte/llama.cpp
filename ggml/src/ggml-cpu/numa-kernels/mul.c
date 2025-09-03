@@ -139,6 +139,15 @@ enum ggml_status ggml_numa_kernel_mul_execute_optimized(void * work_context,
     const int thread_id = params->ith;
     const int num_threads = params->nth;
     
+    // Log execution strategy in standardized format for integration test parsing
+    if (ggml_numa_is_data_parallel_execution) {
+        NUMA_LOG_STRATEGY_DATA_PARALLEL("MUL");
+    } else if (params->nth > 1) {
+        NUMA_LOG_STRATEGY_SINGLE_MULTI("MUL");
+    } else {
+        NUMA_LOG_STRATEGY_SINGLE_SINGLE("MUL");
+    }
+    
     // TEMPLATE DEBUG: Log execution context for development/debugging
     NUMA_LOG_DEBUG("NUMA Node %d, Thread %d/%d MUL kernel start (data_parallel=%d, total_nodes=%d, total_elements=%ld)", 
                    current_node, thread_id, num_threads, is_data_parallel, total_nodes, total_elements);
@@ -369,6 +378,13 @@ enum ggml_status ggml_numa_kernel_mul_execute_low_overhead(void * work_context,
                                                           struct ggml_compute_params * params) {
     struct ggml_tensor * tensor = (struct ggml_tensor *)work_context;
     
+    // Log execution strategy in standardized format for integration test parsing
+    if (params->nth > 1) {
+        NUMA_LOG_STRATEGY_SINGLE_MULTI("MUL");
+    } else {
+        NUMA_LOG_STRATEGY_SINGLE_SINGLE("MUL");
+    }
+    
     // Fast validation
     if (!tensor || !tensor->src[0] || !tensor->src[1]) {
         return GGML_STATUS_FAILED;
@@ -468,6 +484,9 @@ enum ggml_status ggml_numa_kernel_mul_execute_low_overhead(void * work_context,
  */
 enum ggml_status ggml_numa_kernel_mul_execute_no_aggregation(void * work_context,
                                                             struct ggml_compute_params * params) {
+    // Log execution strategy in standardized format for integration test parsing
+    NUMA_LOG_STRATEGY_DATA_PARALLEL("MUL");  // No-aggregation is always data-parallel
+    
     // This is identical to the optimized kernel since it already uses the no-aggregation approach
     return ggml_numa_kernel_mul_execute_optimized(work_context, params);
 }
@@ -489,46 +508,9 @@ typedef struct {
     const char * kernel_name;
 } ggml_mul_strategy_threshold_t;
 
-// Strategy thresholds optimized for MUL operations (same as ADD)
-static const ggml_mul_strategy_threshold_t MUL_THRESHOLDS[] = {
-    // TINY: < 1K elements - Single node, single thread for minimal overhead
-    {
-        .element_threshold = 1024,
-        .strategy = { .node_strategy = NUMA_NODE_STRATEGY_SINGLE, 
-                     .on_node_strategy = NUMA_ON_NODE_STRATEGY_SINGLE_THREAD },
-        .work_buffer_size_per_thread = 0,
-        .work_function = ggml_numa_kernel_mul_execute_low_overhead,
-        .efficiency_score = 0.98f,
-        .kernel_name = "NUMA MUL (Single/Single)"
-    },
-    
-    // SMALL: 1K - 256K elements - Single node, multi-thread for parallelism
-    {
-        .element_threshold = 262144,
-        .strategy = { .node_strategy = NUMA_NODE_STRATEGY_SINGLE,
-                     .on_node_strategy = NUMA_ON_NODE_STRATEGY_MULTI_THREAD },
-        .work_buffer_size_per_thread = 0,
-        .work_function = ggml_numa_kernel_mul_execute_low_overhead,
-        .efficiency_score = 0.96f,
-        .kernel_name = "NUMA MUL (Single/Multi)"
-    },
-    
-    // LARGE: > 256K elements - Data-parallel, multi-thread for maximum performance
-    {
-        .element_threshold = SIZE_MAX,  // No upper limit
-        .strategy = { .node_strategy = NUMA_NODE_STRATEGY_DATA_PARALLEL,
-                     .on_node_strategy = NUMA_ON_NODE_STRATEGY_MULTI_THREAD },
-        .work_buffer_size_per_thread = 0,  // Shared memory approach eliminates buffers
-        .work_function = ggml_numa_kernel_mul_execute_no_aggregation,
-        .efficiency_score = 0.95f,
-        .kernel_name = "NUMA MUL (Data-Parallel Shared Memory)"
-    }
-};
-
-#define MUL_THRESHOLD_COUNT (sizeof(MUL_THRESHOLDS) / sizeof(MUL_THRESHOLDS[0]))
-
 /**
  * Query function for MUL operations
+ * Uses registered thresholds as the single source of truth.
  * Template Pattern: Direct adaptation of ADD kernel query function
  * 
  * Provides strategy selection based on tensor size and characteristics.
@@ -551,13 +533,6 @@ ggml_numa_kernel_query_result_t ggml_numa_kernel_mul_query(const struct ggml_ten
         return result;
     }
     
-    // Calculate total elements for strategy selection
-    const size_t total_elements = ggml_nelements(tensor);
-    
-    // Find optimal strategy using threshold search
-    const ggml_mul_strategy_threshold_t * selected_strategy;
-    NUMA_SELECT_STRATEGY_BY_THRESHOLD(MUL_THRESHOLDS, MUL_THRESHOLD_COUNT, total_elements, selected_strategy);
-    
     // Check if this kernel is actually registered and supported
     if (!ggml_numa_is_kernel_supported(GGML_OP_MUL)) {
         NUMA_LOG_DEBUG("MUL kernel not supported - registration disabled");
@@ -565,13 +540,44 @@ ggml_numa_kernel_query_result_t ggml_numa_kernel_mul_query(const struct ggml_ten
         return result;
     }
     
+    // Get our own cache entry with the registered thresholds (SINGLE SOURCE OF TRUTH!)
+    const ggml_numa_kernel_cache_entry_t * cache_entry = ggml_numa_lookup_kernel_direct(GGML_OP_MUL);
+    if (!cache_entry || !cache_entry->strategy_array.valid) {
+        NUMA_LOG_DEBUG("MUL query: No valid strategy array in cache");
+        return result;
+    }
+    
+    // Calculate total elements for strategy selection
+    const size_t total_elements = ggml_nelements(tensor);
+    
+    // Use the registered thresholds instead of static arrays - UNIFIED ARCHITECTURE!
+    ggml_numa_execution_strategy_t selected_strategy;
+    
+    // Select strategy based on registered thresholds (single source of truth!)
+    NUMA_SELECT_STRATEGY_FROM_CACHE(cache_entry, total_elements, selected_strategy);
+    
     // Build successful query result
     result.supported = true;
-    result.strategy = selected_strategy->strategy;
-    result.work_buffer_size_per_thread = selected_strategy->work_buffer_size_per_thread;
-    result.work_function = selected_strategy->work_function;
-    result.efficiency_score = selected_strategy->efficiency_score;
-    result.kernel_name = selected_strategy->kernel_name;
+    result.strategy = selected_strategy;
+    result.work_buffer_size_per_thread = 0;  // MUL doesn't need work buffers
+    
+    // Select work function based on strategy
+    if (selected_strategy.node_strategy == NUMA_NODE_STRATEGY_SINGLE) {
+        if (selected_strategy.on_node_strategy == NUMA_ON_NODE_STRATEGY_SINGLE_THREAD) {
+            result.work_function = ggml_numa_kernel_mul_execute_low_overhead;
+            result.efficiency_score = 0.98f;
+            result.kernel_name = "NUMA MUL (Single/Single)";
+        } else {
+            result.work_function = ggml_numa_kernel_mul_execute_low_overhead;
+            result.efficiency_score = 0.96f;
+            result.kernel_name = "NUMA MUL (Single/Multi)";
+        }
+    } else {
+        // Data-parallel strategy
+        result.work_function = ggml_numa_kernel_mul_execute_no_aggregation;
+        result.efficiency_score = 0.99f;
+        result.kernel_name = "NUMA MUL (No-Aggregation Data-Parallel)";
+    }
     
     // Apply force strategy override if environment variable is set
     bool strategy_overridden = ggml_numa_apply_kernel_force_strategy(&result, "MUL",
@@ -580,7 +586,7 @@ ggml_numa_kernel_query_result_t ggml_numa_kernel_mul_query(const struct ggml_ten
         ggml_numa_kernel_mul_execute_no_aggregation  // data-parallel function
     );
     
-    // Set aggregation policy - MUL uses no-aggregation shared memory approach
+    // MUL operations don't need aggregation - each node writes directly to result
     result.aggregation_policy = GGML_NUMA_AGGREGATION_NONE;
     
     NUMA_LOG_DEBUG("MUL query: %zu elements -> %s (efficiency: %.2f)%s", 
@@ -609,9 +615,9 @@ ggml_numa_kernel_registration_info_t ggml_numa_kernel_mul_register(void) {
     info.kernel_name = "NUMA MUL Kernel";
     
     // Strategy thresholds for MUL operations (same as ADD - similar characteristics)
-    info.strategy_array.thresholds[NUMA_STRATEGY_IDX_SINGLE_SINGLE] = 1024;      // Single thread below 1K elements
-    info.strategy_array.thresholds[NUMA_STRATEGY_IDX_SINGLE_MULTI] = 262144;     // Multi-thread below 256K elements
-    // Above 256K elements: data-parallel strategy
+    info.strategy_array.thresholds[NUMA_STRATEGY_IDX_SINGLE_SINGLE] = 128;      // Single thread threshold
+    info.strategy_array.thresholds[NUMA_STRATEGY_IDX_SINGLE_MULTI] = 1024;     // Multi-thread threshold
+    // Above this: data-parallel strategy
     info.strategy_array.valid = true;
     
     // Function pointers for different strategies - using work_funcs not agg_funcs

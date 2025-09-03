@@ -156,8 +156,16 @@ analyze_numa_debug_logs() {
     
     # Extract strategy breakdown for each operation
     local strategy_file=$(mktemp)
+    
+    # Extract both query results AND actual strategy logging messages for comprehensive analysis
+    # Pattern 1: Query result messages (e.g., "kernel=NUMA MUL_MAT (Data-Parallel)")
     grep "Query result.*supported=true.*kernel=" "$log_file" | \
         sed -E 's/.*kernel=(.*)/\1/' > "$strategy_file"
+    
+    # Pattern 2: Direct strategy logging messages (e.g., "NUMA MUL_MAT (Data Parallel)")
+    # These are more reliable and use consistent formatting
+    grep -E "NUMA DEBUG: NUMA [A-Z_]+ \([^)]+\)" "$log_file" | \
+        sed -E 's/.*NUMA DEBUG: (NUMA [A-Z_]+ \([^)]+\)).*/\1/' >> "$strategy_file"
     
     # Extract fallback executions (operations that fell back to ggml-cpu)
     # Look for "No kernel found for operation GET_ROWS" patterns specifically
@@ -169,39 +177,51 @@ analyze_numa_debug_logs() {
     if [ -s "$numa_ops_file" ]; then
         echo "✅ Operations using NUMA kernels:"
         while read -r count op; do
-            # Get strategy breakdown for this operation with more precise matching
-            local single_thread=0
+            # Get strategy breakdown for this operation using standardized log patterns
             local single_single=0
             local single_multi=0
             local data_parallel=0
             local kernel_only=0
             
-            # Handle special cases for precise matching
-            case "$op" in
-                "MUL_MAT")
-                    single_single=$(grep -c "NUMA MUL_MAT (Single/Single)" "$strategy_file" 2>/dev/null)
-                    single_multi=$(grep -c "NUMA MUL_MAT (Single/Multi)" "$strategy_file" 2>/dev/null)
-                    ;;
-                "MUL")
-                    single_single=$(grep -c "NUMA MUL (Single/Single)" "$strategy_file" 2>/dev/null)
-                    single_multi=$(grep -c "NUMA MUL (Single/Multi)" "$strategy_file" 2>/dev/null)
-                    ;;
-                "ADD")
-                    single_single=$(grep -c "NUMA ADD (Single/Single)" "$strategy_file" 2>/dev/null)
-                    single_multi=$(grep -c "NUMA ADD (Single/Multi)" "$strategy_file" 2>/dev/null)
-                    ;;
-                "RMS_NORM")
-                    single_thread=$(grep -c "RMS_NORM Single Thread" "$strategy_file" 2>/dev/null)
-                    ;;
-                *)
-                    # For other operations (RESHAPE, VIEW, PERMUTE, etc.)
-                    kernel_only=$(grep -c "NUMA ${op} Kernel" "$strategy_file" 2>/dev/null)
-                    ;;
-            esac
+            # Parse standardized strategy logging format: "NUMA {OP} ({Strategy})"
+            # Ensure we always get a numeric value (default to 0 if grep fails or returns empty)
+            single_single=$(grep -c "NUMA ${op} (Single/Single)" "$strategy_file" 2>/dev/null || echo "0")
+            single_multi=$(grep -c "NUMA ${op} (Single/Multi)" "$strategy_file" 2>/dev/null || echo "0")
+            data_parallel=$(grep -c "NUMA ${op} (Data Parallel)" "$strategy_file" 2>/dev/null || echo "0")
+            
+            # Ensure all variables are integers (handle any non-numeric results)
+            single_single=${single_single:-0}
+            single_multi=${single_multi:-0}
+            data_parallel=${data_parallel:-0}
+            kernel_only=${kernel_only:-0}
+            
+            # Convert any non-numeric values to 0
+            [[ "$single_single" =~ ^[0-9]+$ ]] || single_single=0
+            [[ "$single_multi" =~ ^[0-9]+$ ]] || single_multi=0
+            [[ "$data_parallel" =~ ^[0-9]+$ ]] || data_parallel=0
+            [[ "$kernel_only" =~ ^[0-9]+$ ]] || kernel_only=0
+            
+            # Fallback patterns for operations that may not use standardized logging yet
+            if [ "$single_single" -eq 0 ] && [ "$single_multi" -eq 0 ] && [ "$data_parallel" -eq 0 ]; then
+                case "$op" in
+                    "RMS_NORM")
+                        # Legacy pattern for RMS_NORM
+                        local single_thread=$(grep -c "RMS_NORM Single Thread" "$strategy_file" 2>/dev/null || echo "0")
+                        single_thread=${single_thread:-0}
+                        [[ "$single_thread" =~ ^[0-9]+$ ]] || single_thread=0
+                        [ "$single_thread" -gt 0 ] && kernel_only=$single_thread
+                        ;;
+                    *)
+                        # Generic kernel detection for operations without specific strategy logging
+                        kernel_only=$(grep -c "NUMA ${op} Kernel" "$strategy_file" 2>/dev/null || echo "0")
+                        kernel_only=${kernel_only:-0}
+                        [[ "$kernel_only" =~ ^[0-9]+$ ]] || kernel_only=0
+                        ;;
+                esac
+            fi
             
             # Create strategy summary
             local strategies=""
-            [ "$single_thread" -gt 0 ] && strategies="${strategies}single_thread: ${single_thread}, "
             [ "$single_single" -gt 0 ] && strategies="${strategies}single_single: ${single_single}, "
             [ "$single_multi" -gt 0 ] && strategies="${strategies}single_multi: ${single_multi}, "
             [ "$data_parallel" -gt 0 ] && strategies="${strategies}data_parallel: ${data_parallel}, "

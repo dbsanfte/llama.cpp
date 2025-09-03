@@ -269,6 +269,60 @@ static inline int ggml_numa_perf_enabled(void) {
     fprintf(stderr, "\n")
 
 // ============================================================================
+// NUMA Execution Strategy Logging (Standardized for Integration Tests)
+// ============================================================================
+
+/**
+ * Standardized execution strategy logging for NUMA kernels
+ * This macro ensures consistent logging format that can be parsed by integration tests
+ * 
+ * Format: "NUMA {OPERATION} ({Strategy})"
+ * Examples: 
+ *   - "NUMA MUL_MAT (Single/Single)"
+ *   - "NUMA ADD (Single/Multi)" 
+ *   - "NUMA RMS_NORM (Data Parallel)"
+ * 
+ * @param op_name Operation name (e.g., "MUL_MAT", "ADD", "RMS_NORM")
+ * @param strategy_name Strategy description (e.g., "Single/Single", "Single/Multi", "Data Parallel")
+ */
+#define NUMA_LOG_EXECUTION_STRATEGY(op_name, strategy_name) \
+    do { if (ggml_numa_debug_enabled() >= 1) { \
+        fprintf(stderr, "NUMA DEBUG: NUMA %s (%s)\n", (op_name), (strategy_name)); \
+    } } while(0)
+
+/**
+ * Convenience macros for standard execution strategies
+ * These ensure consistent naming for integration test parsing
+ */
+#define NUMA_LOG_STRATEGY_SINGLE_SINGLE(op_name) \
+    NUMA_LOG_EXECUTION_STRATEGY(op_name, "Single/Single")
+
+#define NUMA_LOG_STRATEGY_SINGLE_MULTI(op_name) \
+    NUMA_LOG_EXECUTION_STRATEGY(op_name, "Single/Multi")
+
+#define NUMA_LOG_STRATEGY_DATA_PARALLEL(op_name) \
+    NUMA_LOG_EXECUTION_STRATEGY(op_name, "Data Parallel")
+
+/**
+ * Dynamic strategy logging based on thread-local execution context
+ * This macro automatically determines the strategy based on execution mode
+ * 
+ * @param op_name Operation name (e.g., "MUL_MAT", "ADD")
+ */
+#define NUMA_LOG_DYNAMIC_STRATEGY(op_name) \
+    do { \
+        extern __thread bool ggml_numa_is_data_parallel_execution; \
+        extern __thread int ggml_current_numa_node; \
+        if (ggml_numa_is_data_parallel_execution) { \
+            NUMA_LOG_STRATEGY_DATA_PARALLEL(op_name); \
+        } else { \
+            /* Determine single vs multi-thread based on params or context */ \
+            /* For now, default to Single/Multi for single-node execution */ \
+            NUMA_LOG_STRATEGY_SINGLE_MULTI(op_name); \
+        } \
+    } while(0)
+
+// ============================================================================
 // NUMA Assertions
 // ============================================================================
 

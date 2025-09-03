@@ -68,6 +68,10 @@ enum ggml_status ggml_numa_kernel_transpose_execute(void * work_context,
     // Performance instrumentation for NUMA execution tracking
     NUMA_PERF_START(NUMA_PERF_KERNEL_NUMA_EXEC, "TRANSPOSE", "no_op_execution", -1, 0, 0);
     
+    // Log execution strategy for integration test parsing
+    // TRANSPOSE operations are always single-thread for optimal no-op performance
+    NUMA_LOG_STRATEGY_SINGLE_SINGLE("TRANSPOSE");
+    
     // Log execution details for debugging (only at trace level to avoid noise)
     NUMA_LOG_TRACE("TRANSPOSE no-op execution: tensor=%p, dims=[%ld,%ld,%ld,%ld]", 
                    tensor, tensor->ne[0], tensor->ne[1], tensor->ne[2], tensor->ne[3]);

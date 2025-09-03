@@ -23,7 +23,7 @@
  * - Index bounds validation for memory safety
  * - Support for all quantization types and F32/F16 data types
  * 
- * @author NUMA Kernel Development Team
+ * @author David Sanftenberg
  * @date 2025
  */
 

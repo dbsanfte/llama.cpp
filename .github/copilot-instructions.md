@@ -4,7 +4,9 @@ This document provides instructions for AI assistants working on the llama.cpp p
 
 ## 🎯 Project Overview
 
-This is a fork of llama.cpp with **NUMA-aware execution architecture** for optimal CPU thread### Pattern: Element-wise Operations (ADD, MUL, etc.)
+This is a fork of llama.cpp with **NUMA-aware execution architecture** for optimal CPU inferencing in a NUMA environment.
+
+### Pattern: Element-wise Operations (ADD, MUL, etc.)
 ```c
 // Registry pattern - threshold-based strategy selection
 ggml_numa_kernel_registration_info_t info = {
@@ -60,7 +62,7 @@ For comprehensive architecture details, see `docs/numa-architecture.md` which co
 
 ## 🔧 NUMA Kernel Implementation Workflow
 
-NOTE: Remember to use Doxygen comments for all new files, functions and structures.
+NOTE: Remember to use Doxygen comments for all new files, functions and structures. For @author you should use David Sanftenberg.
 
 ### Step 1: Analysis & Discovery
 Find the operation and locate mathematical kernels:
@@ -584,6 +586,32 @@ cmake --build build --target ggml-cpu llama && echo "🎉 Complete!" || echo "�
 - **Architecture Flow**: Follow Executor → Registry Direct Dispatch → Coordinator pattern
 - **Debug Control**: Use `GGML_NUMA_DEBUG=1` for development debugging, unset for performance testing
 - **Kernel Registration**: Always use `NUMA_REGISTER_KERNEL()` macro, never legacy function-based registration
+- **Strategy Selection**: Use `NUMA_SELECT_STRATEGY_FROM_CACHE()` macro for unified threshold-based strategy selection
+
+### Strategy Selection Pattern
+All kernels using cache-based thresholds should use the shared macro for consistency:
+```c
+// Get cache entry for this operation
+const ggml_numa_kernel_cache_entry_t * cache_entry = ggml_numa_lookup_kernel_direct(tensor->op);
+
+// Calculate total elements for threshold comparison
+size_t total_elements = ggml_nelements(tensor);
+
+// Use shared macro for unified strategy selection
+ggml_numa_execution_strategy_t selected_strategy;
+NUMA_SELECT_STRATEGY_FROM_CACHE(cache_entry, total_elements, selected_strategy);
+
+// selected_strategy now contains the optimal strategy:
+// - Below threshold[0]: Single node, single thread (fastest for tiny tensors)
+// - Below threshold[1]: Single node, multi-thread (good for small-medium tensors)  
+// - Above threshold[1]: Data-parallel across NUMA nodes (optimal for large tensors)
+```
+
+**Benefits:**
+- **Single Source of Logic**: Strategy selection logic centralized in one macro
+- **Consistent Behavior**: All kernels using this macro behave identically  
+- **Maintainability**: Changes to strategy logic only need to be made in one place
+- **Zero Performance Impact**: Macro expands to identical code at compile time
 
 ### Debug Message Implementation
 When adding new NUMA components, always use the centralized debug control system:
@@ -631,7 +659,7 @@ ggml/src/ggml-cpu/numa-kernels/reshape.c          # Template: View operations & 
 - [ ] Implement kernel function in `numa-kernels/` directory following template patterns
 - [ ] Use shared memory setup: check `ggml_numa_shared_result_tensor_data` for direct writes
 - [ ] Create `ggml_numa_kernel_{operation}_register()` function that returns registration info
-- [ ] Create `ggml_numa_kernel_{operation}_query()` function for strategy selection (required for direct dispatch)
+- [ ] Create `ggml_numa_kernel_{operation}_query()` function using `NUMA_SELECT_STRATEGY_FROM_CACHE()` macro
 - [ ] Add function declarations to kernel header file (e.g., `add.h`, `mul.h`)
 - [ ] Enable in `numa-kernels.c` using `NUMA_REGISTER_KERNEL(operation)` macro
 - [ ] Use `NUMA_ASSERT` for validation with proper coordinator signaling

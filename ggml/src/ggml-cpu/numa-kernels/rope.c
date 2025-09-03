@@ -39,51 +39,6 @@
 #include "../ops.h"
 #include <math.h>
 
-// ROPE Threshold-Based Strategy Selection
-
-/**
- * Strategy threshold structure for ROPE operations.
- * ROPE operations are compute-intensive and benefit from early parallelization.
- */
-typedef struct {
-    size_t element_threshold;
-    ggml_numa_execution_strategy_t strategy;
-    float efficiency_score;
-} ggml_rope_strategy_threshold_t;
-
-/**
- * ROPE-specific strategy thresholds
- * ROPE benefits from parallelization early due to trigonometric computations
- */
-static const ggml_rope_strategy_threshold_t ROPE_THRESHOLDS[] = {
-    {
-        .element_threshold = 512,  // 512 elements - single thread
-        .strategy = {
-            .node_strategy = NUMA_NODE_STRATEGY_SINGLE,
-            .on_node_strategy = NUMA_ON_NODE_STRATEGY_SINGLE_THREAD
-        },
-        .efficiency_score = 0.90f
-    },
-    {
-        .element_threshold = 16384,  // 16K elements - multi-thread single node  
-        .strategy = {
-            .node_strategy = NUMA_NODE_STRATEGY_SINGLE,
-            .on_node_strategy = NUMA_ON_NODE_STRATEGY_MULTI_THREAD
-        },
-        .efficiency_score = 0.87f
-    },
-    {
-        .element_threshold = SIZE_MAX,  // Above 16K elements - data-parallel strategy
-        .strategy = {
-            .node_strategy = NUMA_NODE_STRATEGY_DATA_PARALLEL,
-            .on_node_strategy = NUMA_ON_NODE_STRATEGY_MULTI_THREAD
-        },
-        .efficiency_score = 0.89f
-    }
-};
-
-#define ROPE_THRESHOLD_COUNT (sizeof(ROPE_THRESHOLDS) / sizeof(ROPE_THRESHOLDS[0]))
-
 // ============================================================================
 // ROPE Support Functions (Copied from ops.cpp)
 // ============================================================================
@@ -220,6 +175,15 @@ enum ggml_status ggml_numa_kernel_rope_execute(void * work_context, struct ggml_
     extern __thread int ggml_numa_total_nodes_for_data_parallel;
     extern __thread bool ggml_numa_is_data_parallel_execution;
     extern __thread void * ggml_numa_shared_result_tensor_data;
+    
+    // Log execution strategy in standardized format for integration test parsing
+    if (ggml_numa_is_data_parallel_execution) {
+        NUMA_LOG_STRATEGY_DATA_PARALLEL("ROPE");
+    } else if (params->nth > 1) {
+        NUMA_LOG_STRATEGY_SINGLE_MULTI("ROPE");
+    } else {
+        NUMA_LOG_STRATEGY_SINGLE_SINGLE("ROPE");
+    }
     
     NUMA_LOG_TRACE("ROPE kernel executing on NUMA node %d/%d (data_parallel=%s)",
                    ggml_current_numa_node, ggml_numa_total_nodes_for_data_parallel, 
@@ -498,6 +462,14 @@ ggml_numa_kernel_query_result_t ggml_numa_kernel_rope_query(const struct ggml_te
         return result;
     }
     
+    // Get cache entry for this operation
+    const ggml_numa_kernel_cache_entry_t * cache_entry = ggml_numa_lookup_kernel_direct(GGML_OP_ROPE);
+    if (!cache_entry || !cache_entry->strategy_array.valid) {
+        NUMA_LOG_DEBUG("ROPE cache entry not found or invalid - falling back to unsupported");
+        result.supported = false;
+        return result;
+    }
+    
     // ROPE operations are compute-intensive with trigonometric calculations
     // Strategy selection based on element count thresholds (ROPE benefits from parallelization early)
     
@@ -510,12 +482,22 @@ ggml_numa_kernel_query_result_t ggml_numa_kernel_rope_query(const struct ggml_te
     result.aggregation_function = NULL;
     result.aggregation_user_data = NULL;
     
-    // Find optimal strategy using threshold search
-    const ggml_rope_strategy_threshold_t * selected_strategy;
-    NUMA_SELECT_STRATEGY_BY_THRESHOLD(ROPE_THRESHOLDS, ROPE_THRESHOLD_COUNT, total_elements, selected_strategy);
+    // Use shared macro for unified strategy selection
+    ggml_numa_execution_strategy_t selected_strategy;
+    NUMA_SELECT_STRATEGY_FROM_CACHE(cache_entry, total_elements, selected_strategy);
     
-    result.strategy = selected_strategy->strategy;
-    result.efficiency_score = selected_strategy->efficiency_score;
+    result.strategy = selected_strategy;
+    
+    // Set efficiency score based on selected strategy
+    if (selected_strategy.node_strategy == NUMA_NODE_STRATEGY_SINGLE && 
+        selected_strategy.on_node_strategy == NUMA_ON_NODE_STRATEGY_SINGLE_THREAD) {
+        result.efficiency_score = 0.75f;  // Single thread for small ROPE operations
+    } else if (selected_strategy.node_strategy == NUMA_NODE_STRATEGY_SINGLE && 
+               selected_strategy.on_node_strategy == NUMA_ON_NODE_STRATEGY_MULTI_THREAD) {
+        result.efficiency_score = 0.85f;  // Multi-thread single node for medium ROPE
+    } else {
+        result.efficiency_score = 0.95f;  // Data-parallel for large ROPE operations
+    }
     
     // Apply force strategy override if set
     ggml_numa_apply_kernel_force_strategy(&result, "ROPE", 
@@ -538,9 +520,9 @@ ggml_numa_kernel_registration_info_t ggml_numa_kernel_rope_register(void) {
     
     // Strategy thresholds for ROPE operations
     // ROPE benefits from parallelization even with smaller tensors due to complex cache operations
-    info.strategy_array.thresholds[NUMA_STRATEGY_IDX_SINGLE_SINGLE] = 512;      // Single thread below 512 elements
-    info.strategy_array.thresholds[NUMA_STRATEGY_IDX_SINGLE_MULTI] = 16384;     // Multi-thread below 16K elements
-    // Above 16K elements: data-parallel strategy across NUMA nodes
+    info.strategy_array.thresholds[NUMA_STRATEGY_IDX_SINGLE_SINGLE] = 128;      // Single thread strategy
+    info.strategy_array.thresholds[NUMA_STRATEGY_IDX_SINGLE_MULTI] = 1024;     // Multi-thread strategy
+    // Above this: data-parallel strategy 
     info.strategy_array.valid = true;
     
     // Function pointers for different execution strategies

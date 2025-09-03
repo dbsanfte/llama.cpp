@@ -1,8 +1,19 @@
-/*
- * NUMA-Aware Memory Allocator Implementation
+/**
+ * @file ggml-numa-allocator.c
+ * @brief NUMA-Aware Memory Allocator Implementation
  * 
- * Provides robust NUMA memory allocation that works even in Docker containers
- * where standard NUMA functions are broken.
+ * This module provides robust NUMA memory allocation that works reliably
+ * even in Docker containers where standard NUMA functions may be broken.
+ * 
+ * Key features:
+ * - Multiple allocation strategies (local, interleave, distribute, mirror)
+ * - Container-safe NUMA detection and allocation
+ * - Per-node allocation tracking and statistics
+ * - Thread-safe allocation/deallocation
+ * - Memory mirroring across all NUMA nodes for optimal access
+ * 
+ * @author GGML NUMA Team
+ * @date 2025
  */
 
 #include "ggml-numa-allocator.h"
@@ -20,26 +31,44 @@
 #include <sched.h>
 
 #ifndef GGML_NUMA_MAX_NODES
-#define GGML_NUMA_MAX_NODES 8
+#define GGML_NUMA_MAX_NODES 8    /**< Maximum supported NUMA nodes */
 #endif
 
-// Global NUMA allocator context (initialized once)
+/** @brief Global NUMA allocator context (initialized once) */
 static ggml_numa_alloc_context_t g_numa_alloc_ctx = {0};
+/** @brief Flag indicating if global context has been initialized */
 static bool g_numa_alloc_initialized = false;
 
-// Simple tracking structure for NUMA allocations
+/**
+ * @brief NUMA allocation tracking entry
+ * 
+ * Internal structure for tracking individual NUMA allocations.
+ * Supports both regular allocations and mirrored allocations
+ * that exist on multiple NUMA nodes simultaneously.
+ */
 typedef struct numa_alloc_entry {
-    void* ptr;
-    size_t size;
-    bool is_mirror;
-    void* mirror_copies[GGML_NUMA_MAX_NODES];  // For MIRROR allocations, track all node copies
-    int num_mirror_copies;
-    struct numa_alloc_entry* next;
+    void* ptr;                                    /**< Primary memory pointer */
+    size_t size;                                  /**< Allocation size in bytes */
+    bool is_mirror;                               /**< True if this is a mirrored allocation */
+    void* mirror_copies[GGML_NUMA_MAX_NODES];     /**< Mirror copies on each node */
+    int num_mirror_copies;                        /**< Number of valid mirror copies */
+    struct numa_alloc_entry* next;               /**< Next entry in linked list */
 } numa_alloc_entry_t;
 
+/** @brief Linked list head for tracking all NUMA allocations */
 static numa_alloc_entry_t* g_numa_allocations = NULL;
+/** @brief Mutex protecting the allocation tracking list */
 static pthread_mutex_t g_numa_alloc_mutex = PTHREAD_MUTEX_INITIALIZER;
 
+/**
+ * @brief Add a regular NUMA allocation to the tracking list
+ * 
+ * Thread-safe function to register a new NUMA allocation for tracking.
+ * Used for regular allocations (not mirrored).
+ * 
+ * @param ptr Pointer to allocated memory
+ * @param size Size of allocation in bytes
+ */
 static void add_numa_allocation(void* ptr, size_t size) {
     pthread_mutex_lock(&g_numa_alloc_mutex);
     numa_alloc_entry_t* entry = malloc(sizeof(numa_alloc_entry_t));
@@ -53,6 +82,17 @@ static void add_numa_allocation(void* ptr, size_t size) {
     pthread_mutex_unlock(&g_numa_alloc_mutex);
 }
 
+/**
+ * @brief Add a mirrored NUMA allocation to the tracking list
+ * 
+ * Thread-safe function to register a mirrored allocation that exists
+ * on multiple NUMA nodes simultaneously. All mirror copies are tracked.
+ * 
+ * @param primary_ptr Primary memory pointer (typically from node 0)
+ * @param mirror_copies Array of pointers to mirror copies on each node
+ * @param num_copies Number of valid mirror copies
+ * @param size Size of each allocation in bytes
+ */
 static void add_numa_mirror_allocation(void* primary_ptr, void** mirror_copies, int num_copies, size_t size) {
     pthread_mutex_lock(&g_numa_alloc_mutex);
     numa_alloc_entry_t* entry = malloc(sizeof(numa_alloc_entry_t));
@@ -68,6 +108,16 @@ static void add_numa_mirror_allocation(void* primary_ptr, void** mirror_copies, 
     pthread_mutex_unlock(&g_numa_alloc_mutex);
 }
 
+/**
+ * @brief Remove and free a NUMA allocation from tracking
+ * 
+ * Thread-safe function to remove an allocation from tracking and
+ * free all associated memory. For mirrored allocations, frees all
+ * mirror copies across all NUMA nodes.
+ * 
+ * @param ptr Primary memory pointer to remove
+ * @return true if allocation was found and removed, false otherwise
+ */
 static bool remove_numa_allocation(void* ptr) {
     pthread_mutex_lock(&g_numa_alloc_mutex);
     numa_alloc_entry_t** current = &g_numa_allocations;
@@ -98,6 +148,16 @@ static bool remove_numa_allocation(void* ptr) {
     return false;
 }
 
+/**
+ * @brief Initialize NUMA allocator context
+ * 
+ * Sets up the NUMA allocation context with the specified strategy.
+ * Detects available NUMA nodes and initializes tracking structures.
+ * 
+ * @param ctx Pointer to NUMA allocation context to initialize
+ * @param strategy Allocation strategy to use (see ggml_numa_alloc_strategy_t)
+ * @return true on successful initialization, false on error
+ */
 bool ggml_numa_alloc_init(ggml_numa_alloc_context_t* ctx, ggml_numa_alloc_strategy_t strategy) {
     if (!ctx) return false;
     
@@ -121,7 +181,15 @@ bool ggml_numa_alloc_init(ggml_numa_alloc_context_t* ctx, ggml_numa_alloc_strate
     return true;
 }
 
-// Utility function to get the NUMA node of a memory address
+/**
+ * @brief Get the NUMA node of a memory address
+ * 
+ * Utility function to determine which NUMA node a memory address
+ * is allocated on. Uses get_mempolicy() system call.
+ * 
+ * @param ptr Memory pointer to check
+ * @return NUMA node ID (0-based), or -1 on error
+ */
 int get_memory_numa_node(void* ptr) {
     if (!ptr) return -1;
     
@@ -133,7 +201,16 @@ int get_memory_numa_node(void* ptr) {
     return node;
 }
 
-// Assert that memory is allocated on the expected NUMA node
+/**
+ * @brief Assert that memory is allocated on the expected NUMA node
+ * 
+ * Development/debugging function that verifies memory allocation
+ * succeeded on the intended NUMA node. Aborts program if assertion fails.
+ * 
+ * @param ptr Memory pointer to check
+ * @param expected_node Expected NUMA node ID
+ * @param context Description of where this assertion is being called from
+ */
 static void assert_numa_allocation(void* ptr, int expected_node, const char* context) {
     if (!ptr) return;
     
@@ -151,7 +228,16 @@ static void assert_numa_allocation(void* ptr, int expected_node, const char* con
     }
 }
 
-// Non-recursive fallback allocation - breaks infinite recursion
+/**
+ * @brief Non-recursive fallback allocation to break infinite recursion
+ * 
+ * Simple aligned allocation without NUMA awareness, used as a fallback
+ * when NUMA-specific allocation fails. Breaks potential recursion loops.
+ * 
+ * @param size Number of bytes to allocate
+ * @param numa_ctx NUMA allocation context for tracking
+ * @return Pointer to allocated memory, or NULL on failure
+ */
 static void* ggml_numa_fallback_alloc(size_t size, ggml_numa_alloc_context_t* numa_ctx) {
     void* mem = aligned_alloc(64, size);
     if (mem) {
@@ -164,6 +250,22 @@ static void* ggml_numa_fallback_alloc(size_t size, ggml_numa_alloc_context_t* nu
     return mem;
 }
 
+/**
+ * @brief NUMA-aware aligned memory allocation
+ * 
+ * Main allocation function that provides aligned memory using the
+ * context's NUMA strategy. Serves as a drop-in replacement for
+ * aligned_malloc() with NUMA awareness.
+ * 
+ * Supports multiple allocation strategies:
+ * - LOCAL: Allocate on current/isolation node
+ * - MIRROR: Create copies on all NUMA nodes
+ * - INTERLEAVE/DISTRIBUTE: Future strategies for balanced allocation
+ * 
+ * @param size Number of bytes to allocate (must be > 0)
+ * @param numa_ctx NUMA allocation context (NULL uses global context)
+ * @return Pointer to allocated memory, or NULL on failure
+ */
 void* ggml_numa_aligned_malloc(size_t size, ggml_numa_alloc_context_t* numa_ctx) {
     if (!numa_ctx) {
         // Use global context
@@ -302,7 +404,25 @@ void* ggml_numa_aligned_malloc(size_t size, ggml_numa_alloc_context_t* numa_ctx)
     }
     
     return mem;
-}void* ggml_numa_aligned_malloc_on_node(size_t size, int preferred_node, ggml_numa_alloc_context_t* numa_ctx) {
+}
+
+/**
+ * @brief NUMA-aware memory allocation with explicit node preference
+ * 
+ * Allocates memory with strong preference for a specific NUMA node.
+ * Falls back to other allocation methods if preferred node allocation fails.
+ * 
+ * This function handles several scenarios:
+ * - Multi-node systems: Uses numa_alloc_onnode() for explicit placement
+ * - Single-node systems: Uses regular aligned allocation
+ * - Container environments: Provides fallbacks when NUMA calls fail
+ * 
+ * @param size Number of bytes to allocate (must be > 0)  
+ * @param preferred_node Preferred NUMA node ID (-1 for no preference)
+ * @param numa_ctx NUMA allocation context
+ * @return Pointer to allocated memory, or NULL on failure
+ */
+void* ggml_numa_aligned_malloc_on_node(size_t size, int preferred_node, ggml_numa_alloc_context_t* numa_ctx) {
     if (!numa_ctx) {
         numa_ctx = &g_numa_alloc_ctx;
     }
@@ -391,6 +511,22 @@ void* ggml_numa_aligned_malloc(size_t size, ggml_numa_alloc_context_t* numa_ctx)
     }
 }
 
+/**
+ * @brief Allocate context memory pool distributed across NUMA nodes
+ * 
+ * Allocates a large memory pool for ggml context usage, with NUMA-aware
+ * placement based on the current NUMA strategy. This is the main entry
+ * point for ggml context memory allocation.
+ * 
+ * Strategy selection:
+ * - ISOLATE mode: Allocate on specific isolation node
+ * - MIRROR mode: Allocate on node 0 (with mirroring handled separately)
+ * - Other modes: Allocate on node 0 as default
+ * 
+ * @param total_size Total size of memory pool to allocate
+ * @param numa_ctx_ptr NUMA allocation context (void* for ggml compatibility)
+ * @return Pointer to allocated memory pool, or NULL on failure
+ */
 void* ggml_numa_alloc_context_memory(size_t total_size, void* numa_ctx_ptr) {
     // Cast back to the proper type  
     ggml_numa_alloc_context_t* numa_ctx = (ggml_numa_alloc_context_t*)numa_ctx_ptr;
@@ -447,6 +583,15 @@ void* ggml_numa_alloc_context_memory(size_t total_size, void* numa_ctx_ptr) {
     return ggml_numa_aligned_malloc_on_node(total_size, 0, numa_ctx);
 }
 
+/**
+ * @brief Free NUMA-allocated memory
+ * 
+ * Frees memory previously allocated by NUMA allocator functions.
+ * Delegates to ggml_numa_free() which handles tracking updates.
+ * 
+ * @param ptr Pointer to memory to free (NULL is safe)
+ * @param numa_ctx NUMA allocation context (unused, kept for API compatibility)
+ */
 void ggml_numa_aligned_free(void* ptr, ggml_numa_alloc_context_t* numa_ctx) {
     if (!ptr) return;
     
@@ -454,6 +599,15 @@ void ggml_numa_aligned_free(void* ptr, ggml_numa_alloc_context_t* numa_ctx) {
     ggml_numa_free(ptr);
 }
 
+/**
+ * @brief Get NUMA allocation statistics
+ * 
+ * Prints detailed allocation statistics including per-node usage,
+ * total allocations, and strategy information. Useful for performance
+ * analysis and debugging NUMA allocation patterns.
+ * 
+ * @param ctx NUMA allocation context to report on (NULL uses global context)
+ */
 void ggml_numa_alloc_stats(const ggml_numa_alloc_context_t* ctx) {
     if (!ctx) ctx = &g_numa_alloc_ctx;
     
@@ -469,11 +623,31 @@ void ggml_numa_alloc_stats(const ggml_numa_alloc_context_t* ctx) {
     }
 }
 
+/**
+ * @brief Enable or disable debug logging
+ * 
+ * Controls verbose debug output for NUMA allocation operations.
+ * When enabled, provides detailed logging of allocation decisions,
+ * NUMA node placement, and memory usage patterns.
+ * 
+ * @param ctx NUMA allocation context (NULL uses global context)
+ * @param enabled true to enable debug logging, false to disable
+ */
 void ggml_numa_alloc_set_debug(ggml_numa_alloc_context_t* ctx, bool enabled) {
     if (!ctx) ctx = &g_numa_alloc_ctx;
     ctx->debug_enabled = enabled;
 }
 
+/**
+ * @brief Check if memory was allocated by NUMA allocator
+ * 
+ * Determines whether a memory pointer was allocated using the NUMA
+ * allocator functions by searching the internal tracking list.
+ * Thread-safe operation that's useful for mixed allocation scenarios.
+ * 
+ * @param ptr Memory pointer to check
+ * @return true if allocated by NUMA allocator, false otherwise
+ */
 bool ggml_numa_is_numa_allocated(void* ptr) {
     pthread_mutex_lock(&g_numa_alloc_mutex);
     numa_alloc_entry_t* current = g_numa_allocations;
@@ -489,6 +663,19 @@ bool ggml_numa_is_numa_allocated(void* ptr) {
     return false;
 }
 
+/**
+ * @brief Free NUMA-allocated memory (context-free version)
+ * 
+ * Frees memory previously allocated by NUMA allocator without requiring
+ * the original allocation context. Handles both regular and mirrored
+ * allocations by consulting the internal tracking list.
+ * 
+ * For mirrored allocations, automatically frees all mirror copies
+ * across all NUMA nodes. Falls back to regular free() for untracked
+ * memory pointers.
+ * 
+ * @param ptr Pointer to memory to free (NULL is safe)
+ */
 void ggml_numa_free(void* ptr) {
     if (!ptr) return;
     
@@ -503,12 +690,27 @@ void ggml_numa_free(void* ptr) {
     }
 }
 
-// Public interface for NUMA allocation assertions
+/**
+ * @brief Public interface for NUMA allocation assertions
+ * 
+ * Wrapper around internal assert_numa_allocation() function to provide
+ * public access for testing and debugging NUMA memory placement.
+ * 
+ * @param ptr Memory pointer to check
+ * @param expected_node Expected NUMA node ID  
+ * @param context Description of where this assertion is being called from
+ */
 void ggml_numa_assert_allocation(void* ptr, int expected_node, const char* context) {
     assert_numa_allocation(ptr, expected_node, context);
 }
 
-// Force linking of NUMA allocator symbols (prevent dead code elimination)
+/**
+ * @brief Force linking of NUMA allocator symbols
+ * 
+ * Ensures that NUMA allocator symbols are linked into the final binary
+ * even if not directly called, preventing linker dead code elimination.
+ * This is important for dynamic symbol resolution and plugin architectures.
+ */
 void ggml_force_link_numa_allocator_symbols(void) {
     // This function ensures that NUMA allocator symbols are linked
     // even if not directly called, preventing linker optimization

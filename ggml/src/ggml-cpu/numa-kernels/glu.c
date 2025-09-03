@@ -8,51 +8,6 @@
 #include "../vec.h"
 #include <assert.h>
 
-// GLU Threshold-Based Strategy Selection
-
-/**
- * Strategy threshold structure for GLU operations.
- * GLU operations benefit from data-parallel execution at moderate sizes.
- */
-typedef struct {
-    size_t element_threshold;
-    ggml_numa_execution_strategy_t strategy;
-    float efficiency_score;
-} ggml_glu_strategy_threshold_t;
-
-/**
- * GLU-specific strategy thresholds
- * Based on element count with moderate computational cost characteristics
- */
-static const ggml_glu_strategy_threshold_t GLU_THRESHOLDS[] = {
-    {
-        .element_threshold = 16384,  // 16K elements - single thread
-        .strategy = {
-            .node_strategy = NUMA_NODE_STRATEGY_SINGLE,
-            .on_node_strategy = NUMA_ON_NODE_STRATEGY_SINGLE_THREAD
-        },
-        .efficiency_score = 0.92f
-    },
-    {
-        .element_threshold = 65536,  // 64K elements - multi-thread single node  
-        .strategy = {
-            .node_strategy = NUMA_NODE_STRATEGY_SINGLE,
-            .on_node_strategy = NUMA_ON_NODE_STRATEGY_MULTI_THREAD
-        },
-        .efficiency_score = 0.85f
-    },
-    {
-        .element_threshold = SIZE_MAX,  // Above 64K elements - data-parallel strategy
-        .strategy = {
-            .node_strategy = NUMA_NODE_STRATEGY_DATA_PARALLEL,
-            .on_node_strategy = NUMA_ON_NODE_STRATEGY_MULTI_THREAD
-        },
-        .efficiency_score = 0.88f
-    }
-};
-
-#define GLU_THRESHOLD_COUNT (sizeof(GLU_THRESHOLDS) / sizeof(GLU_THRESHOLDS[0]))
-
 /**
  * @brief Execute GLU operation using NUMA kernel
  * 
@@ -106,6 +61,15 @@ enum ggml_status ggml_numa_kernel_glu_execute(void * work_context, struct ggml_c
     // Calculate tensor dimensions and row structure
     const int nc = has_separate_src1 ? src0->ne[0] : src0->ne[0] / 2;  // Columns (elements per row)
     const int nr = ggml_nrows(src0);  // Total number of rows
+    
+    // Log execution strategy in standardized format for integration test parsing
+    if (ggml_numa_is_data_parallel_execution) {
+        NUMA_LOG_STRATEGY_DATA_PARALLEL("GLU");
+    } else if (params->nth > 1) {
+        NUMA_LOG_STRATEGY_SINGLE_MULTI("GLU");
+    } else {
+        NUMA_LOG_STRATEGY_SINGLE_SINGLE("GLU");
+    }
     
     NUMA_LOG_DEBUG("GLU operation: type=%d, nc=%d, nr=%d, has_separate_src1=%s, numa_node=%d\n", 
                    glu_op, nc, nr, has_separate_src1 ? "true" : "false", ggml_current_numa_node);
@@ -225,6 +189,14 @@ ggml_numa_kernel_query_result_t ggml_numa_kernel_glu_query(const struct ggml_ten
         return result;
     }
     
+    // Get cache entry for this operation
+    const ggml_numa_kernel_cache_entry_t * cache_entry = ggml_numa_lookup_kernel_direct(GGML_OP_GLU);
+    if (!cache_entry || !cache_entry->strategy_array.valid) {
+        NUMA_LOG_DEBUG("GLU cache entry not found or invalid - falling back to unsupported");
+        result.supported = false;
+        return result;
+    }
+    
     // GLU operations are memory-bound with moderate computational cost
     // Strategy selection based on element count thresholds
     
@@ -236,12 +208,22 @@ ggml_numa_kernel_query_result_t ggml_numa_kernel_glu_query(const struct ggml_ten
     result.aggregation_function = NULL;
     result.aggregation_user_data = NULL;
     
-    // Find optimal strategy using threshold search
-    const ggml_glu_strategy_threshold_t * selected_strategy;
-    NUMA_SELECT_STRATEGY_BY_THRESHOLD(GLU_THRESHOLDS, GLU_THRESHOLD_COUNT, total_elements, selected_strategy);
+    // Use shared macro for unified strategy selection
+    ggml_numa_execution_strategy_t selected_strategy;
+    NUMA_SELECT_STRATEGY_FROM_CACHE(cache_entry, total_elements, selected_strategy);
     
-    result.strategy = selected_strategy->strategy;
-    result.efficiency_score = selected_strategy->efficiency_score;
+    result.strategy = selected_strategy;
+    
+    // Set efficiency score based on selected strategy
+    if (selected_strategy.node_strategy == NUMA_NODE_STRATEGY_SINGLE && 
+        selected_strategy.on_node_strategy == NUMA_ON_NODE_STRATEGY_SINGLE_THREAD) {
+        result.efficiency_score = 0.85f;  // Single thread for small GLU operations
+    } else if (selected_strategy.node_strategy == NUMA_NODE_STRATEGY_SINGLE && 
+               selected_strategy.on_node_strategy == NUMA_ON_NODE_STRATEGY_MULTI_THREAD) {
+        result.efficiency_score = 0.90f;  // Multi-thread single node for medium GLU
+    } else {
+        result.efficiency_score = 0.95f;  // Data-parallel for large GLU operations
+    }
     
     // Apply force strategy override if set
     ggml_numa_apply_kernel_force_strategy(&result, "GLU", 
@@ -270,9 +252,9 @@ ggml_numa_kernel_registration_info_t ggml_numa_kernel_glu_register(void) {
     
     // Strategy thresholds based on element count
     // GLU operations benefit from data-parallel execution at moderate sizes
-    info.strategy_array.thresholds[NUMA_STRATEGY_IDX_SINGLE_SINGLE] = 16384;   // 16K elements - single thread
-    info.strategy_array.thresholds[NUMA_STRATEGY_IDX_SINGLE_MULTI] = 65536;    // 64K elements - multi-thread single node
-    // Above 64K elements: data-parallel strategy across NUMA nodes
+    info.strategy_array.thresholds[NUMA_STRATEGY_IDX_SINGLE_SINGLE] = 128;   // Single thread strategy
+    info.strategy_array.thresholds[NUMA_STRATEGY_IDX_SINGLE_MULTI] = 1024;    // Multi-thread strategy
+    // Above this: data-parallel strategy 
     info.strategy_array.valid = true;
     
     // Function pointers for different execution strategies

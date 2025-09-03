@@ -14,7 +14,7 @@
  * ✅ Matrix operations (MUL_MAT, CONV_1D, CONV_2D)
  * ✅ Complex transformations requiring multidimensional slicing
  * ✅ Operations with intricate data dependencies
- * ✅ Operations requiring specialized SIMD patterns
+ * ✅ Operations requiring specialized patterns and strategies
  * ✅ Operations with custom aggregation requirements
  * ✅ Operations needing chunk-based or block-based processing
  * 
@@ -175,8 +175,23 @@ enum ggml_status ggml_numa_kernel_mul_mat_execute(void * work_context,
     
     // PERFORMANCE: Start timing the kernel execution
     extern __thread int ggml_current_numa_node;
+    extern __thread bool ggml_numa_is_data_parallel_execution;
     const size_t tensor_size = ggml_nelements(dst) * sizeof(float);
     NUMA_PERF_START(NUMA_PERF_KERNEL_NUMA_EXEC, "MUL_MAT", "kernel_execute", ggml_current_numa_node, tensor_size, params->nth);
+    
+    // FORCED DEBUG: Always log MUL_MAT kernel execution for verification
+    NUMA_LOG_DEBUG("MUL_MAT kernel called: data_parallel=%s, nth=%d, numa_node=%d", 
+                   ggml_numa_is_data_parallel_execution ? "YES" : "NO", params->nth, ggml_current_numa_node);
+    
+    // Log execution strategy in standardized format for integration test parsing
+    // These strategy logs use debug level 1 and should be visible with GGML_NUMA_DEBUG=1
+    if (ggml_numa_is_data_parallel_execution) {
+        NUMA_LOG_STRATEGY_DATA_PARALLEL("MUL_MAT");
+    } else if (params->nth > 1) {
+        NUMA_LOG_STRATEGY_SINGLE_MULTI("MUL_MAT");
+    } else {
+        NUMA_LOG_STRATEGY_SINGLE_SINGLE("MUL_MAT");
+    }
     
     // =============================================================================
     // Input Validation & Setup
@@ -712,70 +727,14 @@ typedef struct {
 } ggml_mul_mat_strategy_threshold_t;
 
 /**
- * MUL_MAT-specific strategy thresholds
- * Optimized for matrix multiplication workload characteristics
- * Note: Work buffer sizes are now calculated dynamically per operation
+ * @brief MUL_MAT kernel strategy thresholds now use cache-based configuration
+ * 
+ * Thresholds are stored in the kernel registry cache as single source of truth.
+ * Cache registration defines: 128 (single-single), 512 (single-multi) element thresholds.
+ * Above 512 elements: data-parallel across NUMA nodes.
+ * 
+ * Previous strategy threshold structure removed - cache serves as single source of truth.
  */
-static const ggml_mul_mat_strategy_threshold_t MUL_MAT_THRESHOLDS[] = {
-    // Very small matrices: single-threaded is fastest due to low overhead
-    {
-        .element_threshold = 1024,  // < 1K elements
-        .strategy = { .node_strategy = NUMA_NODE_STRATEGY_SINGLE, .on_node_strategy = NUMA_ON_NODE_STRATEGY_SINGLE_THREAD },
-        .efficiency_score = 0.90f,
-        .kernel_name = "NUMA MUL_MAT (Single/Single)"
-    },
-    
-    // Small matrices: multi-threaded on single node for cache efficiency
-    {
-        .element_threshold = 16384,  // 1K - 16K elements
-        .strategy = { .node_strategy = NUMA_NODE_STRATEGY_SINGLE, .on_node_strategy = NUMA_ON_NODE_STRATEGY_MULTI_THREAD },
-        .efficiency_score = 0.92f,
-        .kernel_name = "NUMA MUL_MAT (Single/Multi)"
-    },
-    
-    // EXPERIMENTAL: Raise thresholds much higher to test overhead hypothesis
-    // Medium matrices: keep on single node much longer
-    {
-        .element_threshold = 16777216,  // 16K - 16M elements (raised from 256K!)
-        .strategy = { .node_strategy = NUMA_NODE_STRATEGY_SINGLE, .on_node_strategy = NUMA_ON_NODE_STRATEGY_MULTI_THREAD },
-        .efficiency_score = 0.93f,
-        .kernel_name = "NUMA MUL_MAT (Single/Multi-Large)"
-    },
-    
-    // Large matrices: only use data-parallel for very large operations
-    {
-        .element_threshold = 67108864,  // 16M - 64M elements (raised from 4M!)
-        .strategy = { .node_strategy = NUMA_NODE_STRATEGY_DATA_PARALLEL, .on_node_strategy = NUMA_ON_NODE_STRATEGY_MULTI_THREAD },
-        .efficiency_score = 0.95f,
-        .kernel_name = "NUMA MUL_MAT (Data-Parallel/Large)"
-    },
-    
-    // Huge matrices: optimized for memory bandwidth utilization
-    {
-        .element_threshold = 67108864,  // 4M - 64M elements
-        .strategy = { .node_strategy = NUMA_NODE_STRATEGY_DATA_PARALLEL, .on_node_strategy = NUMA_ON_NODE_STRATEGY_MULTI_THREAD },
-        .efficiency_score = 0.96f,
-        .kernel_name = "NUMA MUL_MAT (Data-Parallel/Huge)"
-    },
-    
-    // GB-scale: 1GB+ matrices with maximum efficiency
-    {
-        .element_threshold = 268435456,  // 64M - 256M elements (~1GB)
-        .strategy = { .node_strategy = NUMA_NODE_STRATEGY_DATA_PARALLEL, .on_node_strategy = NUMA_ON_NODE_STRATEGY_MULTI_THREAD },
-        .efficiency_score = 0.97f,
-        .kernel_name = "NUMA MUL_MAT (Data-Parallel/1GB)"
-    },
-    
-    // Ultra-large: 2GB+ matrices with optimized chunk distribution
-    {
-        .element_threshold = SIZE_MAX,  // 256M+ elements (2GB+)
-        .strategy = { .node_strategy = NUMA_NODE_STRATEGY_DATA_PARALLEL, .on_node_strategy = NUMA_ON_NODE_STRATEGY_MULTI_THREAD },
-        .efficiency_score = 0.98f,
-        .kernel_name = "NUMA MUL_MAT (Data-Parallel/Ultra)"
-    }
-};
-
-#define MUL_MAT_THRESHOLD_COUNT (sizeof(MUL_MAT_THRESHOLDS) / sizeof(MUL_MAT_THRESHOLDS[0]))
 
 /**
  * Query MUL_MAT kernel for optimal strategy based on tensor characteristics
@@ -787,6 +746,9 @@ static const ggml_mul_mat_strategy_threshold_t MUL_MAT_THRESHOLDS[] = {
  * @return Query result with optimal strategy, or unsupported result if not applicable
  */
 ggml_numa_kernel_query_result_t ggml_numa_kernel_mul_mat_query(const struct ggml_tensor * tensor) {
+    // FORCED DEBUG: Always log MUL_MAT query calls for verification
+    NUMA_LOG_DEBUG("MUL_MAT query called for tensor with op=%d", tensor ? tensor->op : -1);
+    
     // PERFORMANCE: Start timing the query operation
     NUMA_PERF_START(NUMA_PERF_EXECUTOR_QUERY, "MUL_MAT", "query_phase", -1, 0, 0);
     
@@ -827,22 +789,31 @@ ggml_numa_kernel_query_result_t ggml_numa_kernel_mul_mat_query(const struct ggml
     }
     
     // Calculate total elements in result tensor
+    // Get cache entry for this operation
+    const ggml_numa_kernel_cache_entry_t * cache_entry = ggml_numa_lookup_kernel_direct(tensor->op);
+    if (!cache_entry) {
+        NUMA_LOG_DEBUG("MUL_MAT query: Cache entry not found for operation");
+        result.supported = false;
+        NUMA_PERF_END();
+        return result;
+    }
+    
     const size_t total_elements = ggml_nelements(tensor);
     
-    // Find optimal strategy using threshold search
-    const ggml_mul_mat_strategy_threshold_t * selected_strategy;
-    NUMA_SELECT_STRATEGY_BY_THRESHOLD(MUL_MAT_THRESHOLDS, MUL_MAT_THRESHOLD_COUNT, total_elements, selected_strategy);
+    // Use unified cache-based strategy selection
+    ggml_numa_execution_strategy_t selected_strategy;
+    NUMA_SELECT_STRATEGY_FROM_CACHE(cache_entry, total_elements, selected_strategy);
     
     // Calculate work buffer size dynamically based on tensor requirements
     const size_t work_buffer_size = ggml_numa_kernel_mul_mat_calculate_work_buffer_size(tensor);
     
     // Build successful query result
     result.supported = true;
-    result.strategy = selected_strategy->strategy;
+    result.strategy = selected_strategy;
     result.work_buffer_size_per_thread = work_buffer_size;  // Dynamic calculation!
     result.work_function = ggml_numa_kernel_mul_mat_execute;
-    result.efficiency_score = selected_strategy->efficiency_score;
-    result.kernel_name = selected_strategy->kernel_name;
+    result.efficiency_score = 0.95f; // Static efficiency score for cache-based approach
+    result.kernel_name = "NUMA MUL_MAT Kernel";
     
     // MUL_MAT writes directly to shared memory - no aggregation needed
     result.aggregation_policy = GGML_NUMA_AGGREGATION_NONE;
@@ -880,10 +851,10 @@ ggml_numa_kernel_registration_info_t ggml_numa_kernel_mul_mat_register(void) {
     info.supported = true;
     info.kernel_name = "NUMA MUL_MAT Kernel";
     
-    // Strategy thresholds for MUL_MAT operations  
-    info.strategy_array.thresholds[NUMA_STRATEGY_IDX_SINGLE_SINGLE] = 512;       // Single thread below 512 elements
-    info.strategy_array.thresholds[NUMA_STRATEGY_IDX_SINGLE_MULTI] = 131072;     // Multi-thread below 128K elements
-    // Above 128K elements: data-parallel strategy
+    // Strategy thresholds for MUL_MAT kernel 
+    info.strategy_array.thresholds[NUMA_STRATEGY_IDX_SINGLE_SINGLE] = 128;   // Single-thread threshold
+    info.strategy_array.thresholds[NUMA_STRATEGY_IDX_SINGLE_MULTI] = 1024;    // Multi-thread threshold
+    // Above this: data-parallel strategy
     info.strategy_array.valid = true;
     
     // Function pointers for different strategies - using work_funcs not agg_funcs
@@ -892,6 +863,9 @@ ggml_numa_kernel_registration_info_t ggml_numa_kernel_mul_mat_register(void) {
     info.work_funcs.single_multi_fn = ggml_numa_kernel_mul_mat_execute;
     info.work_funcs.data_parallel_fn = ggml_numa_kernel_mul_mat_execute;
     info.work_funcs.valid = true;
+    
+    // Query function pointer for direct dispatch
+    info.query_fn = (void*)ggml_numa_kernel_mul_mat_query;
     
     // MUL_MAT doesn't need aggregation functions (no result aggregation needed)
     info.agg_funcs.single_single_fn = NULL;

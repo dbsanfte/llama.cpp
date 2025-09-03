@@ -25,7 +25,7 @@
  * - Scales well with multi-threading for large tensor operations
  * - SIMD acceleration for memory copying operations
  * 
- * @author NUMA Kernel Development Team
+ * @author David Sanftenberg
  * @date 2025
  */
 
@@ -86,6 +86,15 @@ enum ggml_status ggml_numa_kernel_get_rows_execute(void * work_context, struct g
     
     const int64_t ne00 = src0->ne[0]; // Source tensor row size
     const int64_t nr = ggml_nelements(src1); // Number of rows to extract
+    
+    // Log execution strategy in standardized format for integration test parsing
+    if (ggml_numa_is_data_parallel_execution) {
+        NUMA_LOG_STRATEGY_DATA_PARALLEL("GET_ROWS");
+    } else if (params->nth > 1) {
+        NUMA_LOG_STRATEGY_SINGLE_MULTI("GET_ROWS");
+    } else {
+        NUMA_LOG_STRATEGY_SINGLE_SINGLE("GET_ROWS");
+    }
     
     NUMA_LOG_DEBUG("GET_ROWS execution: src0=[%ld,%ld,%ld,%ld], src1=[%ld,%ld,%ld,%ld], "
                    "nr=%ld, row_size=%ld, numa_node=%d, data_parallel=%s",
@@ -274,9 +283,9 @@ ggml_numa_kernel_registration_info_t ggml_numa_kernel_get_rows_register(void) {
     info.kernel_name = "NUMA GET_ROWS Kernel";
     
     // Configure strategy thresholds optimized for row extraction operations
-    info.strategy_array.thresholds[NUMA_STRATEGY_IDX_SINGLE_SINGLE] = 4096;      // 4K rows - single thread
-    info.strategy_array.thresholds[NUMA_STRATEGY_IDX_SINGLE_MULTI] = 131072;     // 128K rows - multi-thread
-    // Above 128K rows: data-parallel strategy
+    info.strategy_array.thresholds[NUMA_STRATEGY_IDX_SINGLE_SINGLE] = 128;      // Single-thread strategy
+    info.strategy_array.thresholds[NUMA_STRATEGY_IDX_SINGLE_MULTI] = 1024;     // Multi-thread strategy
+    // Above this: data-parallel strategy
     info.strategy_array.valid = true;
     
     // Set work function pointers (same function handles all strategies)

@@ -1,11 +1,43 @@
 /**
  * @file ggml-numa-simple-coordinator.c
- * @brief Simple NUMA coordination system
+ * @brief Simple NUMA coordination system implementation
  * 
- * Minimal NUMA coordination without complex work groups:
- * - Direct threadpool management per NUMA node
- * - Single operation execution (no graph coordination)  
- * - Proper CPU binding and thread affinity
+ * This file implements a minimal yet efficient NUMA coordination system designed for
+ * optimal performance on multi-socket systems. The coordinator manages per-node
+ * threadpools, handles work distribution, and ensures proper thread binding and
+ * memory affinity for maximum throughput.
+ * 
+ * Key Features:
+ * - Direct threadpool management per NUMA node with CPU binding
+ * - Single operation execution without complex graph coordination overhead
+ * - Data-parallel execution with automatic work slicing across nodes
+ * - Shared memory optimization for large tensor operations
+ * - Thread-local execution context for kernel communication
+ * - Fallback support for non-NUMA systems and error conditions
+ * - Performance instrumentation and debugging infrastructure
+ * - Memory locality optimization through NUMA-aware allocation
+ * 
+ * Architecture:
+ * The coordinator operates with a simple dispatch model:
+ * 1. Work requests arrive through execution functions
+ * 2. Strategy selection determines single-node vs data-parallel execution
+ * 3. Threadpools are dispatched with proper NUMA context
+ * 4. Results are collected through shared memory or aggregation
+ * 
+ * Thread Safety:
+ * - Multiple threads can safely call execution functions simultaneously
+ * - Each threadpool operates independently with its own resources
+ * - Thread-local variables provide isolation for concurrent operations
+ * - Atomic operations ensure safe coordinator state management
+ * 
+ * Performance Characteristics:
+ * - O(1) threadpool dispatch through direct array access
+ * - Zero-copy shared memory optimization for large operations
+ * - CPU binding verification ensures optimal thread placement
+ * - Conditional performance timing minimizes measurement overhead
+ * 
+ * @see ggml-numa-simple-coordinator.h for public interface documentation
+ * @see docs/numa-architecture.md for comprehensive system architecture
  */
 
 #include "ggml-numa-simple-coordinator.h"
@@ -51,31 +83,72 @@ static void verify_threadpool_numa_binding_fatal(struct ggml_threadpool * thread
 extern enum ggml_status ggml_numa_kernel_add_execute_no_aggregation(void * work_context, struct ggml_compute_params * params);
 extern void ggml_numa_set_isolate_node(int node);
 
-// Thread-local execution mode for kernel communication
 /**
- * Thread-local NUMA execution context
+ * @brief Thread-local NUMA execution context variables
+ * 
+ * These thread-local variables provide execution context to NUMA kernels,
+ * allowing them to adapt their behavior based on the current execution strategy
+ * and data distribution requirements.
  */
-__thread int ggml_current_numa_node = 0;                    // Current NUMA node for this thread
-__thread bool ggml_numa_is_data_parallel_execution = false; // Whether we're in data-parallel mode
-__thread int ggml_numa_total_nodes_for_data_parallel = 1;   // Total NUMA nodes in data-parallel execution
-__thread void * ggml_numa_shared_result_tensor_data = NULL; // Shared result tensor data pointer for data-parallel operations
 
-// Global variable to expose shared result tensor data to NUMA kernels (accessed from multiple threads)
+/** @brief Current NUMA node for this thread (0-based index) */
+__thread int ggml_current_numa_node = 0;
+
+/** @brief Whether current thread is in data-parallel execution mode */
+__thread bool ggml_numa_is_data_parallel_execution = false;
+
+/** @brief Total NUMA nodes participating in data-parallel execution */
+__thread int ggml_numa_total_nodes_for_data_parallel = 1;
+
+/** @brief Shared result tensor data pointer for data-parallel operations */
+__thread void * ggml_numa_shared_result_tensor_data = NULL;
+
+/**
+ * @brief Global shared result tensor data pointer
+ * 
+ * This global variable exposes shared result tensor data to NUMA kernels
+ * and is accessed from multiple threads during data-parallel operations.
+ * It enables the shared memory optimization for large tensor operations.
+ */
 void * g_simple_coordinator_shared_result_tensor_data = NULL;
 
-// Thread data structure for parallel execution (legacy - kept for compatibility)
+/**
+ * @brief Thread work data structure for parallel execution
+ * 
+ * This structure contains all necessary context for executing work
+ * on a specific NUMA node, including execution parameters, results,
+ * and shared memory information for data-parallel operations.
+ */
 struct thread_work_data {
-    struct ggml_compute_params params;
-    enum ggml_status result;
-    int numa_node;
-    void * work_context;
+    struct ggml_compute_params params;      /**< Compute parameters for the work */
+    enum ggml_status result;                /**< Execution result status */
+    int numa_node;                          /**< Target NUMA node for execution */
+    void * work_context;                    /**< Work context (typically tensor) */
+    
+    /** @brief Work function to execute */
     enum ggml_status (*work_function)(void *, struct ggml_compute_params *);
-    void * shared_tensor_data; // Shared result tensor data for data-parallel operations
-    bool is_data_parallel; // Flag indicating data-parallel execution
-    int total_nodes; // Total number of NUMA nodes for data-parallel
+    
+    void * shared_tensor_data;              /**< Shared result tensor data for data-parallel operations */
+    bool is_data_parallel;                  /**< Flag indicating data-parallel execution */
+    int total_nodes;                        /**< Total number of NUMA nodes for data-parallel */
 };
 
-// Thread worker function
+/**
+ * @brief Thread worker function for executing NUMA work
+ * 
+ * This function serves as the entry point for threads executing NUMA work.
+ * It sets up the proper thread-local execution context, executes the
+ * work function, and cleans up the context afterwards.
+ * 
+ * The worker function establishes NUMA context by:
+ * - Setting the current NUMA node for the thread
+ * - Configuring data-parallel execution mode
+ * - Providing access to shared result tensor data
+ * - Setting total node count for proper data slicing
+ * 
+ * @param arg Pointer to thread_work_data structure containing work context
+ * @return NULL (standard pthread return value)
+ */
 static void * thread_worker(void * arg) {
     struct thread_work_data * data = (struct thread_work_data *)arg;
     
@@ -163,15 +236,30 @@ static void assert_numa_strategy_compliance_fatal(void) {
 }
 #endif
 
-// Threadpool NUMA binding verification
+/**
+ * @brief NUMA thread binding verification context
+ * 
+ * This structure maintains state for verifying that threadpool workers
+ * are properly bound to their expected NUMA nodes. Used during debugging
+ * and development to ensure correct NUMA configuration.
+ */
 struct numa_verification_context {
-    int expected_numa_node;
-    int thread_count;
-    int verified_threads;
-    bool verification_failed;
-    pthread_mutex_t verification_mutex;
+    int expected_numa_node;        /**< Expected NUMA node for thread binding */
+    int thread_count;              /**< Total number of threads to verify */
+    int verified_threads;          /**< Number of threads verified so far */
+    bool verification_failed;      /**< Whether verification has failed */
+    pthread_mutex_t verification_mutex; /**< Mutex for thread-safe verification */
 };
 
+/**
+ * @brief Verification task function for threadpool NUMA binding
+ * 
+ * This function is executed by each worker thread in a threadpool to
+ * verify that it is correctly bound to the expected NUMA node. Used
+ * during development and debugging to ensure proper CPU affinity.
+ * 
+ * @param arg Pointer to numa_verification_context structure
+ */
 static void numa_threadpool_verification_task(void * arg) {
     struct numa_verification_context * ctx = (struct numa_verification_context *)arg;
     
@@ -242,23 +330,57 @@ static void verify_threadpool_numa_binding_fatal(struct ggml_threadpool * thread
 #endif
 }
 
-// Simple coordinator state with proper dispatch architecture
+/**
+ * @brief Simple NUMA coordinator state and dispatch architecture
+ * 
+ * This structure maintains the complete state of the NUMA coordinator,
+ * including per-node threadpools, dispatch coordination mechanisms,
+ * and work distribution infrastructure.
+ * 
+ * The coordinator uses a hybrid architecture:
+ * - Direct threadpool execution for single-node operations
+ * - Master dispatch coordination for data-parallel operations
+ * - Fallback threadpool for error conditions and non-NUMA systems
+ * 
+ * Thread Safety:
+ * - Atomic variables for lock-free work dispatch signaling
+ * - Per-node mutexes and condition variables for coordination
+ * - Completion barriers for synchronized data-parallel execution
+ */
 struct ggml_numa_simple_coordinator {
-    bool initialized;
-    int num_numa_nodes;
-    enum ggml_numa_strategy last_strategy;  // Track strategy for re-initialization
-    struct ggml_threadpool * numa_threadpools[GGML_NUMA_MAX_NODES];
-    int threads_per_node[GGML_NUMA_MAX_NODES];  // Track threads per node
-    struct ggml_threadpool * fallback_threadpool;  // Dedicated fallback threadpool bound to NUMA node 0
+    bool initialized;                    /**< Whether coordinator has been initialized */
+    int num_numa_nodes;                  /**< Number of NUMA nodes in the system */
+    enum ggml_numa_strategy last_strategy; /**< Track strategy for re-initialization */
     
-    // Master dispatch coordination - static threads work directly with worker threadpools
-    pthread_t dispatch_threads[GGML_NUMA_MAX_NODES];  // One dispatch thread per NUMA node
+    /** @brief Per-node threadpools for optimal NUMA performance */
+    struct ggml_threadpool * numa_threadpools[GGML_NUMA_MAX_NODES];
+    
+    /** @brief Thread count per NUMA node for capacity tracking */
+    int threads_per_node[GGML_NUMA_MAX_NODES];
+    
+    /** @brief Dedicated fallback threadpool bound to NUMA node 0 */
+    struct ggml_threadpool * fallback_threadpool;
+    
+    /* Master dispatch coordination infrastructure */
+    
+    /** @brief One dispatch thread per NUMA node for work coordination */
+    pthread_t dispatch_threads[GGML_NUMA_MAX_NODES];
+    
+    /** @brief Per-node mutexes for dispatch synchronization */
     pthread_mutex_t dispatch_mutex[GGML_NUMA_MAX_NODES];
+    
+    /** @brief Per-node condition variables for work signaling */
     pthread_cond_t dispatch_cond[GGML_NUMA_MAX_NODES];
+    
+    /** @brief Completion barrier for synchronized data-parallel execution */
     pthread_barrier_t completion_barrier;
     
-    // Work dispatch state
+    /* Work dispatch state management */
+    
+    /** @brief Atomic flags indicating work availability per node */
     _Atomic bool dispatch_work_available[GGML_NUMA_MAX_NODES];
+    
+    /** @brief Currently active work function for dispatch */
     ggml_numa_work_function_t active_work_function;
     void * active_work_context;
     size_t active_work_size;
@@ -700,7 +822,33 @@ static void create_optimal_cpu_masks(struct ggml_threadpool_params *tpp, int num
     }
 }
 
-// Initialize simple coordinator with proper CPU binding
+/**
+ * @brief Initialize simple NUMA coordinator with per-node threadpools
+ * 
+ * Sets up the complete NUMA coordination infrastructure including:
+ * - Detection and validation of NUMA topology
+ * - Creation of optimized threadpools for each NUMA node
+ * - CPU binding and memory affinity configuration
+ * - Strategy-specific initialization (MIRROR, ISOLATE, DISTRIBUTE)
+ * - Performance instrumentation and monitoring setup
+ * - Fallback threadpool creation for error handling
+ * 
+ * The initialization process includes:
+ * 1. Strategy validation and change detection
+ * 2. NUMA topology discovery and validation
+ * 3. CPU mask optimization for optimal thread distribution
+ * 4. Per-node threadpool creation with CPU binding
+ * 5. NUMA binding verification for development builds
+ * 6. Fallback infrastructure setup
+ * 
+ * Special Strategy Handling:
+ * - ISOLATE: Restricts all operations to a single specified node
+ * - MIRROR: Creates threadpools on all nodes with mirrored memory
+ * - DISTRIBUTE: Optimizes work distribution across available nodes
+ * 
+ * @param tpp Threadpool parameters containing thread counts and CPU binding preferences
+ * @return true on successful initialization, false on failure (NUMA unavailable, invalid config, etc.)
+ */
 bool ggml_numa_simple_coordinator_init(struct ggml_threadpool_params * tpp) {
     NUMA_PERF_START(NUMA_PERF_COORDINATOR_INIT, "coordinator_init", "simple_coordinator", -1, 0, tpp ? tpp->n_threads : 0);
     
@@ -953,7 +1101,31 @@ bool ggml_numa_simple_coordinator_init(struct ggml_threadpool_params * tpp) {
     return true;
 }
 
-// Cleanup simple coordinator
+/**
+ * @brief Cleanup simple NUMA coordinator and free all resources
+ * 
+ * Performs comprehensive cleanup of the NUMA coordination infrastructure:
+ * - Graceful shutdown of all dispatch threads with proper signaling
+ * - Destruction of synchronization primitives (mutexes, conditions, barriers)
+ * - Cleanup of work buffers and memory allocations
+ * - Threadpool cleanup with proper resource deallocation
+ * - Fallback threadpool cleanup for NUMA systems
+ * - Reset of coordinator state for clean restart capability
+ * 
+ * Cleanup Process:
+ * 1. Signal all dispatch threads to exit gracefully
+ * 2. Wake up waiting threads and join all dispatch threads
+ * 3. Destroy synchronization primitives in proper order
+ * 4. Free work buffers and memory allocations
+ * 5. Clean up per-node threadpools and fallback threadpool
+ * 6. Reset coordinator state for potential re-initialization
+ * 
+ * Thread Safety:
+ * - Safe to call from any thread
+ * - Handles multiple cleanup calls gracefully
+ * - Ensures proper resource deallocation order
+ * - Prevents use-after-free conditions
+ */
 void ggml_numa_simple_coordinator_cleanup(void) {
     NUMA_PERF_START(NUMA_PERF_COORDINATOR_CLEANUP, "coordinator_cleanup", "simple_coordinator", -1, 0, 0);
     
@@ -1008,7 +1180,33 @@ void ggml_numa_simple_coordinator_cleanup(void) {
     NUMA_PERF_END();
 }
 
-// Execute work function on single NUMA node
+/**
+ * @brief Execute work function on single NUMA node
+ * 
+ * Executes a NUMA kernel function on a specific target node using that node's
+ * dedicated threadpool. This function provides optimal performance for operations
+ * that benefit from node-local execution with minimal coordination overhead.
+ * 
+ * Execution Process:
+ * 1. Validation of coordinator state and target node
+ * 2. NUMA-local work buffer allocation if required
+ * 3. Direct threadpool execution on target node
+ * 4. Thread-local NUMA context setup for kernel access
+ * 5. Result collection and resource cleanup
+ * 
+ * Features:
+ * - Direct threadpool execution without coordination overhead
+ * - NUMA-local memory allocation for work buffers
+ * - Thread binding verification (debug builds)
+ * - Performance monitoring integration
+ * - Proper thread-local context setup
+ * 
+ * @param work_function The NUMA kernel function to execute
+ * @param work_context Context (typically tensor) for the work
+ * @param target_node Target NUMA node (0-based index)
+ * @param work_size Size of work buffer required (0 if none needed)
+ * @return GGML_STATUS_SUCCESS on success, GGML_STATUS_FAILED on failure
+ */
 enum ggml_status ggml_numa_simple_coordinator_execute_single_node(
     ggml_numa_work_function_t work_function,
     void * work_context,

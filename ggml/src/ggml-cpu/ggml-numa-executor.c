@@ -1,10 +1,27 @@
-/*
- * NUMA Executor - Strategy Engine and Work Orchestration
+/**
+ * @file ggml-numa-executor.c
+ * @brief NUMA Executor - Strategy Engine and Work Orchestration
  * 
- * This component absorbs the old dispatcher logic with a cleaner architecture:
+ * This component serves as the central orchestration layer for NUMA-aware
+ * computation, absorbing the old dispatcher logic with a cleaner, more
+ * maintainable architecture:
+ * 
+ * Core Functions:
  * - Analyzes operations and selects optimal execution strategies  
  * - Delegates to specialized kernels in numa-kernels/ directory
  * - Handles work submission to coordinator and completion synchronization
+ * - Provides fallback mechanisms for unsupported operations
+ * - Implements performance monitoring and efficiency tracking
+ * 
+ * Architecture Benefits:
+ * - O(1) kernel lookups via direct function pointer dispatch
+ * - Eliminates switch statement maintenance overhead
+ * - Supports dynamic strategy selection based on tensor complexity
+ * - Provides seamless integration with NUMA coordinator
+ * - Enables easy addition of new operations without central modifications
+ * 
+ * @author David Sanftenberg
+ * @date 2025
  */
 
 #include "ggml-numa-executor.h"
@@ -21,7 +38,17 @@
 #include <sched.h>
 #endif
 
-// Direct kernel dispatch implementation - calls compute functions directly without graph overhead
+/**
+ * @brief Direct kernel dispatch implementation
+ * 
+ * High-performance execution path that calls compute functions directly
+ * without the overhead of temporary graph creation. This function provides
+ * zero-copy direct kernel invocation with minimal function call overhead.
+ * 
+ * @param tensor The operation tensor to execute
+ * @param params The compute parameters with threading and buffer information
+ * @return GGML_STATUS_SUCCESS on success, GGML_STATUS_FAILED on error
+ */
 enum ggml_status ggml_numa_executor_call_direct_kernel(struct ggml_tensor * tensor, struct ggml_compute_params * params) {
     if (!tensor || !params) {
         return GGML_STATUS_FAILED;
@@ -311,7 +338,24 @@ struct mmid_row_mapping {
 // Core Executor Implementation  
 // ============================================================================
 
-// Compute graph execution - analyze nodes and dispatch to NUMA kernels or fallback
+/**
+ * @brief Compute graph execution with NUMA-aware optimization
+ * 
+ * Processes a complete compute graph by analyzing each node and dispatching
+ * to appropriate NUMA kernels or fallback mechanisms. This function provides
+ * the main execution loop for NUMA-optimized computation.
+ * 
+ * Execution Flow:
+ * 1. Validates input parameters and initializes kernel registry
+ * 2. Iterates through all graph nodes in dependency order
+ * 3. For each node, selects optimal execution strategy
+ * 4. Delegates to NUMA kernels or fallback as appropriate
+ * 5. Collects performance statistics and handles errors
+ * 
+ * @param cgraph The compute graph to execute
+ * @param cplan The compute plan with threading and buffer information
+ * @return GGML_STATUS_SUCCESS on success, error code on failure
+ */
 enum ggml_status ggml_numa_executor_execute_graph(struct ggml_cgraph * cgraph, struct ggml_cplan * cplan) {
     if (!cgraph || !cplan) {
         return GGML_STATUS_FAILED;
@@ -344,6 +388,24 @@ enum ggml_status ggml_numa_executor_execute_graph(struct ggml_cgraph * cgraph, s
 // Public API Implementation
 // ============================================================================
 
+/**
+ * @brief Main NUMA-aware compute graph execution entry point
+ * 
+ * This is the primary entry point for executing compute graphs with NUMA
+ * optimization. It provides intelligent fallback behavior and comprehensive
+ * error handling while maximizing performance on multi-socket systems.
+ * 
+ * Key Features:
+ * - Automatic NUMA dispatch detection and fallback
+ * - Per-node execution with optimal strategy selection
+ * - Integration with standard ggml computation when NUMA unavailable
+ * - Comprehensive logging and performance monitoring
+ * - Graceful degradation for unsupported operations
+ * 
+ * @param cgraph The compute graph to execute
+ * @param cplan The compute plan with threading and buffer information
+ * @return GGML_STATUS_SUCCESS on success, error code on failure
+ */
 enum ggml_status ggml_numa_executor_compute_graph(struct ggml_cgraph * cgraph, struct ggml_cplan * cplan) {
     if (!cgraph || !cplan) {
         GGML_LOG_ERROR("NUMA Executor: Invalid graph or compute plan\n");
@@ -380,6 +442,27 @@ enum ggml_status ggml_numa_executor_compute_graph(struct ggml_cgraph * cgraph, s
     return GGML_STATUS_SUCCESS;
 }
 
+/**
+ * @brief Execute a single tensor operation with optimal NUMA strategy
+ * 
+ * Core execution function that analyzes a single tensor operation and
+ * selects the most appropriate execution path. This function serves as
+ * the decision hub for NUMA optimization, routing operations to:
+ * - NUMA-aware kernels for supported operations
+ * - Direct kernel dispatch for maximum performance
+ * - Fallback mechanisms for compatibility
+ * 
+ * Execution Strategy Selection:
+ * 1. Query kernel registry for NUMA support
+ * 2. Analyze operation complexity and resource requirements
+ * 3. Select optimal execution strategy (NUMA vs fallback)
+ * 4. Route to appropriate execution path
+ * 5. Monitor performance and collect statistics
+ * 
+ * @param tensor The operation tensor to execute
+ * @param cplan The compute plan with threading and buffer information
+ * @return GGML_STATUS_SUCCESS on success, error code on failure
+ */
 enum ggml_status ggml_numa_executor_execute_tensor(struct ggml_tensor * tensor, struct ggml_cplan * cplan) {
     if (!tensor || !cplan) {
         NUMA_LOG_DEBUG("DEBUG: NUMA Executor: NULL tensor=%p or cplan=%p, returning FAILED\n", tensor, cplan);
@@ -630,7 +713,29 @@ static size_t ggml_numa_calculate_work_size(struct ggml_tensor * tensor, int n_t
     return work_size;
 }
 
-// Direct kernel dispatch function - eliminates temporary graph overhead
+/**
+ * @brief Direct kernel dispatch function for maximum performance
+ * 
+ * High-performance execution path that eliminates temporary graph overhead
+ * by calling compute functions directly. This function provides the fastest
+ * possible execution for operations that don't require NUMA coordination.
+ * 
+ * Performance Benefits:
+ * - Zero-copy operation without graph allocation
+ * - Direct function call without dispatch overhead
+ * - Minimal memory footprint and cache impact
+ * - Optimal for small to medium operations
+ * 
+ * Use Cases:
+ * - Operations below NUMA coordination threshold
+ * - Single-node systems where NUMA coordination is unnecessary
+ * - Fallback path when NUMA coordinator unavailable
+ * - Performance-critical code paths
+ * 
+ * @param tensor The operation tensor to execute
+ * @param cplan The compute plan with threading and buffer information
+ * @return GGML_STATUS_SUCCESS on success, error code on failure
+ */
 enum ggml_status ggml_numa_executor_direct_kernel_dispatch(struct ggml_tensor * tensor, struct ggml_cplan * cplan) {
     if (!tensor || !cplan) {
         return GGML_STATUS_FAILED;
@@ -722,7 +827,30 @@ enum ggml_status ggml_numa_executor_direct_kernel_dispatch(struct ggml_tensor * 
     return GGML_STATUS_SUCCESS;
 }
 
-// Legacy fallback function - kept for compatibility but should be replaced by direct kernel dispatch
+/**
+ * @brief Legacy fallback function for compatibility
+ * 
+ * Provides compatibility fallback for operations not yet supported by
+ * the NUMA kernel system or when NUMA coordination is unavailable.
+ * This function creates a temporary graph and executes using standard
+ * ggml computation pipeline.
+ * 
+ * Performance Characteristics:
+ * - Higher overhead due to temporary graph creation
+ * - Standard ggml threading model (no NUMA optimization)
+ * - Broader operation compatibility
+ * - Recursive fallback protection
+ * 
+ * Usage Notes:
+ * - Should be replaced by direct kernel dispatch for better performance
+ * - Kept for compatibility with legacy code paths
+ * - Includes automatic work buffer management
+ * - Prevents infinite recursion through fallback flags
+ * 
+ * @param tensor The operation tensor to execute
+ * @param cplan The compute plan with threading and buffer information
+ * @return GGML_STATUS_SUCCESS on success, error code on failure
+ */
 enum ggml_status ggml_numa_executor_fallback_to_cpu(struct ggml_tensor * tensor, struct ggml_cplan * cplan) {
     if (!tensor || !cplan) {
         return GGML_STATUS_FAILED;

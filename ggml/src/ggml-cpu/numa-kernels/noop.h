@@ -35,6 +35,8 @@
 
 #include "numa-kernels.h"
 #include "../ggml-numa-shared.h"
+#include "../ggml-cpu-impl.h"  // For struct ggml_compute_params
+#include "../ggml-impl.h"      // For struct ggml_compute_params
 
 /**
  * Query function for NUMA NOOP kernel strategy selection  

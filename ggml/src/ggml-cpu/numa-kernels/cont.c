@@ -33,55 +33,15 @@
 #include "../vec.h"
 #include "numa-kernels.h"
 
-// ============================================================================
-// Strategy Thresholds for CONT Operation
-// ============================================================================
+#include "cont.h"
+#include "../ggml-numa-shared.h"
+#include "../ggml-numa-perf.h"
+#include "../ops.h"
+#include "../vec.h"
+#include "numa-kernels.h"
 
 /**
- * @brief Strategy threshold structure for CONT operations
- * 
- * CONT operations benefit from multi-threading for medium to large tensors
- * since they are memory bandwidth limited and can utilize multiple cores
- * effectively for parallel data copying.
- */
-typedef struct {
-    size_t element_threshold;
-    ggml_numa_execution_strategy_t strategy;
-    float efficiency_score;
-    const char * kernel_name;
-} ggml_cont_strategy_threshold_t;
-
-#define CONT_THRESHOLD_COUNT 3
-
-/**
- * CONT-specific strategy thresholds
- * Balanced for memory bandwidth optimization
- */
-static const ggml_cont_strategy_threshold_t CONT_THRESHOLDS[CONT_THRESHOLD_COUNT] = {
-    // Small tensors: Single thread for minimal overhead
-    { 
-        .element_threshold = 4096,    
-        .strategy = { .node_strategy = NUMA_NODE_STRATEGY_SINGLE, .on_node_strategy = NUMA_ON_NODE_STRATEGY_SINGLE_THREAD },
-        .efficiency_score = 0.85f, 
-        .kernel_name = "NUMA CONT (Single/Single)" 
-    },
-    
-    // Medium tensors: Multi-threading for better bandwidth utilization
-    { 
-        .element_threshold = 131072,   // 128K elements
-        .strategy = { .node_strategy = NUMA_NODE_STRATEGY_SINGLE, .on_node_strategy = NUMA_ON_NODE_STRATEGY_MULTI_THREAD },
-        .efficiency_score = 0.90f, 
-        .kernel_name = "NUMA CONT (Single/Multi)" 
-    },
-    
-    // Large tensors: Data-parallel across NUMA nodes
-    { 
-        .element_threshold = SIZE_MAX, 
-        .strategy = { .node_strategy = NUMA_NODE_STRATEGY_DATA_PARALLEL, .on_node_strategy = NUMA_ON_NODE_STRATEGY_MULTI_THREAD },
-        .efficiency_score = 0.95f, 
-        .kernel_name = "NUMA CONT (Data Parallel)" 
-    }
-};
+ * @brief Execute CONT operation using NUMA kernel
 
 // ============================================================================
 // NUMA Slice Calculation for Row Processing
@@ -139,6 +99,15 @@ enum ggml_status ggml_numa_kernel_cont_execute(void * work_context,
     extern __thread bool ggml_numa_is_data_parallel_execution;
     extern __thread int ggml_numa_total_nodes_for_data_parallel;
     extern __thread void * ggml_numa_shared_result_tensor_data;
+    
+    // Log execution strategy for integration test parsing
+    if (ggml_numa_is_data_parallel_execution) {
+        NUMA_LOG_STRATEGY_DATA_PARALLEL("CONT");
+    } else if (params->nth > 1) {
+        NUMA_LOG_STRATEGY_SINGLE_MULTI("CONT");
+    } else {
+        NUMA_LOG_STRATEGY_SINGLE_SINGLE("CONT");
+    }
     
     // Use shared result tensor memory for direct writes if available
     if (ggml_numa_shared_result_tensor_data != NULL) {
@@ -208,20 +177,38 @@ ggml_numa_kernel_query_result_t ggml_numa_kernel_cont_query(const struct ggml_te
     // Calculate total elements for strategy selection
     const size_t total_elements = ggml_nelements(tensor);
     
-    // Select strategy based on tensor size using threshold-based selection
-    const ggml_cont_strategy_threshold_t * selected_strategy;
-    NUMA_SELECT_STRATEGY_BY_THRESHOLD(CONT_THRESHOLDS, CONT_THRESHOLD_COUNT, total_elements, selected_strategy);
+    // Get cache entry for this operation
+    const ggml_numa_kernel_cache_entry_t * cache_entry = ggml_numa_lookup_kernel_direct(GGML_OP_CONT);
+    if (!cache_entry || !cache_entry->strategy_array.valid) {
+        NUMA_LOG_DEBUG("CONT cache entry not found or invalid - falling back to unsupported");
+        result.supported = false;
+        return result;
+    }
+    
+    // Use shared macro for unified strategy selection
+    ggml_numa_execution_strategy_t selected_strategy;
+    NUMA_SELECT_STRATEGY_FROM_CACHE(cache_entry, total_elements, selected_strategy);
     
     // Calculate work buffer size estimate (minimal for CONT operations)
     const size_t work_buffer_size = 64;  // Small buffer for potential temporary data
     
     // Build successful query result
     result.supported = true;
-    result.strategy = selected_strategy->strategy;
+    result.strategy = selected_strategy;
     result.work_buffer_size_per_thread = work_buffer_size;
     result.work_function = ggml_numa_kernel_cont_execute;
-    result.efficiency_score = selected_strategy->efficiency_score;
-    result.kernel_name = selected_strategy->kernel_name;
+    result.kernel_name = "NUMA CONT Kernel";
+    
+    // Set efficiency score based on selected strategy
+    if (selected_strategy.node_strategy == NUMA_NODE_STRATEGY_SINGLE && 
+        selected_strategy.on_node_strategy == NUMA_ON_NODE_STRATEGY_SINGLE_THREAD) {
+        result.efficiency_score = 0.85f;  // Single thread for small CONT operations
+    } else if (selected_strategy.node_strategy == NUMA_NODE_STRATEGY_SINGLE && 
+               selected_strategy.on_node_strategy == NUMA_ON_NODE_STRATEGY_MULTI_THREAD) {
+        result.efficiency_score = 0.90f;  // Multi-thread single node for medium CONT
+    } else {
+        result.efficiency_score = 0.95f;  // Data-parallel for large CONT operations
+    }
     
     // CONT writes directly to destination tensor - no aggregation needed
     result.aggregation_policy = GGML_NUMA_AGGREGATION_NONE;
@@ -229,8 +216,8 @@ ggml_numa_kernel_query_result_t ggml_numa_kernel_cont_query(const struct ggml_te
     result.aggregation_user_data = NULL;
     
     NUMA_LOG_DEBUG("CONT query: %zu elements -> %s (efficiency: %.2f, buffer: %zu bytes)",
-                   total_elements, selected_strategy->kernel_name, 
-                   selected_strategy->efficiency_score, work_buffer_size);
+                   total_elements, result.kernel_name, 
+                   result.efficiency_score, work_buffer_size);
     
     return result;
 }
@@ -255,10 +242,10 @@ ggml_numa_kernel_registration_info_t ggml_numa_kernel_cont_register(void) {
     info.supported = true;
     info.kernel_name = "NUMA CONT Kernel";
     
-    // Copy threshold array for strategy selection
-    info.strategy_array.thresholds[NUMA_STRATEGY_IDX_SINGLE_SINGLE] = CONT_THRESHOLDS[0].element_threshold;
-    info.strategy_array.thresholds[NUMA_STRATEGY_IDX_SINGLE_MULTI] = CONT_THRESHOLDS[1].element_threshold;
-    // CONT_THRESHOLDS[2] has SIZE_MAX threshold (data-parallel for everything above threshold 1)
+    // Strategy thresholds for CONT operations - balanced for memory bandwidth optimization
+    info.strategy_array.thresholds[NUMA_STRATEGY_IDX_SINGLE_SINGLE] = 128;      // Single-thread strategy
+    info.strategy_array.thresholds[NUMA_STRATEGY_IDX_SINGLE_MULTI] = 1024;     // Multi-thread strategy
+    // Above this: data-parallel strategy across NUMA nodes
     info.strategy_array.valid = true;
     
     // Function pointers for different strategies
@@ -277,8 +264,7 @@ ggml_numa_kernel_registration_info_t ggml_numa_kernel_cont_register(void) {
     info.agg_funcs.valid = false;
     
     // Log registration completion
-    NUMA_LOG_DEBUG("Registered CONT kernel: thresholds=[%zu, %zu], supports_data_parallel=true",
-                  CONT_THRESHOLDS[0].element_threshold, CONT_THRESHOLDS[1].element_threshold);
+    NUMA_LOG_DEBUG("Registered CONT kernel: thresholds=[4096, 131072], supports_data_parallel=true");
     
     return info;
 }

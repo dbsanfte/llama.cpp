@@ -244,6 +244,13 @@ enum ggml_status ggml_numa_kernel_add_execute_low_overhead(void * work_context,
                                                           struct ggml_compute_params * params) {
     struct ggml_tensor * tensor = (struct ggml_tensor *)work_context;
     
+    // Log execution strategy in standardized format for integration test parsing
+    if (params->nth > 1) {
+        NUMA_LOG_STRATEGY_SINGLE_MULTI("ADD");
+    } else {
+        NUMA_LOG_STRATEGY_SINGLE_SINGLE("ADD");
+    }
+    
     // Fast validation - minimal checks for critical errors
     if (!tensor || !tensor->src[0] || !tensor->src[1]) {
         return GGML_STATUS_FAILED;
@@ -414,6 +421,16 @@ enum ggml_status ggml_numa_kernel_add_execute_low_overhead(void * work_context,
 enum ggml_status ggml_numa_kernel_add_execute_optimized(void * work_context, 
                                                        struct ggml_compute_params * params) {
     struct ggml_tensor * tensor = (struct ggml_tensor *)work_context;
+    
+    // Log execution strategy in standardized format for integration test parsing
+    extern __thread bool ggml_numa_is_data_parallel_execution;
+    if (ggml_numa_is_data_parallel_execution) {
+        NUMA_LOG_STRATEGY_DATA_PARALLEL("ADD");
+    } else if (params->nth > 1) {
+        NUMA_LOG_STRATEGY_SINGLE_MULTI("ADD");
+    } else {
+        NUMA_LOG_STRATEGY_SINGLE_SINGLE("ADD");
+    }
     
     // TEMPLATE STEP 1: Fast validation (assume coordinator pre-validated)
     // Minimal checks for critical errors only - coordinator handles most validation
@@ -705,78 +722,10 @@ typedef struct {
 } ggml_add_strategy_threshold_t;
 
 /**
- * ADD-specific strategy thresholds
- * Optimized for element-wise addition workload characteristics
- */
-static const ggml_add_strategy_threshold_t ADD_THRESHOLDS[] = {
-    // Very small tensors: single-threaded is fastest due to minimal overhead
-    {
-        .element_threshold = 1024,  // < 1K elements
-        .strategy = { .node_strategy = NUMA_NODE_STRATEGY_SINGLE, .on_node_strategy = NUMA_ON_NODE_STRATEGY_SINGLE_THREAD },
-        .work_buffer_size_per_thread = 0,
-        .work_function = ggml_numa_kernel_add_execute_optimized,
-        .efficiency_score = 0.98f,
-        .kernel_name = "NUMA ADD (Single/Single)"
-    },
-    
-    // Small tensors: multi-threaded on single node for good performance
-    {
-        .element_threshold = 16384,  // 1K - 16K elements
-        .strategy = { .node_strategy = NUMA_NODE_STRATEGY_SINGLE, .on_node_strategy = NUMA_ON_NODE_STRATEGY_MULTI_THREAD },
-        .work_buffer_size_per_thread = 0,
-        .work_function = ggml_numa_kernel_add_execute_optimized,
-        .efficiency_score = 0.96f,
-        .kernel_name = "NUMA ADD (Single/Multi)"
-    },
-    
-    // Medium tensors: single-node multi-thread for cache efficiency
-    {
-        .element_threshold = 262144,  // 16K - 256K elements
-        .strategy = { .node_strategy = NUMA_NODE_STRATEGY_SINGLE, .on_node_strategy = NUMA_ON_NODE_STRATEGY_MULTI_THREAD },
-        .work_buffer_size_per_thread = 0,
-        .work_function = ggml_numa_kernel_add_execute_optimized,
-        .efficiency_score = 0.95f,
-        .kernel_name = "NUMA ADD (Single/Multi-Med)"
-    },
-    
-    // Large tensors: data-parallel with low-overhead optimization
-    {
-        .element_threshold = 16777216,  // 256K - 16M elements
-        .strategy = { .node_strategy = NUMA_NODE_STRATEGY_DATA_PARALLEL, .on_node_strategy = NUMA_ON_NODE_STRATEGY_MULTI_THREAD },
-        .work_buffer_size_per_thread = 0,
-        .work_function = ggml_numa_kernel_add_execute_low_overhead,
-        .efficiency_score = 0.99f,
-        .kernel_name = "NUMA ADD (Low-Overhead Data-Parallel)"
-    },
-    
-    // Huge tensors: no-aggregation for maximum performance
-    {
-        .element_threshold = 268435456,  // 16M - 256M elements (1GB scale)
-        .strategy = { .node_strategy = NUMA_NODE_STRATEGY_DATA_PARALLEL, .on_node_strategy = NUMA_ON_NODE_STRATEGY_MULTI_THREAD },
-        .work_buffer_size_per_thread = 0,
-        .work_function = ggml_numa_kernel_add_execute_no_aggregation,
-        .efficiency_score = 0.99f,
-        .kernel_name = "NUMA ADD (No-Aggregation 1GB Scale)"
-    },
-    
-    // Ultra-large tensors: no-aggregation for GB+ scale
-    {
-        .element_threshold = SIZE_MAX,  // 256M+ elements (multi-GB scale)
-        .strategy = { .node_strategy = NUMA_NODE_STRATEGY_DATA_PARALLEL, .on_node_strategy = NUMA_ON_NODE_STRATEGY_MULTI_THREAD },
-        .work_buffer_size_per_thread = 0,
-        .work_function = ggml_numa_kernel_add_execute_no_aggregation,
-        .efficiency_score = 0.99f,
-        .kernel_name = "NUMA ADD (No-Aggregation Ultra Scale)"
-    }
-};
-
-#define ADD_THRESHOLD_COUNT (sizeof(ADD_THRESHOLDS) / sizeof(ADD_THRESHOLDS[0]))
-
-/**
  * Query ADD kernel for optimal strategy based on tensor characteristics
  * 
  * This function analyzes the tensor and returns the optimal execution strategy
- * without requiring exact complexity class matching.
+ * using the registered thresholds as the single source of truth.
  * 
  * @param tensor The tensor to analyze
  * @return Query result with optimal strategy, or unsupported result if not applicable
@@ -795,13 +744,6 @@ ggml_numa_kernel_query_result_t ggml_numa_kernel_add_query(const struct ggml_ten
         return result;
     }
     
-    // Calculate total elements for strategy selection
-    const size_t total_elements = ggml_nelements(tensor);
-    
-    // Find optimal strategy using threshold search
-    const ggml_add_strategy_threshold_t * selected_strategy;
-    NUMA_SELECT_STRATEGY_BY_THRESHOLD(ADD_THRESHOLDS, ADD_THRESHOLD_COUNT, total_elements, selected_strategy);
-    
     // Check if this kernel is actually registered and supported
     if (!ggml_numa_is_kernel_supported(GGML_OP_ADD)) {
         NUMA_LOG_DEBUG("ADD kernel not supported - registration disabled");
@@ -809,13 +751,44 @@ ggml_numa_kernel_query_result_t ggml_numa_kernel_add_query(const struct ggml_ten
         return result;
     }
     
+    // Get our own cache entry with the registered thresholds (SINGLE SOURCE OF TRUTH!)
+    const ggml_numa_kernel_cache_entry_t * cache_entry = ggml_numa_lookup_kernel_direct(GGML_OP_ADD);
+    if (!cache_entry || !cache_entry->strategy_array.valid) {
+        NUMA_LOG_DEBUG("ADD query: No valid strategy array in cache");
+        return result;
+    }
+    
+    // Calculate total elements for strategy selection
+    const size_t total_elements = ggml_nelements(tensor);
+    
+    // Use the registered thresholds instead of static arrays - UNIFIED ARCHITECTURE!
+    ggml_numa_execution_strategy_t selected_strategy;
+    
+    // Select strategy based on registered thresholds (single source of truth!)
+    NUMA_SELECT_STRATEGY_FROM_CACHE(cache_entry, total_elements, selected_strategy);
+    
     // Build successful query result
     result.supported = true;
-    result.strategy = selected_strategy->strategy;
-    result.work_buffer_size_per_thread = selected_strategy->work_buffer_size_per_thread;
-    result.work_function = selected_strategy->work_function;
-    result.efficiency_score = selected_strategy->efficiency_score;
-    result.kernel_name = selected_strategy->kernel_name;
+    result.strategy = selected_strategy;
+    result.work_buffer_size_per_thread = 0;  // ADD doesn't need work buffers
+    
+    // Select work function based on strategy
+    if (selected_strategy.node_strategy == NUMA_NODE_STRATEGY_SINGLE) {
+        if (selected_strategy.on_node_strategy == NUMA_ON_NODE_STRATEGY_SINGLE_THREAD) {
+            result.work_function = ggml_numa_kernel_add_execute_optimized;
+            result.efficiency_score = 0.98f;
+            result.kernel_name = "NUMA ADD (Single/Single)";
+        } else {
+            result.work_function = ggml_numa_kernel_add_execute_optimized;
+            result.efficiency_score = 0.96f;
+            result.kernel_name = "NUMA ADD (Single/Multi)";
+        }
+    } else {
+        // Data-parallel strategy
+        result.work_function = ggml_numa_kernel_add_execute_no_aggregation;
+        result.efficiency_score = 0.99f;
+        result.kernel_name = "NUMA ADD (No-Aggregation Data-Parallel)";
+    }
     
     // Apply force strategy override if environment variable is set
     bool strategy_overridden = ggml_numa_apply_kernel_force_strategy(&result, "ADD",
@@ -846,6 +819,9 @@ ggml_numa_kernel_query_result_t ggml_numa_kernel_add_query(const struct ggml_ten
 enum ggml_status ggml_numa_kernel_add_execute_no_aggregation(void * work_context, 
                                                             struct ggml_compute_params * params) {
     struct ggml_tensor * tensor = (struct ggml_tensor *)work_context;
+    
+    // Log execution strategy in standardized format for integration test parsing
+    NUMA_LOG_STRATEGY_DATA_PARALLEL("ADD");  // No-aggregation is always data-parallel
     
     // Fast validation - minimal checks
     if (!tensor || !tensor->src[0] || !tensor->src[1]) {
@@ -1082,9 +1058,9 @@ ggml_numa_kernel_registration_info_t ggml_numa_kernel_add_register(void) {
     info.kernel_name = "NUMA ADD Kernel";
     
     // Strategy thresholds for ADD operations
-    info.strategy_array.thresholds[NUMA_STRATEGY_IDX_SINGLE_SINGLE] = 1024;      // Single thread below 1K elements
-    info.strategy_array.thresholds[NUMA_STRATEGY_IDX_SINGLE_MULTI] = 262144;     // Multi-thread below 256K elements
-    // Above 256K elements: data-parallel strategy
+    info.strategy_array.thresholds[NUMA_STRATEGY_IDX_SINGLE_SINGLE] = 131072;      // Single thread strategy
+    info.strategy_array.thresholds[NUMA_STRATEGY_IDX_SINGLE_MULTI] = 1024;     // Multi-thread strategy
+    // Above this: data-parallel strategy
     info.strategy_array.valid = true;
     
     // Function pointers for different strategies - using work_funcs not agg_funcs

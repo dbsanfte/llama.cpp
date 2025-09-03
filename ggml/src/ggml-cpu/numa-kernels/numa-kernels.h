@@ -264,13 +264,49 @@ bool ggml_numa_apply_kernel_force_strategy(ggml_numa_kernel_query_result_t * res
  * Performance: O(1) for tiny operations (most common case), O(log n) worst case
  */
 #define NUMA_SELECT_STRATEGY_BY_THRESHOLD(threshold_array, threshold_count, total_elements, selected_strategy) do { \
-    /* Start from simplest strategy (fastest for tiny operations) and work up */ \
-    selected_strategy = &threshold_array[0]; \
+    /* Find the first threshold where total_elements < element_threshold */ \
+    selected_strategy = &threshold_array[threshold_count - 1]; /* Default to last (largest) strategy */ \
     for (size_t i = 0; i < threshold_count; i++) { \
         if (total_elements < threshold_array[i].element_threshold) { \
             selected_strategy = &threshold_array[i]; \
             break; \
         } \
+    } \
+} while(0)
+
+/**
+ * NUMA_SELECT_STRATEGY_FROM_CACHE - Macro for unified cache-based strategy selection
+ * 
+ * This macro implements the standard three-tier strategy selection pattern used by kernels.
+ * It encapsulates the threshold comparison logic using registered cache entry thresholds.
+ * Eliminates code duplication across kernel query functions.
+ * 
+ * @param cache_entry - Pointer to the cached kernel registration info
+ * @param total_elements - Number of elements in the tensor
+ * @param selected_strategy - [OUT] Variable to store the selected strategy
+ * 
+ * Usage example in kernel query functions:
+ *   ggml_numa_execution_strategy_t selected_strategy;
+ *   NUMA_SELECT_STRATEGY_FROM_CACHE(cache_entry, total_elements, selected_strategy);
+ * 
+ * Three-tier strategy:
+ * - Below threshold[0]: Single node, single thread (fastest for tiny tensors)
+ * - Below threshold[1]: Single node, multi-thread (good for small-medium tensors)  
+ * - Above threshold[1]: Data-parallel across NUMA nodes (optimal for large tensors)
+ */
+#define NUMA_SELECT_STRATEGY_FROM_CACHE(cache_entry, total_elements, selected_strategy) do { \
+    if (total_elements < cache_entry->strategy_array.thresholds[NUMA_STRATEGY_IDX_SINGLE_SINGLE]) { \
+        /* Very small tensors: single-threaded */ \
+        selected_strategy.node_strategy = NUMA_NODE_STRATEGY_SINGLE; \
+        selected_strategy.on_node_strategy = NUMA_ON_NODE_STRATEGY_SINGLE_THREAD; \
+    } else if (total_elements < cache_entry->strategy_array.thresholds[NUMA_STRATEGY_IDX_SINGLE_MULTI]) { \
+        /* Small to medium tensors: multi-threaded on single node */ \
+        selected_strategy.node_strategy = NUMA_NODE_STRATEGY_SINGLE; \
+        selected_strategy.on_node_strategy = NUMA_ON_NODE_STRATEGY_MULTI_THREAD; \
+    } else { \
+        /* Large tensors: data-parallel across NUMA nodes */ \
+        selected_strategy.node_strategy = NUMA_NODE_STRATEGY_DATA_PARALLEL; \
+        selected_strategy.on_node_strategy = NUMA_ON_NODE_STRATEGY_MULTI_THREAD; \
     } \
 } while(0)
 

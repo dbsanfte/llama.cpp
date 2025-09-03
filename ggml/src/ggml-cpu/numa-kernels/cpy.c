@@ -69,6 +69,15 @@ enum ggml_status ggml_numa_kernel_cpy_execute(void * work_context, struct ggml_c
     extern __thread int ggml_numa_total_nodes_for_data_parallel; 
     extern __thread bool ggml_numa_is_data_parallel_execution;
     
+    // Log execution strategy for integration test parsing
+    if (ggml_numa_is_data_parallel_execution) {
+        NUMA_LOG_STRATEGY_DATA_PARALLEL("CPY");
+    } else if (params->nth > 1) {
+        NUMA_LOG_STRATEGY_SINGLE_MULTI("CPY");
+    } else {
+        NUMA_LOG_STRATEGY_SINGLE_SINGLE("CPY");
+    }
+    
     NUMA_LOG_TRACE("CPY NUMA context: node=%d, total_nodes=%d, data_parallel=%s",
                     ggml_current_numa_node, ggml_numa_total_nodes_for_data_parallel,
                     ggml_numa_is_data_parallel_execution ? "true" : "false");
@@ -221,9 +230,9 @@ ggml_numa_kernel_registration_info_t ggml_numa_kernel_cpy_register(void) {
     info.kernel_name = "NUMA CPY Kernel";
     
     // Strategy thresholds optimized for memory copying operations
-    info.strategy_array.thresholds[NUMA_STRATEGY_IDX_SINGLE_SINGLE] = 8192;     // 8K elements
-    info.strategy_array.thresholds[NUMA_STRATEGY_IDX_SINGLE_MULTI] = 262144;    // 256K elements
-    // Above 256K elements: data-parallel strategy
+    info.strategy_array.thresholds[NUMA_STRATEGY_IDX_SINGLE_SINGLE] = 128;     // Single-thread strategy
+    info.strategy_array.thresholds[NUMA_STRATEGY_IDX_SINGLE_MULTI] = 1024;    // Multi-thread strategy
+    // Above this: data-parallel strategy
     info.strategy_array.valid = true;
     
     // Function pointers for different execution strategies

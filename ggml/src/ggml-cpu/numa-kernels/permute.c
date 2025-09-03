@@ -68,6 +68,9 @@ enum ggml_status ggml_numa_kernel_permute_execute(void * work_context, struct gg
     const int axis2 = axes[2];
     const int axis3 = axes[3];
     
+    // Log execution strategy in standardized format for integration test parsing
+    NUMA_LOG_STRATEGY_SINGLE_SINGLE("PERMUTE");  // Permute is always single-single strategy (view operation)
+    
     NUMA_LOG_TRACE("PERMUTE: axes [%d,%d,%d,%d], src shape [%ld,%ld,%ld,%ld] -> dst shape [%ld,%ld,%ld,%ld]",
                    axis0, axis1, axis2, axis3,
                    src->ne[0], src->ne[1], src->ne[2], src->ne[3],
@@ -197,9 +200,13 @@ ggml_numa_kernel_query_result_t ggml_numa_kernel_permute_query(const struct ggml
         return result;
     }
     
-    // Define thresholds for different strategies
-    const int64_t single_thread_threshold = 1024;      // 1K elements
-    const int64_t multi_thread_threshold = 262144;     // 256K elements
+    // Get cache entry for this operation
+    const ggml_numa_kernel_cache_entry_t * cache_entry = ggml_numa_lookup_kernel_direct(GGML_OP_PERMUTE);
+    if (!cache_entry || !cache_entry->strategy_array.valid) {
+        NUMA_LOG_DEBUG("PERMUTE cache entry not found or invalid - falling back to unsupported");
+        result.supported = false;
+        return result;
+    }
     
     result.supported = true;
     result.work_buffer_size_per_thread = 0;  // No work buffer needed
@@ -207,23 +214,22 @@ ggml_numa_kernel_query_result_t ggml_numa_kernel_permute_query(const struct ggml
     result.kernel_name = "NUMA PERMUTE Kernel";
     result.aggregation_policy = GGML_NUMA_AGGREGATION_NONE;  // No aggregation needed
     
-    // Create execution strategy based on tensor size
-    ggml_numa_execution_strategy_t strategy = {0};
-    if (total_elements < single_thread_threshold) {
-        strategy.node_strategy = NUMA_NODE_STRATEGY_SINGLE;
-        strategy.on_node_strategy = NUMA_ON_NODE_STRATEGY_SINGLE_THREAD;
+    // Use shared macro for unified strategy selection
+    ggml_numa_execution_strategy_t selected_strategy;
+    NUMA_SELECT_STRATEGY_FROM_CACHE(cache_entry, total_elements, selected_strategy);
+    
+    result.strategy = selected_strategy;
+    
+    // Set efficiency scores based on selected strategy
+    if (selected_strategy.node_strategy == NUMA_NODE_STRATEGY_SINGLE && 
+        selected_strategy.on_node_strategy == NUMA_ON_NODE_STRATEGY_SINGLE_THREAD) {
         result.efficiency_score = 0.95f;
-    } else if (total_elements < multi_thread_threshold) {
-        strategy.node_strategy = NUMA_NODE_STRATEGY_SINGLE;
-        strategy.on_node_strategy = NUMA_ON_NODE_STRATEGY_MULTI_THREAD;
+    } else if (selected_strategy.node_strategy == NUMA_NODE_STRATEGY_SINGLE && 
+               selected_strategy.on_node_strategy == NUMA_ON_NODE_STRATEGY_MULTI_THREAD) {
         result.efficiency_score = 0.92f;
     } else {
-        strategy.node_strategy = NUMA_NODE_STRATEGY_DATA_PARALLEL;
-        strategy.on_node_strategy = NUMA_ON_NODE_STRATEGY_MULTI_THREAD;
         result.efficiency_score = 0.88f;
     }
-    
-    result.strategy = strategy;
     
     // Apply force strategy override if set
     ggml_numa_apply_kernel_force_strategy(&result, "PERMUTE", 
@@ -247,9 +253,9 @@ ggml_numa_kernel_registration_info_t ggml_numa_kernel_permute_register(void) {
     info.kernel_name = "NUMA PERMUTE Kernel";
     
     // Strategy thresholds - more conservative since permutation involves random memory access
-    info.strategy_array.thresholds[NUMA_STRATEGY_IDX_SINGLE_SINGLE] = 1024;      // 1K elements
-    info.strategy_array.thresholds[NUMA_STRATEGY_IDX_SINGLE_MULTI] = 262144;     // 256K elements
-    // Above 256K elements: data-parallel strategy
+    info.strategy_array.thresholds[NUMA_STRATEGY_IDX_SINGLE_SINGLE] = 128;      
+    info.strategy_array.thresholds[NUMA_STRATEGY_IDX_SINGLE_MULTI] = 1024;     
+    // Above this: data-parallel strategy
     info.strategy_array.valid = true;
     
     // Work function pointers - same function handles all strategies

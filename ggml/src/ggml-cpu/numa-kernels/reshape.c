@@ -59,6 +59,9 @@ enum ggml_status ggml_numa_kernel_reshape_execute(void * work_context,
     extern __thread int ggml_current_numa_node;
     extern __thread bool ggml_numa_is_data_parallel_execution;
     
+    // Log execution strategy in standardized format for integration test parsing
+    NUMA_LOG_STRATEGY_SINGLE_SINGLE("RESHAPE");  // Reshape is always single-single strategy (view operation)
+    
     NUMA_LOG_TRACE("NUMA RESHAPE kernel executing on node %d (data_parallel=%s) - tensor: %s",
                    ggml_current_numa_node, 
                    ggml_numa_is_data_parallel_execution ? "true" : "false",
@@ -115,6 +118,14 @@ ggml_numa_kernel_query_result_t ggml_numa_kernel_reshape_query(const struct ggml
         return result;
     }
     
+    // Get cache entry for this operation
+    const ggml_numa_kernel_cache_entry_t * cache_entry = ggml_numa_lookup_kernel_direct(GGML_OP_RESHAPE);
+    if (!cache_entry || !cache_entry->strategy_array.valid) {
+        NUMA_LOG_DEBUG("RESHAPE cache entry not found or invalid - falling back to unsupported");
+        result.supported = false;
+        return result;
+    }
+    
     // RESHAPE is always supported regardless of tensor configuration
     result.supported = true;
     result.work_buffer_size_per_thread = 0; // No work buffer needed
@@ -125,20 +136,11 @@ ggml_numa_kernel_query_result_t ggml_numa_kernel_reshape_query(const struct ggml
     result.aggregation_function = NULL;
     result.aggregation_user_data = NULL;
     
-    // Strategy selection based on element count (consistent with other kernels)
-    if (total_elements <= 1024) {
-        // Small tensors: Use single-node, single-thread for minimal overhead
-        result.strategy.node_strategy = NUMA_NODE_STRATEGY_SINGLE;
-        result.strategy.on_node_strategy = NUMA_ON_NODE_STRATEGY_SINGLE_THREAD;
-    } else if (total_elements <= 262144) {
-        // Medium tensors: Use single-node, multi-thread
-        result.strategy.node_strategy = NUMA_NODE_STRATEGY_SINGLE;
-        result.strategy.on_node_strategy = NUMA_ON_NODE_STRATEGY_MULTI_THREAD;
-    } else {
-        // Large tensors: Use multi-node, data-parallel for consistency
-        result.strategy.node_strategy = NUMA_NODE_STRATEGY_DATA_PARALLEL;
-        result.strategy.on_node_strategy = NUMA_ON_NODE_STRATEGY_MULTI_THREAD;
-    }
+    // Use shared macro for unified strategy selection
+    ggml_numa_execution_strategy_t selected_strategy;
+    NUMA_SELECT_STRATEGY_FROM_CACHE(cache_entry, total_elements, selected_strategy);
+    
+    result.strategy = selected_strategy;
     
     // Apply force strategy override if environment variable is set
     // Note: RESHAPE is no-op, so all functions point to the same implementation
@@ -173,9 +175,9 @@ ggml_numa_kernel_registration_info_t ggml_numa_kernel_reshape_register(void) {
     info.kernel_name = "NUMA RESHAPE Kernel";
     
     // Strategy thresholds for RESHAPE operations (view operation pattern)
-    info.strategy_array.thresholds[NUMA_STRATEGY_IDX_SINGLE_SINGLE] = 1024;      // Single thread below 1K elements
-    info.strategy_array.thresholds[NUMA_STRATEGY_IDX_SINGLE_MULTI] = 262144;     // Multi-thread below 256K elements
-    // Above 256K elements: data-parallel strategy
+    info.strategy_array.thresholds[NUMA_STRATEGY_IDX_SINGLE_SINGLE] = 128;      // Single thread strategy
+    info.strategy_array.thresholds[NUMA_STRATEGY_IDX_SINGLE_MULTI] = 1024;     // Multi-thread strategy
+    // Above this: data-parallel strategy
     info.strategy_array.valid = true;
     
     // Work function pointers for different strategies (all use same no-op function)
