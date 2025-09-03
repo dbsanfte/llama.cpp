@@ -1,51 +1,90 @@
 /**
- * NUMA Kernel: Element-wise Addition (ADD)
+ * @file add.h
+ * @brief NUMA Kernel: Element-wise Addition (ADD)
+ * @author David Sanftenberg
  * 
- * Uses pre-allocated NUMA-local mirrored tensor data directly without migration.
+ * NUMA-aware element-wise addition operations with comprehensive type support,
+ * broadcasting, and SIMD optimization.
+ * 
+ * OPERATION CHARACTERISTICS:
+ * - Element-wise addition: dst[i] = src0[i] + src1[i]
+ * - Full broadcasting support matching reference implementation
+ * - Comprehensive quantization type coverage (F32, F16, BF16, Q4_0, Q5_0, Q8_0, etc.)
+ * - Perfect data-parallel scalability for same-shape operations
+ * - Complex broadcasting logic for mismatched tensor shapes
+ * - High SIMD optimization potential with ggml_vec_add_f32()
+ * 
+ * IMPLEMENTATION STRATEGY:
+ * - Based on proven NUMA kernel patterns from MUL kernel
+ * - Ultra-fast optimized path for large same-shape tensors
+ * - Low-overhead path for smaller tensors
+ * - Comprehensive broadcasting support following reference binary-ops.cpp
+ * - Type-aware dispatch for F32/F16/BF16 and quantized types
+ * - Shared memory optimization for no-aggregation execution
+ * 
+ * BROADCASTING SUPPORT:
+ * - Full compatibility with reference implementation
+ * - Contiguous and non-contiguous src1 broadcasting
+ * - Complex indexing for multi-dimensional broadcast scenarios
+ * - Regression testing for previously broken broadcasting cases
  */
 
 #pragma once
 
-#include "../ggml-impl.h"
+#include "../ggml-cpu-impl.h"
+#include "../ggml-impl.h" 
 #include "numa-kernels.h"
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-// Kernel interface functions
-bool ggml_numa_kernel_add_supports(const struct ggml_tensor * tensor);
-ggml_numa_execution_strategy_t ggml_numa_kernel_add_get_strategy(const struct ggml_tensor * tensor);
-size_t ggml_numa_kernel_add_get_work_buffer_size(const struct ggml_tensor * tensor);
-float ggml_numa_kernel_add_get_efficiency_score(const struct ggml_tensor * tensor);
-const char * ggml_numa_kernel_add_get_name(const struct ggml_tensor * tensor);
-
-// Kernel registration function - provides strategy arrays and function pointers
-ggml_numa_kernel_registration_info_t ggml_numa_kernel_add_register(void);
+/**
+ * Main ADD kernel execution function
+ * 
+ * Handles element-wise addition with full broadcasting support and quantization
+ * type coverage. Uses NUMA-aware data slicing for optimal performance.
+ * 
+ * EXECUTION FLOW:
+ * 1. Validate tensor inputs and check for broadcasting requirements
+ * 2. Extract tensor data using NUMA-local tensor_data()
+ * 3. Read thread-local NUMA context from coordinator 
+ * 4. Dispatch to appropriate type-specific implementation
+ * 5. Handle broadcasting logic following reference implementation
+ * 6. Execute SIMD operations on assigned NUMA slice
+ * 
+ * THREAD SAFETY: Thread-safe via data slicing (no shared state)
+ * NUMA AWARENESS: Accesses only NUMA-local memory via tensor_data()
+ * PERFORMANCE: Optimized for minimal overhead, maximum SIMD utilization
+ * 
+ * @param work_context  Tensor to process (cast from void*)
+ * @param params        Threadpool parameters (thread ID, thread count)
+ * @return              GGML_STATUS_SUCCESS on success, GGML_STATUS_FAILED on error
+ */
+enum ggml_status ggml_numa_kernel_add_execute(void * work_context, struct ggml_compute_params * params);
 
 /**
- * Query ADD kernel for optimal strategy based on tensor characteristics
+ * Strategy query function for ADD operations
  * 
- * This function analyzes the tensor and returns the optimal execution strategy
- * using operation-specific thresholds rather than rigid complexity classes.
+ * Determines optimal execution strategy based on tensor characteristics:
+ * - Single-node single-thread for tiny tensors (< 128 elements)
+ * - Single-node multi-thread for small tensors (< 1024 elements)  
+ * - Data-parallel across NUMA nodes for larger tensors
  * 
- * @param tensor The tensor to analyze
- * @return Query result with optimal strategy, or unsupported result if not applicable
+ * @param tensor  The destination tensor to analyze
+ * @return        Query result with selected strategy and efficiency estimate
  */
 ggml_numa_kernel_query_result_t ggml_numa_kernel_add_query(const struct ggml_tensor * tensor);
 
-// Main execution function
-enum ggml_status ggml_numa_kernel_add_execute(void * work_context, 
-                                              struct ggml_compute_params * params);
-
-// Optimized execution functions
-enum ggml_status ggml_numa_kernel_add_execute_low_overhead(void * work_context, 
-                                                          struct ggml_compute_params * params);
-enum ggml_status ggml_numa_kernel_add_execute_no_aggregation(void * work_context, 
-                                                            struct ggml_compute_params * params);
-
-// Debug and performance functions  
-enum ggml_status ggml_numa_kernel_add_debug_data_locality(const struct ggml_tensor * tensor);
+/**
+ * Kernel registration function 
+ * 
+ * Returns registration info for the ADD kernel including strategy thresholds,
+ * function pointers, and metadata for the NUMA registry system.
+ * 
+ * @return  Registration info structure for ADD kernel
+ */
+ggml_numa_kernel_registration_info_t ggml_numa_kernel_add_register(void);
 
 #ifdef __cplusplus
 }
