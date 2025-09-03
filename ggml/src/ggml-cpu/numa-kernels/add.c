@@ -123,7 +123,7 @@ static enum ggml_status ggml_numa_kernel_add_f32_execute(void * work_context,
     int64_t numa_start, numa_end;
     
     if (is_data_parallel && total_nodes > 1) {
-        // DATA-PARALLEL MODE
+        // DATA-PARALLEL MODE WITH THREADPOOL SUPPORT
         const int64_t elements_per_node = total_elements / total_nodes;
         
         // Calculate this node's slice in the global tensor
@@ -132,21 +132,16 @@ static enum ggml_status ggml_numa_kernel_add_f32_execute(void * work_context,
                                  total_elements : 
                                  node_start + elements_per_node;
         
-        // Only thread 0 executes for data-parallel mode (coordinator uses single-thread execution)
-        if (thread_id == 0) {
-            numa_start = node_start;
-            numa_end = node_end;
-            NUMA_LOG_TRACE("NUMA Node %d, Thread %d ADD processing FULL NODE RANGE: [%ld, %ld) (%ld elements)", 
-                           current_node, thread_id, numa_start, numa_end, numa_end - numa_start);
-        } else {
-            // Multi-thread mode within node (not currently used but keep for future)
-            const int64_t elements_per_thread = (node_end - node_start + num_threads - 1) / num_threads;
-            numa_start = node_start + thread_id * elements_per_thread;
-            numa_end = MIN(numa_start + elements_per_thread, node_end);
-            
-            NUMA_LOG_TRACE("NUMA Node %d, Thread %d ADD processing slice: [%ld, %ld) (%ld elements)", 
-                           current_node, thread_id, numa_start, numa_end, numa_end - numa_start);
-        }
+        // Within each NUMA node, distribute work across all threads
+        const int64_t node_elements = node_end - node_start;
+        const int64_t elements_per_thread = (node_elements + num_threads - 1) / num_threads;
+        
+        numa_start = node_start + thread_id * elements_per_thread;
+        numa_end = MIN(numa_start + elements_per_thread, node_end);
+        
+        NUMA_LOG_TRACE("NUMA Node %d, Thread %d/%d ADD processing: global[%ld, %ld), node[%ld, %ld), thread[%ld, %ld) (%ld elements)", 
+                       current_node, thread_id, num_threads, 0L, total_elements, 
+                       node_start, node_end, numa_start, numa_end, numa_end - numa_start);
     } else {
         // SINGLE-NODE MODE
         const int64_t elements_per_thread = (total_elements + num_threads - 1) / num_threads;

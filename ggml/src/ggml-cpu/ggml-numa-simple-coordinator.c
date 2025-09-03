@@ -500,24 +500,29 @@ static void* numa_dispatch_worker(void* arg) {
             struct ggml_tensor * tensor = (struct ggml_tensor *)g_simple_coordinator.active_work_context;
             
             if (tensor && ggml_numa_is_data_parallel_execution) {
-                // Direct NUMA kernel execution for data-parallel operations
-                NUMA_LOG_DEBUG("NUMA Node %d: Direct kernel execution for data-parallel operation", numa_node);
+                // Direct NUMA kernel execution for data-parallel operations with threadpool support
+                NUMA_LOG_DEBUG("NUMA Node %d: Data-parallel kernel execution with %d threads", 
+                              numa_node, g_simple_coordinator.threads_per_node[numa_node]);
                 
-                // Create compute params for the kernel
+                // Create compute params for the kernel with full threadpool support
                 struct ggml_compute_params compute_params = {
-                    .ith = 0,  // Use thread 0 for each NUMA node (coordinator pattern)
-                    .nth = 1,  // Single thread per node for data-parallel operations
+                    .ith = 0,  // Main thread index for this NUMA node
+                    .nth = g_simple_coordinator.threads_per_node[numa_node], // Use all threads per node!
                     .wdata = work_params.wdata,
-                    .wsize = work_params.wsize
+                    .wsize = work_params.wsize,
+                    .threadpool = g_simple_coordinator.numa_threadpools[numa_node] // Provide threadpool for parallelization
                 };
                 
-                // Call the NUMA work function directly
+                NUMA_LOG_DEBUG("NUMA Node %d: Calling kernel with %d threads and threadpool support", 
+                              numa_node, compute_params.nth);
+                
+                // Call the NUMA work function directly with threadpool support
                 result = g_simple_coordinator.active_work_function(
                     g_simple_coordinator.active_work_context, 
                     &compute_params
                 );
                 
-                NUMA_LOG_DEBUG("NUMA Node %d: Direct kernel execution completed with status %d", numa_node, result);
+                NUMA_LOG_DEBUG("NUMA Node %d: Data-parallel kernel execution completed with status %d", numa_node, result);
                 
             } else if (tensor) {
                 // Use threadpool execution for single-node operations

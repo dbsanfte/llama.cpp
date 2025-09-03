@@ -538,11 +538,10 @@ run_integration_test() {
     local large_test_prompt="What is artificial intelligence?"
     local large_expected_pattern="I need to figure out what artificial intelligence is"
     
-    # TODO: Reenable when perf is better
-    #if ! test_single_model "$large_model_name" "$large_model_path" "$large_model_url" "$large_model_id" "$large_expected_pattern" "$large_test_prompt"; then
-    #    echo -e "${RED}❌ Large model test failed${NC}"
-    #    return 1
-    #fi
+    if ! test_single_model "$large_model_name" "$large_model_path" "$large_model_url" "$large_model_id" "$large_expected_pattern" "$large_test_prompt"; then
+        echo -e "${RED}❌ Large model test failed${NC}"
+        return 1
+    fi
     
     echo ""
     echo -e "${GREEN}🎉 Both models passed validation!${NC}"
