@@ -9,14 +9,94 @@ This document describes the NUMA-aware execution architecture implemented in lla
 ### 🎯 Execution Flow
 
 ```
-Compute Graph → Executor → Kernel Registry Query → Coordinator Dispatch → NUMA Threadpools
+Compute Graph → Executor → Kernel Registry Query → Coordinator Three-Strategy Dispatch → NUMA Threadpools
 ```
 
 The architecture consists of three main components working together:
 
 1. **NUMA Kernel Registry** - Centralized database with O(1) cache lookups
 2. **NUMA Executor** - Strategy engine and orchestration layer  
-3. **NUMA Coordinator** - Resource management and work distribution
+3. **NUMA Coordinator** - Three-strategy resource management and work distribution
+
+---
+
+## 🏗️ Simplified Coordinator Architecture
+
+The NUMA coordinator implements a **three-strategy execution model** for optimal performance across different tensor sizes and computational requirements.
+
+### **Three Execution Strategies**
+
+#### 1. **Single-Thread/Single-Node**: `ggml_numa_simple_coordinator_execute_single_thread()`
+- **Use case**: Very small tensors (< 1K elements)
+- **Pattern**: One thread on target NUMA node, minimal overhead
+- **Thread-local context**: 
+  - `ggml_numa_is_data_parallel_execution = false`
+  - `ggml_current_numa_node = target_node`
+  - No data slicing - processes entire tensor
+- **Performance**: Optimized for minimal dispatch overhead
+
+#### 2. **Multi-Thread/Single-Node**: `ggml_numa_simple_coordinator_execute_single_node()`
+- **Use case**: Medium tensors (1K-256K elements)
+- **Pattern**: All threads on one NUMA node, shared memory locality
+- **Thread-local context**:
+  - `ggml_numa_is_data_parallel_execution = false`
+  - `ggml_current_numa_node = target_node`
+  - Thread-based slicing within single node
+- **Performance**: Maximizes single-node thread utilization
+
+#### 3. **Multi-Thread/Multi-Node (Data-Parallel)**: `ggml_numa_simple_coordinator_execute_data_parallel()`
+- **Use case**: Large tensors (> 256K elements)
+- **Pattern**: All NUMA nodes participate, maximum parallelism
+- **Thread-local context**:
+  - `ggml_numa_is_data_parallel_execution = true`
+  - `ggml_numa_total_nodes_for_data_parallel = num_active_nodes`
+  - Both NUMA-level and thread-level slicing
+- **Performance**: Optimal for large-scale computational workloads
+
+### **Thread-Local Context Variables**
+
+The coordinator sets up thread-local variables that kernels use for adaptive data slicing:
+
+```c
+// NUMA node identification
+extern __thread int ggml_current_numa_node;                    // Current NUMA node (0-based)
+
+// Data-parallel execution context  
+extern __thread bool ggml_numa_is_data_parallel_execution;     // True if multi-node execution
+extern __thread int ggml_numa_total_nodes_for_data_parallel;   // Total nodes participating
+
+// Shared memory optimization
+extern __thread void * ggml_numa_shared_result_tensor_data;    // Direct result memory access
+```
+
+### **Dual-Level Data Slicing Mechanism**
+
+**NUMA-Level Slicing** (for data-parallel execution):
+```c
+if (ggml_numa_is_data_parallel_execution) {
+    size_t total_elements = ggml_nelements(tensor);
+    size_t elements_per_node = total_elements / ggml_numa_total_nodes_for_data_parallel;
+    size_t numa_start = ggml_current_numa_node * elements_per_node;
+    size_t numa_end = (ggml_current_numa_node == ggml_numa_total_nodes_for_data_parallel - 1) ? 
+                      total_elements : numa_start + elements_per_node;
+    
+    // Process only this NUMA node's slice: numa_start to numa_end
+}
+```
+
+**Thread-Level Slicing** (within each NUMA node):
+```c
+// Standard ggml threading within the NUMA slice
+int ith = params->ith;         // Thread index within this NUMA node
+int nth = params->nth;         // Total threads on this NUMA node
+
+size_t slice_elements = numa_end - numa_start;  // Elements for this NUMA node
+size_t elements_per_thread = slice_elements / nth;
+size_t thread_start = numa_start + (ith * elements_per_thread);
+size_t thread_end = (ith == nth - 1) ? numa_end : thread_start + elements_per_thread;
+
+// Process only this thread's slice: thread_start to thread_end
+```
 
 ---
 
@@ -231,46 +311,75 @@ static const ggml_numa_execution_strategy_t idx_to_strategy[] = {
 
 ## 3. NUMA Coordinator
 
-**Location**: `ggml/src/ggml-cpu/ggml-numa-coordinator.c`
+**Location**: `ggml/src/ggml-cpu/ggml-numa-simple-coordinator.c`
 
 ### Purpose
-The NUMA Coordinator manages NUMA node resources and executes work submitted by the executor. It handles thread distribution, memory allocation, and work synchronization across NUMA nodes.
+The NUMA Coordinator implements a **three-strategy execution model** that efficiently manages NUMA node resources and executes work submitted by the executor. It provides optimal thread distribution, memory allocation, and work synchronization across different computational workload sizes.
 
 ### Key Features
-- **NUMA Node Management**: Intelligent assignment of threads to NUMA nodes
-- **Resource Coordination**: Efficient memory allocation and thread distribution
-- **Strategy Execution**: Implementation of different execution strategies
-- **Work Distribution**: Optimal partitioning of work across available resources
+- **Three-Strategy Execution**: Optimized dispatch for small, medium, and large workloads
+- **Thread-Local Context**: Provides kernels with execution context for adaptive data slicing
+- **Shared Memory Optimization**: Direct memory writes eliminate aggregation overhead
+- **NUMA-Aware Resource Management**: Intelligent thread binding and memory allocation
+- **Performance Instrumentation**: Integrated timing and profiling capabilities
 
-### Execution Strategies
+### Three Execution Strategies
 
-#### Node Distribution Strategies
+The coordinator maps simple strategy indices to specific execution functions:
+
+#### **Strategy 1: Single-Thread/Single-Node**
 ```c
-typedef enum {
-    NUMA_NODE_STRATEGY_SINGLE,            // Execute on a single node
-    NUMA_NODE_STRATEGY_DATA_PARALLEL      // Distribute data across multiple nodes
-} ggml_numa_node_strategy_t;
+enum ggml_status ggml_numa_simple_coordinator_execute_single_thread(
+    ggml_numa_work_function_t work_function,
+    void * work_context,
+    int target_node,
+    size_t work_size
+);
 ```
 
-#### On-Node Execution Strategies  
+- **Use case**: Very small tensors (< 1K elements)
+- **Thread-local context**: 
+  - `ggml_numa_is_data_parallel_execution = false`
+  - `ggml_current_numa_node = target_node`
+- **Optimization**: Minimal dispatch overhead for tiny workloads
+
+#### **Strategy 2: Multi-Thread/Single-Node**
 ```c
-typedef enum {
-    NUMA_ON_NODE_STRATEGY_SINGLE_THREAD,  // Single thread execution
-    NUMA_ON_NODE_STRATEGY_MULTI_THREAD    // Multi-threaded execution
-} ggml_numa_on_node_strategy_t;
+enum ggml_status ggml_numa_simple_coordinator_execute_single_node(
+    ggml_numa_work_function_t work_function,
+    void * work_context,
+    int target_node,
+    size_t work_size
+);
 ```
 
-#### Combined Strategy
+- **Use case**: Medium tensors (1K-256K elements)
+- **Thread-local context**:
+  - `ggml_numa_is_data_parallel_execution = false`
+  - `ggml_current_numa_node = target_node`
+- **Optimization**: Maximizes single-node thread utilization with shared memory locality
+
+#### **Strategy 3: Multi-Thread/Multi-Node (Data-Parallel)**
 ```c
-typedef struct {
-    ggml_numa_node_strategy_t node_strategy;      // How to distribute across nodes
-    ggml_numa_on_node_strategy_t on_node_strategy; // How to execute within each node
-} ggml_numa_execution_strategy_t;
+enum ggml_status ggml_numa_simple_coordinator_execute_data_parallel(
+    ggml_numa_work_function_t work_function,
+    void * work_context,
+    size_t work_size,
+    ggml_numa_aggregation_policy_t aggregation_policy,
+    ggml_numa_aggregation_function_t aggregation_function,
+    void * aggregation_user_data
+);
 ```
 
-### Work Function Execution
+- **Use case**: Large tensors (> 256K elements)
+- **Thread-local context**:
+  - `ggml_numa_is_data_parallel_execution = true`
+  - `ggml_numa_total_nodes_for_data_parallel = num_active_nodes`
+- **Optimization**: Maximum parallelism across all NUMA nodes
 
-The coordinator executes work functions provided by the registry on each NUMA node:
+### Strategy Selection Interface
+
+The executor provides strategies to the coordinator through simple mappings:
 
 ```c
 bool ggml_numa_simple_coordinator_compute_forward(
@@ -281,43 +390,105 @@ bool ggml_numa_simple_coordinator_compute_forward(
     ggml_numa_aggregation_function_t agg_function,  // May be NULL
     size_t work_buffer_size_per_thread
 ) {
-    // 1. Set up thread-local context for kernels
-    setup_numa_thread_context(tensor, strategy);
-    
-    // 2. Distribute work across NUMA nodes
-    if (strategy.node_strategy == NUMA_NODE_STRATEGY_SINGLE) {
-        execute_on_single_node(work_function, tensor, params);
-    } else {
-        execute_data_parallel(work_function, tensor, params);
+    // Map strategy to specific execution function
+    switch (strategy.node_strategy) {
+        case NUMA_NODE_STRATEGY_SINGLE:
+            if (strategy.on_node_strategy == NUMA_ON_NODE_STRATEGY_SINGLE_THREAD) {
+                return execute_single_thread(work_function, tensor, params, work_buffer_size_per_thread);
+            } else {
+                return execute_single_node(work_function, tensor, params, work_buffer_size_per_thread);
+            }
+            break;
+        case NUMA_NODE_STRATEGY_DATA_PARALLEL:
+            return execute_data_parallel(work_function, tensor, params, work_buffer_size_per_thread, 
+                                        agg_function);
+            break;
     }
-    
-    // 3. Aggregate results if aggregation function provided
-    if (agg_function != NULL) {
-        agg_function(tensor, num_participating_nodes, NULL);
-    }
-    
-    return true;
 }
 ```
 
+### Thread-Local Context System
+
+The coordinator sets up execution context that kernels use for adaptive behavior:
+
+```c
+// Thread-local variables provided to kernels
+extern __thread int ggml_current_numa_node;                    // Current NUMA node (0-based)
+extern __thread bool ggml_numa_is_data_parallel_execution;     // True for data-parallel mode
+extern __thread int ggml_numa_total_nodes_for_data_parallel;   // Total participating nodes
+extern __thread void * ggml_numa_shared_result_tensor_data;    // Direct result memory access
+```
+
+**Context Setup Process:**
+1. **Strategy Detection**: Coordinator determines execution strategy from registry query
+2. **Thread-Local Assignment**: Each thread receives appropriate NUMA node and execution flags
+3. **Shared Memory Setup**: For data-parallel mode, shared result tensor memory is provided
+4. **Kernel Execution**: Work functions adapt their behavior based on thread-local context
+
 ### Work Function Interface
 
-Work functions are the actual computation kernels that execute on NUMA nodes:
+Work functions implement the actual computation and receive standardized context:
 
 ```c
 typedef enum ggml_status (*ggml_numa_work_function_t)(
     void * work_context,                    // Tensor being processed
-    struct ggml_compute_params * params     // Compute parameters (threads, buffer, etc.)
+    struct ggml_compute_params * params     // Compute parameters (ith, nth, wdata, etc.)
 );
 ```
 
-### Thread-Local Context Setup
+**Kernel Data Slicing Pattern:**
+```c
+enum ggml_status numa_kernel_example(void * work_context, struct ggml_compute_params * params) {
+    // Get thread-local context (automatically set by coordinator)
+    extern __thread int ggml_current_numa_node;
+    extern __thread bool ggml_numa_is_data_parallel_execution;
+    extern __thread int ggml_numa_total_nodes_for_data_parallel;
+    
+    size_t total_elements = ggml_nelements(tensor);
+    size_t numa_start = 0, numa_end = total_elements;
+    
+    // NUMA-level slicing (if data-parallel)
+    if (ggml_numa_is_data_parallel_execution) {
+        size_t elements_per_node = total_elements / ggml_numa_total_nodes_for_data_parallel;
+        numa_start = ggml_current_numa_node * elements_per_node;
+        numa_end = (ggml_current_numa_node == ggml_numa_total_nodes_for_data_parallel - 1) ? 
+                   total_elements : numa_start + elements_per_node;
+    }
+    
+    // Thread-level slicing (within NUMA node)
+    int ith = params->ith, nth = params->nth;
+    size_t thread_start = numa_start + (ith * (numa_end - numa_start)) / nth;
+    size_t thread_end = numa_start + ((ith + 1) * (numa_end - numa_start)) / nth;
+    
+    // Process thread's slice with SIMD operations
+    ggml_vec_operation(thread_end - thread_start, dst + thread_start, src + thread_start);
+    
+    return GGML_STATUS_SUCCESS;
+}
+```
 
-The coordinator provides kernels with NUMA-aware execution context:
+### Shared Memory Optimization
+
+For large tensors, the coordinator enables zero-copy optimization:
 
 ```c
-// Thread-local variables available to all kernels
-extern __thread void * ggml_numa_shared_result_tensor_data;  // Shared memory for direct writes
+// Kernel accesses shared result memory directly
+extern __thread void * ggml_numa_shared_result_tensor_data;
+
+float * dst_data;
+if (ggml_numa_shared_result_tensor_data != NULL) {
+    // Direct writes to final tensor memory - no aggregation needed
+    dst_data = (float *)ggml_numa_shared_result_tensor_data;
+} else {
+    // Fallback to local tensor data
+    dst_data = (float *)tensor_data(tensor);
+}
+```
+
+**Benefits:**
+- **Zero-Copy Architecture**: Direct writes to final memory locations
+- **Eliminates Aggregation**: No need to combine results from multiple nodes
+- **Optimal Memory Locality**: Each NUMA node writes to its local memory region
 extern __thread bool ggml_numa_is_data_parallel_execution;   // True if data-parallel mode
 extern __thread int ggml_current_numa_node;                  // Current NUMA node ID
 extern __thread int ggml_numa_total_nodes;                   // Total participating nodes
@@ -418,15 +589,15 @@ The architecture delivers significant performance improvements on multi-socket s
 - **Cache Efficiency**: Reduced memory bandwidth contention
 - **Scalability**: Linear scaling with additional NUMA nodes
 
-### Complexity-Based Optimization
+### Three-Strategy Performance Optimization
 
-Different strategies are automatically selected based on workload size:
+Different execution strategies are automatically selected based on workload size:
 
-| Complexity Class | Elements | Strategy | Characteristics |
-|-----------------|----------|----------|-----------------|
-| TINY | < 32K | Single-node | Low overhead |
-| SMALL | 32K - 1M | Single-node multi-thread | Thread parallelism |
-| MEDIUM | 1M - 16M | Data-parallel | NUMA distribution |
+| Strategy | Tensor Size | Elements | Execution Pattern | Characteristics |
+|----------|-------------|----------|-------------------|-----------------|
+| **Single-Thread/Single-Node** | Very Small | < 1K | One thread on target node | Minimal dispatch overhead |
+| **Multi-Thread/Single-Node** | Medium | 1K - 256K | All threads on one node | Shared memory locality |
+| **Multi-Thread/Multi-Node** | Large | > 256K | Data-parallel across nodes | Maximum parallelism |
 | LARGE | 16M - 256M | Optimized chunking | Cache-aware splitting |
 | HUGE | > 256M | Advanced strategies | Memory bandwidth optimization |
 
