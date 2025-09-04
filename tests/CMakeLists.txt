@@ -224,44 +224,9 @@ target_link_libraries(${LLAMA_TEST_NAME} PRIVATE ggml ggml-cpu common)
 # Prioritize ggml/src/ggml-cpu/ to get the full implementation headers and add ggml/src for ggml-impl.h
 target_include_directories(${LLAMA_TEST_NAME} PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src/ggml-cpu ${CMAKE_SOURCE_DIR}/ggml/src ${CMAKE_SOURCE_DIR}/ggml/include)
 
-# test-numa-mathematical-correctness-mul
-set(LLAMA_TEST_NAME test-numa-mathematical-correctness-mul)
-llama_build_and_test(test-numa-mathematical-correctness-mul.cpp)
-target_link_libraries(${LLAMA_TEST_NAME} PRIVATE ggml ggml-cpu common)
-# Prioritize ggml/src/ggml-cpu/ to get the full implementation headers and add ggml/src for ggml-impl.h
-target_include_directories(${LLAMA_TEST_NAME} PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src/ggml-cpu ${CMAKE_SOURCE_DIR}/ggml/src ${CMAKE_SOURCE_DIR}/ggml/include)
-
-# test-numa-mathematical-correctness-cpy
-set(LLAMA_TEST_NAME test-numa-mathematical-correctness-cpy)
-llama_build_and_test(test-numa-mathematical-correctness-cpy.cpp)
-target_link_libraries(${LLAMA_TEST_NAME} PRIVATE ggml ggml-cpu common)
-# Prioritize ggml/src/ggml-cpu/ to get the full implementation headers and add ggml/src for ggml-impl.h
-target_include_directories(${LLAMA_TEST_NAME} PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src/ggml-cpu ${CMAKE_SOURCE_DIR}/ggml/src ${CMAKE_SOURCE_DIR}/ggml/include)
-
-# test-numa-mathematical-correctness-cont
-set(LLAMA_TEST_NAME test-numa-mathematical-correctness-cont)
-llama_build_and_test(test-numa-mathematical-correctness-cont.cpp)
-target_link_libraries(${LLAMA_TEST_NAME} PRIVATE ggml ggml-cpu common)
-# Prioritize ggml/src/ggml-cpu/ to get the full implementation headers and add ggml/src for ggml-impl.h
-target_include_directories(${LLAMA_TEST_NAME} PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src/ggml-cpu ${CMAKE_SOURCE_DIR}/ggml/src ${CMAKE_SOURCE_DIR}/ggml/include)
-
-# test-numa-mathematical-correctness-get_rows
-set(LLAMA_TEST_NAME test-numa-mathematical-correctness-get_rows)
-llama_build_and_test(test-numa-mathematical-correctness-get_rows.cpp)
-target_link_libraries(${LLAMA_TEST_NAME} PRIVATE ggml ggml-cpu common)
-# Prioritize ggml/src/ggml-cpu/ to get the full implementation headers and add ggml/src for ggml-impl.h
-target_include_directories(${LLAMA_TEST_NAME} PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src/ggml-cpu ${CMAKE_SOURCE_DIR}/ggml/src ${CMAKE_SOURCE_DIR}/ggml/include)
-
 # test-numa-mathematical-correctness-mul_mat
 set(LLAMA_TEST_NAME test-numa-mathematical-correctness-mul_mat)
 llama_build_and_test(test-numa-mathematical-correctness-mul_mat.cpp)
-target_link_libraries(${LLAMA_TEST_NAME} PRIVATE ggml ggml-cpu common)
-# Prioritize ggml/src/ggml-cpu/ to get the full implementation headers and add ggml/src for ggml-impl.h
-target_include_directories(${LLAMA_TEST_NAME} PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src/ggml-cpu ${CMAKE_SOURCE_DIR}/ggml/src ${CMAKE_SOURCE_DIR}/ggml/include)
-
-# test-numa-mathematical-correctness-rms_norm
-set(LLAMA_TEST_NAME test-numa-mathematical-correctness-rms_norm)
-llama_build_and_test(test-numa-mathematical-correctness-rms_norm.cpp)
 target_link_libraries(${LLAMA_TEST_NAME} PRIVATE ggml ggml-cpu common)
 # Prioritize ggml/src/ggml-cpu/ to get the full implementation headers and add ggml/src for ggml-impl.h
 target_include_directories(${LLAMA_TEST_NAME} PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src/ggml-cpu ${CMAKE_SOURCE_DIR}/ggml/src ${CMAKE_SOURCE_DIR}/ggml/include)
@@ -287,13 +252,6 @@ target_link_libraries(${LLAMA_TEST_NAME} PRIVATE ggml ggml-cpu common)
 # Prioritize ggml/src/ggml-cpu/ to get the full implementation headers and add ggml/src for ggml-impl.h
 target_include_directories(${LLAMA_TEST_NAME} PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src/ggml-cpu ${CMAKE_SOURCE_DIR}/ggml/src ${CMAKE_SOURCE_DIR}/ggml/include)
 
-# test-numa-mathematical-correctness-glu
-set(LLAMA_TEST_NAME test-numa-mathematical-correctness-glu)
-llama_build_and_test(test-numa-mathematical-correctness-glu.cpp)
-target_link_libraries(${LLAMA_TEST_NAME} PRIVATE ggml ggml-cpu common)
-# Prioritize ggml/src/ggml-cpu/ to get the full implementation headers and add ggml/src for ggml-impl.h
-target_include_directories(${LLAMA_TEST_NAME} PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src/ggml-cpu ${CMAKE_SOURCE_DIR}/ggml/src ${CMAKE_SOURCE_DIR}/ggml/include)
-
 # test-numa-noop-performance
 set(LLAMA_TEST_NAME test-numa-noop-performance)
 llama_build_and_test(test-numa-noop-performance.cpp)
@@ -307,3 +265,9 @@ llama_build_and_test(test-numa-execution-modes.cpp)
 target_link_libraries(${LLAMA_TEST_NAME} PRIVATE ggml ggml-cpu common)
 target_include_directories(${LLAMA_TEST_NAME} PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src/ggml-cpu ${CMAKE_SOURCE_DIR}/ggml/src ${CMAKE_SOURCE_DIR}/ggml/include)
 target_sources(${LLAMA_TEST_NAME} PRIVATE upi-traffic-monitor.cpp)
+
+# test-ggml-openmp-coordinator
+set(LLAMA_TEST_NAME test-ggml-openmp-coordinator)
+llama_build_and_test(test-ggml-openmp-coordinator.cpp)
+target_link_libraries(${LLAMA_TEST_NAME} PRIVATE ggml ggml-cpu common)
+target_include_directories(${LLAMA_TEST_NAME} PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src/ggml-cpu ${CMAKE_SOURCE_DIR}/ggml/src ${CMAKE_SOURCE_DIR}/ggml/include)

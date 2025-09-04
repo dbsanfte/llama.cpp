@@ -55,7 +55,7 @@
 #include "ggml-numa-executor.h"
 #include "ggml-cpu/numa-kernels/numa-kernels.h"
 #include "ggml-cpu/ops.h"
-#include "ggml-cpu/ggml-numa-simple-coordinator.h"
+#include "ggml-cpu/ggml-numa-openmp-coordinator.h"
 
 // Global test filter
 std::string g_test_filter = "";

@@ -16,7 +16,7 @@
 #include "ggml.h"
 
 #ifdef GGML_NUMA_MIRROR
-#include "ggml-numa-simple-coordinator.h"
+#include "ggml-numa-openmp-coordinator.h"
 #include "ggml-numa-executor.h"
 #ifdef __linux__
 #include <numa.h>
@@ -3162,7 +3162,7 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
     
     // NUMA intercept: Check if NUMA system should handle this graph computation
     bool should_dispatch = ggml_numa_should_dispatch();
-    bool coord_init = ggml_numa_simple_coordinator_is_initialized();
+    bool coord_init = ggml_numa_openmp_coordinator_init();
     bool not_in_fallback = !ggml_numa_is_fallback_active();
     
     GGML_LOG_DEBUG("NUMA Dispatch Decision: should_dispatch=%d, coord_init=%d, not_in_fallback=%d\n", 
@@ -3177,10 +3177,9 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
                       cgraph->n_nodes, cplan->n_threads, (void*)cplan->threadpool);
         test_track_fallback_execution(); // Track fallback path was taken
         
-        // Fix thread count for fallback execution to match available threadpool capacity
-        // This applies whether cplan->threadpool is set or will be set later
-        extern int ggml_numa_simple_coordinator_get_fallback_thread_count(void);
-        int fallback_threads = ggml_numa_simple_coordinator_get_fallback_thread_count();
+        // Fix thread count for fallback execution using OpenMP coordinator config
+        ggml_numa_openmp_config_t config = ggml_numa_openmp_coordinator_get_config();
+        int fallback_threads = config.threads_per_node * config.total_numa_nodes;
         if (cplan->n_threads > fallback_threads) {
             GGML_LOG_INFO("🔧 NUMA Fallback: Limiting requested threads (%d) to fallback threadpool capacity (%d)\n", 
                           cplan->n_threads, fallback_threads);
@@ -3206,25 +3205,11 @@ enum ggml_status ggml_graph_compute_impl(struct ggml_cgraph * cgraph, struct ggm
 
     if (threadpool == NULL) {
 #ifdef GGML_NUMA_MIRROR
-        // Use dedicated fallback threadpool instead of creating disposable one
-        threadpool = ggml_numa_simple_coordinator_get_fallback_threadpool();
-        if (threadpool) {
-            GGML_LOG_INFO("🔧 Using dedicated fallback threadpool: %p (bound to NUMA node 0)\n", threadpool);
-            disposable_threadpool = false; // Don't free the dedicated threadpool
-            
-            // Reset the fallback threadpool parameters for this computation
-            threadpool->cgraph           = cgraph;
-            threadpool->cplan            = cplan;
-            threadpool->current_chunk    = 0;
-            threadpool->abort            = -1;
-            threadpool->ec               = GGML_STATUS_SUCCESS;
-        } else {
-            // Fallback to disposable threadpool if dedicated one not available
-            GGML_LOG_WARN("⚠️ Dedicated fallback threadpool not available, creating disposable threadpool\n");
-            disposable_threadpool = true;
-            struct ggml_threadpool_params ttp = ggml_threadpool_params_default(n_threads);
-            threadpool = ggml_threadpool_new_impl(&ttp, cgraph, cplan);
-        }
+        // For OpenMP coordinator, create standard threadpool for fallback operations
+        GGML_LOG_INFO("🔧 Creating fallback threadpool for %d threads\n", n_threads);
+        disposable_threadpool = true; // Will be freed after use
+        struct ggml_threadpool_params ttp = ggml_threadpool_params_default(n_threads);
+        threadpool = ggml_threadpool_new_impl(&ttp, cgraph, cplan);
 #else
         // Non-NUMA build: create disposable threadpool as before
         disposable_threadpool = true;

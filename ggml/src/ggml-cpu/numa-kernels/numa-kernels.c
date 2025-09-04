@@ -281,11 +281,11 @@ enum ggml_status ggml_numa_kernels_init(void) {
     // Register each kernel using their own registration functions
     // This allows kernels to define their own strategies and function pointers
     
-    // TEMPORARILY DISABLED: All NUMA kernel registrations disabled to fix threading model
-    // We need to fix coordinator threading before re-enabling kernels
-    
-    // Enable ROPE kernel only for testing architectural changes
+    // Register ROPE kernel 
     NUMA_REGISTER_KERNEL(rope);
+
+    // Register MUL_MAT kernel
+    // NUMA_REGISTER_KERNEL(mul_mat);
     
     /*
     // DISABLED FOR TESTING - need to update all to new work buffer function signature
@@ -304,12 +304,6 @@ enum ggml_status ggml_numa_kernels_init(void) {
 
     // Register GET_ROWS kernel for tensor row extraction operations
     NUMA_REGISTER_KERNEL(get_rows);
-
-    // Enable MUL_MAT kernel for matrix multiplication
-    // Register MUL_MAT kernel
-    NUMA_LOG_DEBUG("Registering MUL_MAT kernel...");
-    NUMA_REGISTER_KERNEL(mul_mat);
-    NUMA_LOG_DEBUG("MUL_MAT kernel registration completed");
     
     // Enable RMS_NORM kernel for normalization operations
     // Register RMS_NORM kernel

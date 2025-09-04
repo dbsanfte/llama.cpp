@@ -8,6 +8,11 @@
 #include "ggml.h"
 #include "ggml-numa-allocator.h"  // NUMA-aware memory allocation
 
+// Include OpenMP coordinator for type definitions in weak function declarations
+#ifdef GGML_USE_OPENMP
+#include "ggml-cpu/ggml-numa-openmp-coordinator.h"
+#endif
+
 #ifdef GGML_NUMA_MIRROR
 #include <numa.h>  // NUMA library functions for node isolation
 #endif
@@ -298,8 +303,8 @@ static struct ggml_numa_state g_numa_state = {
 
 // Weak symbol declarations for coordinator functions (defined in ggml-cpu if available)
 #ifdef GGML_NUMA_MIRROR
-__attribute__((weak)) bool ggml_numa_simple_coordinator_init(struct ggml_threadpool_params * tpp);
-__attribute__((weak)) int ggml_numa_simple_coordinator_get_num_nodes(void);
+__attribute__((weak)) bool ggml_numa_openmp_coordinator_init(void);
+__attribute__((weak)) int ggml_numa_openmp_coordinator_get_num_nodes(void);
 #endif
 
 static void ggml_numa_init_coordinator(enum ggml_numa_strategy numa_strategy, const struct ggml_threadpool_params * tpp) {
@@ -309,19 +314,19 @@ static void ggml_numa_init_coordinator(enum ggml_numa_strategy numa_strategy, co
     }
 
     // Check if coordinator functions are available (will be NULL if ggml-cpu is not linked)
-    if (ggml_numa_simple_coordinator_init == NULL || ggml_numa_simple_coordinator_get_num_nodes == NULL) {
+    if (ggml_numa_openmp_coordinator_init == NULL || ggml_numa_openmp_coordinator_get_num_nodes == NULL) {
         // Coordinator functions not available, fall back to basic NUMA support
         g_numa_state.numa_enabled = false;
         g_numa_state.numa_nodes = 1;
         return;
     }
 
-    // Initialize simple coordinator with threadpool parameters
-    if (ggml_numa_simple_coordinator_init((struct ggml_threadpool_params *)tpp)) {
+    // Initialize OpenMP coordinator (no parameters needed)
+    if (ggml_numa_openmp_coordinator_init()) {
         g_numa_state.numa_enabled = true;
         
-        // Get number of NUMA nodes from simple coordinator
-        g_numa_state.numa_nodes = ggml_numa_simple_coordinator_get_num_nodes();
+        // Get number of NUMA nodes from OpenMP coordinator
+        g_numa_state.numa_nodes = ggml_numa_openmp_coordinator_get_num_nodes();
         if (g_numa_state.numa_nodes <= 0) {
             g_numa_state.numa_nodes = 1;
         }
@@ -395,19 +400,27 @@ bool ggml_numa_should_mirror(void) {
 bool ggml_numa_should_dispatch(void) {
     // Check for fallback recursion prevention flag
     if (in_numa_fallback) {
+        GGML_LOG_DEBUG("NUMA Dispatch: blocked by fallback flag\n");
         return false;  // Disable NUMA dispatch during fallback to prevent infinite recursion
     }
     
     // Check for performance testing override
     if (numa_dispatch_override_enabled) {
+        GGML_LOG_DEBUG("NUMA Dispatch: override enabled, value=%d, init=%d\n", 
+                      numa_dispatch_override_value, g_numa_state.initialized);
         return numa_dispatch_override_value && g_numa_state.initialized;
     }
     
-    // Only dispatch to NUMA for MIRROR strategy
-    // DISABLED and ISOLATE strategies should use CPU fallback
+    GGML_LOG_DEBUG("NUMA Dispatch: init=%d, enabled=%d, strategy=%d (disabled=%d)\n",
+                  g_numa_state.initialized, g_numa_state.numa_enabled, 
+                  g_numa_state.strategy, GGML_NUMA_STRATEGY_DISABLED);
+    
+    // Only dispatch to NUMA for MIRROR and ISOLATE strategies  
+    // DISABLED strategy should use CPU fallback
+    // OpenMP coordinator can handle all active NUMA strategies
     return g_numa_state.initialized && 
            g_numa_state.numa_enabled &&
-           (g_numa_state.strategy == GGML_NUMA_STRATEGY_MIRROR);
+           (g_numa_state.strategy != GGML_NUMA_STRATEGY_DISABLED);
 }
 
 // Functions to control fallback recursion prevention

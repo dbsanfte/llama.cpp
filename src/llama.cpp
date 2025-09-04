@@ -9,7 +9,7 @@
 
 #include "ggml.h"
 #include "ggml-backend.h"
-#include "ggml-numa-simple-coordinator.h"
+#include "ggml-numa-openmp-coordinator.h"
 
 #include <algorithm>
 #include <cstddef>
@@ -98,7 +98,7 @@ void llama_numa_init_with_threadpool_params(enum ggml_numa_strategy numa, const 
 
 void llama_backend_free(void) {
     // Clean up NUMA simple coordinator before other backend cleanup
-    ggml_numa_simple_coordinator_cleanup();
+    ggml_numa_openmp_coordinator_shutdown();
     
     ggml_quantize_free();
 }

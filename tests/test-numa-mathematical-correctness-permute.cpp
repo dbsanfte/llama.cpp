@@ -37,7 +37,7 @@
 #include "ggml.h"
 #include "ggml-cpu.h"
 #include "ggml-numa-executor.h"
-#include "ggml-numa-simple-coordinator.h"  // For NUMA functions
+#include "ggml-numa-openmp-coordinator.h"  // For NUMA functions
 #include "ggml-cpu/binary-ops.h"
 #include "ggml-cpu/ops.h"  // For ggml_compute_forward_permute
 

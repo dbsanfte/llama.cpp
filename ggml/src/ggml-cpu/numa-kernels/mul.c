@@ -140,12 +140,15 @@ enum ggml_status ggml_numa_kernel_mul_execute_optimized(void * work_context,
     const int num_threads = params->nth;
     
     // Log execution strategy in standardized format for integration test parsing
-    if (ggml_numa_is_data_parallel_execution) {
-        NUMA_LOG_STRATEGY_DATA_PARALLEL("MUL");
-    } else if (params->nth > 1) {
-        NUMA_LOG_STRATEGY_SINGLE_MULTI("MUL");
-    } else {
-        NUMA_LOG_STRATEGY_SINGLE_SINGLE("MUL");
+    // Only log once per operation (thread 0 of NUMA node 0) to avoid inflated counts
+    if (thread_id == 0 && current_node == 0) {
+        if (ggml_numa_is_data_parallel_execution) {
+            NUMA_LOG_STRATEGY_DATA_PARALLEL("MUL");
+        } else if (params->nth > 1) {
+            NUMA_LOG_STRATEGY_SINGLE_MULTI("MUL");
+        } else {
+            NUMA_LOG_STRATEGY_SINGLE_SINGLE("MUL");
+        }
     }
     
     // TEMPLATE DEBUG: Log execution context for development/debugging
@@ -379,10 +382,14 @@ enum ggml_status ggml_numa_kernel_mul_execute_low_overhead(void * work_context,
     struct ggml_tensor * tensor = (struct ggml_tensor *)work_context;
     
     // Log execution strategy in standardized format for integration test parsing
-    if (params->nth > 1) {
-        NUMA_LOG_STRATEGY_SINGLE_MULTI("MUL");
-    } else {
-        NUMA_LOG_STRATEGY_SINGLE_SINGLE("MUL");
+    // Only log once per operation (thread 0 of NUMA node 0) to avoid inflated counts
+    extern __thread int ggml_current_numa_node;
+    if (params->ith == 0 && ggml_current_numa_node == 0) {
+        if (params->nth > 1) {
+            NUMA_LOG_STRATEGY_SINGLE_MULTI("MUL");
+        } else {
+            NUMA_LOG_STRATEGY_SINGLE_SINGLE("MUL");
+        }
     }
     
     // Fast validation
@@ -485,7 +492,11 @@ enum ggml_status ggml_numa_kernel_mul_execute_low_overhead(void * work_context,
 enum ggml_status ggml_numa_kernel_mul_execute_no_aggregation(void * work_context,
                                                             struct ggml_compute_params * params) {
     // Log execution strategy in standardized format for integration test parsing
-    NUMA_LOG_STRATEGY_DATA_PARALLEL("MUL");  // No-aggregation is always data-parallel
+    // Only log once per operation (thread 0 of NUMA node 0) to avoid inflated counts
+    extern __thread int ggml_current_numa_node;
+    if (params->ith == 0 && ggml_current_numa_node == 0) {
+        NUMA_LOG_STRATEGY_DATA_PARALLEL("MUL");  // No-aggregation is always data-parallel
+    }
     
     // This is identical to the optimized kernel since it already uses the no-aggregation approach
     return ggml_numa_kernel_mul_execute_optimized(work_context, params);

@@ -107,13 +107,16 @@ static enum ggml_status ggml_numa_kernel_add_f32_execute(void * work_context,
     const int thread_id = params->ith;
     const int num_threads = params->nth;
     
-    // Log execution strategy in standardized format
-    if (ggml_numa_is_data_parallel_execution) {
-        NUMA_LOG_STRATEGY_DATA_PARALLEL("ADD");
-    } else if (params->nth > 1) {
-        NUMA_LOG_STRATEGY_SINGLE_MULTI("ADD");
-    } else {
-        NUMA_LOG_STRATEGY_SINGLE_SINGLE("ADD");
+    // Log execution strategy in standardized format for integration test parsing
+    // Only log once per operation (thread 0 of NUMA node 0) to avoid inflated counts
+    if (thread_id == 0 && current_node == 0) {
+        if (ggml_numa_is_data_parallel_execution) {
+            NUMA_LOG_STRATEGY_DATA_PARALLEL("ADD");
+        } else if (params->nth > 1) {
+            NUMA_LOG_STRATEGY_SINGLE_MULTI("ADD");
+        } else {
+            NUMA_LOG_STRATEGY_SINGLE_SINGLE("ADD");
+        }
     }
     
     // CRITICAL DEBUG: Log every kernel execution start with full context

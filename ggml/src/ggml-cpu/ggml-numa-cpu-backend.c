@@ -7,7 +7,7 @@
 
 #include "ggml-numa-cpu-backend.h"
 #include "ggml-numa-executor.h"
-#include "ggml-numa-simple-coordinator.h"
+#include "ggml-numa-openmp-coordinator.h"
 #include "ggml-impl.h"
 
 // ============================================================================
@@ -29,9 +29,9 @@ enum ggml_status ggml_numa_backend_compute_graph_internal(struct ggml_cgraph * c
     GGML_LOG_INFO("NUMA Backend: Computing graph with %d nodes using %d threads\n", 
                   cgraph->n_nodes, cplan->n_threads);
     
-    // Check if simple NUMA coordinator is initialized
-    if (!ggml_numa_simple_coordinator_is_initialized()) {
-        GGML_LOG_ERROR("NUMA Backend: Simple NUMA coordinator not initialized\n");
+    // Check if OpenMP NUMA coordinator is initialized
+    if (!ggml_numa_openmp_coordinator_init()) {
+        GGML_LOG_ERROR("NUMA Backend: OpenMP NUMA coordinator initialization failed\n");
         return GGML_STATUS_FAILED;
     }
     

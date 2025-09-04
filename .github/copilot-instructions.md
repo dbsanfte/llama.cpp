@@ -449,7 +449,7 @@ cp tests/test-numa-mathematical-correctness-template.cpp tests/test-numa-mathema
 ### Build Commands
 ```bash
 # Configure debug build with NUMA support
-cmake -B build -DCMAKE_BUILD_TYPE=Debug -DCMAKE_EXPORT_COMPILE_COMMANDS=ON -DGGML_NUMA_MIRROR=ON -DGGML_OPENMP=OFF
+cmake -B build -DCMAKE_BUILD_TYPE=Debug -DCMAKE_EXPORT_COMPILE_COMMANDS=ON -DGGML_NUMA_MIRROR=ON -DGGML_OPENMP=ON
 
 # Build (let cmake auto-detect thread count)
 cmake --build build --parallel

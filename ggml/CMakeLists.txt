@@ -341,13 +341,8 @@ if (GGML_NUMA_MIRROR AND NOT GGML_NUMA)
     set(GGML_NUMA ON)
 endif()
 
-# Automatically disable OpenMP when NUMA is enabled (they conflict)
-if (GGML_NUMA_MIRROR OR GGML_NUMA)
-    if (GGML_OPENMP)
-        message(STATUS "Automatically disabling GGML_OPENMP because NUMA is enabled (they conflict)")
-        set(GGML_OPENMP OFF CACHE BOOL "ggml: use OpenMP" FORCE)
-    endif()
-endif()
+# Keep OpenMP enabled even with NUMA - we'll use OpenMP for NUMA threading
+# The previous conflict was with the old NUMA implementation
 
 if (GGML_NUMA_MIRROR)
     find_library(NUMA_LIBRARY NAMES numa)

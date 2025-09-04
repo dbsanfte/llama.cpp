@@ -24,7 +24,7 @@
 #include "ggml.h"
 #include "ggml-cpu.h"
 #include "ggml-numa-executor.h"
-#include "ggml-numa-simple-coordinator.h"  // For NUMA functions
+#include "ggml-numa-openmp-coordinator.h"  // For NUMA functions
 
 #include <cstdio>
 #include <cstdlib>

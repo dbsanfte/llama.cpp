@@ -10,7 +10,7 @@
 #include "ggml-cpu.h"
 
 #ifdef GGML_NUMA_MIRROR
-#include "ggml-numa-simple-coordinator.h"
+#include "ggml-numa-openmp-coordinator.h"
 #include "ggml-numa-executor.h"
 #endif
 

@@ -27,8 +27,8 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
         # New NUMA Architecture
         ggml-cpu/ggml-numa-shared.h
         ggml-cpu/ggml-numa-shared.c
-        ggml-cpu/ggml-numa-simple-coordinator.c
-        ggml-cpu/ggml-numa-simple-coordinator.h
+        ggml-cpu/ggml-numa-openmp-coordinator.c
+        ggml-cpu/ggml-numa-openmp-coordinator.h
         ggml-cpu/ggml-numa-cpu-backend.c
         ggml-cpu/ggml-numa-cpu-backend.h
         ggml-cpu/ggml-numa-executor.c
@@ -49,8 +49,8 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
         # ggml-cpu/numa-kernels/cont.h
         # ggml-cpu/numa-kernels/get_rows.c
         # ggml-cpu/numa-kernels/get_rows.h
-        # ggml-cpu/numa-kernels/mul_mat.c
-        # ggml-cpu/numa-kernels/mul_mat.h
+        ggml-cpu/numa-kernels/mul_mat.c
+        ggml-cpu/numa-kernels/mul_mat.h
         # TEMPORARILY DISABLED: Kernels using old registration signature
         # ggml-cpu/numa-kernels/rms_norm.c
         # ggml-cpu/numa-kernels/rms_norm.h

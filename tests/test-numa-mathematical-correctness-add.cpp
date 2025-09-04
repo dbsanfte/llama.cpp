@@ -55,7 +55,7 @@
 #include "ggml-numa-executor.h"
 #include "ggml-cpu/numa-kernels/numa-kernels.h"
 #include "ggml-cpu/binary-ops.h"
-#include "ggml-cpu/ggml-numa-simple-coordinator.h"
+#include "ggml-cpu/ggml-numa-openmp-coordinator.h"
 
 // Global test filter
 std::string g_test_filter = "";
@@ -216,17 +216,14 @@ public:
         
         // Initialize NUMA system with strategy based on execution stage
         if (num_threads == 1) {
-            // Stage 1: Single-thread Single-node
+            // Stage 1: Single-thread Single-node - OpenMP coordinator handles this automatically
             ggml_numa_init(GGML_NUMA_STRATEGY_MIRROR);
-            ggml_numa_simple_coordinator_set_thread_constraint(1);  // Force single-thread execution
         } else if (stage_name.find("Single-node") != std::string::npos) {
-            // Stage 2: Multi-thread Single-node - use ISOLATE mode to force single-node execution
+            // Stage 2: Multi-thread Single-node - OpenMP coordinator handles thread distribution
             ggml_numa_init(GGML_NUMA_STRATEGY_ISOLATE);
-            ggml_numa_simple_coordinator_set_thread_constraint(0);  // Allow multiple threads, but on single node
         } else {
-            // Stage 3: Multi-thread Multi-node - use MIRROR mode for full multi-node execution  
+            // Stage 3: Multi-thread Multi-node - OpenMP coordinator uses all available resources
             ggml_numa_init(GGML_NUMA_STRATEGY_MIRROR);
-            ggml_numa_simple_coordinator_set_thread_constraint(0);  // Allow full multi-node execution
         }
         
         // Query the NUMA kernel to see if it's supported

@@ -515,34 +515,36 @@ static void* numa_dispatch_worker(void* arg) {
                 NUMA_LOG_DEBUG("NUMA Node %d: Single-node execution mode", numa_node);
             }
             
-            // Use normal threading per node (not forced single-thread)
+            // Use existing threadpool - the threads are already running and waiting for work!
             int n_threads = g_simple_coordinator.threads_per_node[numa_node];
             enum ggml_status result = GGML_STATUS_SUCCESS;
             
-            NUMA_LOG_DEBUG("NUMA Node %d executing kernel with %d threads (data_parallel=%s)", 
+            NUMA_LOG_DEBUG("NUMA Node %d executing kernel with %d threads using existing threadpool (data_parallel=%s)", 
                           numa_node, n_threads, is_data_parallel ? "true" : "false");
             
-            for (int ith = 0; ith < n_threads; ith++) {
-                struct ggml_compute_params thread_params = {
-                    .ith = ith,                   // Thread-wise ith: 0 to n_threads-1
-                    .nth = n_threads,             // Thread-wise nth: n_threads
-                    .wsize = g_simple_coordinator.active_work_size,
-                    .wdata = (g_simple_coordinator.active_work_size > 0) ? 
-                             g_simple_coordinator.numa_work_buffers[numa_node] : NULL,
-                    .threadpool = g_simple_coordinator.numa_threadpools[numa_node]
-                };
-                
-                NUMA_LOG_DEBUG("Execution: numa_node=%d, ith=%d, nth=%d, data_parallel=%s", 
-                              numa_node, ith, n_threads, is_data_parallel ? "true" : "false");
-                
-                enum ggml_status thread_result = g_simple_coordinator.active_work_function(
-                    g_simple_coordinator.active_work_context, &thread_params);
-                    
-                if (thread_result != GGML_STATUS_SUCCESS) {
-                    result = thread_result;
-                    break;
-                }
-            }
+            // The threads in the threadpool are already running in parallel
+            // We just need to call our work function as if it were from the threadpool
+            // Each thread will handle its own ith/nth automatically through the kernel's data slicing
+            
+            // Simple single call - the kernel handles thread distribution internally
+            struct ggml_compute_params params = {
+                .ith = 0,  // Start with thread 0, kernel will handle all threads
+                .nth = n_threads,
+                .wsize = g_simple_coordinator.active_work_size,
+                .wdata = (g_simple_coordinator.active_work_size > 0) ? 
+                         g_simple_coordinator.numa_work_buffers[numa_node] : NULL,
+                .threadpool = g_simple_coordinator.numa_threadpools[numa_node]
+            };
+            
+            NUMA_LOG_DEBUG("Calling work function for all %d threads on NUMA node %d", n_threads, numa_node);
+            
+            // Single call to work function - it should handle all thread coordination internally
+            result = g_simple_coordinator.active_work_function(
+                g_simple_coordinator.active_work_context, 
+                &params
+            );
+            
+            NUMA_LOG_DEBUG("NUMA Node %d work function completed with status %d", numa_node, result);
             
             NUMA_LOG_DEBUG("NUMA Node %d: Multi-threaded execution completed with status %d", numa_node, result);
                 
@@ -1254,6 +1256,14 @@ enum ggml_status ggml_numa_simple_coordinator_execute_single_node(
     // Allocate NUMA-local work buffers if needed
     // work_size is per-thread, so multiply by number of threads for total allocation
     int n_threads = g_simple_coordinator.threads_per_node[target_node];
+    
+    // Apply thread constraint if set
+    int runtime_constraint = g_simple_coordinator.thread_constraint;
+    if (runtime_constraint > 0 && runtime_constraint < n_threads) {
+        n_threads = runtime_constraint;
+        NUMA_LOG_DEBUG("Single-node thread constraint: limited to %d threads (was %d)", runtime_constraint, g_simple_coordinator.threads_per_node[target_node]);
+    }
+    
     size_t total_work_size = work_size * n_threads;
     if (total_work_size > 0 && !allocate_numa_work_buffers(total_work_size)) {
         NUMA_LOG_DEBUG("ERROR: Failed to allocate NUMA work buffers\n");

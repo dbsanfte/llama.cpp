@@ -1,6 +1,6 @@
 #include "ggml.h"
 #include "ggml-cpu.h"
-#include "ggml-numa-simple-coordinator.h"
+#include "ggml-numa-openmp-coordinator.h"
 #include "upi-traffic-monitor.h"
 #include <vector>
 #include <chrono>
