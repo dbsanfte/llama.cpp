@@ -1,16 +1,15 @@
 /**
  * @file numa-kernels.c
- * @brief NUMA Kernel Registry Implementation - Direct Array System
+ * @brief NUMA Kernel Registry 
  * 
  * This module provides ultra-fast kernel lookups through direct array access.
- * No hash functions, no collisions, no complexity - just pure performance.
  * 
  * Architecture:
  * 1. Array 1: g_kernel_cache[GGML_OP_COUNT] - Main storage (sparse, most NULL)
  * 2. Array 2: g_kernel_lookup[GGML_OP_COUNT] - Fast pointers (inference hot path)
  * 3. Kernel registration at startup populates both arrays
  * 4. Inference: Single memory access lookup_table[op_type]
- * 5. Performance: ~2-3 CPU cycles vs ~5-8 for hash table
+ * 5. Performance: ~2-3 CPU cycles 
  */
 
 #include "numa-kernels.h"

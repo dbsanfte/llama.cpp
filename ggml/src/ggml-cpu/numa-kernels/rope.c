@@ -42,7 +42,7 @@
 #include "rope.h"
 #include "numa-kernels.h"
 #include "../ggml-numa-shared.h"
-#include "../ggml-numa-simple-coordinator.h"
+#include "../ggml-numa-openmp-coordinator.h"
 #include "../ggml-cpu-impl.h"
 #include "../ggml-impl.h"
 

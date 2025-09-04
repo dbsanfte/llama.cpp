@@ -1,15 +1,15 @@
 /*
- * NUMA Kernel Registry - O(1) Hash Table Strategy Selection
+ * NUMA Kernel Registry - O(1) Array-Based Strategy Selection
  * 
  * This module provides a centralized registry for all NUMA kernels with
- * ultra-fast O(1) hash table strategy selection. Kernels provide simple
- * threshold arrays at registration time for optimal performance.
+ * ultra-fast O(1) strategy selection using direct array access.
+ * Kernels provide simple threshold arrays at registration time for optimal performance.
  */
 
 #pragma once
 
 #include "ggml.h"
-#include "ggml-numa-shared.h"  // For execution strategy types and hash table utilities
+#include "ggml-numa-shared.h"  // For execution strategy types and utilities
 
 #ifdef __cplusplus
 extern "C" {
@@ -19,10 +19,10 @@ extern "C" {
 struct ggml_cplan;
 
 /**
- * NUMA Strategy Cache Manager - O(1) Hash Table System
- * 
+ * NUMA Strategy Array Manager - O(1) Array-Based Selection
+ *
  * Each kernel registers simple threshold arrays and function pointers.
- * The cache manager builds hash tables at startup for O(1) lookups.
+ * The array manager builds sparse arrays at startup for O(1) direct access lookups.
  */
 
 // Forward declaration for query result type  
@@ -46,7 +46,7 @@ typedef ggml_numa_kernel_query_result_t (*ggml_numa_kernel_query_fn_t)(const str
 typedef size_t (*ggml_numa_kernel_work_buffer_calc_fn_t)(const struct ggml_tensor * tensor, int total_numa_nodes, int total_threads);
 
 /**
- * Kernel cache entry for O(1) kernel lookup and dispatch
+ * Kernel array entry for O(1) kernel lookup and dispatch
  * Contains direct function pointers for maximum performance
  */
 typedef struct ggml_numa_kernel_cache_entry {
@@ -68,17 +68,17 @@ typedef struct ggml_numa_kernel_cache_entry {
 } ggml_numa_kernel_cache_entry_t;
 
 /**
- * Global kernel cache with direct array access - NO HASH TABLE!
+ * Global kernel array with direct access - NO HASH COMPUTATION!
  * 
  * Two-array system for maximum performance:
- * 1. g_kernel_cache[GGML_OP_COUNT]: Main storage (sparse array, most entries NULL)
- * 2. g_kernel_lookup[GGML_OP_COUNT]: Fast lookup pointers (what we query in hot path)
+ * 1. cache_storage[GGML_OP_COUNT]: Main storage (sparse array, most entries NULL)
+ * 2. lookup_table[GGML_OP_COUNT]: Fast lookup pointers (what we query in hot path)
  * 
- * Usage: result = g_kernel_lookup[op_type]; if (!result) fallback();
+ * Usage: result = lookup_table[op_type]; if (!result) fallback();
  * Performance: Single memory access + NULL check = ~2-3 CPU cycles
  */
 typedef struct {
-    ggml_numa_kernel_cache_entry_t cache_storage[GGML_OP_COUNT];        // Array 1: Main cache storage
+    ggml_numa_kernel_cache_entry_t cache_storage[GGML_OP_COUNT];        // Array 1: Main array storage
     ggml_numa_kernel_cache_entry_t* lookup_table[GGML_OP_COUNT];        // Array 2: Fast lookup pointers
     bool cache_initialized;                                             // Initialization flag  
     size_t num_registered_ops;                                         // Count of registered operations
@@ -99,7 +99,7 @@ enum ggml_status ggml_numa_register_kernel_strategy(
     bool is_noop);
 
 /**
- * Initialize the global kernel array cache (called once at startup)
+ * Initialize the global kernel array system (called once at startup)
  */
 enum ggml_status ggml_numa_init_kernel_array_cache(void);
 
@@ -213,7 +213,7 @@ void ggml_numa_kernels_cleanup(void);
  * - How much compute buffer each thread needs
  * - Which work function the coordinator should execute
  * 
- * IMPROVED: Now uses kernel-specific O(1) hash table lookups for optimal performance.
+ * IMPROVED: Now uses direct array access for optimal performance.
  * 
  * @param tensor The tensor operation to query about
  * @return Query result with all execution information
@@ -224,7 +224,7 @@ ggml_numa_kernel_query_result_t ggml_numa_kernels_query(const struct ggml_tensor
  * Fast strategy lookup for a tensor operation (simplified interface)
  * 
  * @param tensor The tensor operation to query about
- * @return Execution strategy result with O(1) threshold lookup
+ * @return Execution strategy result with O(1) array lookup
  */
 ggml_numa_kernel_query_result_t ggml_numa_kernels_strategy_lookup(const struct ggml_tensor * tensor);
 
@@ -294,13 +294,13 @@ bool ggml_numa_apply_kernel_force_strategy(ggml_numa_kernel_query_result_t * res
 } while(0)
 
 /**
- * NUMA_SELECT_STRATEGY_FROM_CACHE - Macro for unified cache-based strategy selection
+ * NUMA_SELECT_STRATEGY_FROM_CACHE - Macro for unified array-based strategy selection
  * 
  * This macro implements the standard three-tier strategy selection pattern used by kernels.
- * It encapsulates the threshold comparison logic using registered cache entry thresholds.
+ * It encapsulates the threshold comparison logic using registered array entry thresholds.
  * Eliminates code duplication across kernel query functions.
  * 
- * @param cache_entry - Pointer to the cached kernel registration info
+ * @param cache_entry - Pointer to the array-stored kernel registration info
  * @param total_elements - Number of elements in the tensor
  * @param selected_strategy - [OUT] Variable to store the selected strategy
  * 
