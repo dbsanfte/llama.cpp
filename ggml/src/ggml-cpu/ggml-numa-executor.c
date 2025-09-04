@@ -560,6 +560,9 @@ enum ggml_status ggml_numa_executor_execute_tensor(struct ggml_tensor * tensor, 
         GGML_LOG_DEBUG("NUMA Executor: Dispatching %s for data-parallel execution across %d nodes\n", 
                        op_name, num_numa_nodes);
         
+        // Set thread constraint from compute plan to inform coordinator's fallback logic
+        ggml_numa_simple_coordinator_set_thread_constraint(cplan->n_threads);
+        
         // Track data-parallel execution for debugging
         test_track_data_parallel();
         
@@ -615,8 +618,16 @@ enum ggml_status ggml_numa_executor_execute_tensor(struct ggml_tensor * tensor, 
         GGML_LOG_DEBUG("NUMA Executor: Dispatching %s for single-node execution on node %d\n", 
                        ggml_op_name(tensor->op), target_node);
         
-        result = ggml_numa_simple_coordinator_execute_single_node(
-            query_result.work_function, tensor, target_node, query_result.work_buffer_size_per_thread);
+        // Choose between single-thread and multi-thread execution based on on_node_strategy
+        if (query_result.strategy.on_node_strategy == NUMA_ON_NODE_STRATEGY_SINGLE_THREAD) {
+            NUMA_LOG_DEBUG("DEBUG: NUMA Executor: Using single-thread execution\n");
+            result = ggml_numa_simple_coordinator_execute_single_thread(
+                query_result.work_function, tensor, target_node, query_result.work_buffer_size_per_thread);
+        } else {
+            NUMA_LOG_DEBUG("DEBUG: NUMA Executor: Using multi-thread execution\n");
+            result = ggml_numa_simple_coordinator_execute_single_node(
+                query_result.work_function, tensor, target_node, query_result.work_buffer_size_per_thread);
+        }
         
         NUMA_LOG_DEBUG("DEBUG: NUMA Executor: Single-node execution result=%d\n", result);
         NUMA_PERF_END();

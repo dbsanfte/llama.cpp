@@ -79,17 +79,19 @@ grep -r "GGML_OP_YOUR_OPERATION" ggml/src/ggml-cpu/
 
 **⚠️ Critical:** Extract pure mathematical kernels - avoid ggml threading logic that conflicts with NUMA coordinator!
 
-**Operation suitability:**
-- ✅ **Excellent**: Element-wise ops (ADD, MUL, GLU) - independent computations, linear memory access
+**Operation Characteristics:**
+- ✅ **Straightforward**: Element-wise ops (ADD, MUL, GLU) - independent computations, linear memory access
 - ⚠️ **Complex**: Matrix ops (MUL_MAT), reductions (RMS_NORM) - need specialized splitting
-- 🔧 **View Operations**: RESHAPE, PERMUTE - metadata-only, minimal computation
-- ❌ **Poor**: Global synchronization, complex dependencies
+- 🔧 **View Operations**: RESHAPE, PERMUTE - metadata-only, minimal/no computation (no-op)
 
 **🚀 SIMD Optimization Requirements:**
 - **Always use SIMD**: Replace scalar operations with `ggml_vec_*` functions from `ggml/src/ggml-cpu/vec.h`
 - **Common SIMD functions**: `ggml_vec_add_f32()`, `ggml_vec_dot_f32()`, `ggml_vec_scale_f32()`, `ggml_vec_cpy_f32()`
 - **Performance impact**: SIMD provides significant speedup on modern CPUs with AVX2/AVX512 support
 - **Mathematical equivalence**: SIMD operations must produce identical results to scalar reference
+
+**⚠️ Quantisation Type Support:** 
+Ensure all tensor quant types supported by the underlying reference kernel are also supported in the NUMA kernel (F32, F16, Q8_0, Q4_0, Q5_0, etc). We must support everything in the NUMA kernel that the underlying reference kernel supports, because our goal is to replace it!
 
 ### Step 2: Template Selection & Implementation
 

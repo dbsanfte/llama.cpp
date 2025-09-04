@@ -63,6 +63,31 @@ bool ggml_numa_simple_coordinator_init(struct ggml_threadpool_params * tpp);
 void ggml_numa_simple_coordinator_cleanup(void);
 
 /**
+ * @brief Execute work function with single thread on single NUMA node
+ * 
+ * Executes a NUMA kernel function using only a single thread on the specified
+ * target node. This provides the most lightweight execution path for small
+ * operations or debugging scenarios.
+ * 
+ * Single-thread features:
+ * - Minimal coordination overhead
+ * - Direct execution without thread distribution
+ * - Thread binding to target NUMA node
+ * - Memory allocation on target node
+ * 
+ * @param work_function The NUMA kernel function to execute
+ * @param work_context Context (typically tensor) for the work
+ * @param target_node Target NUMA node (0-based index)
+ * @param work_size Size of work buffer required (0 if none needed)
+ * @return GGML_STATUS_SUCCESS on success, error code on failure
+ */
+enum ggml_status ggml_numa_simple_coordinator_execute_single_thread(
+    ggml_numa_work_function_t work_function,
+    void * work_context,
+    int target_node,
+    size_t work_size);
+
+/**
  * @brief Execute work function on single NUMA node
  * 
  * Executes a NUMA kernel function on a specific target node using that
@@ -243,6 +268,32 @@ void ggml_numa_simple_coordinator_assert_thread_binding(int expected_node, const
  * ```
  */
 extern __thread bool ggml_numa_is_data_parallel_execution;
+
+/**
+ * @brief Set runtime thread constraint for coordinator operations
+ * 
+ * Sets a runtime constraint on the total number of threads that the coordinator
+ * should use for the next operation. This allows the test framework or other
+ * callers to override the coordinator's default thread allocation.
+ * 
+ * Thread constraint behavior:
+ * - When set to > 0, the coordinator will respect this limit
+ * - When set to 0 or not set, coordinator uses its own thread allocation
+ * - Automatically cleared after each operation
+ * - Used for fallback decisions in data-parallel execution
+ * 
+ * @param max_threads Maximum number of threads to use (0 = no constraint)
+ */
+void ggml_numa_simple_coordinator_set_thread_constraint(int max_threads);
+
+/**
+ * @brief Get current runtime thread constraint
+ * 
+ * Returns the currently set thread constraint for coordinator operations.
+ * 
+ * @return Current thread constraint (0 = no constraint)
+ */
+int ggml_numa_simple_coordinator_get_thread_constraint(void);
 
 /**
  * @brief Thread-local pointer to shared result tensor data for data-parallel operations

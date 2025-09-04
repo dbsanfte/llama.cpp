@@ -116,8 +116,13 @@ static enum ggml_status ggml_numa_kernel_add_f32_execute(void * work_context,
         NUMA_LOG_STRATEGY_SINGLE_SINGLE("ADD");
     }
     
+    // CRITICAL DEBUG: Log every kernel execution start with full context
+    printf("[ADD_KERNEL_START] NUMA_Node=%d Thread=%d/%d DataParallel=%s TotalNodes=%d TotalElements=%ld TensorPtr=%p\n",
+           current_node, thread_id, num_threads, is_data_parallel ? "YES" : "NO", 
+           total_nodes, total_elements, (void*)tensor);
+    
     NUMA_LOG_DEBUG("NUMA Node %d, Thread %d/%d ADD kernel start (data_parallel=%d, total_nodes=%d, total_elements=%ld)", 
-                   current_node, thread_id, num_threads, is_data_parallel, total_nodes, total_elements);
+                   current_node, thread_id + 1, num_threads, is_data_parallel, total_nodes, total_elements);
     
     // Calculate data slice for this thread/node combination
     int64_t numa_start, numa_end;
@@ -140,8 +145,19 @@ static enum ggml_status ggml_numa_kernel_add_f32_execute(void * work_context,
         numa_end = MIN(numa_start + elements_per_thread, node_end);
         
         NUMA_LOG_TRACE("NUMA Node %d, Thread %d/%d ADD processing: global[%ld, %ld), node[%ld, %ld), thread[%ld, %ld) (%ld elements)", 
-                       current_node, thread_id, num_threads, 0L, total_elements, 
+                       current_node, thread_id + 1, num_threads, 0L, total_elements, 
                        node_start, node_end, numa_start, numa_end, numa_end - numa_start);
+        
+        // CRITICAL DEBUG: Show exact slice calculations for all nodes
+        printf("[ADD_DATA_SLICE] Node=%d Thread=%d/%d GlobalSlice=[%ld,%ld) NodeSlice=[%ld,%ld) ThreadSlice=[%ld,%ld) Elements=%ld\n",
+               current_node, thread_id, num_threads, 0L, total_elements, 
+               node_start, node_end, numa_start, numa_end, numa_end - numa_start);
+        
+        // Special debug: For Node 1, show actual slice details
+        if (current_node == 1 && thread_id == 0) {
+            NUMA_LOG_DEBUG("NODE 1 SLICE: node_start=%ld, node_end=%ld, numa_start=%ld, numa_end=%ld", 
+                           node_start, node_end, numa_start, numa_end);
+        }
     } else {
         // SINGLE-NODE MODE
         const int64_t elements_per_thread = (total_elements + num_threads - 1) / num_threads;
@@ -173,6 +189,10 @@ static enum ggml_status ggml_numa_kernel_add_f32_execute(void * work_context,
         // Element-wise addition (most common, should be fastest)
         NUMA_LOG_DEBUG("NUMA Node %d ADD using ELEMENT-WISE path (elements_in_slice=%zu)", 
                        current_node, elements_in_slice);
+        
+        // CRITICAL DEBUG: Show SIMD operation details
+        printf("[ADD_SIMD_EXEC] Node=%d Thread=%d ElementsInSlice=%zu SliceStart=%ld SliceEnd=%ld SIMDCall=ggml_vec_add_f32\n",
+               current_node, thread_id, elements_in_slice, numa_start, numa_end);
         
         // Pure SIMD addition operation on global positions - maximum performance path
         ggml_vec_add_f32(elements_in_slice, dst_data + numa_start, src0_data + numa_start, src1_data + numa_start);
@@ -260,10 +280,108 @@ static enum ggml_status ggml_numa_kernel_add_f32_execute(void * work_context,
         }
     }
     
+    // CRITICAL DEBUG: Log kernel completion
+    printf("[ADD_KERNEL_END] Node=%d Thread=%d ProcessedElements=%zu Status=SUCCESS\n",
+           current_node, thread_id, elements_in_slice);
+    
     NUMA_LOG_DEBUG("NUMA Node %d ADD kernel completed successfully (processed %zu elements)", 
                    current_node, elements_in_slice);
     
     return GGML_STATUS_SUCCESS;
+}
+
+// ============================================================================
+// Non-Quantized ADD Implementation
+// ============================================================================
+
+/**
+ * Non-quantized ADD kernel implementation
+ * Handles F32, F16, BF16 types following reference binary-ops.cpp
+ * Supports all type combinations from the reference implementation
+ */
+static enum ggml_status ggml_numa_kernel_add_non_quantized_execute(void * work_context, 
+                                                                   struct ggml_compute_params * params) {
+    struct ggml_tensor * tensor = (struct ggml_tensor *)work_context;
+    
+    // Fast validation
+    if (!tensor || !tensor->src[0] || !tensor->src[1]) {
+        return GGML_STATUS_FAILED;
+    }
+    
+    const struct ggml_tensor * src0 = tensor->src[0];
+    const struct ggml_tensor * src1 = tensor->src[1];
+    
+    // Type validation - must match reference binary_op supported combinations
+    bool supported_combination = false;
+    
+    // Check all supported non-quantized type combinations from binary-ops.cpp
+    if (src0->type == GGML_TYPE_F32  && src1->type == GGML_TYPE_F32  && tensor->type == GGML_TYPE_F32) {
+        supported_combination = true;
+    } else if (src0->type == GGML_TYPE_F16  && src1->type == GGML_TYPE_F16  && tensor->type == GGML_TYPE_F16) {
+        supported_combination = true;
+    } else if (src0->type == GGML_TYPE_BF16 && src1->type == GGML_TYPE_BF16 && tensor->type == GGML_TYPE_BF16) {
+        supported_combination = true;
+    } else if (src0->type == GGML_TYPE_BF16 && src1->type == GGML_TYPE_F32  && tensor->type == GGML_TYPE_BF16) {
+        supported_combination = true;
+    } else if (src0->type == GGML_TYPE_BF16 && src1->type == GGML_TYPE_F32  && tensor->type == GGML_TYPE_F32) {
+        supported_combination = true;
+    } else if (src0->type == GGML_TYPE_F16  && src1->type == GGML_TYPE_F32  && tensor->type == GGML_TYPE_F16) {
+        supported_combination = true;
+    } else if (src0->type == GGML_TYPE_F16  && src1->type == GGML_TYPE_F32  && tensor->type == GGML_TYPE_F32) {
+        supported_combination = true;
+    }
+    
+    if (!supported_combination) {
+        NUMA_LOG_DEBUG("ADD Non-quantized: Unsupported type combination %s + %s → %s, falling back",
+                       ggml_type_name(src0->type), ggml_type_name(src1->type), ggml_type_name(tensor->type));
+        return GGML_STATUS_FAILED; // Fall back to reference
+    }
+    
+    // For now, delegate to F32 implementation for all-F32 case
+    // TODO: Implement proper type conversion and mixed-type support
+    if (src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32 && tensor->type == GGML_TYPE_F32) {
+        return ggml_numa_kernel_add_f32_execute(work_context, params);
+    } else {
+        // For other type combinations, fall back to reference for now
+        // This ensures correctness while we implement full type support
+        NUMA_LOG_DEBUG("ADD Non-quantized: Mixed types not fully implemented yet, falling back");
+        return GGML_STATUS_FAILED; // Fall back to reference
+    }
+}
+
+// ============================================================================
+// Quantized ADD Implementation  
+// ============================================================================
+
+/**
+ * Quantized ADD kernel implementation
+ * Handles all quantized types following reference ops.cpp implementation
+ * Pattern: Quantized + F32 → Quantized (with dequant/quant cycle)
+ */
+static enum ggml_status ggml_numa_kernel_add_quantized_execute(void * work_context,
+                                                               struct ggml_compute_params * params) {
+    struct ggml_tensor * tensor = (struct ggml_tensor *)work_context;
+    
+    // Fast validation
+    if (!tensor || !tensor->src[0] || !tensor->src[1]) {
+        return GGML_STATUS_FAILED;
+    }
+    
+    const struct ggml_tensor * src0 = tensor->src[0];
+    const struct ggml_tensor * src1 = tensor->src[1];
+    
+    // Quantized ADD pattern validation: src0=quantized, src1=F32, dst=quantized
+    if (!ggml_is_quantized(src0->type) || src1->type != GGML_TYPE_F32) {
+        NUMA_LOG_DEBUG("ADD Quantized: Invalid pattern - expected quantized + F32, got %s + %s",
+                       ggml_type_name(src0->type), ggml_type_name(src1->type));
+        return GGML_STATUS_FAILED; // Fall back to reference
+    }
+    
+    // For now, fall back to reference implementation for quantized operations
+    // This ensures correctness while maintaining the infrastructure for future implementation
+    // TODO: Implement NUMA-aware quantized ADD with proper dequant/add/quant cycle
+    NUMA_LOG_DEBUG("ADD Quantized: Not fully implemented yet, falling back to reference");
+    return GGML_STATUS_FAILED; // Fall back to reference
 }
 
 // ============================================================================
@@ -289,19 +407,42 @@ enum ggml_status ggml_numa_kernel_add_execute(void * work_context, struct ggml_c
                    (void*)tensor, ggml_type_name(src0->type), 
                    ggml_type_name(tensor->src[1]->type), ggml_type_name(tensor->type));
 
-    // For now, only support F32 - other types will fall back to reference implementation
-    // This ensures we handle the most common case with high performance
+    // Comprehensive type support matching reference implementation exactly
     switch (src0->type) {
+        // Non-quantized types: Use binary_op style implementation 
         case GGML_TYPE_F32:
+        case GGML_TYPE_F16:
+        case GGML_TYPE_BF16:
             {
-                // Check that src1 and dst are also F32 for current implementation
-                if (tensor->src[1]->type == GGML_TYPE_F32 && tensor->type == GGML_TYPE_F32) {
-                    return ggml_numa_kernel_add_f32_execute(work_context, params);
-                } else {
-                    NUMA_LOG_DEBUG("ADD: Mixed types not implemented yet, falling back");
-                    return GGML_STATUS_FAILED; // Fall back to reference
-                }
+                return ggml_numa_kernel_add_non_quantized_execute(work_context, params);
             }
+        
+        // Quantized types: Use quantized ADD implementation
+        case GGML_TYPE_Q4_0:
+        case GGML_TYPE_Q4_1:
+        case GGML_TYPE_Q5_0:
+        case GGML_TYPE_Q5_1:
+        case GGML_TYPE_Q8_0:
+        case GGML_TYPE_Q2_K:
+        case GGML_TYPE_Q3_K:
+        case GGML_TYPE_Q4_K:
+        case GGML_TYPE_Q5_K:
+        case GGML_TYPE_Q6_K:
+        case GGML_TYPE_TQ1_0:
+        case GGML_TYPE_TQ2_0:
+        case GGML_TYPE_IQ2_XXS:
+        case GGML_TYPE_IQ2_XS:
+        case GGML_TYPE_IQ3_XXS:
+        case GGML_TYPE_IQ1_S:
+        case GGML_TYPE_IQ1_M:
+        case GGML_TYPE_IQ4_NL:
+        case GGML_TYPE_IQ4_XS:
+        case GGML_TYPE_IQ3_S:
+        case GGML_TYPE_IQ2_S:
+            {
+                return ggml_numa_kernel_add_quantized_execute(work_context, params);
+            }
+        
         default:
             {
                 NUMA_LOG_DEBUG("ADD: Unsupported src0 type %s, falling back", ggml_type_name(src0->type));

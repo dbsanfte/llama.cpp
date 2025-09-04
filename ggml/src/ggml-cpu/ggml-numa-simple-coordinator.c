@@ -386,14 +386,24 @@ struct ggml_numa_simple_coordinator {
     size_t active_work_size;
     _Atomic bool work_completion_status[GGML_NUMA_MAX_NODES];
     
+    /** @brief Results from dispatch thread execution */
+    enum ggml_status dispatch_results[GGML_NUMA_MAX_NODES];
+    
     // Shared result tensor data pointer for data-parallel operations
     void * shared_result_tensor_data;
+    
+    // Execution mode information for dispatch threads
+    bool is_data_parallel_execution;
+    int total_nodes_for_data_parallel;
     
     // NUMA-aware work buffers - one per node
     void * numa_work_buffers[GGML_NUMA_MAX_NODES];
     size_t numa_work_buffer_sizes[GGML_NUMA_MAX_NODES];
     void * fallback_work_buffer;
     size_t fallback_work_buffer_size;
+    
+    // Runtime thread constraint for overriding default allocation
+    int thread_constraint;  /**< Maximum threads to use (0 = no constraint) */
 };
 
 static struct ggml_numa_simple_coordinator g_simple_coordinator = {0};
@@ -474,122 +484,78 @@ static void* numa_dispatch_worker(void* arg) {
                 .threadpool = g_simple_coordinator.numa_threadpools[numa_node]
             };
             
-            // Execute the work function using proper threadpool instead of direct execution
+            // Execute the work function using threadpool
             // CRITICAL: Set thread-local NUMA node for tensor_data() access
             extern __thread int ggml_current_numa_node;
             ggml_current_numa_node = numa_node;
             NUMA_LOG_DEBUG("Set ggml_current_numa_node=%d before calling work function on node %d", 
                    ggml_current_numa_node, numa_node);
             
-            // CRITICAL: Set data-parallel execution flag for kernel to enable proper data slicing
+            // CRITICAL: Use global execution mode to eliminate race condition
+            // Instead of detecting mode dynamically, use the mode set by coordinator
+            bool is_data_parallel = g_simple_coordinator.is_data_parallel_execution;
+            int total_nodes = g_simple_coordinator.total_nodes_for_data_parallel;
+            
+            // CRITICAL: Set execution context based on global mode (no race condition)
             extern __thread bool ggml_numa_is_data_parallel_execution;
             extern __thread int ggml_numa_total_nodes_for_data_parallel;
             extern __thread void * ggml_numa_shared_result_tensor_data;
-            ggml_numa_is_data_parallel_execution = true;
-            ggml_numa_total_nodes_for_data_parallel = g_simple_coordinator.num_numa_nodes; // Pass total nodes
-            ggml_numa_shared_result_tensor_data = g_simple_coordinator.shared_result_tensor_data; // Pass shared tensor data
             
-            // Execute work using threadpool to utilize ALL threads per NUMA node
-            enum ggml_status result = GGML_STATUS_SUCCESS;
-            
-            NUMA_LOG_DEBUG("NUMA Node %d executing kernel via THREADPOOL with %d threads", 
-                          numa_node, g_simple_coordinator.threads_per_node[numa_node]);
-            
-            // For data-parallel execution, call the NUMA kernel directly to avoid
-            // race conditions from running ggml_graph_compute on multiple nodes simultaneously
-            struct ggml_tensor * tensor = (struct ggml_tensor *)g_simple_coordinator.active_work_context;
-            
-            if (tensor && ggml_numa_is_data_parallel_execution) {
-                // Direct NUMA kernel execution for data-parallel operations with threadpool support
-                NUMA_LOG_DEBUG("NUMA Node %d: Data-parallel kernel execution with %d threads", 
-                              numa_node, g_simple_coordinator.threads_per_node[numa_node]);
-                
-                // Create compute params for the kernel with full threadpool support
-                struct ggml_compute_params compute_params = {
-                    .ith = 0,  // Main thread index for this NUMA node
-                    .nth = g_simple_coordinator.threads_per_node[numa_node], // Use all threads per node!
-                    .wdata = work_params.wdata,
-                    .wsize = work_params.wsize,
-                    .threadpool = g_simple_coordinator.numa_threadpools[numa_node] // Provide threadpool for parallelization
-                };
-                
-                NUMA_LOG_DEBUG("NUMA Node %d: Calling kernel with %d threads and threadpool support", 
-                              numa_node, compute_params.nth);
-                
-                // Call the NUMA work function directly with threadpool support
-                result = g_simple_coordinator.active_work_function(
-                    g_simple_coordinator.active_work_context, 
-                    &compute_params
-                );
-                
-                NUMA_LOG_DEBUG("NUMA Node %d: Data-parallel kernel execution completed with status %d", numa_node, result);
-                
-            } else if (tensor) {
-                // Use threadpool execution for single-node operations
-                // Create a single-node computation graph for this work
-                struct ggml_context * temp_ctx = NULL;
-                struct ggml_cgraph * temp_graph = NULL;
-                
-                // Create temporary context for graph execution
-                // Need sufficient space for graph metadata + nodes + hash tables
-                // Default graph size (2048) needs ~80KB + overhead = 128KB for safety
-                struct ggml_init_params init_params = {
-                    .mem_size = 128 * 1024,  // 128KB buffer for graph metadata and nodes
-                    .mem_buffer = NULL,
-                    .no_alloc = true   // Don't allocate tensor data
-                };
-                temp_ctx = ggml_init(init_params);
-                
-                if (temp_ctx) {
-                    // Create computation graph with the tensor
-                    temp_graph = ggml_new_graph(temp_ctx);
-                    ggml_build_forward_expand(temp_graph, tensor);
-                    
-                    // Execute graph using threadpool - THIS USES ALL THREADS!
-                    struct ggml_cplan cplan = ggml_graph_plan(temp_graph, 
-                                                             g_simple_coordinator.threads_per_node[numa_node],
-                                                             g_simple_coordinator.numa_threadpools[numa_node]);
-                    cplan.work_data = work_params.wdata;
-                    
-                    NUMA_LOG_DEBUG("NUMA Node %d: Executing graph with %d threads (cplan.n_threads=%d)", 
-                                  numa_node, g_simple_coordinator.threads_per_node[numa_node], cplan.n_threads);
-                    
-                    result = ggml_graph_compute(temp_graph, &cplan);
-                    
-                    NUMA_LOG_DEBUG("NUMA Node %d: Graph execution completed with status %d", numa_node, result);
-                } else {
-                    NUMA_LOG_DEBUG("NUMA Node %d: Failed to create temporary context, falling back to direct execution", numa_node);
-                    // Fallback to direct execution if graph creation fails
-                    result = g_simple_coordinator.active_work_function(
-                        g_simple_coordinator.active_work_context, 
-                        &work_params
-                    );
-                }
-                
-                // Clean up temporary context
-                if (temp_ctx) {
-                    ggml_free(temp_ctx);
-                }
+            if (is_data_parallel) {
+                // Data-parallel mode: multiple nodes working on different parts
+                ggml_numa_is_data_parallel_execution = true;
+                ggml_numa_total_nodes_for_data_parallel = total_nodes;
+                ggml_numa_shared_result_tensor_data = g_simple_coordinator.shared_result_tensor_data;
+                NUMA_LOG_DEBUG("NUMA Node %d: Data-parallel execution mode with %d total nodes", numa_node, total_nodes);
             } else {
-                NUMA_LOG_DEBUG("NUMA Node %d: No tensor context, falling back to direct function call", numa_node);
-                // Fallback for non-tensor operations
-                result = g_simple_coordinator.active_work_function(
-                    g_simple_coordinator.active_work_context, 
-                    &work_params
-                );
+                // Single-node mode (either single-thread or multi-thread on one node)
+                ggml_numa_is_data_parallel_execution = false;
+                ggml_numa_total_nodes_for_data_parallel = 1;
+                ggml_numa_shared_result_tensor_data = NULL;
+                NUMA_LOG_DEBUG("NUMA Node %d: Single-node execution mode", numa_node);
             }
             
-            NUMA_LOG_DEBUG("NUMA Node %d completed work execution", numa_node);
+            // Use normal threading per node (not forced single-thread)
+            int n_threads = g_simple_coordinator.threads_per_node[numa_node];
+            enum ggml_status result = GGML_STATUS_SUCCESS;
             
+            NUMA_LOG_DEBUG("NUMA Node %d executing kernel with %d threads (data_parallel=%s)", 
+                          numa_node, n_threads, is_data_parallel ? "true" : "false");
+            
+            for (int ith = 0; ith < n_threads; ith++) {
+                struct ggml_compute_params thread_params = {
+                    .ith = ith,                   // Thread-wise ith: 0 to n_threads-1
+                    .nth = n_threads,             // Thread-wise nth: n_threads
+                    .wsize = g_simple_coordinator.active_work_size,
+                    .wdata = (g_simple_coordinator.active_work_size > 0) ? 
+                             g_simple_coordinator.numa_work_buffers[numa_node] : NULL,
+                    .threadpool = g_simple_coordinator.numa_threadpools[numa_node]
+                };
+                
+                NUMA_LOG_DEBUG("Execution: numa_node=%d, ith=%d, nth=%d, data_parallel=%s", 
+                              numa_node, ith, n_threads, is_data_parallel ? "true" : "false");
+                
+                enum ggml_status thread_result = g_simple_coordinator.active_work_function(
+                    g_simple_coordinator.active_work_context, &thread_params);
+                    
+                if (thread_result != GGML_STATUS_SUCCESS) {
+                    result = thread_result;
+                    break;
+                }
+            }
+            
+            NUMA_LOG_DEBUG("NUMA Node %d: Multi-threaded execution completed with status %d", numa_node, result);
+                
             // Reset data-parallel flag after execution
             ggml_numa_is_data_parallel_execution = false;
             ggml_numa_total_nodes_for_data_parallel = 1;
             
             NUMA_TIMING_END(work_start_time, work_end_time, work_time_ms)
             
-            // Store completion status
+            // Store completion status and result
             atomic_store(&g_simple_coordinator.work_completion_status[numa_node], 
                         (result == GGML_STATUS_SUCCESS));
+            g_simple_coordinator.dispatch_results[numa_node] = result;
             atomic_store(&g_simple_coordinator.dispatch_work_available[numa_node], false);
             
             NUMA_LOG_DEBUG("Dispatch thread %d completed work with status %d (%.3fms)", numa_node, result, work_time_ms);
@@ -1185,6 +1151,64 @@ void ggml_numa_simple_coordinator_cleanup(void) {
     NUMA_PERF_END();
 }
 
+enum ggml_status ggml_numa_simple_coordinator_execute_single_thread(
+    ggml_numa_work_function_t work_function,
+    void * work_context,
+    int target_node,
+    size_t work_size) {
+    
+    if (!g_simple_coordinator.initialized) {
+        return GGML_STATUS_FAILED;
+    }
+
+    if (target_node < 0 || target_node >= g_simple_coordinator.num_numa_nodes) {
+        return GGML_STATUS_FAILED;
+    }
+
+    // Allocate NUMA-local work buffers if needed
+    if (work_size > 0 && !allocate_numa_work_buffers(work_size)) {
+        NUMA_LOG_DEBUG("ERROR: Failed to allocate NUMA work buffers\n");
+        return GGML_STATUS_FAILED;
+    }
+
+    NUMA_LOG_DEBUG("Coordinator Single-Thread: Using node %d, single thread execution", target_node);
+
+    // Use dispatch thread communication for single-thread execution
+    g_simple_coordinator.active_work_function = work_function;
+    g_simple_coordinator.active_work_context = work_context;
+    g_simple_coordinator.active_work_size = work_size;
+    g_simple_coordinator.shared_result_tensor_data = NULL;  // No shared memory for single-thread
+    
+    // CRITICAL: Set execution mode for single-thread execution
+    g_simple_coordinator.is_data_parallel_execution = false;
+    g_simple_coordinator.total_nodes_for_data_parallel = 1;
+    NUMA_LOG_DEBUG("Set global execution mode: data_parallel=false, total_nodes=1");
+    
+    // Signal target node only
+    for (int node = 0; node < g_simple_coordinator.num_numa_nodes; node++) {
+        atomic_store(&g_simple_coordinator.dispatch_work_available[node], (node == target_node));
+    }
+    
+    // Reset barrier for single node
+    pthread_barrier_init(&g_simple_coordinator.completion_barrier, NULL, 2);  // Main + 1 dispatch thread
+    
+    // Signal target dispatch thread
+    pthread_mutex_lock(&g_simple_coordinator.dispatch_mutex[target_node]);
+    pthread_cond_signal(&g_simple_coordinator.dispatch_cond[target_node]);
+    pthread_mutex_unlock(&g_simple_coordinator.dispatch_mutex[target_node]);
+    
+    // Wait for completion
+    pthread_barrier_wait(&g_simple_coordinator.completion_barrier);
+    
+    // Get result from dispatch thread
+    enum ggml_status result = g_simple_coordinator.dispatch_results[target_node];
+    
+    NUMA_LOG_DEBUG("Single-thread execution completed with status %d", result);
+    
+    return result;
+}
+
+
 /**
  * @brief Execute work function on single NUMA node
  * 
@@ -1232,41 +1256,43 @@ enum ggml_status ggml_numa_simple_coordinator_execute_single_node(
         return GGML_STATUS_FAILED;
     }
 
-    // Execute directly on target node's threadpool
-    struct ggml_threadpool * threadpool = g_simple_coordinator.numa_threadpools[target_node];
-    if (!threadpool) {
-        return GGML_STATUS_FAILED;
+    int n_threads = g_simple_coordinator.threads_per_node[target_node];
+    NUMA_LOG_DEBUG("Coordinator Single-Node: Using node %d with %d threads", target_node, n_threads);
+
+    // Use dispatch thread communication for single-node execution
+    g_simple_coordinator.active_work_function = work_function;
+    g_simple_coordinator.active_work_context = work_context;
+    g_simple_coordinator.active_work_size = work_size;
+    g_simple_coordinator.shared_result_tensor_data = NULL;  // No shared memory for single-node
+    
+    // CRITICAL: Set execution mode for single-node execution
+    g_simple_coordinator.is_data_parallel_execution = false;
+    g_simple_coordinator.total_nodes_for_data_parallel = 1;
+    NUMA_LOG_DEBUG("Set global execution mode: data_parallel=false, total_nodes=1");
+    
+    // Signal target node only  
+    for (int node = 0; node < g_simple_coordinator.num_numa_nodes; node++) {
+        atomic_store(&g_simple_coordinator.dispatch_work_available[node], (node == target_node));
     }
-
-    NUMA_LOG_DEBUG("Coordinator Single-Node: Using node %d threadpool=%p, threads=%d", 
-           target_node, threadpool, g_simple_coordinator.threads_per_node[target_node]);
-
-    // For single-node execution, we can execute directly without coordination overhead
-    // Create compute params with NUMA-local work buffer
-    struct ggml_compute_params params = {
-        .ith = 0,
-        .nth = 1,  // Single thread for simplicity
-        .wsize = work_size,
-        .wdata = (work_size > 0) ? g_simple_coordinator.numa_work_buffers[target_node] : NULL,
-        .threadpool = threadpool
-    };
     
-    // CRITICAL: Set thread-local NUMA node for tensor_data() access
-    extern __thread int ggml_current_numa_node;
-    ggml_current_numa_node = target_node;
-    NUMA_LOG_DEBUG("Single-node execution: Set ggml_current_numa_node=%d for target_node=%d", 
-           ggml_current_numa_node, target_node);
+    // Reset barrier for single node
+    pthread_barrier_init(&g_simple_coordinator.completion_barrier, NULL, 2);  // Main + 1 dispatch thread
     
-    enum ggml_status result = work_function(work_context, &params);
-    NUMA_PERF_END();
+    // Signal target dispatch thread
+    pthread_mutex_lock(&g_simple_coordinator.dispatch_mutex[target_node]);
+    pthread_cond_signal(&g_simple_coordinator.dispatch_cond[target_node]);
+    pthread_mutex_unlock(&g_simple_coordinator.dispatch_mutex[target_node]);
+    
+    // Wait for completion
+    pthread_barrier_wait(&g_simple_coordinator.completion_barrier);
+    
+    // Get result from dispatch thread
+    enum ggml_status result = g_simple_coordinator.dispatch_results[target_node];
+    
+    NUMA_LOG_DEBUG("Single-node execution completed with status %d", result);
+    
     return result;
 }
-
-// Execute work function across all NUMA nodes with data-parallel strategy using dispatch threads
-
-// Removed old async task functions - using dispatch architecture instead
-
-// Removed old async task functions - using dispatch architecture instead
 
 // Execute work function across all NUMA nodes with data-parallel strategy using dispatch threads
 enum ggml_status ggml_numa_simple_coordinator_execute_data_parallel(
@@ -1299,9 +1325,61 @@ enum ggml_status ggml_numa_simple_coordinator_execute_data_parallel(
     enum ggml_numa_strategy current_strategy = g_simple_coordinator.last_strategy;
     int actual_numa_nodes = (current_strategy == GGML_NUMA_STRATEGY_ISOLATE) ? 1 : g_simple_coordinator.num_numa_nodes;
     int num_nodes = actual_numa_nodes;
+    
+    // Check if we have sufficient threads for effective data-parallel execution
+    // Respect runtime thread constraint if set, otherwise use coordinator's thread allocation
+    int runtime_constraint = g_simple_coordinator.thread_constraint;
+    
+    int total_threads = 0;
+    int nodes_with_threads = 0;
+    for (int i = 0; i < num_nodes; i++) {
+        int node = (current_strategy == GGML_NUMA_STRATEGY_ISOLATE) ? ggml_numa_get_isolate_node() : i;
+        int node_threads = g_simple_coordinator.threads_per_node[node];
+        total_threads += node_threads;
+        if (node_threads > 0) {
+            nodes_with_threads++;
+        }
+    }
+    
+    // Apply runtime constraint if set
+    if (runtime_constraint > 0 && runtime_constraint < total_threads) {
+        total_threads = runtime_constraint;
+        NUMA_LOG_DEBUG("Applying runtime thread constraint: limited to %d threads (was %d)", runtime_constraint, total_threads);
+    }
+    
+    // Fallback conditions:
+    // 1. Only 1 thread total (can't effectively distribute work)
+    // 2. Only 1 node has threads (no actual data-parallel benefit)
+    // 3. Very few threads across multiple nodes (overhead > benefit)
+    // 4. Runtime constraint forces single-thread execution
+    if (total_threads <= 1 || nodes_with_threads <= 1 || (total_threads <= 2 && num_nodes > 1) || runtime_constraint == 1) {
+        NUMA_LOG_DEBUG("Data-parallel fallback: %d total threads (%d constraint) across %d nodes (%d active nodes), falling back to single-node execution", 
+                       total_threads, runtime_constraint, num_nodes, nodes_with_threads);
+        NUMA_PERF_END();
+        
+        // Clear thread constraint after use
+        g_simple_coordinator.thread_constraint = 0;
+        
+        // Find the node with the most threads and use single-node execution
+        int target_node = 0;
+        int max_threads = 0;
+        for (int i = 0; i < num_nodes; i++) {
+            int node = (current_strategy == GGML_NUMA_STRATEGY_ISOLATE) ? ggml_numa_get_isolate_node() : i;
+            if (g_simple_coordinator.threads_per_node[node] > max_threads) {
+                max_threads = g_simple_coordinator.threads_per_node[node];
+                target_node = node;
+            }
+        }
+        
+        return ggml_numa_simple_coordinator_execute_single_thread(work_function, work_context, target_node, work_size);
+    }
+    
+    // Clear thread constraint after evaluation
+    g_simple_coordinator.thread_constraint = 0;
+    
     NUMA_TIMING_START(coord_start_time)
     
-    NUMA_LOG_DEBUG("Starting TRUE async dispatch execution across %d nodes (optimal NUMA architecture!)", num_nodes);
+    NUMA_LOG_DEBUG("Starting TRUE async dispatch execution across %d nodes with %d total threads (optimal NUMA architecture!)", num_nodes, total_threads);
     
     // Set up work for dispatch threads
     g_simple_coordinator.active_work_function = work_function;
@@ -1324,6 +1402,12 @@ enum ggml_status ggml_numa_simple_coordinator_execute_data_parallel(
     } else {
         g_simple_coordinator.shared_result_tensor_data = NULL;
     }
+    
+    // CRITICAL: Set execution mode for all dispatch threads to eliminate race condition
+    // This ensures all NUMA nodes have consistent execution mode information
+    g_simple_coordinator.is_data_parallel_execution = true;
+    g_simple_coordinator.total_nodes_for_data_parallel = num_nodes;
+    NUMA_LOG_DEBUG("Set global execution mode: data_parallel=true, total_nodes=%d", num_nodes);
     
     // Signal all dispatch threads to start work IN PARALLEL
     int isolate_node = ggml_numa_get_isolate_node();
@@ -1528,4 +1612,14 @@ void ggml_numa_simple_coordinator_assert_thread_binding(int expected_node, const
     if (expected_node >= 0) {  // Only validate if expected_node is specified
         assert_numa_thread_binding_fatal(expected_node, thread_type, thread_id);
     }
+}
+
+// Thread constraint functions for runtime thread limiting
+void ggml_numa_simple_coordinator_set_thread_constraint(int max_threads) {
+    g_simple_coordinator.thread_constraint = max_threads;
+    NUMA_LOG_DEBUG("Set thread constraint to %d", max_threads);
+}
+
+int ggml_numa_simple_coordinator_get_thread_constraint(void) {
+    return g_simple_coordinator.thread_constraint;
 }
