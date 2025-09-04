@@ -409,7 +409,7 @@ enum ggml_status ggml_numa_kernel_mul_mat_execute(void * work_context,
                      current_node, src1->type, vec_dot_type, (src1->type != vec_dot_type) ? "YES" : "NO");
     
     NUMA_LOG_VERBOSE("MUL_MAT Node %d, Thread %d/%d: dims=[%ld,%ld,%ld,%ld] x [%ld,%ld,%ld,%ld] -> [%ld,%ld,%ld,%ld]", 
-                     current_node, thread_id, num_threads,
+                     current_node, thread_id + 1, num_threads,
                      ne00, ne01, ne02, ne03, ne10, ne11, ne12, ne13, ne0, ne1, ne2, ne3);
     
     // =============================================================================
@@ -852,8 +852,8 @@ ggml_numa_kernel_registration_info_t ggml_numa_kernel_mul_mat_register(void) {
     info.kernel_name = "NUMA MUL_MAT Kernel";
     
     // Strategy thresholds for MUL_MAT kernel 
-    info.strategy_array.thresholds[NUMA_STRATEGY_IDX_SINGLE_SINGLE] = 128;   // Single-thread threshold
-    info.strategy_array.thresholds[NUMA_STRATEGY_IDX_SINGLE_MULTI] = 1024;    // Multi-thread threshold
+    info.strategy_array.thresholds[NUMA_STRATEGY_IDX_SINGLE_SINGLE] = 9999999;   // Single-thread threshold
+    info.strategy_array.thresholds[NUMA_STRATEGY_IDX_SINGLE_MULTI] = 9999999; //TODO: remove    // Multi-thread threshold
     // Above this: data-parallel strategy
     info.strategy_array.valid = true;
     

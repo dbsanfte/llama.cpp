@@ -41,16 +41,18 @@ if (ggml_numa_is_data_parallel_execution) {
 
 // SIMD operation on NUMA slice
 ggml_vec_add_f32(numa_end - numa_start, dst + numa_start, src0 + numa_start, src1 + numa_start);
-```ory allocation on multi-socket systems:
+```
+
+This is a fork of llama.cpp with **NUMA-aware execution architecture** for optimal CPU inferencing in a NUMA environment featuring kernel-based work buffer allocation:
 
 - **NUMA Kernel Registry** - `ggml/src/ggml-cpu/numa-kernels/` - O(1) cache database with direct function pointer dispatch
-- **NUMA Executor** - `ggml/src/ggml-cpu/ggml-numa-executor.c` - Strategy engine and work orchestration
-- **NUMA Coordinator** - `ggml/src/ggml-cpu/ggml-numa-simple-coordinator.c` - Resource management and work distribution
+- **NUMA Executor** - `ggml/src/ggml-cpu/ggml-numa-executor.c` - Strategy engine and work orchestration (work buffer calculation moved to kernels)
+- **NUMA Coordinator** - `ggml/src/ggml-cpu/ggml-numa-simple-coordinator.c` - Resource management, work distribution, and kernel-based work buffer allocation
 - **Dev Container** - Ubuntu 24.04 with pre-installed dependencies
 
 **Goal**: Provide lightning-fast NUMA-aware execution for all operations through intelligent strategy selection and optimal resource utilization. 
 
-**Architecture Flow**: `Compute Graph → Executor → Kernel Registry Direct Dispatch → Coordinator Three-Strategy Dispatch → NUMA Threadpools`
+**Architecture Flow**: `Compute Graph → Executor → Kernel Registry Direct Dispatch → Coordinator Three-Strategy Dispatch → Kernel Work Buffer Allocation → NUMA Threadpools`
 
 ## 🏗️ Simplified Coordinator Architecture
 
@@ -106,7 +108,7 @@ if (ggml_numa_is_data_parallel_execution) {
 
 **Thread-Level Slicing** (within each NUMA node):
 ```c
-// Standard ggml threading within the NUMA slice
+// Standard threading within the NUMA slice
 int ith = params->ith;         // Thread index within this NUMA node
 int nth = params->nth;         // Total threads on this NUMA node
 
@@ -143,7 +145,7 @@ grep -r "GGML_OP_YOUR_OPERATION" ggml/src/ggml-cpu/
 
 **Target functions:** `ggml_compute_forward_your_operation()`, `ggml_compute_forward_your_operation_f32()`, etc.
 
-**⚠️ Critical:** Extract pure mathematical kernels - avoid ggml threading logic that conflicts with NUMA coordinator!
+**⚠️ Critical:** Extract pure mathematical kernels - avoid ggml threading logic that conflicts with NUMA coordinator! The NUMA coordinator does NOT use the ggml threading/threadpool scheme!!
 
 **Operation Characteristics:**
 - ✅ **Straightforward**: Element-wise ops (ADD, MUL, GLU) - independent computations, linear memory access
@@ -320,6 +322,9 @@ ggml_numa_kernel_registration_info_t ggml_numa_kernel_your_operation_register(vo
     // Query function pointer - enables direct dispatch without switch statements
     info.query_fn = (void*)ggml_numa_kernel_your_operation_query;
     
+    // Work buffer calculation function pointer - NEW ARCHITECTURE
+    info.work_buffer_calc_fn = (void*)ggml_numa_kernel_your_operation_work_buffer_calc;
+    
     // Most operations don't need aggregation functions
     info.agg_funcs.single_single_fn = NULL;
     info.agg_funcs.single_multi_fn = NULL; 
@@ -329,11 +334,22 @@ ggml_numa_kernel_registration_info_t ggml_numa_kernel_your_operation_register(vo
     return info;
 }
 
-// Step 2: Add function declarations to your kernel .h file (e.g., add.h, mul.h, etc.)
+// Step 2: Implement work buffer calculation function (if operation needs work buffers)
+size_t ggml_numa_kernel_your_operation_work_buffer_calc(const struct ggml_tensor * tensor, int total_numa_nodes, int total_threads) {
+    // Calculate per-thread work buffer size (e.g., cache, temporary arrays)
+    const size_t cache_line_size_f32 = 16;  // CACHE_LINE_SIZE_F32 approximation
+    const size_t per_thread_buffer = (tensor->ne[0] + cache_line_size_f32) * sizeof(float);
+    
+    // Return TOTAL work buffer size for ALL threads (coordinator will allocate this)
+    return per_thread_buffer * total_threads;
+}
+
+// Step 3: Add function declarations to your kernel .h file (e.g., add.h, mul.h, etc.)
 ggml_numa_kernel_registration_info_t ggml_numa_kernel_your_operation_register(void);
 ggml_numa_kernel_query_result_t ggml_numa_kernel_your_operation_query(const struct ggml_tensor * tensor);
+size_t ggml_numa_kernel_your_operation_work_buffer_calc(const struct ggml_tensor * tensor, int total_numa_nodes, int total_threads);
 
-// Step 3: Enable in numa-kernels.c using NUMA_REGISTER_KERNEL macro
+// Step 4: Enable in numa-kernels.c using NUMA_REGISTER_KERNEL macro
 void ggml_numa_kernels_init(void) {
     // ... other kernels ...
     
@@ -347,6 +363,30 @@ void ggml_numa_kernels_init(void) {
 - **Automatic Registration**: `NUMA_REGISTER_KERNEL()` macro automatically populates query function pointers
 - **Zero Maintenance Overhead**: Adding new kernels requires NO changes to central dispatch logic
 - **Cache-Optimized Lookup**: Single array access followed by direct function call: `entry->query_fn(tensor)`
+
+**🏗️ NEW ARCHITECTURE: Kernel-Based Work Buffer Allocation**
+- **Complexity Moved Out of Executor**: Work buffer calculation is now handled by individual kernels, not central executor switch statements
+- **Kernel-Specific Logic**: Each kernel defines its own `work_buffer_calc_fn` that understands its specific memory requirements
+- **Coordinator Allocation**: NUMA coordinator calls kernel's work buffer function and allocates total size for all threads
+- **Thread-Local Access**: Work buffers are available to kernels via `params->wdata` with per-thread offsets
+- **Simplified Executor**: Executor no longer needs operation-specific work buffer logic - just calls kernel's function
+- **Scalable Design**: Adding new operations with work buffers requires no changes to executor code
+
+**Work Buffer Implementation Pattern:**
+```c
+// Kernel defines its work buffer needs
+size_t ggml_numa_kernel_rope_work_buffer_calc(const struct ggml_tensor * tensor, int total_numa_nodes, int total_threads) {
+    const size_t ne0 = tensor->ne[0];
+    const size_t cache_line_size_f32 = 16;  // CACHE_LINE_SIZE_F32 approximation
+    const size_t per_thread_buffer = (ne0 + cache_line_size_f32) * sizeof(float);
+    
+    // Return TOTAL work buffer size for ALL threads
+    return per_thread_buffer * total_threads;
+}
+
+// Coordinator allocates and kernel accesses
+float * cache = (float *) params->wdata + (ne0 + CACHE_LINE_SIZE_F32) * ith;  // Thread-specific offset
+```
 
 **🚨 CRITICAL: Always use NUMA_REGISTER_KERNEL() macro**
 - **Pattern**: `NUMA_REGISTER_KERNEL(kernel_name)` in `numa-kernels.c`
@@ -839,7 +879,8 @@ ggml/src/ggml-cpu/numa-kernels/reshape.c          # Template: View operations & 
 - [ ] Use shared memory setup: check `ggml_numa_shared_result_tensor_data` for direct writes
 - [ ] Create `ggml_numa_kernel_{operation}_register()` function that returns registration info
 - [ ] Create `ggml_numa_kernel_{operation}_query()` function using `NUMA_SELECT_STRATEGY_FROM_CACHE()` macro
-- [ ] Add function declarations to kernel header file (e.g., `add.h`, `mul.h`)
+- [ ] **Implement work buffer calculation function** if operation needs temporary storage (cache, arrays, etc.)
+- [ ] Add function declarations to kernel header file (e.g., `add.h`, `mul.h`) including work buffer calc function
 - [ ] Enable in `numa-kernels.c` using `NUMA_REGISTER_KERNEL(operation)` macro
 - [ ] Use `NUMA_ASSERT` for validation with proper coordinator signaling
 - [ ] Use `NUMA_LOG_DEBUG` macros instead of printf for debug messages

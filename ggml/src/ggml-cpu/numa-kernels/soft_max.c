@@ -210,7 +210,7 @@ enum ggml_status ggml_numa_kernel_soft_max_execute(void * work_context, struct g
     thread_end_row += numa_start_row;
     
     NUMA_LOG_TRACE("SOFT_MAX thread %d/%d processing rows %ld-%ld", 
-                  ith, nth, thread_start_row, thread_end_row);
+                  ith + 1, nth, thread_start_row, thread_end_row);
     
     // Allocate working memory for row processing
     float * wp = (float *) params->wdata + (ne00 + CACHE_LINE_SIZE_F32) * ith;
@@ -389,8 +389,8 @@ ggml_numa_kernel_registration_info_t ggml_numa_kernel_soft_max_register(void) {
     info.kernel_name = "NUMA SOFT_MAX Kernel";
     
     // Strategy thresholds for SOFT_MAX kernel
-    info.strategy_array.thresholds[NUMA_STRATEGY_IDX_SINGLE_SINGLE] = 128;   // Single-thread strategy
-    info.strategy_array.thresholds[NUMA_STRATEGY_IDX_SINGLE_MULTI] = 1024;   // Multi-thread strategy
+    info.strategy_array.thresholds[NUMA_STRATEGY_IDX_SINGLE_SINGLE] = 9999999;   // Single-thread strategy
+    info.strategy_array.thresholds[NUMA_STRATEGY_IDX_SINGLE_MULTI] = 9999999; //TODO: remove   // Multi-thread strategy
     // Above this: data-parallel strategy
     info.strategy_array.valid = true;
     

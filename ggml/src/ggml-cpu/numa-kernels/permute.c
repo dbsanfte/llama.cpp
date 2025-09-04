@@ -253,8 +253,8 @@ ggml_numa_kernel_registration_info_t ggml_numa_kernel_permute_register(void) {
     info.kernel_name = "NUMA PERMUTE Kernel";
     
     // Strategy thresholds - more conservative since permutation involves random memory access
-    info.strategy_array.thresholds[NUMA_STRATEGY_IDX_SINGLE_SINGLE] = 128;      
-    info.strategy_array.thresholds[NUMA_STRATEGY_IDX_SINGLE_MULTI] = 1024;     
+    info.strategy_array.thresholds[NUMA_STRATEGY_IDX_SINGLE_SINGLE] = 9999999;      
+    info.strategy_array.thresholds[NUMA_STRATEGY_IDX_SINGLE_MULTI] = 9999999; //TODO: remove     
     // Above this: data-parallel strategy
     info.strategy_array.valid = true;
     

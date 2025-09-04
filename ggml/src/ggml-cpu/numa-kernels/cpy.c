@@ -230,8 +230,8 @@ ggml_numa_kernel_registration_info_t ggml_numa_kernel_cpy_register(void) {
     info.kernel_name = "NUMA CPY Kernel";
     
     // Strategy thresholds optimized for memory copying operations
-    info.strategy_array.thresholds[NUMA_STRATEGY_IDX_SINGLE_SINGLE] = 128;     // Single-thread strategy
-    info.strategy_array.thresholds[NUMA_STRATEGY_IDX_SINGLE_MULTI] = 1024;    // Multi-thread strategy
+    info.strategy_array.thresholds[NUMA_STRATEGY_IDX_SINGLE_SINGLE] = 9999999;     // Single-thread strategy
+    info.strategy_array.thresholds[NUMA_STRATEGY_IDX_SINGLE_MULTI] = 9999999; //TODO: remove    // Multi-thread strategy
     // Above this: data-parallel strategy
     info.strategy_array.valid = true;
     

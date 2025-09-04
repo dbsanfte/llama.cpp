@@ -34,6 +34,12 @@ ggml_numa_kernel_registration_info_t ggml_numa_kernel_rope_register(void);
  */
 ggml_numa_kernel_query_result_t ggml_numa_kernel_rope_query(const struct ggml_tensor * tensor);
 
+/**
+ * Calculate work buffer size for ROPE operation
+ * Returns per-thread work buffer size in bytes
+ */
+size_t ggml_numa_kernel_rope_work_buffer_calc(const struct ggml_tensor * tensor, int total_numa_nodes, int total_threads);
+
 // ============================================================================
 // NUMA ROPE Kernel Work Functions
 // ============================================================================

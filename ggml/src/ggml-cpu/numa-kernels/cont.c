@@ -243,8 +243,8 @@ ggml_numa_kernel_registration_info_t ggml_numa_kernel_cont_register(void) {
     info.kernel_name = "NUMA CONT Kernel";
     
     // Strategy thresholds for CONT operations - balanced for memory bandwidth optimization
-    info.strategy_array.thresholds[NUMA_STRATEGY_IDX_SINGLE_SINGLE] = 128;      // Single-thread strategy
-    info.strategy_array.thresholds[NUMA_STRATEGY_IDX_SINGLE_MULTI] = 1024;     // Multi-thread strategy
+    info.strategy_array.thresholds[NUMA_STRATEGY_IDX_SINGLE_SINGLE] = 9999999;      // Single-thread strategy
+    info.strategy_array.thresholds[NUMA_STRATEGY_IDX_SINGLE_MULTI] = 9999999; //TODO: remove     // Multi-thread strategy
     // Above this: data-parallel strategy across NUMA nodes
     info.strategy_array.valid = true;
     

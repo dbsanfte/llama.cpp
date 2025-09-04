@@ -150,7 +150,7 @@ enum ggml_status ggml_numa_kernel_mul_execute_optimized(void * work_context,
     
     // TEMPLATE DEBUG: Log execution context for development/debugging
     NUMA_LOG_DEBUG("NUMA Node %d, Thread %d/%d MUL kernel start (data_parallel=%d, total_nodes=%d, total_elements=%ld)", 
-                   current_node, thread_id, num_threads, is_data_parallel, total_nodes, total_elements);
+                   current_node, thread_id + 1, num_threads, is_data_parallel, total_nodes, total_elements);
     NUMA_LOG_DEBUG("NUMA Node %d MUL memory pointers: src0=%p, src1=%p, dst=%p", 
                    current_node, src0_data, src1_data, dst_data);
     
@@ -408,7 +408,7 @@ enum ggml_status ggml_numa_kernel_mul_execute_low_overhead(void * work_context,
     const int64_t src1_elements = ggml_nelements(src1);
     
     NUMA_LOG_DEBUG("NUMA Node %d, Thread %d/%d MUL LOW-OVERHEAD start (total_elements=%ld)", 
-                   current_node, thread_id, num_threads, total_elements);
+                   current_node, thread_id + 1, num_threads, total_elements);
     
     // Simple thread-based slicing for single-node execution
     const int64_t elements_per_thread = (total_elements + num_threads - 1) / num_threads;
@@ -615,8 +615,8 @@ ggml_numa_kernel_registration_info_t ggml_numa_kernel_mul_register(void) {
     info.kernel_name = "NUMA MUL Kernel";
     
     // Strategy thresholds for MUL operations (same as ADD - similar characteristics)
-    info.strategy_array.thresholds[NUMA_STRATEGY_IDX_SINGLE_SINGLE] = 128;      // Single thread threshold
-    info.strategy_array.thresholds[NUMA_STRATEGY_IDX_SINGLE_MULTI] = 1024;     // Multi-thread threshold
+    info.strategy_array.thresholds[NUMA_STRATEGY_IDX_SINGLE_SINGLE] = 9999999;      // Single thread threshold
+    info.strategy_array.thresholds[NUMA_STRATEGY_IDX_SINGLE_MULTI] = 9999999; //TODO: remove     // Multi-thread threshold
     // Above this: data-parallel strategy
     info.strategy_array.valid = true;
     

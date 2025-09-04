@@ -38,36 +38,38 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
         # NUMA Kernels - Real implementations for data-parallel execution
         ggml-cpu/numa-kernels/numa-kernels.c
         ggml-cpu/numa-kernels/numa-kernels.h
-        ggml-cpu/numa-kernels/add.c
-        ggml-cpu/numa-kernels/add.h
-        ggml-cpu/numa-kernels/mul.c
-        ggml-cpu/numa-kernels/mul.h
-        ggml-cpu/numa-kernels/cpy.c
-        ggml-cpu/numa-kernels/cpy.h
-        ggml-cpu/numa-kernels/cont.c
-        ggml-cpu/numa-kernels/cont.h
-        ggml-cpu/numa-kernels/get_rows.c
-        ggml-cpu/numa-kernels/get_rows.h
-        ggml-cpu/numa-kernels/mul_mat.c
-        ggml-cpu/numa-kernels/mul_mat.h
-        ggml-cpu/numa-kernels/rms_norm.c
-        ggml-cpu/numa-kernels/rms_norm.h
+        # TEMPORARILY DISABLED: Basic kernels using old registration signature
+        # ggml-cpu/numa-kernels/add.c
+        # ggml-cpu/numa-kernels/add.h
+        # ggml-cpu/numa-kernels/mul.c
+        # ggml-cpu/numa-kernels/mul.h
+        # ggml-cpu/numa-kernels/cpy.c
+        # ggml-cpu/numa-kernels/cpy.h
+        # ggml-cpu/numa-kernels/cont.c
+        # ggml-cpu/numa-kernels/cont.h
+        # ggml-cpu/numa-kernels/get_rows.c
+        # ggml-cpu/numa-kernels/get_rows.h
+        # ggml-cpu/numa-kernels/mul_mat.c
+        # ggml-cpu/numa-kernels/mul_mat.h
+        # TEMPORARILY DISABLED: Kernels using old registration signature
+        # ggml-cpu/numa-kernels/rms_norm.c
+        # ggml-cpu/numa-kernels/rms_norm.h
         ggml-cpu/numa-kernels/rope.c
         ggml-cpu/numa-kernels/rope.h
-        ggml-cpu/numa-kernels/permute.c
-        ggml-cpu/numa-kernels/permute.h
-        ggml-cpu/numa-kernels/glu.c
-        ggml-cpu/numa-kernels/glu.h
-        ggml-cpu/numa-kernels/reshape.c
-        ggml-cpu/numa-kernels/reshape.h
-        ggml-cpu/numa-kernels/view.c
-        ggml-cpu/numa-kernels/view.h
-        ggml-cpu/numa-kernels/soft_max.c
-        ggml-cpu/numa-kernels/soft_max.h
-        ggml-cpu/numa-kernels/transpose.c
-        ggml-cpu/numa-kernels/transpose.h
-        ggml-cpu/numa-kernels/noop.c
-        ggml-cpu/numa-kernels/noop.h
+        # ggml-cpu/numa-kernels/permute.c
+        # ggml-cpu/numa-kernels/permute.h
+        # ggml-cpu/numa-kernels/glu.c
+        # ggml-cpu/numa-kernels/glu.h
+        # ggml-cpu/numa-kernels/reshape.c
+        # ggml-cpu/numa-kernels/reshape.h
+        # ggml-cpu/numa-kernels/view.c
+        # ggml-cpu/numa-kernels/view.h
+        # ggml-cpu/numa-kernels/soft_max.c
+        # ggml-cpu/numa-kernels/soft_max.h
+        # ggml-cpu/numa-kernels/transpose.c
+        # ggml-cpu/numa-kernels/transpose.h
+        # ggml-cpu/numa-kernels/noop.c
+        # ggml-cpu/numa-kernels/noop.h
         ggml-work-item.c
         ggml-cpu/repack.cpp
         ggml-cpu/repack.h

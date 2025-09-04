@@ -70,6 +70,7 @@ enum ggml_status ggml_numa_register_kernel_strategy(
     const ggml_numa_kernel_work_funcs_t * work_funcs,
     const ggml_numa_kernel_aggregation_funcs_t * agg_funcs,
     ggml_numa_kernel_query_fn_t query_fn,
+    ggml_numa_kernel_work_buffer_calc_fn_t work_buffer_calc_fn,
     bool supported,
     bool is_noop) {    if (!g_kernel_array_cache.cache_initialized) {
         enum ggml_status init_result = ggml_numa_init_kernel_array_cache();
@@ -93,9 +94,10 @@ enum ggml_status ggml_numa_register_kernel_strategy(
     // Store in Array 1: Main cache storage
     ggml_numa_kernel_cache_entry_t * entry = &g_kernel_array_cache.cache_storage[op_type];
     entry->op_type = op_type;
-    entry->supported = supported;  // Store the supported flag
-    entry->query_fn = query_fn;    // Store the query function pointer
-    entry->is_noop = is_noop;      // Store the no-op flag
+    entry->supported = supported;               // Store the supported flag
+    entry->is_noop = is_noop;                   // Store the no-op flag
+    entry->query_fn = query_fn;                 // Store the query function pointer
+    entry->work_buffer_calc_fn = work_buffer_calc_fn;  // Store the work buffer calculation function pointer
     
     if (strategy_array && strategy_array->valid) {
         entry->strategy_array = *strategy_array;
@@ -282,6 +284,11 @@ enum ggml_status ggml_numa_kernels_init(void) {
     // TEMPORARILY DISABLED: All NUMA kernel registrations disabled to fix threading model
     // We need to fix coordinator threading before re-enabling kernels
     
+    // Enable ROPE kernel only for testing architectural changes
+    NUMA_REGISTER_KERNEL(rope);
+    
+    /*
+    // DISABLED FOR TESTING - need to update all to new work buffer function signature
     // Enable ADD kernel for multi-threaded data-parallel testing
     NUMA_REGISTER_KERNEL(add);
     
@@ -308,10 +315,6 @@ enum ggml_status ggml_numa_kernels_init(void) {
     // Register RMS_NORM kernel
     NUMA_REGISTER_KERNEL(rms_norm);
     
-    // Enable ROPE kernel for rotary position embeddings
-    // Register ROPE kernel
-    NUMA_REGISTER_KERNEL(rope);
-    
     // Register PERMUTE kernel for tensor dimension permutation
     NUMA_REGISTER_KERNEL(permute);
     
@@ -329,6 +332,7 @@ enum ggml_status ggml_numa_kernels_init(void) {
     
     // Register TRANSPOSE kernel for tensor dimension swapping
     NUMA_REGISTER_KERNEL(transpose);
+    */
     
     // Register NOOP kernel for performance testing
     //ggml_numa_register_noop_kernels();

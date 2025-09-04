@@ -1166,12 +1166,13 @@ enum ggml_status ggml_numa_simple_coordinator_execute_single_thread(
     }
 
     // Allocate NUMA-local work buffers if needed
+    // For single-thread execution, work_size is the total needed (1 thread * work_size)
     if (work_size > 0 && !allocate_numa_work_buffers(work_size)) {
         NUMA_LOG_DEBUG("ERROR: Failed to allocate NUMA work buffers\n");
         return GGML_STATUS_FAILED;
     }
 
-    NUMA_LOG_DEBUG("Coordinator Single-Thread: Using node %d, single thread execution", target_node);
+    NUMA_LOG_DEBUG("Coordinator Single-Thread: Using node %d, single thread execution (work_size=%zu)", target_node, work_size);
 
     // Use dispatch thread communication for single-thread execution
     g_simple_coordinator.active_work_function = work_function;
@@ -1251,18 +1252,21 @@ enum ggml_status ggml_numa_simple_coordinator_execute_single_node(
     }
 
     // Allocate NUMA-local work buffers if needed
-    if (work_size > 0 && !allocate_numa_work_buffers(work_size)) {
+    // work_size is per-thread, so multiply by number of threads for total allocation
+    int n_threads = g_simple_coordinator.threads_per_node[target_node];
+    size_t total_work_size = work_size * n_threads;
+    if (total_work_size > 0 && !allocate_numa_work_buffers(total_work_size)) {
         NUMA_LOG_DEBUG("ERROR: Failed to allocate NUMA work buffers\n");
         return GGML_STATUS_FAILED;
     }
 
-    int n_threads = g_simple_coordinator.threads_per_node[target_node];
-    NUMA_LOG_DEBUG("Coordinator Single-Node: Using node %d with %d threads", target_node, n_threads);
+    NUMA_LOG_DEBUG("Coordinator Single-Node: Using node %d with %d threads (work_size_per_thread=%zu, total_work_size=%zu)", 
+                   target_node, n_threads, work_size, total_work_size);
 
     // Use dispatch thread communication for single-node execution
     g_simple_coordinator.active_work_function = work_function;
     g_simple_coordinator.active_work_context = work_context;
-    g_simple_coordinator.active_work_size = work_size;
+    g_simple_coordinator.active_work_size = work_size; // Keep per-thread size for kernel calculations
     g_simple_coordinator.shared_result_tensor_data = NULL;  // No shared memory for single-node
     
     // CRITICAL: Set execution mode for single-node execution
@@ -1315,11 +1319,22 @@ enum ggml_status ggml_numa_simple_coordinator_execute_data_parallel(
     GGML_UNUSED(tensor); // Tensor copying is handled at model loading time in llama-mmap.cpp
 
     // Allocate NUMA-local work buffers if needed  
-    if (work_size > 0 && !allocate_numa_work_buffers(work_size)) {
+    // For data-parallel execution, work_size is per-thread, multiply by max threads per node
+    int max_threads_per_node = 0;
+    for (int i = 0; i < g_simple_coordinator.num_numa_nodes; i++) {
+        if (g_simple_coordinator.threads_per_node[i] > max_threads_per_node) {
+            max_threads_per_node = g_simple_coordinator.threads_per_node[i];
+        }
+    }
+    size_t total_work_size = work_size * max_threads_per_node;
+    if (total_work_size > 0 && !allocate_numa_work_buffers(total_work_size)) {
         NUMA_LOG_DEBUG("ERROR: Failed to allocate NUMA work buffers\n");
         NUMA_PERF_END();
         return GGML_STATUS_FAILED;
     }
+    
+    NUMA_LOG_DEBUG("Coordinator Data-Parallel: work_size_per_thread=%zu, max_threads_per_node=%d, total_work_size=%zu", 
+                   work_size, max_threads_per_node, total_work_size);
 
     // Calculate actual NUMA nodes to match barrier initialization logic
     enum ggml_numa_strategy current_strategy = g_simple_coordinator.last_strategy;

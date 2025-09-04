@@ -137,6 +137,7 @@ typedef struct {
     ggml_numa_kernel_work_funcs_t work_funcs;                // Work function pointers
     ggml_numa_kernel_aggregation_funcs_t agg_funcs;          // Aggregation function pointers (optional)
     void * query_fn;                                          // Query function pointer (void* to avoid circular dependency)
+    void * work_buffer_calc_fn;                              // Work buffer size calculation function (void* to avoid circular dependency)
     const char * kernel_name;                                // Human-readable name
     bool supported;                                           // Whether kernel is available
     bool is_noop;                                             // Skip coordinator dispatch for no-op kernels (view ops, testing)

@@ -9,14 +9,14 @@ This document describes the NUMA-aware execution architecture implemented in lla
 ### 🎯 Execution Flow
 
 ```
-Compute Graph → Executor → Kernel Registry Query → Coordinator Three-Strategy Dispatch → NUMA Threadpools
+Compute Graph → Executor → Kernel Registry Query → Kernel Work Buffer Calculation → Coordinator Three-Strategy Dispatch → NUMA Threadpools
 ```
 
-The architecture consists of three main components working together:
+The architecture consists of three main components working together with kernel-based work buffer allocation:
 
-1. **NUMA Kernel Registry** - Centralized database with O(1) cache lookups
-2. **NUMA Executor** - Strategy engine and orchestration layer  
-3. **NUMA Coordinator** - Three-strategy resource management and work distribution
+1. **NUMA Kernel Registry** - Centralized database with O(1) cache lookups and kernel-specific work buffer calculation
+2. **NUMA Executor** - Strategy engine and orchestration layer (work buffer calculation moved to kernels)
+3. **NUMA Coordinator** - Three-strategy resource management, work distribution, and kernel-calculated work buffer allocation
 
 ---
 
@@ -217,25 +217,49 @@ bool ggml_numa_available(enum ggml_op op) {
     return ggml_numa_kernels_is_supported(op);
 }
 
-bool ggml_numa_compute_forward(struct ggml_compute_params * params, struct ggml_tensor * tensor) {
-    // 1. Query registry for optimal strategy (O(1) lookup)
-    ggml_numa_kernel_query_result_t query_result = ggml_numa_kernels_query_strategy(tensor);
+enum ggml_status ggml_numa_executor_execute_tensor(struct ggml_tensor * tensor, struct ggml_cplan * cplan) {
+    // 1. Query registry for optimal strategy (O(1) lookup) - NEW ARCHITECTURE
+    ggml_numa_kernel_query_result_t query_result = ggml_numa_kernels_query(tensor);
     
     if (!query_result.supported) {
-        return false;  // Fall back to CPU implementation
+        return GGML_STATUS_FAILED;  // Fall back to CPU implementation
     }
     
-    // 2. Execute using coordinator with work function
-    bool success = ggml_numa_simple_coordinator_compute_forward(
-        params, tensor, 
+    // 2. Kernel calculates its own work buffer requirements - NEW ARCHITECTURE  
+    size_t work_buffer_size = 0;
+    if (query_result.work_buffer_calc_fn) {
+        int total_numa_nodes = ggml_numa_get_available_nodes();
+        int total_threads = cplan->n_threads;
+        work_buffer_size = query_result.work_buffer_calc_fn(tensor, total_numa_nodes, total_threads);
+    }
+    
+    // 3. Execute using coordinator with kernel-calculated work buffer
+    enum ggml_status status = ggml_numa_simple_coordinator_compute_forward(
+        tensor, 
         query_result.strategy,
         query_result.work_function,
         query_result.aggregation_function,  // May be NULL
-        query_result.work_buffer_size_per_thread
+        work_buffer_size,  // Total size for all threads
+        cplan
     );
     
-    return success;
+    return status;
 }
+```
+
+### New Work Buffer Architecture
+
+The executor no longer manages operation-specific work buffer calculations. Instead:
+
+1. **Kernel-Specific Calculation**: Each kernel defines its own `work_buffer_calc_fn` that understands its specific memory requirements
+2. **Total Size Calculation**: Kernels return the TOTAL work buffer size needed for ALL threads
+3. **Coordinator Allocation**: The coordinator allocates the total buffer and provides per-thread offsets via `params->wdata`
+4. **Simplified Executor Logic**: Executor just calls the kernel's function and passes the result to coordinator
+
+**Benefits**:
+- **Scalability**: Adding new operations with work buffers requires no changes to executor code
+- **Kernel Autonomy**: Each kernel manages its own memory requirements
+- **Elimination of Switch Statements**: No central work buffer calculation logic needed
 ```
 
 ### Query Interface
@@ -379,32 +403,67 @@ enum ggml_status ggml_numa_simple_coordinator_execute_data_parallel(
 
 ### Strategy Selection Interface
 
-The executor provides strategies to the coordinator through simple mappings:
+The executor provides strategies to the coordinator through simplified interface with kernel-based work buffer allocation:
 
 ```c
-bool ggml_numa_simple_coordinator_compute_forward(
-    struct ggml_compute_params * params,
+enum ggml_status ggml_numa_simple_coordinator_compute_forward(
     struct ggml_tensor * tensor,
     ggml_numa_execution_strategy_t strategy,
     ggml_numa_work_function_t work_function,        // Provided by registry
-    ggml_numa_aggregation_function_t agg_function,  // May be NULL
-    size_t work_buffer_size_per_thread
+    ggml_numa_aggregation_function_t agg_function,  // May be NULL  
+    size_t total_work_buffer_size,                  // NEW: Total size for ALL threads
+    struct ggml_cplan * cplan
 ) {
-    // Map strategy to specific execution function
+    // 1. Allocate work buffers if needed - NEW ARCHITECTURE
+    void * work_buffer_data = NULL;
+    if (total_work_buffer_size > 0) {
+        work_buffer_data = allocate_numa_work_buffers(total_work_buffer_size, cplan->n_threads);
+    }
+    
+    // 2. Map strategy to specific execution function
     switch (strategy.node_strategy) {
         case NUMA_NODE_STRATEGY_SINGLE:
             if (strategy.on_node_strategy == NUMA_ON_NODE_STRATEGY_SINGLE_THREAD) {
-                return execute_single_thread(work_function, tensor, params, work_buffer_size_per_thread);
+                return execute_single_thread(work_function, tensor, work_buffer_data, cplan);
             } else {
-                return execute_single_node(work_function, tensor, params, work_buffer_size_per_thread);
+                return execute_single_node(work_function, tensor, work_buffer_data, cplan);
             }
             break;
         case NUMA_NODE_STRATEGY_DATA_PARALLEL:
-            return execute_data_parallel(work_function, tensor, params, work_buffer_size_per_thread, 
-                                        agg_function);
+            return execute_data_parallel(work_function, tensor, work_buffer_data, cplan, agg_function);
             break;
     }
 }
+```
+
+### New Work Buffer Allocation System
+
+**Key Changes from Previous Architecture:**
+1. **Total Size Input**: Coordinator receives total work buffer size for all threads (calculated by kernel)
+2. **Coordinator Allocation**: Coordinator handles NUMA-aware allocation and distribution 
+3. **Per-Thread Offsets**: Work buffers provided to kernels via `params->wdata` with thread-specific offsets
+4. **Kernel Autonomy**: Each kernel defines its own memory requirements through `work_buffer_calc_fn`
+
+**Work Buffer Allocation Process:**
+```c
+static void * allocate_numa_work_buffers(size_t total_work_size, int n_threads) {
+    if (total_work_size == 0) return NULL;
+    
+    // Allocate on current NUMA node for optimal memory locality
+    void * work_buffer = numa_alloc_onnode(total_work_size, ggml_numa_get_current_node());
+    
+    // Zero-initialize for consistent behavior
+    memset(work_buffer, 0, total_work_size);
+    
+    return work_buffer;
+}
+```
+
+**Thread-Local Work Buffer Access:**
+```c
+// In kernel execution, access thread-specific work buffer portion
+float * cache = (float *) params->wdata + (work_size_per_thread * ith) / sizeof(float);
+```
 ```
 
 ### Thread-Local Context System

@@ -656,11 +656,29 @@ enum ggml_status ggml_numa_executor_execute_tensor(struct ggml_tensor * tensor, 
 extern void ggml_numa_set_fallback_flag(bool value);
 extern enum ggml_status ggml_graph_compute_impl(struct ggml_cgraph * cgraph, struct ggml_cplan * cplan);
 
-// Calculate work buffer size needed for a specific operation (from ggml-cpu.c logic)
+// Calculate work buffer size needed for a specific operation using kernel function
 static size_t ggml_numa_calculate_work_size(struct ggml_tensor * tensor, int n_threads) {
-    size_t work_size = 0;
+    if (!tensor) {
+        return 0;
+    }
     
-    GGML_LOG_DEBUG("NUMA Work Buffer: Calculating for operation %s\n", ggml_op_name(tensor->op));
+    NUMA_LOG_DEBUG("NUMA Work Buffer: Calculating for operation %s", ggml_op_name(tensor->op));
+    
+    // Try to get work buffer calculation from kernel
+    const ggml_numa_kernel_cache_entry_t * entry = ggml_numa_lookup_kernel_direct(tensor->op);
+    if (entry && entry->work_buffer_calc_fn) {
+        // Use kernel's work buffer calculation function
+        ggml_numa_kernel_work_buffer_calc_fn_t calc_fn = entry->work_buffer_calc_fn;
+        int numa_nodes = ggml_numa_simple_coordinator_get_num_nodes();
+        size_t work_size = calc_fn(tensor, numa_nodes, n_threads);
+        
+        NUMA_LOG_DEBUG("NUMA Work Buffer: Kernel function calculated %zu bytes for %s", 
+                       work_size, ggml_op_name(tensor->op));
+        return work_size;
+    }
+    
+    // Fallback to legacy switch statement for kernels without work buffer calculation
+    size_t work_size = 0;
     
     switch (tensor->op) {
         case GGML_OP_CPY:
@@ -672,7 +690,7 @@ static size_t ggml_numa_calculate_work_size(struct ggml_tensor * tensor, int n_t
                     (tensor->src[0]->type == GGML_TYPE_BF16 && tensor->src[1] && tensor->src[1]->type == GGML_TYPE_F16)) {
                     work_size = ggml_type_size(GGML_TYPE_F32) * tensor->ne[0] * n_threads;
                 }
-                GGML_LOG_DEBUG("NUMA Work Buffer: CPY/DUP calculated size: %zu bytes\n", work_size);
+                NUMA_LOG_DEBUG("NUMA Work Buffer: CPY/DUP calculated size: %zu bytes", work_size);
             } break;
         case GGML_OP_MUL_MAT:
             {
@@ -683,10 +701,10 @@ static size_t ggml_numa_calculate_work_size(struct ggml_tensor * tensor, int n_t
                     if (tensor->src[1]->type != vec_dot_type) {
                         work_size = ggml_row_size(vec_dot_type, ggml_nelements(tensor->src[1]));
                     }
-                    GGML_LOG_DEBUG("NUMA Work Buffer: MUL_MAT src0_type=%d, src1_type=%d, vec_dot_type=%d, calculated size: %zu bytes\n", 
+                    NUMA_LOG_DEBUG("NUMA Work Buffer: MUL_MAT src0_type=%d, src1_type=%d, vec_dot_type=%d, calculated size: %zu bytes", 
                                    (int)tensor->src[0]->type, (int)tensor->src[1]->type, (int)vec_dot_type, work_size);
                 } else {
-                    GGML_LOG_WARN("NUMA Work Buffer: MUL_MAT missing source tensors\n");
+                    NUMA_LOG_WARN("NUMA Work Buffer: MUL_MAT missing source tensors");
                 }
             } break;
         case GGML_OP_MUL_MAT_ID:
@@ -716,11 +734,13 @@ static size_t ggml_numa_calculate_work_size(struct ggml_tensor * tensor, int n_t
                 }
             } break;
         default:
-            // For unknown operations, use a reasonable default
-            work_size = 1024 * 1024; // 1MB safety buffer
+            // For unknown operations, use zero work size
+            work_size = 0;
             break;
     }
     
+    NUMA_LOG_DEBUG("NUMA Work Buffer: Legacy calculation for %s: %zu bytes", 
+                   ggml_op_name(tensor->op), work_size);
     return work_size;
 }
 

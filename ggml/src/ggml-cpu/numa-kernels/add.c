@@ -557,6 +557,12 @@ ggml_numa_kernel_registration_info_t ggml_numa_kernel_add_register(void) {
     info.work_funcs.data_parallel_fn = ggml_numa_kernel_add_execute;
     info.work_funcs.valid = true;
     
+    // Query function pointer for strategy selection
+    info.query_fn = (void*)ggml_numa_kernel_add_query;
+    
+    // ADD doesn't need work buffer (no complex caching)
+    info.work_buffer_calc_fn = NULL;
+    
     // ADD doesn't need aggregation functions (element-wise operation)
     info.agg_funcs.single_single_fn = NULL;
     info.agg_funcs.single_multi_fn = NULL;
