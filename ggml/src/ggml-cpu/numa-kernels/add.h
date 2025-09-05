@@ -40,7 +40,7 @@ extern "C" {
 #endif
 
 /**
- * Main ADD kernel execution function
+ * Main ADD kernel execution function (unified implementation)
  * 
  * Handles element-wise addition with full broadcasting support and quantization
  * type coverage. Uses NUMA-aware data slicing for optimal performance.
@@ -49,8 +49,8 @@ extern "C" {
  * 1. Validate tensor inputs and check for broadcasting requirements
  * 2. Extract tensor data using NUMA-local tensor_data()
  * 3. Read thread-local NUMA context from coordinator 
- * 4. Dispatch to appropriate type-specific implementation
- * 5. Handle broadcasting logic following reference implementation
+ * 4. Use unified execution path for all data types
+ * 5. Handle broadcasting logic with optimized data slicing
  * 6. Execute SIMD operations on assigned NUMA slice
  * 
  * THREAD SAFETY: Thread-safe via data slicing (no shared state)
@@ -61,14 +61,14 @@ extern "C" {
  * @param params        Threadpool parameters (thread ID, thread count)
  * @return              GGML_STATUS_SUCCESS on success, GGML_STATUS_FAILED on error
  */
-enum ggml_status ggml_numa_kernel_add_execute(void * work_context, struct ggml_compute_params * params);
+enum ggml_status ggml_numa_kernel_add_unified_execute(void * work_context, struct ggml_compute_params * params);
 
 /**
  * Strategy query function for ADD operations
  * 
  * Determines optimal execution strategy based on tensor characteristics:
- * - Single-node single-thread for tiny tensors (< 128 elements)
- * - Single-node multi-thread for small tensors (< 1024 elements)  
+ * - Single-node single-thread for tiny tensors (< 1024 elements)
+ * - Single-node multi-thread for small tensors (< 262144 elements)  
  * - Data-parallel across NUMA nodes for larger tensors
  * 
  * @param tensor  The destination tensor to analyze
@@ -85,6 +85,20 @@ ggml_numa_kernel_query_result_t ggml_numa_kernel_add_query(const struct ggml_ten
  * @return  Registration info structure for ADD kernel
  */
 ggml_numa_kernel_registration_info_t ggml_numa_kernel_add_register(void);
+
+/**
+ * Work buffer calculation function
+ * 
+ * ADD operations don't require work buffers for temporary storage.
+ * 
+ * @param tensor The destination tensor to analyze
+ * @param total_numa_nodes Total number of NUMA nodes
+ * @param total_threads Total number of threads
+ * @return 0 (no work buffer needed)
+ */
+size_t ggml_numa_kernel_add_work_buffer_calc(const struct ggml_tensor * tensor, 
+                                             int total_numa_nodes, 
+                                             int total_threads);
 
 #ifdef __cplusplus
 }

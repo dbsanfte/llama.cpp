@@ -307,15 +307,15 @@ TestResult test_rope_operation(const TestConfig& config, bool enable_numa, const
         if (config.num_threads == 1) {
             // Stage 1: Single-thread Single-node
             ggml_numa_init(GGML_NUMA_STRATEGY_MIRROR);
-            ggml_numa_simple_coordinator_set_thread_constraint(1);  // Force single-thread execution
+            // Note: Thread constraints removed - using forced strategy executor instead
         } else if (stage_name.find("Single-node") != std::string::npos) {
             // Stage 2: Multi-thread Single-node - use ISOLATE mode to force single-node execution
             ggml_numa_init(GGML_NUMA_STRATEGY_ISOLATE);
-            ggml_numa_simple_coordinator_set_thread_constraint(0);  // Allow multiple threads, but on single node
+            // Note: Thread constraints removed - using forced strategy executor instead
         } else {
             // Stage 3: Multi-thread Multi-node - use MIRROR mode for full multi-node execution  
             ggml_numa_init(GGML_NUMA_STRATEGY_MIRROR);
-            ggml_numa_simple_coordinator_set_thread_constraint(0);  // Allow full multi-node execution
+            // Note: Thread constraints removed - using forced strategy executor instead
         }
         
         // Explain execution mode for clarity

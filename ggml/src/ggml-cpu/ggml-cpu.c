@@ -1743,8 +1743,11 @@ void ggml_compute_forward(struct ggml_compute_params * params, struct ggml_tenso
             GGML_LOG_DEBUG("Tensor operation %s successfully executed via NUMA executor\n", ggml_op_name(tensor->op));
             return; // Successfully handled by NUMA executor
         }
-        // If NUMA failed, fall through to standard execution
-        GGML_LOG_DEBUG("Tensor operation %s falling back to standard CPU path\n", ggml_op_name(tensor->op));
+        // CRITICAL: NUMA kernel failure is now a hard error - no fallback allowed
+        GGML_LOG_ERROR("CRITICAL: NUMA kernel for operation %s failed with status %d - this indicates an incomplete implementation\n", 
+                       ggml_op_name(tensor->op), (int)numa_result);
+        GGML_ABORT("NUMA kernel failure: %s returned %d (kernels must handle all supported type combinations)", 
+                   ggml_op_name(tensor->op), (int)numa_result);
     } else {
         GGML_LOG_DEBUG("Tensor operation %s skipped direct NUMA dispatch (thread %d, not main)\n", 
                       ggml_op_name(tensor->op), params->ith);

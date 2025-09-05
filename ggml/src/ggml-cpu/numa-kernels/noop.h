@@ -1,92 +1,108 @@
 /**
  * @file noop.h
- * @brief NUMA NOOP Kernel - Performance Testing Kernel
- *
- * This file implements a NUMA-aware NOOP (No Operation) kernel specifically designed
- * for performance testing and benchmarking the NUMA kernel dispatch system.
+ * @brief Header for NUMA-aware NOOP kernel implementation
  * 
- * The NOOP kernel performs no actual computation but follows the full NUMA kernel
- * execution path, allowing measurement of the overhead introduced by the NUMA
- * coordinator, executor, and kernel dispatch system.
- *
- * Key Features:
- * - Zero computational work (immediate return)
- * - Full NUMA kernel registration and lookup
- * - Standard work function interface
- * - Minimal resource usage
- * - Performance measurement friendly
- *
- * Usage:
- * This kernel is intended for benchmarking purposes to compare the dispatch
- * overhead between the NUMA kernel system and the standard ggml-cpu fallback
- * system when paired with GGML_OP_NUMA_FALLBACK_NOOP.
- *
- * Performance Characteristics:
- * - Operation type: GGML_OP_NUMA_NOOP
- * - Work buffer size: 0 bytes
- * - Execution time: ~1-2 nanoseconds (function call overhead only)
- * - Memory access: Minimal (only function parameters)
- * - Thread safety: Fully thread-safe (no shared state)
- *
- * @see ggml_compute_forward_numa_fallback_noop() in ggml-cpu.c for comparison
+ * This header defines the interface for the NUMA NOOP kernel, which provides
+ * a minimal no-operation implementation for performance testing and benchmarking.
+ * The kernel follows the standard NUMA kernel interface patterns while performing
+ * minimal computation to isolate NUMA system overhead.
+ * 
+ * Key features:
+ * - Minimal computational overhead for pure NUMA system measurement
+ * - Support for all three NUMA execution strategies
+ * - Standard kernel interface compliance for consistent integration
+ * - Debugging and validation capabilities for NUMA execution flows
+ * 
+ * @author David Sanftenberg
+ * @date 2024
  */
 
-#pragma once
+#ifndef GGML_NUMA_KERNEL_NOOP_H
+#define GGML_NUMA_KERNEL_NOOP_H
 
-#include "numa-kernels.h"
 #include "../ggml-numa-shared.h"
-#include "../ggml-cpu-impl.h"  // For struct ggml_compute_params
-#include "../ggml-impl.h"      // For struct ggml_compute_params
-
-/**
- * Query function for NUMA NOOP kernel strategy selection  
- * 
- * Returns strategy recommendations for NOOP operations with custom thresholds
- * for performance testing different execution strategies. Since NOOP requires
- * no computation, all strategies are equally efficient.
- * 
- * @param tensor Target tensor (used for strategy consistency)
- * @return Kernel query result with strategy recommendation
- */
-ggml_numa_kernel_query_result_t ggml_numa_kernel_noop_query(
-    const struct ggml_tensor * tensor
-);
+#include "numa-kernels.h"
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
 /**
- * @brief NUMA NOOP kernel work function
+ * @brief Unified NOOP kernel execution function
  * 
- * This function performs no operation and returns immediately. It serves as a
- * minimal baseline for measuring the overhead of the NUMA kernel dispatch system.
+ * Provides a minimal no-operation implementation that follows the standard
+ * NUMA kernel execution pattern. Performs basic validation and returns
+ * immediately, making it ideal for measuring pure NUMA system overhead
+ * without computational complexity.
  * 
- * @param work_context Tensor context (unused in NOOP)
- * @param params Compute parameters (unused in NOOP)
- * @return GGML_STATUS_SUCCESS always
+ * Supports all three NUMA execution strategies:
+ * - Single-thread/single-node: Minimal overhead measurement
+ * - Multi-thread/single-node: Threading overhead measurement  
+ * - Data-parallel/multi-node: Full NUMA distribution overhead measurement
+ * 
+ * @param work_context Pointer to the tensor being processed (cast from ggml_tensor*)
+ * @param params Compute parameters containing thread information and work data
+ * @return GGML_STATUS_SUCCESS on successful completion
+ * 
+ * @note This function intentionally performs minimal work to isolate NUMA
+ *       system overhead from computational complexity
  */
-enum ggml_status ggml_numa_kernel_noop_execute(void * work_context, 
-                                                struct ggml_compute_params * params);
+enum ggml_status ggml_numa_kernel_noop_unified_execute(void * work_context, struct ggml_compute_params * params);
 
 /**
- * @brief Calculate work buffer size for NOOP operations
+ * @brief Kernel registration function for NUMA NOOP operations
  * 
- * NOOP operations require no work buffer.
+ * Provides registration information for the NOOP kernel, configuring it
+ * for all three NUMA execution strategies with thresholds optimized for
+ * performance testing scenarios.
  * 
- * @param tensor Target tensor (unused)
- * @return 0 (no work buffer needed)
+ * Strategy configuration:
+ * - Below 1K elements: Single-thread execution (minimal overhead)
+ * - 1K-256K elements: Multi-thread single-node (threading overhead)
+ * - Above 256K elements: Data-parallel execution (NUMA distribution overhead)
+ * 
+ * @return Registration information structure with function pointers and thresholds
+ * 
+ * @note The NOOP kernel does not require aggregation functions as it performs
+ *       no meaningful computation that needs to be combined across threads
  */
-size_t ggml_numa_kernel_noop_calculate_work_buffer_size(const struct ggml_tensor * tensor);
+ggml_numa_kernel_registration_info_t ggml_numa_kernel_noop_register(void);
 
 /**
- * @brief Register NUMA NOOP kernels with the kernel cache system
+ * @brief Query function for NUMA NOOP kernel strategy selection
  * 
- * Registers the NOOP kernel for GGML_OP_NUMA_NOOP operations with appropriate
- * strategy thresholds and work function mappings.
+ * Determines the optimal execution strategy for NOOP operations based on
+ * tensor size and system configuration. Uses unified strategy selection
+ * to ensure consistent behavior across all kernels.
+ * 
+ * Strategy selection based on element count thresholds makes this ideal
+ * for measuring overhead at different computational scales.
+ * 
+ * @param tensor The tensor to be processed (used for size calculation)
+ * @return Query result containing selected strategy and execution parameters
+ * 
+ * @note Returns minimal operation count (1) to represent pure overhead measurement
  */
-void ggml_numa_register_noop_kernels(void);
+ggml_numa_kernel_query_result_t ggml_numa_kernel_noop_query(const struct ggml_tensor * tensor);
+
+/**
+ * @brief Work buffer calculation function for NOOP operations
+ * 
+ * NOOP operations require no work buffers as they perform no meaningful
+ * computation. This function returns zero to indicate no additional
+ * memory allocation is needed.
+ * 
+ * @param tensor The tensor being processed (unused for NOOP)
+ * @param total_numa_nodes Total number of NUMA nodes (unused for NOOP)  
+ * @param total_threads Total number of threads (unused for NOOP)
+ * @return Zero indicating no work buffer memory required
+ * 
+ * @note Maintains standard kernel interface while indicating no memory overhead
+ */
+size_t ggml_numa_kernel_noop_work_buffer_calc(const struct ggml_tensor * tensor, int total_numa_nodes, int total_threads);
 
 #ifdef __cplusplus
 }
 #endif
+
+#endif // GGML_NUMA_KERNEL_NOOP_H

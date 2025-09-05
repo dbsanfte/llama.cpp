@@ -37,6 +37,12 @@ target_include_directories(${TARGET} PRIVATE ../llava)
 target_include_directories(${TARGET} PRIVATE ${CMAKE_SOURCE_DIR})
 target_link_libraries(${TARGET} PRIVATE common mtmd ${CMAKE_THREAD_LIBS_INIT})
 
+# Add OpenMP support for NUMA functionality
+find_package(OpenMP)
+if(OpenMP_C_FOUND AND OpenMP_CXX_FOUND)
+    target_link_libraries(${TARGET} PRIVATE OpenMP::OpenMP_C OpenMP::OpenMP_CXX)
+endif()
+
 if (LLAMA_SERVER_SSL)
     find_package(OpenSSL REQUIRED)
     target_link_libraries(${TARGET} PRIVATE OpenSSL::SSL OpenSSL::Crypto)

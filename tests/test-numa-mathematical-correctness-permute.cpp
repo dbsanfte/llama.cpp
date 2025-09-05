@@ -196,7 +196,7 @@ public:
         
         // Add NUMA-aware thread counts based on actual hardware topology
         std::vector<int> numa_thread_counts;
-        int num_numa_nodes = ggml_numa_simple_coordinator_get_num_nodes();
+        int num_numa_nodes = ggml_numa_openmp_coordinator_get_num_nodes();
         if (num_numa_nodes > 0) {
             // Get total CPU count and derive threads per node
             // Using reasonable estimates for threads per node based on typical systems

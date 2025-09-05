@@ -14,19 +14,8 @@
 
 #include "numa-kernels.h"
 #include "add.h"
-#include "mul.h"
 #include "mul_mat.h"
-#include "cpy.h"
-#include "cont.h"
-#include "get_rows.h"
-#include "rms_norm.h"
 #include "rope.h"
-#include "permute.h"
-#include "glu.h"
-#include "reshape.h"
-#include "view.h"
-#include "soft_max.h"
-#include "transpose.h"
 #include "noop.h"
 #include "../ggml-impl.h"
 
@@ -284,51 +273,13 @@ enum ggml_status ggml_numa_kernels_init(void) {
     NUMA_REGISTER_KERNEL(rope);
 
     // Register MUL_MAT kernel
-    // NUMA_REGISTER_KERNEL(mul_mat);
+    // NUMA_REGISTER_KERNEL(mul_mat);  // Temporarily disabled - debugging cross-NUMA race conditions
     
-    /*
-    // DISABLED FOR TESTING - need to update all to new work buffer function signature
     // Enable ADD kernel for multi-threaded data-parallel testing
-    NUMA_REGISTER_KERNEL(add);
-    
-    // Enable MUL kernel for testing
-    // Register MUL kernel
-    NUMA_REGISTER_KERNEL(mul);
-
-    // Register CPY kernel - Re-enabled with corrected implementation
-    NUMA_REGISTER_KERNEL(cpy);
-
-    // Register CONT kernel for tensor contiguity operations
-    NUMA_REGISTER_KERNEL(cont);
-
-    // Register GET_ROWS kernel for tensor row extraction operations
-    NUMA_REGISTER_KERNEL(get_rows);
-    
-    // Enable RMS_NORM kernel for normalization operations
-    // Register RMS_NORM kernel
-    NUMA_REGISTER_KERNEL(rms_norm);
-    
-    // Register PERMUTE kernel for tensor dimension permutation
-    NUMA_REGISTER_KERNEL(permute);
-    
-    // Register GLU kernel for gated linear unit operations
-    NUMA_REGISTER_KERNEL(glu);
-    
-    // Register RESHAPE kernel for tensor shape transformation
-    NUMA_REGISTER_KERNEL(reshape);
-    
-    // Register VIEW kernel for tensor view operations
-    NUMA_REGISTER_KERNEL(view);
-    
-    // Register SOFT_MAX kernel for softmax activation
-    NUMA_REGISTER_KERNEL(soft_max);
-    
-    // Register TRANSPOSE kernel for tensor dimension swapping
-    NUMA_REGISTER_KERNEL(transpose);
-    */
+    NUMA_REGISTER_KERNEL(add);  // Re-enabled to confirm this is corruption source  // Re-enabled to debug data slicing issue
     
     // Register NOOP kernel for performance testing
-    //ggml_numa_register_noop_kernels();
+    NUMA_REGISTER_KERNEL(noop);
     
     g_numa_kernels_initialized = true;
     

@@ -33,6 +33,7 @@ RUN apt-get update && \
         python3-venv \
         libcurl4-openssl-dev \
         libnuma-dev \
+        libomp-dev \
         linux-tools-generic \
         linux-tools-common \
         numactl \

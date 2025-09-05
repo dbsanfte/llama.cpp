@@ -1,5 +1,8 @@
 llama_add_compile_flags()
 
+# Find OpenMP for NUMA tests that use OpenMP coordinator
+find_package(OpenMP REQUIRED)
+
 function(llama_build source)
     if (DEFINED LLAMA_TEST_NAME)
         set(TEST_TARGET ${LLAMA_TEST_NAME})
@@ -220,54 +223,54 @@ target_link_libraries(${TEST_TARGET} PRIVATE llama)
 # test-numa-mathematical-correctness-add
 set(LLAMA_TEST_NAME test-numa-mathematical-correctness-add)
 llama_build_and_test(test-numa-mathematical-correctness-add.cpp)
-target_link_libraries(${LLAMA_TEST_NAME} PRIVATE ggml ggml-cpu common)
+target_link_libraries(${LLAMA_TEST_NAME} PRIVATE ggml ggml-cpu common OpenMP::OpenMP_C OpenMP::OpenMP_CXX)
 # Prioritize ggml/src/ggml-cpu/ to get the full implementation headers and add ggml/src for ggml-impl.h
 target_include_directories(${LLAMA_TEST_NAME} PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src/ggml-cpu ${CMAKE_SOURCE_DIR}/ggml/src ${CMAKE_SOURCE_DIR}/ggml/include)
 
 # test-numa-mathematical-correctness-mul_mat
 set(LLAMA_TEST_NAME test-numa-mathematical-correctness-mul_mat)
 llama_build_and_test(test-numa-mathematical-correctness-mul_mat.cpp)
-target_link_libraries(${LLAMA_TEST_NAME} PRIVATE ggml ggml-cpu common)
+target_link_libraries(${LLAMA_TEST_NAME} PRIVATE ggml ggml-cpu common OpenMP::OpenMP_C OpenMP::OpenMP_CXX)
 # Prioritize ggml/src/ggml-cpu/ to get the full implementation headers and add ggml/src for ggml-impl.h
 target_include_directories(${LLAMA_TEST_NAME} PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src/ggml-cpu ${CMAKE_SOURCE_DIR}/ggml/src ${CMAKE_SOURCE_DIR}/ggml/include)
 
 # test-numa-mathematical-correctness-rope
 set(LLAMA_TEST_NAME test-numa-mathematical-correctness-rope)
 llama_build_and_test(test-numa-mathematical-correctness-rope.cpp)
-target_link_libraries(${LLAMA_TEST_NAME} PRIVATE ggml ggml-cpu common)
+target_link_libraries(${LLAMA_TEST_NAME} PRIVATE ggml ggml-cpu common OpenMP::OpenMP_C OpenMP::OpenMP_CXX)
 # Prioritize ggml/src/ggml-cpu/ to get the full implementation headers and add ggml/src for ggml-impl.h
 target_include_directories(${LLAMA_TEST_NAME} PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src/ggml-cpu ${CMAKE_SOURCE_DIR}/ggml/src ${CMAKE_SOURCE_DIR}/ggml/include)
 
 # test-numa-mathematical-correctness-permute
 set(LLAMA_TEST_NAME test-numa-mathematical-correctness-permute)
 llama_build_and_test(test-numa-mathematical-correctness-permute.cpp)
-target_link_libraries(${LLAMA_TEST_NAME} PRIVATE ggml ggml-cpu common)
+target_link_libraries(${LLAMA_TEST_NAME} PRIVATE ggml ggml-cpu common OpenMP::OpenMP_C OpenMP::OpenMP_CXX)
 # Prioritize ggml/src/ggml-cpu/ to get the full implementation headers and add ggml/src for ggml-impl.h
 target_include_directories(${LLAMA_TEST_NAME} PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src/ggml-cpu ${CMAKE_SOURCE_DIR}/ggml/src ${CMAKE_SOURCE_DIR}/ggml/include)
 
 # test-numa-mathematical-correctness-view
 set(LLAMA_TEST_NAME test-numa-mathematical-correctness-view)
 llama_build_and_test(test-numa-mathematical-correctness-view.cpp)
-target_link_libraries(${LLAMA_TEST_NAME} PRIVATE ggml ggml-cpu common)
+target_link_libraries(${LLAMA_TEST_NAME} PRIVATE ggml ggml-cpu common OpenMP::OpenMP_C OpenMP::OpenMP_CXX)
 # Prioritize ggml/src/ggml-cpu/ to get the full implementation headers and add ggml/src for ggml-impl.h
 target_include_directories(${LLAMA_TEST_NAME} PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src/ggml-cpu ${CMAKE_SOURCE_DIR}/ggml/src ${CMAKE_SOURCE_DIR}/ggml/include)
 
 # test-numa-noop-performance
 set(LLAMA_TEST_NAME test-numa-noop-performance)
 llama_build_and_test(test-numa-noop-performance.cpp)
-target_link_libraries(${LLAMA_TEST_NAME} PRIVATE ggml ggml-cpu common)
+target_link_libraries(${LLAMA_TEST_NAME} PRIVATE ggml ggml-cpu common OpenMP::OpenMP_C OpenMP::OpenMP_CXX)
 # Prioritize ggml/src/ggml-cpu/ to get the full implementation headers and add ggml/src for ggml-impl.h
 target_include_directories(${LLAMA_TEST_NAME} PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src/ggml-cpu ${CMAKE_SOURCE_DIR}/ggml/src ${CMAKE_SOURCE_DIR}/ggml/include)
 
 # test-numa-execution-modes
 set(LLAMA_TEST_NAME test-numa-execution-modes)
 llama_build_and_test(test-numa-execution-modes.cpp)
-target_link_libraries(${LLAMA_TEST_NAME} PRIVATE ggml ggml-cpu common)
+target_link_libraries(${LLAMA_TEST_NAME} PRIVATE ggml ggml-cpu common OpenMP::OpenMP_C OpenMP::OpenMP_CXX)
 target_include_directories(${LLAMA_TEST_NAME} PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src/ggml-cpu ${CMAKE_SOURCE_DIR}/ggml/src ${CMAKE_SOURCE_DIR}/ggml/include)
 target_sources(${LLAMA_TEST_NAME} PRIVATE upi-traffic-monitor.cpp)
 
 # test-ggml-openmp-coordinator
 set(LLAMA_TEST_NAME test-ggml-openmp-coordinator)
 llama_build_and_test(test-ggml-openmp-coordinator.cpp)
-target_link_libraries(${LLAMA_TEST_NAME} PRIVATE ggml ggml-cpu common)
+target_link_libraries(${LLAMA_TEST_NAME} PRIVATE ggml ggml-cpu common OpenMP::OpenMP_C OpenMP::OpenMP_CXX)
 target_include_directories(${LLAMA_TEST_NAME} PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src/ggml-cpu ${CMAKE_SOURCE_DIR}/ggml/src ${CMAKE_SOURCE_DIR}/ggml/include)

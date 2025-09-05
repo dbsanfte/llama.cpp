@@ -17,10 +17,18 @@ extern "C" {
 
 #include <stddef.h>
 #include <stdbool.h>
+#include <pthread.h>
+
+// Constants
+#define NUMA_MAX_NODES 16  // Maximum NUMA nodes supported
 
 // Forward declarations
 struct ggml_tensor;
 struct ggml_compute_params;
+struct ggml_cplan;
+
+// Include for status types - use forward declaration
+enum ggml_status;
 
 /**
  * @brief CPU mask for thread affinity control
@@ -47,16 +55,59 @@ typedef enum {
 } ggml_numa_openmp_strategy_t;
 
 /**
- * @brief OpenMP coordinator configuration
+ * @brief Per-NUMA thread team for dedicated CPU binding
  * 
- * Simplified configuration using OpenMP thread binding instead of
- * complex ggml_threadpool management.
+ * Each NUMA node gets its own persistent thread team with threads
+ * bound only to CPUs of that specific NUMA node.
  */
 typedef struct {
+    int numa_node_id;               ///< NUMA node this team serves
+    int num_threads;                ///< Number of threads in this team
+    bool initialized;               ///< Whether this team is initialized
+    bool threads_bound;             ///< Whether threads are properly bound to NUMA node
+    
+    // CPU binding information for this NUMA node
+    int * cpu_ids;                  ///< Array of CPU IDs for this NUMA node
+    int num_cpus;                   ///< Number of CPUs available on this NUMA node
+} ggml_numa_thread_team_t;
+
+/**
+ * @brief Manager for all per-NUMA thread teams
+ * 
+ * Coordinates multiple thread teams, one per NUMA node, for optimal
+ * CPU affinity and memory locality.
+ */
+typedef struct {
+    ggml_numa_thread_team_t * teams;    ///< Array of thread teams, one per NUMA node
+    int num_teams;                      ///< Number of thread teams (equals num NUMA nodes)
+    bool teams_initialized;             ///< Whether all teams are initialized
+    
+    // Synchronization for multi-NUMA operations
+    pthread_barrier_t start_barrier;    ///< Barrier for coordinated starts
+    pthread_barrier_t end_barrier;      ///< Barrier for coordinated completions
+    bool barriers_initialized;          ///< Whether barriers are initialized
+} ggml_numa_threadpool_manager_t;
+
+/**
+ * @brief Enhanced OpenMP coordinator configuration with per-NUMA thread teams
+ * 
+ * Extended configuration that includes persistent thread teams for each NUMA node.
+ */
+typedef struct {
+    // Basic NUMA configuration (from original struct)
     int total_numa_nodes;           ///< Total NUMA nodes available
     int threads_per_node;           ///< Threads to use per NUMA node
     bool numa_available;            ///< Whether NUMA is available on system
     bool initialized;               ///< Whether coordinator is initialized
+    
+    // OpenMP 5.0 topology information
+    int openmp_numa_places;         ///< Number of NUMA places detected by OpenMP
+    int openmp_cores_per_place;     ///< Cores/processors per OpenMP place
+    bool openmp_places_configured;  ///< Whether OMP_PLACES is properly configured
+    bool openmp_binding_enabled;    ///< Whether OMP_PROC_BIND is enabled
+    
+    // Per-NUMA thread team management
+    ggml_numa_threadpool_manager_t threadpool_manager;  ///< Manager for per-NUMA thread teams
 } ggml_numa_openmp_config_t;
 
 /**
@@ -73,25 +124,27 @@ typedef enum ggml_status (*ggml_numa_openmp_work_fn_t)(
 );
 
 /**
- * @brief Initialize OpenMP-based NUMA coordinator
+ * @brief Initialize OpenMP-based NUMA coordinator with automatic CPU detection
  * 
- * Sets up OpenMP thread binding and NUMA node configuration.
- * Much simpler than ggml_threadpool initialization.
+ * Sets up OpenMP thread binding, NUMA node configuration, and creates
+ * dedicated thread teams for each NUMA node with proper CPU affinity.
+ * Automatically detects available CPUs and creates optimal thread teams.
  * 
  * @return True if initialization successful, false otherwise
  */
 bool ggml_numa_openmp_coordinator_init(void);
 
 /**
- * @brief Initialize OpenMP coordinator with CPU mask
+ * @brief Initialize OpenMP-based NUMA coordinator with user-specified CPU mask
  * 
- * Allows user-specified CPU selection for NUMA-aware execution.
+ * Sets up OpenMP thread binding, NUMA node configuration, and creates
+ * dedicated thread teams for each NUMA node, respecting user-specified
+ * CPU masks for fine-grained control over CPU binding and allocation.
  * 
- * @param cpu_mask Bitmask of CPUs to use (NULL for auto-detection)
- * @param total_threads Total number of threads to use (0 for auto-detection)
+ * @param cpu_mask User-specified CPU mask to restrict CPU usage
  * @return True if initialization successful, false otherwise
  */
-bool ggml_numa_openmp_coordinator_init_with_mask(const ggml_numa_cpu_mask_t * cpu_mask, int total_threads);
+bool ggml_numa_openmp_coordinator_init_with_mask(const ggml_numa_cpu_mask_t * cpu_mask);
 
 /**
  * @brief Get OpenMP coordinator configuration
@@ -188,11 +241,25 @@ void ggml_numa_free_cpu_mask(ggml_numa_cpu_mask_t * mask);
  * @brief Get fallback threadpool for legacy ggml operations
  * 
  * Some ggml operations (like MUL_MAT) expect a valid threadpool for barrier synchronization.
- * This provides a minimal threadpool structure that can handle those operations.
+ * This provides a proper threadpool that can handle the full thread count.
  * 
  * @return Pointer to fallback threadpool or NULL if not available
  */
 struct ggml_threadpool * ggml_numa_openmp_get_fallback_threadpool(void);
+
+/**
+ * @brief Get the thread count of the fallback threadpool
+ * 
+ * @return Number of threads in fallback threadpool, or 0 if not initialized
+ */
+int ggml_numa_openmp_get_fallback_thread_count(void);
+
+/**
+ * Cross-NUMA barrier for kernel synchronization during data-parallel execution
+ * 
+ * @return true if barrier wait was successful, false if not in data-parallel mode
+ */
+bool ggml_numa_simple_coordinator_cross_numa_barrier(void);
 
 #ifdef __cplusplus
 }

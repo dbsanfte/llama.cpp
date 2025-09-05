@@ -47,33 +47,36 @@ This is a fork of llama.cpp with **NUMA-aware execution architecture** for optim
 
 - **NUMA Kernel Registry** - `ggml/src/ggml-cpu/numa-kernels/` - O(1) cache database with direct function pointer dispatch
 - **NUMA Executor** - `ggml/src/ggml-cpu/ggml-numa-executor.c` - Strategy engine and work orchestration (work buffer calculation moved to kernels)
-- **NUMA Coordinator** - `ggml/src/ggml-cpu/ggml-numa-simple-coordinator.c` - Resource management, work distribution, and kernel-based work buffer allocation
+- **NUMA OpenMP Coordinator** - `ggml/src/ggml-cpu/ggml-numa-openmp-coordinator.c` - OpenMP-based resource management, work distribution, and kernel-based work buffer allocation
 - **Dev Container** - Ubuntu 24.04 with pre-installed dependencies
 
 **Goal**: Provide lightning-fast NUMA-aware execution for all operations through intelligent strategy selection and optimal resource utilization. 
 
-**Architecture Flow**: `Compute Graph → Executor → Kernel Registry Direct Dispatch → Coordinator Three-Strategy Dispatch → Kernel Work Buffer Allocation → NUMA Threadpools`
+**Architecture Flow**: `Compute Graph → Executor → Kernel Registry Direct Dispatch → OpenMP Coordinator Three-Strategy Dispatch → Kernel Work Buffer Allocation → OpenMP Parallel Regions`
 
-## 🏗️ Simplified Coordinator Architecture
+## 🏗️ OpenMP Coordinator Architecture
 
-The NUMA coordinator uses a **three-strategy execution model** for optimal performance:
+The NUMA OpenMP coordinator uses a **three-strategy execution model** with OpenMP parallel regions for optimal performance:
 
 ### **Three Execution Strategies**
 
-1. **Single-Thread/Single-Node**: `ggml_numa_simple_coordinator_execute_single_thread()`
+1. **Single-Thread/Single-Node**: `ggml_numa_openmp_execute_single_thread()`
    - **Use case**: Very small tensors (< 1K elements)
    - **Pattern**: One thread on target NUMA node, minimal overhead
    - **Data slicing**: No slicing - processes entire tensor
+   - **OpenMP**: Single thread execution with CPU affinity
 
-2. **Multi-Thread/Single-Node**: `ggml_numa_simple_coordinator_execute_single_node()`
+2. **Multi-Thread/Single-Node**: `ggml_numa_openmp_execute_single_node()`
    - **Use case**: Medium tensors (1K-256K elements)
    - **Pattern**: All threads on one NUMA node, shared memory locality
    - **Data slicing**: Thread-based slicing within single node
+   - **OpenMP**: `#pragma omp parallel` region with NUMA-bound CPU affinity
 
-3. **Multi-Thread/Multi-Node (Data-Parallel)**: `ggml_numa_simple_coordinator_execute_data_parallel()`
+3. **Multi-Thread/Multi-Node (Data-Parallel)**: `ggml_numa_openmp_execute_data_parallel()`
    - **Use case**: Large tensors (> 256K elements)
    - **Pattern**: All NUMA nodes participate, maximum parallelism
    - **Data slicing**: Both NUMA-level and thread-level slicing
+   - **OpenMP**: Nested parallel regions or explicit thread binding per NUMA node
 
 ### **Thread-Local Context Variables**
 
@@ -663,10 +666,10 @@ tensor_dims = {cube_root, cube_root, cube_root, 1}; // Balanced 3D tensor
 ```
 
 ### NUMA Memory Management
-- **Files**: `ggml-numa-simple-coordinator.c`, `ggml-cpu-numa-buffer.cpp`, `ggml.h`
+- **Files**: `ggml-numa-openmp-coordinator.c`, `ggml-cpu-numa-buffer.cpp`, `ggml.h`
 - **NUMA mirroring**: Use `tensor_data()`/`tensor_set_data()` for NUMA-aware access
 - **Memory allocation**: Always use `numa_alloc_onnode()` for local allocation
-- **Thread mapping**: Each threadpool assigned to its own NUMA node
+- **OpenMP thread management**: CPU affinity and NUMA binding through OpenMP parallel regions
 
 ## � Debugging
 
@@ -713,9 +716,9 @@ cp tests/test-numa-mathematical-correctness-template.cpp tests/test-numa-mathema
 
 **Critical**: ALL mathematical correctness tests MUST include comprehensive quantization type coverage. Missing quantization testing can lead to silent model inference failures in production. The template enforces this requirement with detailed TODOs and examples.
 
-## 🏗️ Simplified Coordinator Architecture Summary
+## 🏗️ OpenMP Coordinator Architecture Summary
 
-The current NUMA architecture uses a **three-strategy execution model** optimized for different computational workload sizes:
+The current NUMA architecture uses a **three-strategy execution model** with OpenMP parallel regions optimized for different computational workload sizes:
 
 ### **Strategy Selection & Data Slicing**
 
@@ -853,7 +856,7 @@ NUMA_LOG_VERBOSE("Detailed debug info: %f\n", detail);
 ```
 ggml/src/ggml-cpu/numa-kernels/numa-kernels.c     # Kernel registry
 ggml/src/ggml-cpu/ggml-numa-executor.c            # Strategy engine and orchestration
-ggml/src/ggml-cpu/ggml-numa-simple-coordinator.c  # Threadpool and NUMA management
+ggml/src/ggml-cpu/ggml-numa-openmp-coordinator.c  # OpenMP-based NUMA management
 ggml/src/ggml-cpu/ggml-numa-shared.h              # Debug control and shared utilities
 ggml/src/ggml-cpu/ggml-numa-perf.c                # Performance instrumentation framework
 ggml/src/ggml-cpu/ggml-cpu.c                      # Mathematical kernels (reference)

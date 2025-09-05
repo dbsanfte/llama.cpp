@@ -2597,6 +2597,9 @@ extern "C" {
 #ifdef GGML_NUMA_MIRROR
     GGML_API void ggml_numa_set_fallback_flag(bool value);
     GGML_API bool ggml_numa_is_fallback_active(void);
+    GGML_API void ggml_numa_reset_execution_count(void);
+    GGML_API int  ggml_numa_get_execution_count(void);
+    GGML_API void ggml_numa_increment_execution_count(void);
 #endif
 
 #ifdef  __cplusplus

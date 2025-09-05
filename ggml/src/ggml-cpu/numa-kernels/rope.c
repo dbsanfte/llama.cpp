@@ -237,6 +237,15 @@ static enum ggml_status ggml_numa_kernel_rope_f32_execute(void * work_context,
     extern __thread int ggml_numa_total_nodes_for_data_parallel;
     extern __thread void * ggml_numa_shared_result_tensor_data;
     
+    // Strategy logging - only log once per operation (thread 0 of NUMA node 0)
+    if (params->ith == 0 && ggml_current_numa_node == 0) {
+        if (ggml_numa_is_data_parallel_execution) {
+            NUMA_LOG_STRATEGY_DATA_PARALLEL("ROPE");
+        } else {
+            NUMA_LOG_STRATEGY_SINGLE_MULTI("ROPE");
+        }
+    }
+    
     // Use shared result tensor memory for direct writes
     float * dst_base;
     if (ggml_numa_shared_result_tensor_data != NULL) {
@@ -414,6 +423,26 @@ static enum ggml_status ggml_numa_kernel_rope_f32_execute(void * work_context,
     NUMA_LOG_TRACE("Processed rows %d-%d on NUMA node %d, thread %d/%d", 
                    ir0, ir1, ggml_current_numa_node, ith, nth);
     
+    // CRITICAL: Cross-NUMA barrier to ensure all writes complete before operation finishes
+    extern __thread bool ggml_numa_is_data_parallel_execution;
+    if (ggml_numa_is_data_parallel_execution || nth > 1) {
+        if (ggml_numa_is_data_parallel_execution) {
+            // Use proper cross-NUMA barrier for data-parallel execution
+            NUMA_LOG_DEBUG("ROPE F32: Thread %d/%d (NUMA node %d) waiting at cross-NUMA barrier", 
+                          ith, nth, ggml_current_numa_node);
+            ggml_numa_simple_coordinator_cross_numa_barrier();
+            NUMA_LOG_DEBUG("ROPE F32: Thread %d/%d (NUMA node %d) passed cross-NUMA barrier", 
+                          ith, nth, ggml_current_numa_node);
+        } else {
+            // Single NUMA node - use standard OpenMP barrier
+            #pragma omp barrier
+            NUMA_LOG_DEBUG("ROPE F32: Thread %d/%d (NUMA node %d) completed operation using OpenMP barrier", 
+                          ith, nth, ggml_current_numa_node);
+        }
+    } else {
+        NUMA_LOG_DEBUG("ROPE F32: Single thread execution, skipping operation completion barrier");
+    }
+    
     return GGML_STATUS_SUCCESS;
 }
 
@@ -480,6 +509,15 @@ static enum ggml_status ggml_numa_kernel_rope_f16_execute(void * work_context,
     extern __thread bool ggml_numa_is_data_parallel_execution;
     extern __thread int ggml_numa_total_nodes_for_data_parallel;
     extern __thread void * ggml_numa_shared_result_tensor_data;
+    
+    // Strategy logging - only log once per operation (thread 0 of NUMA node 0)
+    if (params->ith == 0 && ggml_current_numa_node == 0) {
+        if (ggml_numa_is_data_parallel_execution) {
+            NUMA_LOG_STRATEGY_DATA_PARALLEL("ROPE");
+        } else {
+            NUMA_LOG_STRATEGY_SINGLE_MULTI("ROPE");
+        }
+    }
     
     // Use shared result tensor memory for direct writes
     ggml_fp16_t * dst_base;
@@ -658,6 +696,26 @@ static enum ggml_status ggml_numa_kernel_rope_f16_execute(void * work_context,
     NUMA_LOG_TRACE("Processed rows %d-%d on NUMA node %d, thread %d/%d", 
                    ir0, ir1, ggml_current_numa_node, ith, nth);
     
+    // CRITICAL: Cross-NUMA barrier to ensure all writes complete before operation finishes
+    extern __thread bool ggml_numa_is_data_parallel_execution;
+    if (ggml_numa_is_data_parallel_execution || nth > 1) {
+        if (ggml_numa_is_data_parallel_execution) {
+            // Use proper cross-NUMA barrier for data-parallel execution
+            NUMA_LOG_DEBUG("ROPE F16: Thread %d/%d (NUMA node %d) waiting at cross-NUMA barrier", 
+                          ith, nth, ggml_current_numa_node);
+            ggml_numa_simple_coordinator_cross_numa_barrier();
+            NUMA_LOG_DEBUG("ROPE F16: Thread %d/%d (NUMA node %d) passed cross-NUMA barrier", 
+                          ith, nth, ggml_current_numa_node);
+        } else {
+            // Single NUMA node - use standard OpenMP barrier
+            #pragma omp barrier
+            NUMA_LOG_DEBUG("ROPE F16: Thread %d/%d (NUMA node %d) completed operation using OpenMP barrier", 
+                          ith, nth, ggml_current_numa_node);
+        }
+    } else {
+        NUMA_LOG_DEBUG("ROPE F16: Single thread execution, skipping operation completion barrier");
+    }
+    
     return GGML_STATUS_SUCCESS;
 }
 
@@ -785,8 +843,8 @@ ggml_numa_kernel_registration_info_t ggml_numa_kernel_rope_register(void) {
     
     // Strategy thresholds for ROPE operations
     // ROPE has complex indexing patterns, so use moderate thresholds
-    info.strategy_array.thresholds[NUMA_STRATEGY_IDX_SINGLE_SINGLE] = 2048;      // Single thread below 2K elements
-    info.strategy_array.thresholds[NUMA_STRATEGY_IDX_SINGLE_MULTI] = 131072;     // Multi-thread below 128K elements
+    info.strategy_array.thresholds[NUMA_STRATEGY_IDX_SINGLE_SINGLE] = 128;      // Single thread below 2K elements
+    info.strategy_array.thresholds[NUMA_STRATEGY_IDX_SINGLE_MULTI] = 1024;     // Multi-thread below 128K elements
     // Above 128K elements: data-parallel strategy
     info.strategy_array.valid = true;
     

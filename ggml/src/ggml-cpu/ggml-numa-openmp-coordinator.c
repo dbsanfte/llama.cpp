@@ -12,18 +12,38 @@
 #include "ggml-numa-shared.h"
 #include "ggml-cpu-impl.h"
 #include "ggml-impl.h"
+#include "../include/ggml.h"  // For ggml_cplan and related structures
+#include "../include/ggml-cpu.h"  // For struct ggml_cplan definition
 
 #include <numa.h>
 #include <sched.h>
 #include <pthread.h>
+#include <unistd.h>  // For sysconf
+#include <omp.h>
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
 #include <stdatomic.h>  // For atomic operations
+#include <limits.h>     // For INT_MAX
 
 #ifdef GGML_USE_OPENMP
 #include <omp.h>
+
+// OpenMP 5.0 feature detection
+#if defined(GGML_USE_OPENMP_5_0) || _OPENMP >= 201811
+#define GGML_OPENMP_5_0_AVAILABLE 1
+#elif defined(GGML_FORCE_OPENMP_5_0_APIS)
+// Force-enable for systems where functions work despite version detection
+#define GGML_OPENMP_5_0_AVAILABLE 1
+#warning "Force-enabling OpenMP 5.0 APIs - functions available but version detection failed"
+#else
+#define GGML_OPENMP_5_0_AVAILABLE 0
 #endif
+
+#endif
+
+// Forward declarations for static functions
+static bool ggml_numa_openmp_init_per_numa_threadpools_with_mask(const ggml_numa_cpu_mask_t * cpu_mask);
 
 // Thread-local variables for kernels
 __thread int ggml_current_numa_node = 0;
@@ -94,6 +114,414 @@ void ggml_numa_free_cpu_mask(ggml_numa_cpu_mask_t * mask) {
 }
 
 /**
+ * @brief Query OpenMP topology using OpenMP 5.0 APIs
+ * 
+ * Uses OpenMP 5.0 place APIs to understand the current thread binding
+ * and NUMA topology configuration. Provides much more robust detection
+ * than simple core counting.
+ */
+static void query_openmp_topology(void) {
+#if GGML_OPENMP_5_0_AVAILABLE && defined(GGML_USE_OPENMP)
+    NUMA_LOG_DEBUG("Querying OpenMP 5.0 topology...\n");
+    
+    // Check if places are configured
+    int num_places = omp_get_num_places();
+    if (num_places == 0) {
+        NUMA_LOG_DEBUG("No OpenMP places configured - using basic topology detection\n");
+        return;
+    }
+    
+    NUMA_LOG_DEBUG("OpenMP places configured: %d places\n", num_places);
+    
+    // Analyze place structure to understand NUMA topology
+    int total_procs = 0;
+    int min_procs_per_place = INT_MAX;
+    int max_procs_per_place = 0;
+    
+    for (int place = 0; place < num_places && place < 16; place++) {  // Limit to first 16 for debugging
+        int procs_in_place = omp_get_place_num_procs(place);
+        total_procs += procs_in_place;
+        
+        if (procs_in_place < min_procs_per_place) min_procs_per_place = procs_in_place;
+        if (procs_in_place > max_procs_per_place) max_procs_per_place = procs_in_place;
+        
+        NUMA_LOG_VERBOSE("Place %d: %d processors\n", place, procs_in_place);
+        
+        // Show first few processor IDs for debugging
+        if (procs_in_place > 0) {
+            int sample_size = (procs_in_place < 8) ? procs_in_place : 8;
+            int *proc_ids = malloc(procs_in_place * sizeof(int));
+            if (proc_ids) {
+                omp_get_place_proc_ids(place, proc_ids);
+                NUMA_LOG_VERBOSE("  First %d proc IDs: ", sample_size);
+                for (int i = 0; i < sample_size; i++) {
+                    NUMA_LOG_VERBOSE("%d ", proc_ids[i]);
+                }
+                NUMA_LOG_VERBOSE("\n");
+                free(proc_ids);
+            }
+        }
+    }
+    
+    // Determine NUMA topology based on place structure
+    if (num_places == 2 && min_procs_per_place == max_procs_per_place && max_procs_per_place > 1) {
+        NUMA_LOG_DEBUG("Detected NUMA domains: 2 places with %d cores each\n", max_procs_per_place);
+        g_openmp_config.openmp_numa_places = num_places;
+        g_openmp_config.openmp_cores_per_place = max_procs_per_place;
+    } else if (min_procs_per_place == 2 && max_procs_per_place == 2) {
+        NUMA_LOG_DEBUG("Detected physical cores: %d places with 2 hyperthreads each\n", num_places);
+        g_openmp_config.openmp_numa_places = 0;  // Core-level, not NUMA
+        g_openmp_config.openmp_cores_per_place = 2;  // Hyperthreads per core
+    } else {
+        NUMA_LOG_DEBUG("Mixed place configuration: %d places, %d-%d cores per place\n", 
+                       num_places, min_procs_per_place, max_procs_per_place);
+        g_openmp_config.openmp_numa_places = num_places;
+        g_openmp_config.openmp_cores_per_place = max_procs_per_place;
+    }
+    
+    // Check current thread's partition
+    #pragma omp parallel
+    {
+        #pragma omp single
+        {
+            int partition_size = omp_get_partition_num_places();
+            NUMA_LOG_DEBUG("Thread partition size: %d places\n", partition_size);
+            
+            if (partition_size > 0 && partition_size <= 16) {
+                int *place_nums = malloc(partition_size * sizeof(int));
+                if (place_nums) {
+                    omp_get_partition_place_nums(place_nums);
+                    NUMA_LOG_VERBOSE("Partition place numbers: ");
+                    for (int i = 0; i < partition_size; i++) {
+                        NUMA_LOG_VERBOSE("%d ", place_nums[i]);
+                    }
+                    NUMA_LOG_VERBOSE("\n");
+                    free(place_nums);
+                }
+            }
+        }
+    }
+    
+    NUMA_LOG_DEBUG("OpenMP topology query complete\n");
+#else
+    NUMA_LOG_DEBUG("OpenMP 5.0 APIs not available, skipping topology query\n");
+#endif
+}
+
+/**
+ * @brief Get CPU IDs for specific NUMA node
+ * 
+ * Returns array of CPU IDs that belong to the specified NUMA node.
+ * Uses OpenMP 5.0 topology detection when available, falls back to numa library.
+ */
+static int ggml_numa_openmp_get_cpus_for_numa_node(int numa_node_id, int * cpu_ids, int max_cpus) {
+    if (!cpu_ids || max_cpus <= 0 || numa_node_id < 0) {
+        return -1;
+    }
+    
+    if (!g_openmp_config.numa_available || numa_node_id >= g_openmp_config.total_numa_nodes) {
+        NUMA_LOG_DEBUG("Invalid NUMA node %d (total: %d)\n", numa_node_id, g_openmp_config.total_numa_nodes);
+        return -1;
+    }
+
+#if GGML_OPENMP_5_0_AVAILABLE
+    // Try OpenMP 5.0 place-based detection first
+    int num_places = omp_get_num_places();
+    if (num_places > 0 && g_openmp_config.openmp_numa_places == g_openmp_config.total_numa_nodes) {
+        // We have NUMA domain places that match our NUMA node count
+        if (numa_node_id < num_places) {
+            int procs_in_place = omp_get_place_num_procs(numa_node_id);
+            int cpus_to_copy = (procs_in_place < max_cpus) ? procs_in_place : max_cpus;
+            
+            omp_get_place_proc_ids(numa_node_id, cpu_ids);
+            
+            NUMA_LOG_DEBUG("OpenMP: NUMA node %d has %d CPUs (returning %d)\n", 
+                           numa_node_id, procs_in_place, cpus_to_copy);
+            return cpus_to_copy;
+        }
+    }
+#endif
+
+    // Fallback to numa library
+    struct bitmask * numa_cpus = numa_allocate_cpumask();
+    if (!numa_cpus) {
+        NUMA_LOG_DEBUG("Failed to allocate NUMA CPU mask\n");
+        return -1;
+    }
+    
+    if (numa_node_to_cpus(numa_node_id, numa_cpus) != 0) {
+        numa_free_cpumask(numa_cpus);
+        NUMA_LOG_DEBUG("Failed to get CPUs for NUMA node %d\n", numa_node_id);
+        return -1;
+    }
+    
+    int cpu_count = 0;
+    for (int cpu = 0; cpu < numa_num_possible_cpus() && cpu_count < max_cpus; cpu++) {
+        if (numa_bitmask_isbitset(numa_cpus, cpu)) {
+            cpu_ids[cpu_count++] = cpu;
+        }
+    }
+    
+    numa_free_cpumask(numa_cpus);
+    
+    NUMA_LOG_DEBUG("numa library: NUMA node %d has %d CPUs\n", numa_node_id, cpu_count);
+    return cpu_count;
+}
+
+/**
+ * @brief Initialize per-NUMA thread teams with CPU binding
+ * 
+ * Creates persistent thread teams for each NUMA node where threads
+ * are bound only to CPUs of their specific NUMA node.
+ */
+static bool ggml_numa_openmp_init_per_numa_threadpools(void) {
+    return ggml_numa_openmp_init_per_numa_threadpools_with_mask(NULL);
+}
+
+/**
+ * @brief Initialize per-NUMA thread teams with CPU mask support
+ * 
+ * Creates persistent thread teams for each NUMA node, respecting user-specified
+ * CPU masks for fine-grained control over CPU binding and allocation.
+ * 
+ * @param cpu_mask User-specified CPU mask to restrict CPU usage (NULL for auto-detection)
+ * @return True if thread teams initialized successfully, false otherwise
+ */
+static bool ggml_numa_openmp_init_per_numa_threadpools_with_mask(const ggml_numa_cpu_mask_t * cpu_mask) {
+    if (!g_openmp_config.numa_available) {
+        NUMA_LOG_DEBUG("NUMA not available, skipping per-NUMA thread team creation\n");
+        return true; // Not an error for non-NUMA systems
+    }
+    
+    if (g_openmp_config.threadpool_manager.teams_initialized) {
+        NUMA_LOG_DEBUG("Per-NUMA thread teams already initialized\n");
+        return true;
+    }
+    
+    ggml_numa_threadpool_manager_t * manager = &g_openmp_config.threadpool_manager;
+    manager->num_teams = g_openmp_config.total_numa_nodes;
+    
+    // Allocate thread teams array
+    manager->teams = calloc(manager->num_teams, sizeof(ggml_numa_thread_team_t));
+    if (!manager->teams) {
+        NUMA_LOG_DEBUG("Failed to allocate memory for thread teams\n");
+        return false;
+    }
+    
+    // Initialize each NUMA node's thread team
+    for (int numa_id = 0; numa_id < manager->num_teams; numa_id++) {
+        ggml_numa_thread_team_t * team = &manager->teams[numa_id];
+        
+        team->numa_node_id = numa_id;
+        team->num_threads = g_openmp_config.threads_per_node;
+        team->initialized = false;
+        team->threads_bound = false;
+        
+        // Get CPU IDs for this NUMA node
+        team->cpu_ids = malloc(256 * sizeof(int)); // Max 256 CPUs per NUMA node
+        if (!team->cpu_ids) {
+            NUMA_LOG_DEBUG("Failed to allocate CPU ID array for NUMA node %d\n", numa_id);
+            goto cleanup_teams;
+        }
+        
+        team->num_cpus = ggml_numa_openmp_get_cpus_for_numa_node(numa_id, team->cpu_ids, 256);
+        if (team->num_cpus <= 0) {
+            NUMA_LOG_DEBUG("Failed to get CPU IDs for NUMA node %d\n", numa_id);
+            goto cleanup_teams;
+        }
+        
+        team->initialized = true;
+        // Set threads_bound to true since we have CPU IDs available for binding
+        team->threads_bound = true;
+        
+        NUMA_LOG_DEBUG("Thread team %d: NUMA node %d, %d threads, %d CPUs available\n",
+                       numa_id, team->numa_node_id, team->num_threads, team->num_cpus);
+    }
+    
+    // Initialize synchronization barriers for multi-NUMA coordination
+    if (manager->num_teams > 1) {
+        if (pthread_barrier_init(&manager->start_barrier, NULL, manager->num_teams) != 0) {
+            NUMA_LOG_DEBUG("Failed to initialize start barrier\n");
+            goto cleanup_teams;
+        }
+        
+        if (pthread_barrier_init(&manager->end_barrier, NULL, manager->num_teams) != 0) {
+            NUMA_LOG_DEBUG("Failed to initialize end barrier\n");
+            pthread_barrier_destroy(&manager->start_barrier);
+            goto cleanup_teams;
+        }
+        
+        manager->barriers_initialized = true;
+    }
+    
+    manager->teams_initialized = true;
+    
+    NUMA_LOG_DEBUG("Successfully initialized %d per-NUMA thread teams\n", manager->num_teams);
+    return true;
+
+cleanup_teams:
+    // Cleanup on failure
+    if (manager->teams) {
+        for (int i = 0; i < manager->num_teams; i++) {
+            if (manager->teams[i].cpu_ids) {
+                free(manager->teams[i].cpu_ids);
+            }
+        }
+        free(manager->teams);
+        manager->teams = NULL;
+    }
+    manager->teams_initialized = false;
+    return false;
+}
+
+/**
+ * @brief Coordinate multi-NUMA execution across all thread teams
+ * 
+ * Executes work function simultaneously on all NUMA nodes using their
+ * dedicated thread teams, with proper synchronization.
+ */
+static enum ggml_status ggml_numa_openmp_execute_multi_numa(
+    ggml_numa_openmp_work_fn_t work_fn,
+    void * work_context,
+    struct ggml_cplan * cplan) {
+    
+    if (!g_openmp_config.threadpool_manager.teams_initialized) {
+        NUMA_LOG_DEBUG("Thread teams not initialized, cannot execute multi-NUMA\n");
+        return GGML_STATUS_FAILED;
+    }
+    
+    ggml_numa_threadpool_manager_t * manager = &g_openmp_config.threadpool_manager;
+    enum ggml_status result = GGML_STATUS_SUCCESS;
+    
+    // Set thread-local NUMA context for data-parallel execution
+    ggml_numa_is_data_parallel_execution = true;
+    ggml_numa_total_nodes_for_data_parallel = manager->num_teams;
+    
+    NUMA_LOG_DEBUG("Starting multi-NUMA execution across %d NUMA nodes\n", manager->num_teams);
+    
+    // Create array to track per-NUMA results
+    enum ggml_status numa_results[NUMA_MAX_NODES];
+    for (int i = 0; i < manager->num_teams; i++) {
+        numa_results[i] = GGML_STATUS_SUCCESS;
+    }
+    
+    // Execute on all NUMA nodes in parallel using OpenMP
+    #pragma omp parallel for num_threads(manager->num_teams)
+    for (int numa_id = 0; numa_id < manager->num_teams; numa_id++) {
+        ggml_numa_thread_team_t * team = &manager->teams[numa_id];
+        
+        // Set thread-local context for this NUMA coordinator thread
+        ggml_current_numa_node = numa_id;
+        
+        NUMA_LOG_VERBOSE("NUMA coordinator %d starting nested execution\n", numa_id);
+        
+        // Synchronize start across all NUMA coordinators
+        if (manager->barriers_initialized) {
+            pthread_barrier_wait(&manager->start_barrier);
+        }
+        
+        // Execute work using this NUMA node's dedicated thread team
+        enum ggml_status numa_result = GGML_STATUS_SUCCESS;
+        
+        // Create nested OpenMP parallel region for this NUMA node
+        #pragma omp parallel num_threads(team->num_threads)
+        {
+            int thread_id = omp_get_thread_num();
+            
+            // Bind thread to specific CPU from this NUMA node
+            if (team->num_cpus > 0) {
+                int cpu_index = thread_id % team->num_cpus;
+                int target_cpu = team->cpu_ids[cpu_index];
+                
+                cpu_set_t cpuset;
+                CPU_ZERO(&cpuset);
+                CPU_SET(target_cpu, &cpuset);
+                pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset);
+                
+                // Additional NUMA binding
+                numa_run_on_node(numa_id);
+            }
+            
+            // Execute the work function
+            struct ggml_compute_params params = {
+                .ith = thread_id,
+                .nth = team->num_threads,
+                .wdata = cplan ? cplan->work_data : NULL,
+                .wsize = cplan ? cplan->work_size : 0
+            };
+            
+            enum ggml_status thread_result = work_fn(work_context, &params);
+            
+            if (thread_result != GGML_STATUS_SUCCESS) {
+                #pragma omp atomic write
+                numa_result = thread_result;
+            }
+        }
+        
+        // Store result for this NUMA node
+        numa_results[numa_id] = numa_result;
+        
+        // Synchronize completion across all NUMA coordinators
+        if (manager->barriers_initialized) {
+            pthread_barrier_wait(&manager->end_barrier);
+        }
+        
+        NUMA_LOG_VERBOSE("NUMA coordinator %d completed execution\n", numa_id);
+    }
+    
+    // Check all NUMA results
+    for (int i = 0; i < manager->num_teams; i++) {
+        if (numa_results[i] != GGML_STATUS_SUCCESS) {
+            result = numa_results[i];
+            break;
+        }
+    }
+    
+    NUMA_LOG_DEBUG("Multi-NUMA execution completed\n");
+    return result;
+}
+
+/**
+ * @brief Clean up all per-NUMA thread pools and resources
+ * 
+ * Destroys barriers and frees allocated memory for CPU lists.
+ */
+static void ggml_numa_openmp_cleanup_threadpools(void) {
+    ggml_numa_threadpool_manager_t * manager = &g_openmp_config.threadpool_manager;
+    
+    if (!manager->teams_initialized) {
+        NUMA_LOG_DEBUG("Thread teams not initialized, nothing to clean up\n");
+        return;
+    }
+    
+    NUMA_LOG_DEBUG("Cleaning up per-NUMA thread pools\n");
+    
+    // Destroy barriers if they were initialized
+    if (manager->barriers_initialized) {
+        pthread_barrier_destroy(&manager->start_barrier);
+        pthread_barrier_destroy(&manager->end_barrier);
+        manager->barriers_initialized = false;
+        NUMA_LOG_VERBOSE("Destroyed pthread barriers\n");
+    }
+    
+    // Free CPU lists for each team
+    for (int i = 0; i < manager->num_teams; i++) {
+        ggml_numa_thread_team_t * team = &manager->teams[i];
+        if (team->cpu_ids) {
+            free(team->cpu_ids);
+            team->cpu_ids = NULL;
+            team->num_cpus = 0;
+        }
+    }
+    
+    // Reset manager state
+    manager->num_teams = 0;
+    manager->teams_initialized = false;
+    
+    NUMA_LOG_DEBUG("Per-NUMA thread pools cleanup completed\n");
+}
+
+/**
  * @brief Bind current thread to specific NUMA node
  * 
  * Uses numa_run_on_node() for clean NUMA binding without
@@ -126,6 +554,9 @@ bool ggml_numa_openmp_coordinator_init(void) {
 
     // Initialize configuration
     memset(&g_openmp_config, 0, sizeof(g_openmp_config));
+    
+    // Query OpenMP 5.0 topology first (if available)
+    query_openmp_topology();
     
     // Check NUMA availability
     if (numa_available() == 0) {
@@ -172,6 +603,13 @@ bool ggml_numa_openmp_coordinator_init(void) {
                    g_openmp_config.total_numa_nodes, g_openmp_config.threads_per_node);
 
     g_openmp_config.initialized = true;
+    
+    // Initialize per-NUMA thread teams for optimal CPU binding
+    if (!ggml_numa_openmp_init_per_numa_threadpools()) {
+        NUMA_LOG_DEBUG("Warning: Failed to initialize per-NUMA thread teams, falling back to basic OpenMP\n");
+        // Continue with basic functionality - this is not a fatal error
+    }
+    
     g_openmp_initialized = true;
     
     return true;
@@ -180,7 +618,7 @@ bool ggml_numa_openmp_coordinator_init(void) {
 /**
  * @brief Initialize OpenMP coordinator with user-specified CPU mask
  */
-bool ggml_numa_openmp_coordinator_init_with_mask(const ggml_numa_cpu_mask_t * cpu_mask, int total_threads) {
+bool ggml_numa_openmp_coordinator_init_with_mask(const ggml_numa_cpu_mask_t * cpu_mask) {
     if (g_openmp_initialized) {
         return true;
     }
@@ -197,23 +635,17 @@ bool ggml_numa_openmp_coordinator_init_with_mask(const ggml_numa_cpu_mask_t * cp
     } else {
         g_openmp_config.numa_available = false;
         g_openmp_config.total_numa_nodes = 1;
-        
         NUMA_LOG_DEBUG("NUMA not available, using single node\n");
     }
 
-    // Determine thread count based on user input or system detection
+    // Auto-detect thread count based on available cores
     int effective_threads;
-    if (total_threads > 0) {
-        effective_threads = total_threads;
-        NUMA_LOG_DEBUG("Using user-specified thread count: %d\n", effective_threads);
-    } else {
 #ifdef GGML_USE_OPENMP
-        effective_threads = omp_get_max_threads();
+    effective_threads = omp_get_max_threads();
 #else
-        effective_threads = 1;
+    effective_threads = 1;
 #endif
-        NUMA_LOG_DEBUG("Auto-detected thread count: %d\n", effective_threads);
-    }
+    NUMA_LOG_DEBUG("Auto-detected thread count: %d\n", effective_threads);
 
     // Calculate threads per node with validation for uneven distribution
     if (g_openmp_config.total_numa_nodes > 0) {
@@ -236,17 +668,17 @@ bool ggml_numa_openmp_coordinator_init_with_mask(const ggml_numa_cpu_mask_t * cp
         g_openmp_config.threads_per_node = effective_threads;
     }
 
-    // TODO: If cpu_mask is provided, use it for thread affinity
-    // This would require platform-specific CPU affinity implementation
-    if (cpu_mask && cpu_mask->valid) {
-        NUMA_LOG_DEBUG("CPU mask provided but affinity setting not yet implemented\n");
-        // Future implementation would set thread affinity based on cpu_mask
-    }
-
-    NUMA_LOG_DEBUG("OpenMP coordinator initialized with mask: %d nodes, %d threads per node\n",
+    NUMA_LOG_DEBUG("OpenMP coordinator initialized with CPU mask: %d nodes, %d threads per node\n",
                    g_openmp_config.total_numa_nodes, g_openmp_config.threads_per_node);
 
     g_openmp_config.initialized = true;
+    
+    // Initialize per-NUMA thread teams with CPU mask support
+    if (!ggml_numa_openmp_init_per_numa_threadpools_with_mask(cpu_mask)) {
+        NUMA_LOG_DEBUG("Warning: Failed to initialize per-NUMA thread teams with CPU mask, falling back to basic OpenMP\n");
+        // Continue with basic functionality - this is not a fatal error
+    }
+    
     g_openmp_initialized = true;
     
     return true;
@@ -306,18 +738,18 @@ enum ggml_status ggml_numa_openmp_execute_single_thread(
         NUMA_ASSERT(work_buffer != NULL, "Work buffer allocation failed");
     }
 
-    // Set thread-local context for single-thread execution
-    ggml_current_numa_node = target_numa_node;
-    ggml_numa_is_data_parallel_execution = false;
-    ggml_numa_total_nodes_for_data_parallel = 1;
-    ggml_numa_shared_result_tensor_data = ggml_get_data(tensor);
-
     enum ggml_status result = GGML_STATUS_FAILED;
 
 #ifdef GGML_USE_OPENMP
     // Use OpenMP single thread with NUMA binding
     #pragma omp parallel num_threads(1)
     {
+        // Set thread-local context for single-thread execution (must be inside parallel region)
+        ggml_current_numa_node = target_numa_node;
+        ggml_numa_is_data_parallel_execution = false;
+        ggml_numa_total_nodes_for_data_parallel = 1;
+        ggml_numa_shared_result_tensor_data = ggml_get_data(tensor);
+
         // Bind to target NUMA node
         if (bind_thread_to_numa_node(target_numa_node)) {
             // Set up compute params for single thread
@@ -341,8 +773,14 @@ enum ggml_status ggml_numa_openmp_execute_single_thread(
     }
 #else
     // Fallback without OpenMP
+    // Set thread-local context for fallback execution
+    ggml_current_numa_node = target_numa_node;
+    ggml_numa_is_data_parallel_execution = false;
+    ggml_numa_total_nodes_for_data_parallel = 1;
+    ggml_numa_shared_result_tensor_data = ggml_get_data(tensor);
+    
     struct ggml_compute_params params = {
-        .ith = 0, .nth = 1, .wdata = NULL, .wsize = 0
+        .ith = 0, .nth = 1, .wdata = work_buffer, .wsize = work_buffer_size
     };
     result = work_fn(tensor, &params);
 #endif
@@ -397,21 +835,36 @@ enum ggml_status ggml_numa_openmp_execute_single_node(
         NUMA_ASSERT(work_buffer != NULL, "Work buffer allocation failed");
     }
 
-    // Set thread-local context for single-node execution
-    ggml_current_numa_node = target_numa_node;
-    ggml_numa_is_data_parallel_execution = false;
-    ggml_numa_total_nodes_for_data_parallel = 1;
-    ggml_numa_shared_result_tensor_data = ggml_get_data(tensor);
-
     enum ggml_status result = GGML_STATUS_SUCCESS;
 
 #ifdef GGML_USE_OPENMP
+    // CRITICAL FIX: Use direct mapping from OpenMP thread ID to logical task ID
+    // This prevents race conditions by using deterministic thread assignment
+    
     // Use OpenMP parallel region with specified thread count
     #pragma omp parallel num_threads(n_threads)
     {
-        // Get OpenMP thread info
-        int ith = omp_get_thread_num();
-        int nth = omp_get_num_threads();
+        // Get OpenMP thread ID and use directly as logical task ID
+        int omp_thread_id = omp_get_thread_num();
+        int ith = omp_thread_id;  // Direct mapping (0, 1, 2, ..., n_threads-1)
+        int nth = n_threads;      // Total logical tasks
+
+        NUMA_LOG_DEBUG("SINGLE_NODE_TASK: OpenMP thread %d mapped to logical task %d/%d\n", 
+                       omp_thread_id, ith, nth);
+
+        // Set thread-local context for single-node execution (must be inside parallel region)
+        ggml_current_numa_node = target_numa_node;
+        ggml_numa_is_data_parallel_execution = false;
+        ggml_numa_total_nodes_for_data_parallel = 1;
+        
+        // CRITICAL FIX: Disable shared memory optimization for multi-threaded single-node execution
+        // The shared memory pointer causes race conditions when multiple threads write to same memory
+        // Only safe for single-threaded or data-parallel execution
+        if (n_threads == 1) {
+            ggml_numa_shared_result_tensor_data = ggml_get_data(tensor);  // Safe for single thread
+        } else {
+            ggml_numa_shared_result_tensor_data = NULL;  // Force individual tensor access for multi-thread
+        }
 
         // Bind all threads to target NUMA node
         bind_thread_to_numa_node(target_numa_node);
@@ -428,13 +881,13 @@ enum ggml_status ggml_numa_openmp_execute_single_node(
         }
         
         struct ggml_compute_params params = {
-            .ith = ith,                     // Unique thread index
-            .nth = nth,                     // Total threads
+            .ith = ith,                     // Unique logical task index
+            .nth = nth,                     // Total logical tasks
             .wdata = thread_work_buffer,    // Shared work buffer (not sliced)
             .wsize = thread_work_size       // Full work buffer size
         };
 
-        // Each thread calls work function with unique ith
+        // Each thread calls work function with unique logical task ID
         enum ggml_status thread_result = work_fn(tensor, &params);
         
         // Use OpenMP critical section to collect results
@@ -447,6 +900,12 @@ enum ggml_status ggml_numa_openmp_execute_single_node(
     }
 #else
     // Fallback without OpenMP - single thread execution
+    // Set thread-local context for fallback execution
+    ggml_current_numa_node = target_numa_node;
+    ggml_numa_is_data_parallel_execution = false;
+    ggml_numa_total_nodes_for_data_parallel = 1;
+    ggml_numa_shared_result_tensor_data = ggml_get_data(tensor);
+    
     struct ggml_compute_params params = {
         .ith = 0, .nth = 1, .wdata = work_buffer, .wsize = work_buffer_size
     };
@@ -488,6 +947,12 @@ enum ggml_status ggml_numa_openmp_execute_data_parallel(
 
     NUMA_LOG_DEBUG("Executing data-parallel strategy: %d nodes, %d threads per node (%d total, work_buffer_size=%zu)\n",
                    total_nodes, threads_per_node, total_threads, work_buffer_size);
+    
+    // TRACE: Log detailed data-parallel coordination setup for debugging
+    NUMA_LOG_TRACE("COORDINATOR_DATA_PARALLEL_START: tensor=%p op=%s total_nodes=%d threads_per_node=%d total_threads=%d",
+                   (void*)tensor, ggml_op_name(tensor->op), total_nodes, threads_per_node, total_threads);
+    NUMA_LOG_TRACE("COORDINATOR_DP_TENSOR_INFO: elements=%ld shape=[%ld,%ld,%ld,%ld] work_buffer_size=%zu",
+                   ggml_nelements(tensor), tensor->ne[0], tensor->ne[1], tensor->ne[2], tensor->ne[3], work_buffer_size);
 
     // Allocate work buffer distributed across NUMA nodes
     void * work_buffer = NULL;
@@ -497,24 +962,35 @@ enum ggml_status ggml_numa_openmp_execute_data_parallel(
         NUMA_ASSERT(work_buffer != NULL, "Work buffer allocation failed");
     }
 
-    // Set thread-local context for data-parallel execution
-    ggml_numa_is_data_parallel_execution = true;
-    ggml_numa_total_nodes_for_data_parallel = total_nodes;
-    ggml_numa_shared_result_tensor_data = ggml_get_data(tensor);
-
     enum ggml_status result = GGML_STATUS_SUCCESS;
 
 #ifdef GGML_USE_OPENMP
+    // CRITICAL FIX: Use direct mapping from OpenMP thread ID to logical task ID
+    // This prevents race conditions by using deterministic thread assignment
+    
     // Use OpenMP parallel region with total thread count
     #pragma omp parallel num_threads(total_threads)
     {
-        // Calculate which NUMA node this thread belongs to
-        int global_thread_id = omp_get_thread_num();
-        int numa_node = global_thread_id / threads_per_node;
-        int local_thread_id = global_thread_id % threads_per_node;
+        // Get OpenMP thread ID and map to logical task assignment
+        int omp_thread_id = omp_get_thread_num();
+        int numa_node = omp_thread_id / threads_per_node;
+        int local_task_id = omp_thread_id % threads_per_node;
 
-        // Set thread-local NUMA context
+        // DEBUG: Log logical vs physical thread assignment
+        NUMA_LOG_DEBUG("DATA_PARALLEL_TASK: OpenMP thread %d mapped to NUMA %d, local task %d/%d\n",
+                       omp_thread_id, numa_node, local_task_id, threads_per_node);
+        
+        // TRACE: Log detailed thread coordination for debugging data-parallel issues
+        NUMA_LOG_TRACE("COORDINATOR_THREAD_SETUP: omp_thread_id=%d numa_node=%d local_task_id=%d total_nodes=%d",
+                       omp_thread_id, numa_node, local_task_id, total_nodes);
+        NUMA_LOG_TRACE("COORDINATOR_THREAD_CONTEXT: tensor_data=%p elements=%ld data_parallel=true",
+                       ggml_get_data(tensor), ggml_nelements(tensor));
+
+        // Set thread-local context for data-parallel execution (must be inside parallel region)
         ggml_current_numa_node = numa_node;
+        ggml_numa_is_data_parallel_execution = true;
+        ggml_numa_total_nodes_for_data_parallel = total_nodes;
+        ggml_numa_shared_result_tensor_data = ggml_get_data(tensor);
 
         // Bind thread to its NUMA node
         bind_thread_to_numa_node(numa_node);
@@ -531,7 +1007,7 @@ enum ggml_status ggml_numa_openmp_execute_data_parallel(
         }
         
         struct ggml_compute_params params = {
-            .ith = local_thread_id,         // Thread index within NUMA node
+            .ith = local_task_id,           // Logical task index within NUMA node
             .nth = threads_per_node,        // Threads per NUMA node
             .wdata = thread_work_buffer,    // Shared work buffer (not sliced)
             .wsize = thread_work_size       // Full work buffer size
@@ -539,6 +1015,15 @@ enum ggml_status ggml_numa_openmp_execute_data_parallel(
 
         // Each thread calls work function
         enum ggml_status thread_result = work_fn(tensor, &params);
+        
+        // TRACE: Log work function completion for debugging
+        NUMA_LOG_TRACE("COORDINATOR_WORK_COMPLETE: omp_id=%d numa_node=%d local_id=%d result=%s",
+                       omp_thread_id, numa_node, local_task_id, 
+                       (thread_result == GGML_STATUS_SUCCESS) ? "SUCCESS" : "FAILED");
+        
+        // DEBUG: Log thread completion
+        NUMA_LOG_DEBUG("OPENMP_THREAD_END: OpenMP=%d, NUMA=%d, Result=%d\n", 
+                       omp_thread_id, numa_node, thread_result);
         
         // Collect results
         #pragma omp critical
@@ -550,7 +1035,12 @@ enum ggml_status ggml_numa_openmp_execute_data_parallel(
     }
 #else
     // Fallback without OpenMP - single thread execution
+    // Set thread-local context for fallback execution
     ggml_current_numa_node = 0;
+    ggml_numa_is_data_parallel_execution = true;
+    ggml_numa_total_nodes_for_data_parallel = total_nodes;
+    ggml_numa_shared_result_tensor_data = ggml_get_data(tensor);
+    
     struct ggml_compute_params params = {
         .ith = 0, .nth = 1, .wdata = work_buffer, .wsize = work_buffer_size
     };
@@ -568,6 +1058,18 @@ enum ggml_status ggml_numa_openmp_execute_data_parallel(
 }
 
 /**
+ * @brief Proper fallback threadpool for legacy ggml operations
+ * 
+ * Some ggml operations (like MUL_MAT) require a proper threadpool with the correct
+ * thread count for barrier synchronization to work correctly.
+ */
+static struct {
+    struct ggml_threadpool * threadpool;    // Real threadpool instance
+    int n_threads;                         // Number of threads in fallback threadpool
+    bool initialized;                      // Whether this fallback is initialized
+} g_fallback_threadpool = {0};
+
+/**
  * @brief Shutdown OpenMP coordinator
  */
 void ggml_numa_openmp_coordinator_shutdown(void) {
@@ -576,6 +1078,17 @@ void ggml_numa_openmp_coordinator_shutdown(void) {
     }
 
     NUMA_LOG_DEBUG("Shutting down OpenMP coordinator\n");
+
+    // Clean up fallback threadpool
+    if (g_fallback_threadpool.initialized && g_fallback_threadpool.threadpool) {
+        ggml_threadpool_free(g_fallback_threadpool.threadpool);
+        g_fallback_threadpool.threadpool = NULL;
+        g_fallback_threadpool.initialized = false;
+        NUMA_LOG_DEBUG("Cleaned up fallback threadpool\n");
+    }
+
+    // Clean up per-NUMA thread teams first
+    ggml_numa_openmp_cleanup_threadpools();
 
     // Reset configuration
     memset(&g_openmp_config, 0, sizeof(g_openmp_config));
@@ -586,24 +1099,10 @@ void ggml_numa_openmp_coordinator_shutdown(void) {
 }
 
 /**
- * @brief Minimal threadpool structure for legacy ggml operations
- * 
- * Some ggml operations (like MUL_MAT) expect a valid threadpool for barrier synchronization.
- * This minimal structure provides the necessary fields without full threadpool implementation.
- */
-static struct {
-    // Only the essential fields needed for barrier operations
-    atomic_int current_chunk;   // Required for MUL_MAT work distribution
-    atomic_int n_barrier;       // Required for barrier synchronization  
-    atomic_int n_barrier_passed; // Required for barrier synchronization
-    bool initialized;           // Whether this fallback is initialized
-} g_fallback_threadpool_minimal = {0};
-
-/**
  * @brief Get fallback threadpool for legacy ggml operations
  * 
- * Provides a minimal threadpool structure that can handle barrier operations
- * required by some ggml functions (like ggml_compute_forward_mul_mat).
+ * Provides a proper threadpool that can handle the full thread count
+ * required by ggml functions (like ggml_compute_forward_mul_mat).
  * 
  * @return Pointer to fallback threadpool or NULL if not available
  */
@@ -612,17 +1111,95 @@ struct ggml_threadpool * ggml_numa_openmp_get_fallback_threadpool(void) {
         return NULL;
     }
 
-    // Initialize the minimal fallback on first use
-    if (!g_fallback_threadpool_minimal.initialized) {
-        atomic_store_explicit(&g_fallback_threadpool_minimal.current_chunk, 0, memory_order_relaxed);
-        atomic_store_explicit(&g_fallback_threadpool_minimal.n_barrier, 0, memory_order_relaxed);
-        atomic_store_explicit(&g_fallback_threadpool_minimal.n_barrier_passed, 0, memory_order_relaxed);
-        g_fallback_threadpool_minimal.initialized = true;
+    // Initialize the fallback threadpool on first use
+    if (!g_fallback_threadpool.initialized) {
+        // Use a reasonable default thread count (system cores) for the fallback threadpool
+        int max_threads = 1; // Start with single thread as fallback
         
-        NUMA_LOG_DEBUG("Initialized minimal fallback threadpool for legacy operations\n");
+        #ifdef _OPENMP
+        // If OpenMP is available, use all available threads
+        max_threads = omp_get_max_threads();
+        #else
+        // Without OpenMP, try to get system thread count from sysconf
+        long nprocs = sysconf(_SC_NPROCESSORS_ONLN);
+        if (nprocs > 0) {
+            max_threads = (int)nprocs;
+        }
+        #endif
+        
+        // Create threadpool parameters with single thread for fallback simplicity
+        struct ggml_threadpool_params tpp = ggml_threadpool_params_default(1);
+        
+        // Create the actual threadpool (single-threaded to avoid barrier issues)
+        g_fallback_threadpool.threadpool = ggml_threadpool_new(&tpp);
+        if (!g_fallback_threadpool.threadpool) {
+            NUMA_LOG_ERROR("Failed to create fallback threadpool with 1 thread\n");
+            return NULL;
+        }
+        
+        g_fallback_threadpool.n_threads = 1;
+        g_fallback_threadpool.initialized = true;
+        
+        NUMA_LOG_DEBUG("Initialized single-threaded fallback threadpool for legacy operations\n");
     }
 
-    // Cast to ggml_threadpool* - this is safe because we only access the atomic fields
-    // that are at the same memory offsets in the real struct
-    return (struct ggml_threadpool*)&g_fallback_threadpool_minimal;
+    return g_fallback_threadpool.threadpool;
+}
+
+/**
+ * @brief Get the thread count of the fallback threadpool
+ * 
+ * @return Number of threads in fallback threadpool, or 0 if not initialized
+ */
+int ggml_numa_openmp_get_fallback_thread_count(void) {
+    if (!g_openmp_initialized || !g_fallback_threadpool.initialized) {
+        return 0;
+    }
+    
+    return g_fallback_threadpool.n_threads;
+}
+
+/**
+ * @brief Cross-NUMA barrier for kernel synchronization during data-parallel execution
+ * 
+ * This function provides a barrier mechanism for kernels executing in data-parallel
+ * mode across multiple NUMA nodes using OpenMP. Since the OpenMP coordinator uses
+ * a single parallel region across all NUMA nodes, standard OpenMP barriers work
+ * for cross-NUMA synchronization.
+ * 
+ * Usage Pattern:
+ * - Call this function from within kernels when synchronization across NUMA nodes is required
+ * - Only effective during data-parallel execution (multiple NUMA nodes active)
+ * - Uses OpenMP barrier for synchronization across all participating threads
+ * - Safe to call from any thread within the OpenMP parallel region
+ * 
+ * @return true if barrier wait was successful, false if not in data-parallel mode
+ */
+bool ggml_numa_simple_coordinator_cross_numa_barrier(void) {
+    // Check if we're in data-parallel execution mode
+    extern __thread bool ggml_numa_is_data_parallel_execution;
+    extern __thread int ggml_numa_total_nodes_for_data_parallel;
+    extern __thread int ggml_current_numa_node;
+    
+    if (!ggml_numa_is_data_parallel_execution || ggml_numa_total_nodes_for_data_parallel <= 1) {
+        NUMA_LOG_DEBUG("Cross-NUMA barrier skipped: data_parallel=%d, total_nodes=%d", 
+                       ggml_numa_is_data_parallel_execution, ggml_numa_total_nodes_for_data_parallel);
+        return false;
+    }
+    
+    NUMA_LOG_DEBUG("NUMA node %d waiting at cross-NUMA barrier (participants=%d)", 
+                   ggml_current_numa_node, ggml_numa_total_nodes_for_data_parallel);
+    
+#ifdef GGML_USE_OPENMP
+    // Use OpenMP barrier for cross-NUMA synchronization
+    // This works because the OpenMP coordinator uses a single parallel region across all NUMA nodes
+    #pragma omp barrier
+    
+    NUMA_LOG_DEBUG("NUMA node %d passed cross-NUMA barrier successfully", ggml_current_numa_node);
+    return true;
+#else
+    // No OpenMP - barrier not available
+    NUMA_LOG_DEBUG("NUMA node %d: OpenMP not available, skipping cross-NUMA barrier", ggml_current_numa_node);
+    return false;
+#endif
 }

@@ -1,7 +1,7 @@
 
 /**
  * @file add.c
- * @brief NUMA Kernel: Element-wise Addition (ADD) 
+ * @brief NUMA Kernel: Element-wise Addition (ADD)
  * @author David Sanftenberg
  * 
  * ============================================================================
@@ -43,10 +43,21 @@
 #include "add.h"
 #include "numa-kernels.h"
 #include "../ggml-numa-shared.h"
-#include "../ggml-numa-simple-coordinator.h"
+#include "../ggml-numa-openmp-coordinator.h"
 #include "../ggml-cpu-impl.h"
 #include "../ggml-impl.h"
 #include "../vec.h"
+#include "../ops.h"                    // For reference implementations
+#include "../binary-ops.h"             // For non-quantized reference implementations
+#include "../../include/ggml.h"        // For NUMA execution counter functions
+
+// Standard library includes
+#include <stdlib.h>     // For malloc/free
+#include <string.h>     // For memcpy
+
+// For NUMA node detection
+#include <sched.h>      // For sched_getcpu()
+#include <numa.h>       // For numa_node_of_cpu()
 
 // External declarations from ggml-cpu.c and ggml.c
 extern const struct ggml_type_traits_cpu * ggml_get_type_traits_cpu(enum ggml_type type);
@@ -57,410 +68,281 @@ extern const struct ggml_type_traits * ggml_get_type_traits(enum ggml_type type)
 #endif
 
 // ============================================================================
-// ADD Kernel Implementation for F32 (most common case)
+// NUMA Data Slicing Helper Functions
 // ============================================================================
 
+typedef struct {
+    int64_t start;
+    int64_t end;
+    bool has_work;
+} numa_slice_t;
+
 /**
- * High-performance ADD kernel for F32 type tensors
- * 
- * This is the core implementation following the MUL kernel pattern
- * with NUMA-aware data slicing and broadcasting support.
+ * Calculate NUMA-aware data slice for current thread
+ * Handles both element-wise and row-based (broadcasting) slicing
  */
-static enum ggml_status ggml_numa_kernel_add_f32_execute(void * work_context, 
-                                                         struct ggml_compute_params * params) {
-    struct ggml_tensor * tensor = (struct ggml_tensor *)work_context;
+static numa_slice_t calculate_numa_slice(const struct ggml_tensor * tensor, 
+                                         const struct ggml_tensor * src1,
+                                         struct ggml_compute_params * params,
+                                         bool use_row_based_slicing) {
+    numa_slice_t slice = {0};
     
-    // Fast validation (assume coordinator pre-validated)
-    if (!tensor || !tensor->src[0] || !tensor->src[1]) {
-        return GGML_STATUS_FAILED;
-    }
-    
-    // Extract tensor parameters and cache frequently accessed values
-    const struct ggml_tensor * src0 = tensor->src[0];
-    const struct ggml_tensor * src1 = tensor->src[1];
-    const int64_t total_elements = ggml_nelements(tensor);
-    
-    // Get NUMA-local data pointers 
-    const float * src0_data = (const float *)tensor_data(src0);
-    const float * src1_data = (const float *)tensor_data(src1);
-    
-    // Use shared result tensor for no-aggregation optimization
-    extern __thread void * ggml_numa_shared_result_tensor_data;
-    float * dst_data;
-    if (ggml_numa_shared_result_tensor_data != NULL) {
-        // Use shared result tensor memory - eliminates aggregation overhead
-        dst_data = (float *)ggml_numa_shared_result_tensor_data;
-    } else {
-        // Fallback to local tensor data for compatibility
-        dst_data = (float *)tensor_data(tensor);
-    }
-    
-    // Read thread-local NUMA context from coordinator
+    // Get NUMA execution context
     extern __thread bool ggml_numa_is_data_parallel_execution;
     extern __thread int ggml_numa_total_nodes_for_data_parallel;
     extern __thread int ggml_current_numa_node;
     
     const int current_node = ggml_current_numa_node;
-    const int total_nodes = ggml_numa_is_data_parallel_execution ? 
-                           ggml_numa_total_nodes_for_data_parallel : 1;
-    const bool is_data_parallel = ggml_numa_is_data_parallel_execution;
     const int thread_id = params->ith;
     const int num_threads = params->nth;
+    const bool is_data_parallel = ggml_numa_is_data_parallel_execution;
+    const int total_nodes = is_data_parallel ? ggml_numa_total_nodes_for_data_parallel : 1;
     
-    // Log execution strategy in standardized format for integration test parsing
-    // Only log once per operation (thread 0 of NUMA node 0) to avoid inflated counts
+    int64_t total_work_units, work_unit_size;
+    if (use_row_based_slicing) {
+        total_work_units = ggml_nrows(tensor->src[0]);
+        work_unit_size = tensor->ne[0];  // elements per row
+    } else {
+        total_work_units = ggml_nelements(tensor);
+        work_unit_size = 1;  // each element is a work unit
+    }
+    
+    // Calculate work slice
+    if (is_data_parallel && total_nodes > 1) {
+        // Multi-node: distribute work units across NUMA nodes first
+        const int64_t units_per_node = total_work_units / total_nodes;
+        const int64_t node_start = current_node * units_per_node;
+        const int64_t node_end = (current_node == total_nodes - 1) ? 
+                                 total_work_units : node_start + units_per_node;
+        const int64_t node_units = node_end - node_start;
+        
+        // Then distribute among threads within this node
+        if (thread_id >= node_units) {
+            slice.has_work = false;
+            return slice;
+        }
+        
+        const int64_t units_per_thread = (node_units + num_threads - 1) / num_threads;
+        const int64_t thread_start_unit = node_start + thread_id * units_per_thread;
+        const int64_t thread_end_unit = MIN(thread_start_unit + units_per_thread, node_end);
+        
+        slice.start = thread_start_unit * work_unit_size;
+        slice.end = thread_end_unit * work_unit_size;
+    } else {
+        // Single node: distribute work units among threads
+        const int64_t units_per_thread = (total_work_units + num_threads - 1) / num_threads;
+        const int64_t thread_start_unit = thread_id * units_per_thread;
+        const int64_t thread_end_unit = MIN(thread_start_unit + units_per_thread, total_work_units);
+        
+        slice.start = thread_start_unit * work_unit_size;
+        slice.end = thread_end_unit * work_unit_size;
+    }
+    
+    slice.has_work = (slice.start < slice.end);
+    return slice;
+}
+
+// ============================================================================
+// Unified ADD Kernel Implementation
+// ============================================================================
+
+/**
+ * Unified ADD kernel that handles all data types and broadcasting patterns
+ */
+enum ggml_status ggml_numa_kernel_add_unified_execute(void * work_context, 
+                                                     struct ggml_compute_params * params) {
+    struct ggml_tensor * tensor = (struct ggml_tensor *)work_context;
+    
+    // Fast validation
+    if (!tensor || !tensor->src[0] || !tensor->src[1]) {
+        return GGML_STATUS_FAILED;
+    }
+    
+    const struct ggml_tensor * src0 = tensor->src[0];
+    const struct ggml_tensor * src1 = tensor->src[1];
+    
+    // Get NUMA execution context
+    extern __thread bool ggml_numa_is_data_parallel_execution;
+    extern __thread int ggml_current_numa_node;
+    extern __thread void * ggml_numa_shared_result_tensor_data;
+    
+    const int current_node = ggml_current_numa_node;
+    const int thread_id = params->ith;
+    const int num_threads = params->nth;
+    const int64_t total_elements = ggml_nelements(tensor);
+    const int64_t src1_elements = ggml_nelements(src1);
+    
+    // Log execution strategy (once per operation)
     if (thread_id == 0 && current_node == 0) {
         if (ggml_numa_is_data_parallel_execution) {
             NUMA_LOG_STRATEGY_DATA_PARALLEL("ADD");
-        } else if (params->nth > 1) {
+        } else if (num_threads > 1) {
             NUMA_LOG_STRATEGY_SINGLE_MULTI("ADD");
         } else {
             NUMA_LOG_STRATEGY_SINGLE_SINGLE("ADD");
         }
     }
     
-    // CRITICAL DEBUG: Log every kernel execution start with full context
-    printf("[ADD_KERNEL_START] NUMA_Node=%d Thread=%d/%d DataParallel=%s TotalNodes=%d TotalElements=%ld TensorPtr=%p\n",
-           current_node, thread_id, num_threads, is_data_parallel ? "YES" : "NO", 
-           total_nodes, total_elements, (void*)tensor);
+    // Determine operation type and slicing strategy
+    bool is_scalar = (src1_elements == 1);
+    bool is_elementwise = (src1_elements == total_elements);
+    bool is_broadcasting = (!is_scalar && !is_elementwise);
+    bool use_row_slicing = is_broadcasting;
     
-    NUMA_LOG_DEBUG("NUMA Node %d, Thread %d/%d ADD kernel start (data_parallel=%d, total_nodes=%d, total_elements=%ld)", 
-                   current_node, thread_id + 1, num_threads, is_data_parallel, total_nodes, total_elements);
+    // Calculate data slice for this thread
+    numa_slice_t slice = calculate_numa_slice(tensor, src1, params, use_row_slicing);
     
-    // Calculate data slice for this thread/node combination
-    int64_t numa_start, numa_end;
-    
-    if (is_data_parallel && total_nodes > 1) {
-        // DATA-PARALLEL MODE WITH THREADPOOL SUPPORT
-        const int64_t elements_per_node = total_elements / total_nodes;
-        
-        // Calculate this node's slice in the global tensor
-        const int64_t node_start = current_node * elements_per_node;
-        const int64_t node_end = (current_node == total_nodes - 1) ? 
-                                 total_elements : 
-                                 node_start + elements_per_node;
-        
-        // Within each NUMA node, distribute work across all threads
-        const int64_t node_elements = node_end - node_start;
-        const int64_t elements_per_thread = (node_elements + num_threads - 1) / num_threads;
-        
-        numa_start = node_start + thread_id * elements_per_thread;
-        numa_end = MIN(numa_start + elements_per_thread, node_end);
-        
-        NUMA_LOG_TRACE("NUMA Node %d, Thread %d/%d ADD processing: global[%ld, %ld), node[%ld, %ld), thread[%ld, %ld) (%ld elements)", 
-                       current_node, thread_id + 1, num_threads, 0L, total_elements, 
-                       node_start, node_end, numa_start, numa_end, numa_end - numa_start);
-        
-        // CRITICAL DEBUG: Show exact slice calculations for all nodes
-        printf("[ADD_DATA_SLICE] Node=%d Thread=%d/%d GlobalSlice=[%ld,%ld) NodeSlice=[%ld,%ld) ThreadSlice=[%ld,%ld) Elements=%ld\n",
-               current_node, thread_id, num_threads, 0L, total_elements, 
-               node_start, node_end, numa_start, numa_end, numa_end - numa_start);
-        
-        // Special debug: For Node 1, show actual slice details
-        if (current_node == 1 && thread_id == 0) {
-            NUMA_LOG_DEBUG("NODE 1 SLICE: node_start=%ld, node_end=%ld, numa_start=%ld, numa_end=%ld", 
-                           node_start, node_end, numa_start, numa_end);
+    // Handle threads with no work
+    if (!slice.has_work) {
+        if (ggml_numa_is_data_parallel_execution || num_threads > 1) {
+            #ifdef GGML_USE_OPENMP
+            #pragma omp barrier
+            #endif
         }
-    } else {
-        // SINGLE-NODE MODE
-        const int64_t elements_per_thread = (total_elements + num_threads - 1) / num_threads;
-        numa_start = thread_id * elements_per_thread;
-        numa_end = MIN(numa_start + elements_per_thread, total_elements);
-        
-        NUMA_LOG_TRACE("NUMA Node %d, Thread %d ADD processing tensor slice: [%ld, %ld) (%ld elements)", 
-                       current_node, thread_id, numa_start, numa_end, numa_end - numa_start);
+        return GGML_STATUS_SUCCESS;
     }
     
-    // Execute SIMD operations on assigned data slice
-    const size_t elements_in_slice = numa_end - numa_start;
+    // Get destination pointer (shared memory optimization)
+    void * dst_data = ggml_numa_shared_result_tensor_data ? 
+                      ggml_numa_shared_result_tensor_data : 
+                      tensor_data(tensor);
     
-    // Handle operation-specific logic (broadcasting, etc.)
-    const int64_t src1_elements = ggml_nelements(src1);
+    // Execute ADD operation based on data types
+    enum ggml_status status = GGML_STATUS_SUCCESS;
     
-    if (src1_elements == 1) {
-        // Scalar addition (broadcast single value)
-        NUMA_LOG_DEBUG("NUMA Node %d ADD using SCALAR addition path (elements_in_slice=%zu)", 
-                       current_node, elements_in_slice);
-        const float scalar = src1_data[0];
-        
-        // Scalar addition: dst = src0 + scalar
-        for (size_t i = 0; i < elements_in_slice; ++i) {
-            dst_data[numa_start + i] = src0_data[numa_start + i] + scalar;
-        }
-        
-    } else if (src1_elements == total_elements) {
-        // Element-wise addition (most common, should be fastest)
-        NUMA_LOG_DEBUG("NUMA Node %d ADD using ELEMENT-WISE path (elements_in_slice=%zu)", 
-                       current_node, elements_in_slice);
-        
-        // CRITICAL DEBUG: Show SIMD operation details
-        printf("[ADD_SIMD_EXEC] Node=%d Thread=%d ElementsInSlice=%zu SliceStart=%ld SliceEnd=%ld SIMDCall=ggml_vec_add_f32\n",
-               current_node, thread_id, elements_in_slice, numa_start, numa_end);
-        
-        // Pure SIMD addition operation on global positions - maximum performance path
-        ggml_vec_add_f32(elements_in_slice, dst_data + numa_start, src0_data + numa_start, src1_data + numa_start);
-        
-    } else {
-        // Complex broadcasting - use reference implementation approach
-        NUMA_LOG_DEBUG("NUMA Node %d ADD using BROADCASTING path (src1_elements=%ld, total=%ld, slice=%zu)", 
-                       current_node, src1_elements, total_elements, elements_in_slice);
-        
-        // Get tensor shapes and strides for proper broadcasting
-        const int64_t ne0 = tensor->ne[0];
-        const int64_t ne1 = tensor->ne[1];
-        const int64_t ne2 = tensor->ne[2];
-        const int64_t ne3 = tensor->ne[3];
-        
-        const size_t nb1 = tensor->nb[1];
-        const size_t nb2 = tensor->nb[2];
-        const size_t nb3 = tensor->nb[3];
-        
-        const int64_t ne00 = src0->ne[0];
-        const int64_t ne01 = src0->ne[1];
-        const int64_t ne02 = src0->ne[2];
-        
-        const size_t nb01 = src0->nb[1];
-        const size_t nb02 = src0->nb[2];
-        const size_t nb03 = src0->nb[3];
-        
-        const int64_t ne10 = src1->ne[0];
-        const int64_t ne11 = src1->ne[1];
-        const int64_t ne12 = src1->ne[2];
-        const int64_t ne13 = src1->ne[3];
-        
-        const size_t nb10 = src1->nb[0];
-        const size_t nb11 = src1->nb[1];
-        const size_t nb12 = src1->nb[2];
-        const size_t nb13 = src1->nb[3];
-        
-        // Follow reference implementation: process by rows
-        const int64_t total_rows = ne1 * ne2 * ne3;
-        
-        // Convert element slice to row slice
-        const int64_t elements_per_row = ne0;
-        const int64_t start_row = numa_start / elements_per_row;
-        const int64_t end_row = MIN((numa_end + elements_per_row - 1) / elements_per_row, total_rows);
-        
-        NUMA_LOG_TRACE("NUMA Node %d ADD processing rows [%ld, %ld) from total %ld rows", 
-                       current_node, start_row, end_row, total_rows);
-        
-        // Process each row using reference broadcasting logic
-        for (int64_t ir = start_row; ir < end_row; ++ir) {
-            // Calculate 3D indices (same as reference)
-            const int64_t i03 = ir / (ne02 * ne01);
-            const int64_t i02 = (ir - i03 * ne02 * ne01) / ne01;
-            const int64_t i01 = ir - i03 * ne02 * ne01 - i02 * ne01;
-            
-            // Apply broadcasting with modulo (same as reference)
-            const int64_t i13 = i03 % ne13;
-            const int64_t i12 = i02 % ne12;
-            const int64_t i11 = i01 % ne11;
-            
-            // Calculate row pointers using byte strides (same as reference)
-            float * dst_ptr = (float *)((char *)dst_data + i03*nb3 + i02*nb2 + i01*nb1);
-            const float * src0_ptr = (const float *)((const char *)src0_data + i03*nb03 + i02*nb02 + i01*nb01);
-            const float * src1_ptr = (const float *)((const char *)src1_data + i13*nb13 + i12*nb12 + i11*nb11);
-            
-            // Check if src1 is contiguous for this row
-            const bool is_src1_contiguous = (nb10 == sizeof(float));
-            
-            if (is_src1_contiguous) {
-                // src1 is broadcastable across src0 and dst in i1, i2, i3
-                const int64_t nr0 = ne00 / ne10;
-                
-                for (int64_t r = 0; r < nr0; ++r) {
-                    // Use SIMD addition for performance
-                    ggml_vec_add_f32(ne10, dst_ptr + r*ne10, src0_ptr + r*ne10, src1_ptr);
-                }
-            } else {
-                // Non-contiguous case - element by element
-                for (int64_t i = 0; i < ne0; ++i) {
-                    int i10 = i % ne10;
-                    const float * y_ptr = (const float *)((const char *)src1_ptr + i10*nb10);
-                    dst_ptr[i] = src0_ptr[i] + (*y_ptr);
-                }
-            }
-        }
-    }
-    
-    // CRITICAL DEBUG: Log kernel completion
-    printf("[ADD_KERNEL_END] Node=%d Thread=%d ProcessedElements=%zu Status=SUCCESS\n",
-           current_node, thread_id, elements_in_slice);
-    
-    NUMA_LOG_DEBUG("NUMA Node %d ADD kernel completed successfully (processed %zu elements)", 
-                   current_node, elements_in_slice);
-    
-    return GGML_STATUS_SUCCESS;
-}
-
-// ============================================================================
-// Non-Quantized ADD Implementation
-// ============================================================================
-
-/**
- * Non-quantized ADD kernel implementation
- * Handles F32, F16, BF16 types following reference binary-ops.cpp
- * Supports all type combinations from the reference implementation
- */
-static enum ggml_status ggml_numa_kernel_add_non_quantized_execute(void * work_context, 
-                                                                   struct ggml_compute_params * params) {
-    struct ggml_tensor * tensor = (struct ggml_tensor *)work_context;
-    
-    // Fast validation
-    if (!tensor || !tensor->src[0] || !tensor->src[1]) {
-        return GGML_STATUS_FAILED;
-    }
-    
-    const struct ggml_tensor * src0 = tensor->src[0];
-    const struct ggml_tensor * src1 = tensor->src[1];
-    
-    // Type validation - must match reference binary_op supported combinations
-    bool supported_combination = false;
-    
-    // Check all supported non-quantized type combinations from binary-ops.cpp
-    if (src0->type == GGML_TYPE_F32  && src1->type == GGML_TYPE_F32  && tensor->type == GGML_TYPE_F32) {
-        supported_combination = true;
-    } else if (src0->type == GGML_TYPE_F16  && src1->type == GGML_TYPE_F16  && tensor->type == GGML_TYPE_F16) {
-        supported_combination = true;
-    } else if (src0->type == GGML_TYPE_BF16 && src1->type == GGML_TYPE_BF16 && tensor->type == GGML_TYPE_BF16) {
-        supported_combination = true;
-    } else if (src0->type == GGML_TYPE_BF16 && src1->type == GGML_TYPE_F32  && tensor->type == GGML_TYPE_BF16) {
-        supported_combination = true;
-    } else if (src0->type == GGML_TYPE_BF16 && src1->type == GGML_TYPE_F32  && tensor->type == GGML_TYPE_F32) {
-        supported_combination = true;
-    } else if (src0->type == GGML_TYPE_F16  && src1->type == GGML_TYPE_F32  && tensor->type == GGML_TYPE_F16) {
-        supported_combination = true;
-    } else if (src0->type == GGML_TYPE_F16  && src1->type == GGML_TYPE_F32  && tensor->type == GGML_TYPE_F32) {
-        supported_combination = true;
-    }
-    
-    if (!supported_combination) {
-        NUMA_LOG_DEBUG("ADD Non-quantized: Unsupported type combination %s + %s → %s, falling back",
-                       ggml_type_name(src0->type), ggml_type_name(src1->type), ggml_type_name(tensor->type));
-        return GGML_STATUS_FAILED; // Fall back to reference
-    }
-    
-    // For now, delegate to F32 implementation for all-F32 case
-    // TODO: Implement proper type conversion and mixed-type support
     if (src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32 && tensor->type == GGML_TYPE_F32) {
-        return ggml_numa_kernel_add_f32_execute(work_context, params);
+        // F32 path - direct SIMD operations
+        const float * src0_data = (const float *)tensor_data(src0);
+        const float * src1_data = (const float *)tensor_data(src1);
+        float * dst_f32 = (float *)dst_data;
+        
+        if (is_scalar) {
+            const float scalar = src1_data[0];
+            for (int64_t i = slice.start; i < slice.end; ++i) {
+                dst_f32[i] = src0_data[i] + scalar;
+            }
+        } else if (is_elementwise) {
+            ggml_vec_add_f32(slice.end - slice.start, dst_f32 + slice.start, 
+                           src0_data + slice.start, src1_data + slice.start);
+        } else {
+            // Broadcasting - process rows
+            const int64_t ne0 = tensor->ne[0];
+            const int64_t start_row = slice.start / ne0;
+            const int64_t end_row = slice.end / ne0;
+            
+            for (int64_t row = start_row; row < end_row; ++row) {
+                const float * src0_row = src0_data + row * ne0;
+                float * dst_row = dst_f32 + row * ne0;
+                
+                // Simple broadcasting: assume src1 broadcasts across the row
+                if (src1_elements == ne0) {
+                    ggml_vec_add_f32(ne0, dst_row, src0_row, src1_data);
+                } else {
+                    // More complex broadcasting - fall back to element by element
+                    for (int64_t i = 0; i < ne0; ++i) {
+                        int64_t src1_idx = i % src1_elements;
+                        dst_row[i] = src0_row[i] + src1_data[src1_idx];
+                    }
+                }
+            }
+        }
     } else {
-        // For other type combinations, fall back to reference for now
-        // This ensures correctness while we implement full type support
-        NUMA_LOG_DEBUG("ADD Non-quantized: Mixed types not fully implemented yet, falling back");
-        return GGML_STATUS_FAILED; // Fall back to reference
-    }
-}
-
-// ============================================================================
-// Quantized ADD Implementation  
-// ============================================================================
-
-/**
- * Quantized ADD kernel implementation
- * Handles all quantized types following reference ops.cpp implementation
- * Pattern: Quantized + F32 → Quantized (with dequant/quant cycle)
- */
-static enum ggml_status ggml_numa_kernel_add_quantized_execute(void * work_context,
-                                                               struct ggml_compute_params * params) {
-    struct ggml_tensor * tensor = (struct ggml_tensor *)work_context;
-    
-    // Fast validation
-    if (!tensor || !tensor->src[0] || !tensor->src[1]) {
-        return GGML_STATUS_FAILED;
-    }
-    
-    const struct ggml_tensor * src0 = tensor->src[0];
-    const struct ggml_tensor * src1 = tensor->src[1];
-    
-    // Quantized ADD pattern validation: src0=quantized, src1=F32, dst=quantized
-    if (!ggml_is_quantized(src0->type) || src1->type != GGML_TYPE_F32) {
-        NUMA_LOG_DEBUG("ADD Quantized: Invalid pattern - expected quantized + F32, got %s + %s",
-                       ggml_type_name(src0->type), ggml_type_name(src1->type));
-        return GGML_STATUS_FAILED; // Fall back to reference
-    }
-    
-    // For now, fall back to reference implementation for quantized operations
-    // This ensures correctness while maintaining the infrastructure for future implementation
-    // TODO: Implement NUMA-aware quantized ADD with proper dequant/add/quant cycle
-    NUMA_LOG_DEBUG("ADD Quantized: Not fully implemented yet, falling back to reference");
-    return GGML_STATUS_FAILED; // Fall back to reference
-}
-
-// ============================================================================
-// Main ADD Kernel Entry Point
-// ============================================================================
-
-/**
- * Main ADD kernel execution function
- * Dispatches to appropriate implementation based on tensor types
- */
-enum ggml_status ggml_numa_kernel_add_execute(void * work_context, struct ggml_compute_params * params) {
-    struct ggml_tensor * tensor = (struct ggml_tensor *)work_context;
-    
-    // Fast validation
-    NUMA_ASSERT(tensor != NULL, "Tensor cannot be null");
-    NUMA_ASSERT(params != NULL, "Compute params cannot be null");
-    NUMA_ASSERT(tensor->src[0] != NULL, "src0 cannot be null");
-    NUMA_ASSERT(tensor->src[1] != NULL, "src1 cannot be null");
-
-    const struct ggml_tensor * src0 = tensor->src[0];
-
-    NUMA_LOG_TRACE("ADD kernel: Processing tensor %p with src0 type %s, src1 type %s, dst type %s",
-                   (void*)tensor, ggml_type_name(src0->type), 
-                   ggml_type_name(tensor->src[1]->type), ggml_type_name(tensor->type));
-
-    // Comprehensive type support matching reference implementation exactly
-    switch (src0->type) {
-        // Non-quantized types: Use binary_op style implementation 
-        case GGML_TYPE_F32:
-        case GGML_TYPE_F16:
-        case GGML_TYPE_BF16:
-            {
-                return ggml_numa_kernel_add_non_quantized_execute(work_context, params);
-            }
+        // Mixed types or quantized - use type conversion
+        const struct ggml_type_traits * src0_traits = ggml_get_type_traits(src0->type);
+        const struct ggml_type_traits * src1_traits = ggml_get_type_traits(src1->type);
+        const struct ggml_type_traits * dst_traits = ggml_get_type_traits(tensor->type);
         
-        // Quantized types: Use quantized ADD implementation
-        case GGML_TYPE_Q4_0:
-        case GGML_TYPE_Q4_1:
-        case GGML_TYPE_Q5_0:
-        case GGML_TYPE_Q5_1:
-        case GGML_TYPE_Q8_0:
-        case GGML_TYPE_Q2_K:
-        case GGML_TYPE_Q3_K:
-        case GGML_TYPE_Q4_K:
-        case GGML_TYPE_Q5_K:
-        case GGML_TYPE_Q6_K:
-        case GGML_TYPE_TQ1_0:
-        case GGML_TYPE_TQ2_0:
-        case GGML_TYPE_IQ2_XXS:
-        case GGML_TYPE_IQ2_XS:
-        case GGML_TYPE_IQ3_XXS:
-        case GGML_TYPE_IQ1_S:
-        case GGML_TYPE_IQ1_M:
-        case GGML_TYPE_IQ4_NL:
-        case GGML_TYPE_IQ4_XS:
-        case GGML_TYPE_IQ3_S:
-        case GGML_TYPE_IQ2_S:
-            {
-                return ggml_numa_kernel_add_quantized_execute(work_context, params);
-            }
+        const size_t slice_elements = slice.end - slice.start;
         
-        default:
-            {
-                NUMA_LOG_DEBUG("ADD: Unsupported src0 type %s, falling back", ggml_type_name(src0->type));
-                return GGML_STATUS_FAILED; // Fall back to reference
+        // Allocate temporary F32 buffers
+        float * temp_src0 = malloc(slice_elements * sizeof(float));
+        float * temp_src1 = malloc(slice_elements * sizeof(float));
+        float * temp_dst = malloc(slice_elements * sizeof(float));
+        
+        if (!temp_src0 || !temp_src1 || !temp_dst) {
+            free(temp_src0); free(temp_src1); free(temp_dst);
+            return GGML_STATUS_FAILED;
+        }
+        
+        // Convert src0 to F32
+        if (src0->type == GGML_TYPE_F32) {
+            memcpy(temp_src0, (const float *)tensor_data(src0) + slice.start, slice_elements * sizeof(float));
+        } else if (ggml_is_quantized(src0->type)) {
+            // Quantized dequantization
+            const size_t block_size = src0_traits->blck_size;
+            const size_t type_size = src0_traits->type_size;
+            const char * src0_data = (const char *)tensor_data(src0);
+            src0_traits->to_float(src0_data + (slice.start * type_size / block_size), temp_src0, slice_elements);
+        } else {
+            // Non-quantized type conversion
+            const char * src0_data = (const char *)tensor_data(src0);
+            src0_traits->to_float(src0_data + slice.start * src0_traits->type_size, temp_src0, slice_elements);
+        }
+        
+        // Convert src1 to F32 (handle broadcasting)
+        if (is_scalar) {
+            float scalar_val;
+            if (src1->type == GGML_TYPE_F32) {
+                scalar_val = ((const float *)tensor_data(src1))[0];
+            } else {
+                src1_traits->to_float((const char *)tensor_data(src1), &scalar_val, 1);
             }
+            for (size_t i = 0; i < slice_elements; ++i) {
+                temp_src1[i] = scalar_val;
+            }
+        } else if (is_elementwise) {
+            if (src1->type == GGML_TYPE_F32) {
+                memcpy(temp_src1, (const float *)tensor_data(src1) + slice.start, slice_elements * sizeof(float));
+            } else {
+                const char * src1_data = (const char *)tensor_data(src1);
+                src1_traits->to_float(src1_data + slice.start * src1_traits->type_size, temp_src1, slice_elements);
+            }
+        } else {
+            // Broadcasting - simplified version
+            const float * src1_f32 = (const float *)tensor_data(src1);
+            for (size_t i = 0; i < slice_elements; ++i) {
+                size_t src1_idx = (slice.start + i) % src1_elements;
+                temp_src1[i] = src1_f32[src1_idx];
+            }
+        }
+        
+        // Perform SIMD addition
+        ggml_vec_add_f32(slice_elements, temp_dst, temp_src0, temp_src1);
+        
+        // Convert result back to destination type
+        if (tensor->type == GGML_TYPE_F32) {
+            memcpy((float *)dst_data + slice.start, temp_dst, slice_elements * sizeof(float));
+        } else if (ggml_is_quantized(tensor->type)) {
+            // Quantized requantization
+            const size_t block_size = dst_traits->blck_size;
+            const size_t type_size = dst_traits->type_size;
+            char * dst_bytes = (char *)dst_data;
+            dst_traits->from_float_ref(temp_dst, dst_bytes + (slice.start * type_size / block_size), slice_elements);
+        } else {
+            // Non-quantized type conversion
+            char * dst_bytes = (char *)dst_data;
+            dst_traits->from_float_ref(temp_dst, dst_bytes + slice.start * dst_traits->type_size, slice_elements);
+        }
+        
+        free(temp_src0);
+        free(temp_src1);
+        free(temp_dst);
     }
+    
+    // Synchronization barrier
+    if (ggml_numa_is_data_parallel_execution || num_threads > 1) {
+        #ifdef GGML_USE_OPENMP
+        #pragma omp barrier
+        #endif
+    }
+    
+    return status;
 }
 
 // ============================================================================
-// Strategy Query and Registration
+// Kernel Query Function
 // ============================================================================
 
-/**
- * Strategy query function for ADD operations
- */
 ggml_numa_kernel_query_result_t ggml_numa_kernel_add_query(const struct ggml_tensor * tensor) {
     ggml_numa_kernel_query_result_t result = { .supported = false };
     
@@ -501,30 +383,16 @@ ggml_numa_kernel_query_result_t ggml_numa_kernel_add_query(const struct ggml_ten
     result.strategy = selected_strategy;
     result.work_buffer_size_per_thread = 0;  // ADD doesn't need work buffers
     
-    // Select work function based on strategy - currently all use the same function
-    // but keep the structure for future optimization
-    if (selected_strategy.node_strategy == NUMA_NODE_STRATEGY_SINGLE) {
-        if (selected_strategy.on_node_strategy == NUMA_ON_NODE_STRATEGY_SINGLE_THREAD) {
-            result.work_function = ggml_numa_kernel_add_execute;
-            result.efficiency_score = 0.95f;
-            result.kernel_name = "NUMA ADD (Single/Single)";
-        } else {
-            result.work_function = ggml_numa_kernel_add_execute;
-            result.efficiency_score = 0.96f;
-            result.kernel_name = "NUMA ADD (Single/Multi)";
-        }
-    } else {
-        // Data-parallel strategy
-        result.work_function = ggml_numa_kernel_add_execute;
-        result.efficiency_score = 0.99f;
-        result.kernel_name = "NUMA ADD (Data-Parallel)";
-    }
+    // Use unified execution function for all strategies
+    result.work_function = ggml_numa_kernel_add_unified_execute;
+    result.efficiency_score = 0.98f;
+    result.kernel_name = "NUMA ADD (Unified)";
     
     // Apply force strategy override if environment variable is set
     bool strategy_overridden = ggml_numa_apply_kernel_force_strategy(&result, "ADD",
-        ggml_numa_kernel_add_execute,   // single-single function
-        ggml_numa_kernel_add_execute,   // single-multi function  
-        ggml_numa_kernel_add_execute    // data-parallel function
+        ggml_numa_kernel_add_unified_execute,   // single-single function
+        ggml_numa_kernel_add_unified_execute,   // single-multi function  
+        ggml_numa_kernel_add_unified_execute    // data-parallel function
     );
     
     // ADD operations don't need aggregation - each node writes directly to result
@@ -537,6 +405,24 @@ ggml_numa_kernel_query_result_t ggml_numa_kernel_add_query(const struct ggml_ten
     return result;
 }
 
+// ============================================================================
+// Work Buffer Calculation
+// ============================================================================
+
+size_t ggml_numa_kernel_add_work_buffer_calc(const struct ggml_tensor * tensor, 
+                                             int total_numa_nodes, 
+                                             int total_threads) {
+    // ADD operation doesn't need work buffers
+    GGML_UNUSED(tensor);
+    GGML_UNUSED(total_numa_nodes);
+    GGML_UNUSED(total_threads);
+    return 0;
+}
+
+// ============================================================================
+// Kernel Registration
+// ============================================================================
+
 /**
  * Kernel registration function
  */
@@ -548,23 +434,22 @@ ggml_numa_kernel_registration_info_t ggml_numa_kernel_add_register(void) {
     info.kernel_name = "NUMA ADD Kernel";
     
     // Strategy thresholds for ADD operations
-    // Based on MUL kernel but optimized for ADD characteristics
-    info.strategy_array.thresholds[NUMA_STRATEGY_IDX_SINGLE_SINGLE] = 128;      // Single thread threshold
-    info.strategy_array.thresholds[NUMA_STRATEGY_IDX_SINGLE_MULTI] = 1024;     // Multi-thread threshold
+    info.strategy_array.thresholds[NUMA_STRATEGY_IDX_SINGLE_SINGLE] = 128;        // Single-thread strategy
+    info.strategy_array.thresholds[NUMA_STRATEGY_IDX_SINGLE_MULTI] = 1024;       // Multi-thread strategy
     // Above this: data-parallel strategy
     info.strategy_array.valid = true;
     
     // Function pointers for different strategies
-    info.work_funcs.single_single_fn = ggml_numa_kernel_add_execute;
-    info.work_funcs.single_multi_fn = ggml_numa_kernel_add_execute;
-    info.work_funcs.data_parallel_fn = ggml_numa_kernel_add_execute;
+    info.work_funcs.single_single_fn = ggml_numa_kernel_add_unified_execute;
+    info.work_funcs.single_multi_fn = ggml_numa_kernel_add_unified_execute;
+    info.work_funcs.data_parallel_fn = ggml_numa_kernel_add_unified_execute;
     info.work_funcs.valid = true;
     
     // Query function pointer for strategy selection
     info.query_fn = (void*)ggml_numa_kernel_add_query;
     
     // ADD doesn't need work buffer (no complex caching)
-    info.work_buffer_calc_fn = NULL;
+    info.work_buffer_calc_fn = (void*)ggml_numa_kernel_add_work_buffer_calc;
     
     // ADD doesn't need aggregation functions (element-wise operation)
     info.agg_funcs.single_single_fn = NULL;

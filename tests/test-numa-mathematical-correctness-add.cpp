@@ -56,6 +56,7 @@
 #include "ggml-cpu/numa-kernels/numa-kernels.h"
 #include "ggml-cpu/binary-ops.h"
 #include "ggml-cpu/ggml-numa-openmp-coordinator.h"
+#include "ggml-cpu/ggml-numa-shared.h"  // For ggml_numa_execution_strategy_t
 
 // Global test filter
 std::string g_test_filter = "";
@@ -89,8 +90,9 @@ struct TestResult {
 // Test configuration
 struct TestConfig {
     int ne0, ne1, ne2, ne3;
-    int num_threads;
+    ggml_numa_execution_strategy_t strategy;
     const char* test_name;
+    const char* strategy_name;
 };
 
 // Size classifications (matching complexity levels)
@@ -102,9 +104,10 @@ enum TestSizeClass {
 };
 
 // Get tensor dimensions based on size class
-TestConfig get_test_config(TestSizeClass size_class, int num_threads) {
+TestConfig get_test_config(TestSizeClass size_class, ggml_numa_execution_strategy_t strategy, const char* strategy_name) {
     TestConfig config;
-    config.num_threads = num_threads;
+    config.strategy = strategy;
+    config.strategy_name = strategy_name;
     
     switch (size_class) {
         case TINY:
@@ -166,10 +169,11 @@ public:
     std::vector<TestResult> results;
     
     /**
-     * Test single ADD case with specified dimensions and thread count
+     * Test single ADD case with specified dimensions and forced strategy
      */
-    bool test_single_ADD_case(int ne0, int ne1, int ne2, int ne3, int num_threads, const char* test_name, const std::string& stage_name) {
-        printf("\n🧮 Testing ADD %s (%dx%dx%dx%d, %d threads)\n", test_name, ne0, ne1, ne2, ne3, num_threads);
+    bool test_single_ADD_case(int ne0, int ne1, int ne2, int ne3, ggml_numa_execution_strategy_t strategy, 
+                             const char* test_name, const char* strategy_name) {
+        printf("\n🧮 Testing ADD %s (%dx%dx%dx%d, strategy=%s)\n", test_name, ne0, ne1, ne2, ne3, strategy_name);
         
         const size_t total_elements = ne0 * ne1 * ne2 * ne3;
         bool case_passed = false;
@@ -214,17 +218,8 @@ public:
             return false;
         }
         
-        // Initialize NUMA system with strategy based on execution stage
-        if (num_threads == 1) {
-            // Stage 1: Single-thread Single-node - OpenMP coordinator handles this automatically
-            ggml_numa_init(GGML_NUMA_STRATEGY_MIRROR);
-        } else if (stage_name.find("Single-node") != std::string::npos) {
-            // Stage 2: Multi-thread Single-node - OpenMP coordinator handles thread distribution
-            ggml_numa_init(GGML_NUMA_STRATEGY_ISOLATE);
-        } else {
-            // Stage 3: Multi-thread Multi-node - OpenMP coordinator uses all available resources
-            ggml_numa_init(GGML_NUMA_STRATEGY_MIRROR);
-        }
+        // Initialize NUMA system 
+        ggml_numa_init(GGML_NUMA_STRATEGY_MIRROR);
         
         // Query the NUMA kernel to see if it's supported
         ggml_numa_kernel_query_result_t query_result = ggml_numa_kernels_query(numa_result);
@@ -232,30 +227,30 @@ public:
         if (!query_result.supported) {
             printf("⚠️  ADD operation not supported by NUMA kernels - skipping NUMA test\n");
             ggml_free(test_ctx);
-            return true;  // Consider this a pass since kernel isn't available
+            return false;  // Consider this a fail since kernel isn't available
         }
         
         printf("📊 NUMA Strategy: %s (efficiency: %.2f)\n", 
                query_result.kernel_name, query_result.efficiency_score);
         
         // Explain execution mode for clarity
-        if (num_threads == 1) {
-            printf("🔧 Thread Constraint Test: Executor strategy may show 'data-parallel' but coordinator will enforce single-node execution\n");
-        } else {
-            printf("🌐 Multi-thread Test: Full NUMA capabilities enabled for %d threads\n", num_threads);
-        }
+        printf("🔧 Strategy Test: Forcing execution strategy to %s\n", strategy_name);
         
-        // Setup compute plan for NUMA execution
-        struct ggml_cplan cplan = ggml_graph_plan(ggml_new_graph(test_ctx), num_threads, nullptr);
+        // Ensure NUMA dispatch is enabled for our test
+        ggml_numa_set_fallback_flag(false);  // Ensure NUMA dispatch is enabled
+        
+        // Setup compute plan for NUMA execution (let coordinator choose thread count)
+        int default_threads = 16;  // Use reasonable default thread count
+        struct ggml_cplan cplan = ggml_graph_plan(ggml_new_graph(test_ctx), default_threads, nullptr);
         cplan.work_size = 0;
         cplan.work_data = nullptr;
-        cplan.n_threads = num_threads;
+        cplan.n_threads = default_threads;
         cplan.threadpool = nullptr;
         cplan.abort_callback = nullptr;
         cplan.abort_callback_data = nullptr;
         
-        // Execute using NUMA executor
-        enum ggml_status dispatch_result = ggml_numa_executor_execute_tensor(numa_result, &cplan);
+        // Execute using NUMA executor with forced strategy
+        enum ggml_status dispatch_result = ggml_numa_executor_execute_tensor_forced_strategy(numa_result, &cplan, strategy);
         
         if (dispatch_result != GGML_STATUS_SUCCESS) {
             printf("❌ NUMA execution failed with status %d\n", (int)dispatch_result);
@@ -285,15 +280,25 @@ public:
         memcpy(ggml_get_data(ref_input_a), data_a, total_elements * sizeof(float));
         memcpy(ggml_get_data(ref_input_b), data_b, total_elements * sizeof(float));
         
-        // Execute reference implementation using standard ggml compute
-        struct ggml_compute_params ref_compute_params;
-        ref_compute_params.ith = 0;
-        ref_compute_params.nth = 1;  // Single-threaded reference
-        ref_compute_params.wsize = 0;
-        ref_compute_params.wdata = nullptr;
-        ref_compute_params.threadpool = nullptr;
+        // Execute reference implementation bypassing NUMA dispatch
+        ggml_numa_set_fallback_flag(true);  // Force fallback to reference implementation
         
-        ggml_compute_forward_add_non_quantized(&ref_compute_params, ref_result);
+        struct ggml_cgraph* ref_gf = ggml_new_graph(ref_ctx);
+        ggml_build_forward_expand(ref_gf, ref_result);
+        
+        struct ggml_cplan ref_plan = ggml_graph_plan(ref_gf, 1, nullptr);  // Single thread
+        if (ref_plan.work_size > 0) {
+            ref_plan.work_data = (uint8_t*)malloc(ref_plan.work_size);
+        }
+        
+        printf("   Executing TRUE reference implementation (bypassing NUMA)...\n");
+        ggml_graph_compute(ref_gf, &ref_plan);
+        
+        ggml_numa_set_fallback_flag(false);  // Re-enable NUMA dispatch
+        
+        if (ref_plan.work_data) {
+            free(ref_plan.work_data);
+        }
         
         // Compare results
         float* numa_data = (float*)ggml_get_data(numa_result);
@@ -313,12 +318,12 @@ public:
     }
     
     /**
-     * Test ADD mathematical equivalence using simplified 3-stage approach:
+     * Test ADD mathematical equivalence using 3-stage approach:
      * 1. Single-thread Single-node: Tests basic functionality and fallback mechanisms
      * 2. Multi-thread Single-node: Tests multi-threading without NUMA complexity  
      * 3. Multi-thread Multi-node: Tests full NUMA data-parallel execution
      * 
-     * This simplified approach eliminates artificial thread constraints and focuses on
+     * This approach eliminates artificial thread constraints and focuses on
      * the three fundamental execution modes that matter for production use.
      */
     void test_ADD_mathematical_equivalence() {
@@ -331,59 +336,56 @@ public:
         // All tensor sizes to test
         std::vector<TestSizeClass> size_classes = {TINY, SMALL, MEDIUM, LARGE};
         
-        // Test Configuration: Simplified 3-stage approach
-        struct ExecutionStage {
-            std::vector<int> thread_counts;
+        // Test Configuration: Strategy-based testing
+        struct ExecutionStrategy {
+            ggml_numa_execution_strategy_t strategy;
+            const char* name;
             const char* description;
-            const char* explanation;
         };
         
-        std::vector<ExecutionStage> stages = {
-            // Stage 1: Single-thread execution - tests basic kernel functionality
-            {{1}, "Single-thread Single-node", 
-             "Tests basic kernel functionality and single-node fallback"},
+        std::vector<ExecutionStrategy> strategies = {
+            // Strategy 1: Single-thread, single-node
+            {{NUMA_NODE_STRATEGY_SINGLE, NUMA_ON_NODE_STRATEGY_SINGLE_THREAD}, 
+             "Single-Single", "Single-thread execution on single NUMA node"},
             
-            // Stage 2: Multi-thread single-node - tests threading without NUMA
-            {{4, 8}, "Multi-thread Single-node", 
-             "Tests multi-threading coordination within single NUMA node"},
+            // Strategy 2: Multi-thread, single-node
+            {{NUMA_NODE_STRATEGY_SINGLE, NUMA_ON_NODE_STRATEGY_MULTI_THREAD}, 
+             "Single-Multi", "Multi-thread execution within single NUMA node"},
             
-            // Stage 3: Multi-thread multi-node - tests full NUMA capabilities  
-            {{8, 16}, "Multi-thread Multi-node", 
-             "Tests full NUMA data-parallel execution across multiple nodes"}
+            // Strategy 3: Multi-thread, multi-node (data-parallel)
+            {{NUMA_NODE_STRATEGY_DATA_PARALLEL, NUMA_ON_NODE_STRATEGY_MULTI_THREAD}, 
+             "Data-Parallel", "Data-parallel execution across multiple NUMA nodes"}
         };
         
         for (TestSizeClass size_class : size_classes) {
-            for (const auto& stage : stages) {
-                printf("\n🎯 Testing %s tensors: %s\n", 
-                       get_test_config(size_class, 1).test_name, stage.description);
-                printf("   %s\n", stage.explanation);
+            for (const auto& strategy_config : strategies) {
+                TestConfig config = get_test_config(size_class, strategy_config.strategy, strategy_config.name);
                 
-                for (int num_threads : stage.thread_counts) {
-                    TestConfig config = get_test_config(size_class, num_threads);
-                    
-                    // Create descriptive test name for filtering
-                    std::string full_test_name = std::string(config.test_name) + " " + 
-                                               stage.description + " (" + 
-                                               std::to_string(config.num_threads) + " threads)";
-                    
-                    // Check if this test matches the filter
-                    if (!matches_filter(full_test_name)) {
-                        printf("⏭️  Skipping: %s (filtered out)\n", full_test_name.c_str());
-                        continue;
-                    }
-                    
-                    bool test_passed = test_single_ADD_case(
-                        config.ne0, config.ne1, config.ne2, config.ne3, 
-                        config.num_threads, config.test_name, stage.description
-                    );
-                    
-                    total_tests++;
-                    if (test_passed) {
-                        passed_tests++;
-                    } else {
-                        if (failure_reason.empty()) {
-                            failure_reason = "First failure: " + full_test_name;
-                        }
+                printf("\n🎯 Testing %s tensors: %s\n", 
+                       config.test_name, strategy_config.description);
+                
+                // Create descriptive test name for filtering
+                std::string full_test_name = std::string(config.test_name) + " " + 
+                                           strategy_config.name + " (" + 
+                                           strategy_config.description + ")";
+                
+                // Check if this test matches the filter
+                if (!matches_filter(full_test_name)) {
+                    printf("⏭️  Skipping: %s (filtered out)\n", full_test_name.c_str());
+                    continue;
+                }
+                
+                bool test_passed = test_single_ADD_case(
+                    config.ne0, config.ne1, config.ne2, config.ne3, 
+                    config.strategy, config.test_name, config.strategy_name
+                );
+                
+                total_tests++;
+                if (test_passed) {
+                    passed_tests++;
+                } else {
+                    if (failure_reason.empty()) {
+                        failure_reason = "First failure: " + full_test_name;
                     }
                 }
             }
@@ -402,7 +404,7 @@ public:
         
         results.push_back({"ADD_mathematical_equivalence", overall_test_passed, failure_reason});
     }
-    
+
     /**
      * Test ADD quantization type coverage - comprehensive testing of all supported type combinations
      * 
@@ -515,9 +517,9 @@ public:
                                 test_passed = true;
                             } else {
                                 // Check if reference implementation supports it
-                                printf("⚠️  %s: NUMA kernel not available, using reference fallback\n", 
+                                printf("⚠️  %s: NUMA kernel not available\n", 
                                        combo.description);
-                                test_passed = true;  // Reference fallback is acceptable
+                                test_passed = false;  // We must test the actual kernel
                             }
                         } else {
                             printf("⚠️  %s: ggml_add returned %s instead of expected %s\n", 
@@ -530,9 +532,9 @@ public:
                                        combo.description, query.efficiency_score);
                                 test_passed = true;
                             } else {
-                                printf("⚠️  %s: Reference fallback for actual type combination\n", 
+                                printf("⚠️  %s: Actual type combination not supported\n", 
                                        combo.description);
-                                test_passed = true;  // Reference fallback is acceptable
+                                test_passed = false;  // We must test the actual kernel
                             }
                         }
                     } else {
@@ -647,7 +649,9 @@ public:
                     if (query.supported) {
                         printf("✅ Matrix + Vector broadcasting supported\n");
                     } else {
-                        printf("⚠️  Matrix + Vector broadcasting will use fallback\n");
+                        printf("❌ Matrix + Vector broadcasting not supported!\n");
+                        all_tests_passed = false;
+                        failure_reason = "Matrix + Vector broadcasting not supported";
                     }
                 } else {
                     printf("❌ Failed to create broadcast ADD operation\n");
@@ -667,10 +671,980 @@ public:
             failure_reason = "Failed to create GGML context";
         }
         
+        // Test Case 2: Corruption Scenario - [896,2] + [896,1] broadcasting
+        printf("\n🚨 Testing Corruption Scenario: [896,2] + [896,1] broadcasting\n");
+        printf("   This specific pattern was causing memory corruption in NUMA ADD kernel\n");
+        
+        struct ggml_init_params corruption_params;
+        corruption_params.mem_size = 32 * 1024 * 1024;  // 32MB for larger tensors
+        corruption_params.mem_buffer = nullptr;
+        corruption_params.no_alloc = false;
+        
+        struct ggml_context* corruption_ctx = ggml_init(corruption_params);
+        
+        if (corruption_ctx) {
+            // Create tensors with exact dimensions from corruption scenario
+            struct ggml_tensor* src0 = ggml_new_tensor_2d(corruption_ctx, GGML_TYPE_F32, 896, 2);  // 1792 elements
+            struct ggml_tensor* src1 = ggml_new_tensor_2d(corruption_ctx, GGML_TYPE_F32, 896, 1);  // 896 elements
+            
+            if (src0 && src1) {
+                printf("   Created tensors: src0[896,2]=%zu elements, src1[896,1]=%zu elements\n",
+                       ggml_nelements(src0), ggml_nelements(src1));
+                
+                // Initialize with deterministic test data
+                float* src0_data = (float*)ggml_get_data(src0);
+                float* src1_data = (float*)ggml_get_data(src1);
+                
+                // Fill with predictable patterns to detect corruption
+                for (size_t i = 0; i < ggml_nelements(src0); i++) {
+                    src0_data[i] = 2.0f + (float)(i % 100) * 0.01f;  // 2.0 to 2.99
+                }
+                for (size_t i = 0; i < ggml_nelements(src1); i++) {
+                    src1_data[i] = 3.0f + (float)(i % 50) * 0.02f;   // 3.0 to 3.98
+                }
+                
+                // Test NUMA implementation
+                struct ggml_tensor* numa_result = ggml_add(corruption_ctx, src0, src1);
+                if (numa_result) {
+                    // Ensure NUMA dispatch is enabled for our test
+                    ggml_numa_set_fallback_flag(false);  // Ensure NUMA dispatch is enabled
+                    
+                    // Build and execute computation graph with NUMA
+                    struct ggml_cgraph* numa_gf = ggml_new_graph(corruption_ctx);
+                    ggml_build_forward_expand(numa_gf, numa_result);
+                    
+                    struct ggml_cplan numa_plan = ggml_graph_plan(numa_gf, 56, nullptr);  // Multi-threaded
+                    if (numa_plan.work_size > 0) {
+                        numa_plan.work_data = (uint8_t*)malloc(numa_plan.work_size);
+                    }
+                    
+                    printf("   Executing NUMA ADD with data-parallel strategy...\n");
+                    ggml_graph_compute(numa_gf, &numa_plan);
+                    
+                    // Copy NUMA results
+                    const size_t result_elements = ggml_nelements(numa_result);
+                    std::vector<float> numa_output(result_elements);
+                    const float* numa_data = (const float*)ggml_get_data(numa_result);
+                    std::copy(numa_data, numa_data + result_elements, numa_output.begin());
+                    
+                    if (numa_plan.work_data) {
+                        free(numa_plan.work_data);
+                    }
+                    
+                    // Now test reference implementation for comparison
+                    struct ggml_init_params ref_params;
+                    ref_params.mem_size = 32 * 1024 * 1024;
+                    ref_params.mem_buffer = nullptr;
+                    ref_params.no_alloc = false;
+                    
+                    struct ggml_context* ref_ctx = ggml_init(ref_params);
+                    if (ref_ctx) {
+                        // Create identical tensors for reference
+                        struct ggml_tensor* ref_src0 = ggml_new_tensor_2d(ref_ctx, GGML_TYPE_F32, 896, 2);
+                        struct ggml_tensor* ref_src1 = ggml_new_tensor_2d(ref_ctx, GGML_TYPE_F32, 896, 1);
+                        
+                        // Initialize with identical data
+                        float* ref_src0_data = (float*)ggml_get_data(ref_src0);
+                        float* ref_src1_data = (float*)ggml_get_data(ref_src1);
+                        
+                        for (size_t i = 0; i < ggml_nelements(ref_src0); i++) {
+                            ref_src0_data[i] = 2.0f + (float)(i % 100) * 0.01f;
+                        }
+                        for (size_t i = 0; i < ggml_nelements(ref_src1); i++) {
+                            ref_src1_data[i] = 3.0f + (float)(i % 50) * 0.02f;
+                        }
+                        
+                        struct ggml_tensor* ref_result = ggml_add(ref_ctx, ref_src0, ref_src1);
+                        
+                        // Execute with reference (single-threaded, bypassing NUMA)
+                        ggml_numa_set_fallback_flag(true);  // Force fallback to reference implementation
+                        
+                        struct ggml_cgraph* ref_gf = ggml_new_graph(ref_ctx);
+                        ggml_build_forward_expand(ref_gf, ref_result);
+                        
+                        struct ggml_cplan ref_plan = ggml_graph_plan(ref_gf, 1, nullptr);  // Single thread
+                        if (ref_plan.work_size > 0) {
+                            ref_plan.work_data = (uint8_t*)malloc(ref_plan.work_size);
+                        }
+                        
+                        printf("   Executing TRUE reference implementation (bypassing NUMA)...\n");
+                        ggml_graph_compute(ref_gf, &ref_plan);
+                        
+                        ggml_numa_set_fallback_flag(false);  // Re-enable NUMA dispatch
+                        
+                        // Compare results
+                        const float* ref_data = (const float*)ggml_get_data(ref_result);
+                        bool corruption_test_passed = true;
+                        double max_diff = 0.0;
+                        size_t first_mismatch = SIZE_MAX;
+                        
+                        for (size_t i = 0; i < result_elements; i++) {
+                            double diff = std::abs(numa_output[i] - ref_data[i]);
+                            if (diff > 1e-5) {
+                                if (first_mismatch == SIZE_MAX) {
+                                    first_mismatch = i;
+                                    printf("   🔍 First mismatch at element %zu: NUMA=%.6f, Ref=%.6f, Diff=%.6f\n",
+                                           i, numa_output[i], ref_data[i], diff);
+                                }
+                                corruption_test_passed = false;
+                            }
+                            max_diff = std::max(max_diff, diff);
+                        }
+                        
+                        if (corruption_test_passed) {
+                            printf("   ✅ Corruption scenario test PASSED: No mathematical differences detected\n");
+                            printf("      Max difference: %.2e (within tolerance)\n", max_diff);
+                        } else {
+                            printf("   ❌ Corruption scenario test FAILED: Mathematical differences detected\n");
+                            printf("      Max difference: %.2e, First mismatch at element %zu\n", max_diff, first_mismatch);
+                            all_tests_passed = false;
+                            if (failure_reason.empty()) {
+                                failure_reason = "Broadcasting corruption detected in [896,2] + [896,1] scenario";
+                            }
+                        }
+                        
+                        if (ref_plan.work_data) {
+                            free(ref_plan.work_data);
+                        }
+                        ggml_free(ref_ctx);
+                    } else {
+                        printf("   ❌ Failed to create reference context for corruption test\n");
+                        all_tests_passed = false;
+                        if (failure_reason.empty()) {
+                            failure_reason = "Failed to create reference context";
+                        }
+                    }
+                } else {
+                    printf("   ❌ Failed to create corruption scenario ADD operation\n");
+                    all_tests_passed = false;
+                    if (failure_reason.empty()) {
+                        failure_reason = "Failed to create corruption scenario ADD operation";
+                    }
+                }
+            } else {
+                printf("   ❌ Failed to create corruption scenario tensors\n");
+                all_tests_passed = false;
+                if (failure_reason.empty()) {
+                    failure_reason = "Failed to create corruption scenario tensors";
+                }
+            }
+            
+            ggml_free(corruption_ctx);
+        } else {
+            printf("   ❌ Failed to create GGML context for corruption test\n");
+            all_tests_passed = false;
+            if (failure_reason.empty()) {
+                failure_reason = "Failed to create GGML context for corruption test";
+            }
+        }
+        
         printf("\n📊 ADD Broadcasting Regression Summary: %s\n", 
                all_tests_passed ? "PASSED" : "FAILED");
         
         results.push_back({"ADD_broadcasting_regression", all_tests_passed, failure_reason});
+    }
+    
+    /**
+     * Test ADD threshold regression - ensure small tensors don't get forced into inappropriate strategies
+     * 
+     * This test specifically checks the bug where thresholds were set to (0,0), forcing all operations 
+     * into data-parallel mode even for tiny tensors. This caused corruption in real models.
+     */
+    void test_ADD_threshold_regression() {
+        printf("\n🔬 === ADD THRESHOLD REGRESSION TESTS ===\n");
+        printf("Testing that small tensors use appropriate execution strategies and don't cause corruption\n");
+        
+        bool all_tests_passed = true;
+        std::string failure_reason = "";
+        
+        // Test small tensor that would have been problematic with old (0,0) thresholds
+        struct TestCase {
+            int ne0, ne1, ne2, ne3;
+            const char* description;
+            bool force_data_parallel;  // Test forced data-parallel to ensure kernel can handle edge cases
+        };
+        
+        std::vector<TestCase> test_cases = {
+            // Small tensors that should naturally use single-single or single-multi
+            {64, 4, 1, 1, "Small tensor (natural strategy)", false},
+            {256, 1, 1, 1, "Small 1D tensor (natural strategy)", false},
+            {32, 32, 1, 1, "Small 2D tensor (natural strategy)", false},
+            
+            // Force same small tensors into data-parallel to test edge case handling
+            {64, 4, 1, 1, "Small tensor (forced data-parallel)", true},
+            {256, 1, 1, 1, "Small 1D tensor (forced data-parallel)", true},
+            {32, 32, 1, 1, "Small 2D tensor (forced data-parallel)", true},
+        };
+        
+        for (const auto& test_case : test_cases) {
+            printf("\n🧪 Testing threshold case: %s (%dx%dx%dx%d)\n", 
+                   test_case.description, test_case.ne0, test_case.ne1, test_case.ne2, test_case.ne3);
+            
+            ggml_numa_execution_strategy_t strategy;
+            if (test_case.force_data_parallel) {
+                // Force data-parallel to test edge case handling
+                strategy = {NUMA_NODE_STRATEGY_DATA_PARALLEL, NUMA_ON_NODE_STRATEGY_MULTI_THREAD};
+            } else {
+                // Let natural strategy selection work
+                strategy = {NUMA_NODE_STRATEGY_SINGLE, NUMA_ON_NODE_STRATEGY_SINGLE_THREAD}; // Will be overridden by query
+            }
+            
+            bool test_passed = test_single_ADD_case(
+                test_case.ne0, test_case.ne1, test_case.ne2, test_case.ne3,
+                strategy, test_case.description, 
+                test_case.force_data_parallel ? "Data-Parallel (FORCED)" : "Natural Selection"
+            );
+            
+            if (!test_passed) {
+                printf("   ❌ Threshold regression test failed: %s\n", test_case.description);
+                all_tests_passed = false;
+                if (failure_reason.empty()) {
+                    failure_reason = std::string("Threshold test failed: ") + test_case.description;
+                }
+            } else {
+                printf("   ✅ Threshold regression test passed: %s\n", test_case.description);
+            }
+        }
+        
+        printf("\n📊 ADD Threshold Regression Summary: %s\n", 
+               all_tests_passed ? "PASSED" : "FAILED");
+        
+        if (all_tests_passed) {
+            printf("✅ Small tensors handle all execution strategies correctly\n");
+            printf("✅ No corruption detected in forced data-parallel execution of small tensors\n");
+        } else {
+            printf("❌ Threshold regression detected - small tensors failing with forced strategies\n");
+        }
+        
+        results.push_back({"ADD_threshold_regression", all_tests_passed, failure_reason});
+    }
+    
+    /**
+     * Test ADD extreme edge cases - ensure ridiculously small tensors work in data-parallel mode
+     * 
+     * This test ensures our kernel can handle ANY tensor size in data-parallel mode, no matter
+     * how small or awkward the dimensions. No papering over bugs with thresholds!
+     */
+    void test_ADD_extreme_edge_cases() {
+        printf("\n🔬 === ADD EXTREME EDGE CASE TESTS ===\n");
+        printf("Testing ridiculously small tensors in forced data-parallel mode to ensure robustness\n");
+        
+        bool all_tests_passed = true;
+        std::string failure_reason = "";
+        
+        // Ultra-small tensor test cases that must work in data-parallel mode
+        struct EdgeCase {
+            int ne0, ne1, ne2, ne3;
+            const char* description;
+            bool expect_success;  // All should succeed if kernel is robust
+        };
+        
+        std::vector<EdgeCase> edge_cases = {
+            // Pathological cases - smaller than number of NUMA nodes
+            {1, 1, 1, 1, "Single element tensor", true},
+            {2, 1, 1, 1, "Two element tensor (1 per NUMA node)", true},
+            {3, 1, 1, 1, "Three element tensor (uneven split)", true},
+            {4, 1, 1, 1, "Four element tensor", true},
+            
+            // Extreme 1D cases
+            {1, 1, 1, 1, "1D: 1 element", true},
+            {5, 1, 1, 1, "1D: 5 elements", true},
+            {7, 1, 1, 1, "1D: 7 elements (prime number)", true},
+            
+            // Extreme 2D cases
+            {1, 2, 1, 1, "2D: 1x2 matrix", true},
+            {2, 1, 1, 1, "2D: 2x1 matrix", true},
+            {1, 5, 1, 1, "2D: 1x5 matrix", true},
+            {5, 1, 1, 1, "2D: 5x1 matrix", true},
+            
+            // Extreme 3D cases
+            {1, 1, 3, 1, "3D: 1x1x3 tensor", true},
+            {2, 2, 1, 1, "3D: 2x2x1 tensor", true},
+            {1, 2, 2, 1, "3D: 1x2x2 tensor", true},
+            
+            // Extreme 4D cases
+            {1, 1, 1, 7, "4D: 1x1x1x7 tensor", true},
+            {2, 1, 1, 2, "4D: 2x1x1x2 tensor", true},
+        };
+        
+        for (const auto& edge_case : edge_cases) {
+            printf("\n🧪 Testing extreme edge case: %s (%dx%dx%dx%d = %d elements)\n", 
+                   edge_case.description, edge_case.ne0, edge_case.ne1, edge_case.ne2, edge_case.ne3,
+                   edge_case.ne0 * edge_case.ne1 * edge_case.ne2 * edge_case.ne3);
+            
+            // Force data-parallel execution - this MUST work for any tensor size
+            ggml_numa_execution_strategy_t forced_data_parallel = {
+                NUMA_NODE_STRATEGY_DATA_PARALLEL, 
+                NUMA_ON_NODE_STRATEGY_MULTI_THREAD
+            };
+            
+            bool test_passed = test_single_ADD_case(
+                edge_case.ne0, edge_case.ne1, edge_case.ne2, edge_case.ne3,
+                forced_data_parallel, edge_case.description, "FORCED Data-Parallel"
+            );
+            
+            if (!test_passed && edge_case.expect_success) {
+                printf("   ❌ CRITICAL: Edge case failed: %s\n", edge_case.description);
+                printf("   💥 This indicates a fundamental bug in data-parallel execution logic!\n");
+                all_tests_passed = false;
+                if (failure_reason.empty()) {
+                    failure_reason = std::string("CRITICAL edge case failed: ") + edge_case.description;
+                }
+            } else if (test_passed) {
+                printf("   ✅ Edge case passed: %s\n", edge_case.description);
+            }
+        }
+        
+        // Test pathological broadcasting cases
+        printf("\n🔬 Testing extreme broadcasting edge cases...\n");
+        
+        struct BroadcastEdgeCase {
+            int src0_ne0, src0_ne1, src0_ne2, src0_ne3;  // Destination tensor
+            int src1_ne0, src1_ne1, src1_ne2, src1_ne3;  // Source tensor (to be broadcast)
+            const char* description;
+        };
+        
+        std::vector<BroadcastEdgeCase> broadcast_cases = {
+            // Scalar to tiny tensor broadcasting
+            {2, 1, 1, 1,   1, 1, 1, 1,   "Scalar to 2-element tensor"},
+            {3, 1, 1, 1,   1, 1, 1, 1,   "Scalar to 3-element tensor"},
+            {1, 3, 1, 1,   1, 1, 1, 1,   "Scalar to 1x3 tensor"},
+            
+            // Vector to matrix broadcasting  
+            {2, 2, 1, 1,   2, 1, 1, 1,   "2-element vector to 2x2 matrix"},
+            {3, 2, 1, 1,   3, 1, 1, 1,   "3-element vector to 3x2 matrix"},
+            {1, 5, 1, 1,   1, 1, 1, 1,   "Scalar to 1x5 matrix"},
+        };
+        
+        for (const auto& bcast_case : broadcast_cases) {
+            printf("\n🧪 Testing broadcast edge case: %s\n", bcast_case.description);
+            printf("   src0: %dx%dx%dx%d (%d elements) + src1: %dx%dx%dx%d (%d elements)\n",
+                   bcast_case.src0_ne0, bcast_case.src0_ne1, bcast_case.src0_ne2, bcast_case.src0_ne3,
+                   bcast_case.src0_ne0 * bcast_case.src0_ne1 * bcast_case.src0_ne2 * bcast_case.src0_ne3,
+                   bcast_case.src1_ne0, bcast_case.src1_ne1, bcast_case.src1_ne2, bcast_case.src1_ne3,
+                   bcast_case.src1_ne0 * bcast_case.src1_ne1 * bcast_case.src1_ne2 * bcast_case.src1_ne3);
+            
+            // Test broadcasting with forced data-parallel 
+            bool bcast_test_passed = test_broadcasting_case(
+                bcast_case.src0_ne0, bcast_case.src0_ne1, bcast_case.src0_ne2, bcast_case.src0_ne3,
+                bcast_case.src1_ne0, bcast_case.src1_ne1, bcast_case.src1_ne2, bcast_case.src1_ne3,
+                true  // force_data_parallel = true
+            );
+            
+            if (!bcast_test_passed) {
+                printf("   ❌ CRITICAL: Broadcast edge case failed: %s\n", bcast_case.description);
+                all_tests_passed = false;
+                if (failure_reason.empty()) {
+                    failure_reason = std::string("CRITICAL broadcast edge case failed: ") + bcast_case.description;
+                }
+            } else {
+                printf("   ✅ Broadcast edge case passed: %s\n", bcast_case.description);
+            }
+        }
+        
+        printf("\n📊 ADD Extreme Edge Case Summary: %s\n", 
+               all_tests_passed ? "PASSED" : "FAILED");
+        
+        if (all_tests_passed) {
+            printf("✅ ALL extreme edge cases work correctly in data-parallel mode\n");
+            printf("✅ Kernel is robust and handles pathological tensor sizes properly\n");
+        } else {
+            printf("❌ CRITICAL FAILURES detected in data-parallel execution logic\n");
+            printf("💥 These failures indicate fundamental bugs that must be fixed\n");
+            printf("🛠️  The kernel must handle ANY tensor size in data-parallel mode robustly\n");
+        }
+        
+        results.push_back({"ADD_extreme_edge_cases", all_tests_passed, failure_reason});
+    }
+    
+    /**
+     * Helper function to test broadcasting cases with optional forced data-parallel execution
+     */
+    bool test_broadcasting_case(int src0_ne0, int src0_ne1, int src0_ne2, int src0_ne3,
+                               int src1_ne0, int src1_ne1, int src1_ne2, int src1_ne3,
+                               bool force_data_parallel) {
+        // Create GGML context
+        struct ggml_init_params params;
+        params.mem_size = 16 * 1024 * 1024;  // 16 MB should be enough for tiny tensors
+        params.mem_buffer = nullptr;
+        params.no_alloc = false;
+        
+        struct ggml_context* ctx = ggml_init(params);
+        if (!ctx) {
+            printf("   ❌ Failed to create GGML context for broadcast test\n");
+            return false;
+        }
+        
+        // Create tensors with specified dimensions
+        struct ggml_tensor* src0 = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, src0_ne0, src0_ne1, src0_ne2, src0_ne3);
+        struct ggml_tensor* src1 = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, src1_ne0, src1_ne1, src1_ne2, src1_ne3);
+        
+        if (!src0 || !src1) {
+            printf("   ❌ Failed to create broadcast test tensors\n");
+            ggml_free(ctx);
+            return false;
+        }
+        
+        // Initialize data
+        float* src0_data = (float*)ggml_get_data(src0);
+        float* src1_data = (float*)ggml_get_data(src1);
+        
+        const size_t src0_elements = ggml_nelements(src0);
+        const size_t src1_elements = ggml_nelements(src1);
+        
+        for (size_t i = 0; i < src0_elements; i++) {
+            src0_data[i] = (float)(i % 10) + 1.0f;  // Values 1.0 to 10.0
+        }
+        for (size_t i = 0; i < src1_elements; i++) {
+            src1_data[i] = (float)(i % 5) * 0.1f;   // Values 0.0, 0.1, 0.2, 0.3, 0.4
+        }
+        
+        // Create ADD operation
+        struct ggml_tensor* result = ggml_add(ctx, src0, src1);
+        if (!result) {
+            printf("   ❌ Failed to create ADD operation for broadcast test\n");
+            ggml_free(ctx);
+            return false;
+        }
+        
+        // Execute with forced strategy if requested
+        ggml_numa_execution_strategy_t strategy;
+        if (force_data_parallel) {
+            strategy = {NUMA_NODE_STRATEGY_DATA_PARALLEL, NUMA_ON_NODE_STRATEGY_MULTI_THREAD};
+        } else {
+            strategy = {NUMA_NODE_STRATEGY_SINGLE, NUMA_ON_NODE_STRATEGY_SINGLE_THREAD};
+        }
+        
+        // Setup compute plan
+        struct ggml_cplan cplan = ggml_graph_plan(ggml_new_graph(ctx), 16, nullptr);
+        cplan.work_size = 0;
+        cplan.work_data = nullptr;
+        cplan.n_threads = 16;
+        cplan.threadpool = nullptr;
+        cplan.abort_callback = nullptr;
+        cplan.abort_callback_data = nullptr;
+        
+        // Execute
+        enum ggml_status status = ggml_numa_executor_execute_tensor_forced_strategy(result, &cplan, strategy);
+        
+        bool success = (status == GGML_STATUS_SUCCESS);
+        
+        if (!success) {
+            printf("   ❌ Broadcast execution failed with status %d\n", (int)status);
+        }
+        
+        ggml_free(ctx);
+        return success;
+    }
+    
+    /**
+     * Canary test to verify fallback path execution
+     * This test specifically validates that the fallback flag correctly prevents NUMA dispatch
+     * and forces execution through the reference implementation pathway.
+     */
+    void test_ADD_fallback_canary() {
+        const std::string test_category = "ADD_fallback_canary";
+        printf("\n📋 %s: Verifying fallback path execution...\n", test_category.c_str());
+        
+        // Use a simple 4x4 tensor for this canary test
+        const int ne0 = 4, ne1 = 4, ne2 = 1, ne3 = 1;
+        const size_t total_elements = ne0 * ne1 * ne2 * ne3;
+        
+        // Create GGML context
+        struct ggml_init_params params;
+        params.mem_size = 16 * 1024 * 1024;  // 16MB
+        params.mem_buffer = nullptr;
+        params.no_alloc = false;
+        struct ggml_context * ctx = ggml_init(params);
+        GGML_ASSERT(ctx != nullptr);
+        
+        // Create tensors with simple test data
+        struct ggml_tensor * src0 = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, ne0, ne1, ne2, ne3);
+        struct ggml_tensor * src1 = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, ne0, ne1, ne2, ne3);
+        struct ggml_tensor * result = ggml_add(ctx, src0, src1);
+        
+        // Fill with predictable test data
+        float * src0_data = (float *)tensor_data(src0);
+        float * src1_data = (float *)tensor_data(src1);
+        for (size_t i = 0; i < total_elements; i++) {
+            src0_data[i] = (float)(i + 1);      // 1, 2, 3, 4, ...
+            src1_data[i] = (float)(i * 2 + 10); // 10, 12, 14, 16, ...
+        }
+        
+        // Create computation graph
+        struct ggml_cgraph * graph = ggml_new_graph(ctx);
+        ggml_build_forward_expand(graph, result);
+        
+        // Test 1: Verify fallback flag BLOCKS NUMA dispatch (reference path)
+        printf("   🧪 Test 1: Verifying fallback flag blocks NUMA dispatch...\n");
+        ggml_numa_set_fallback_flag(true);  // Enable fallback - should block NUMA
+        
+        // Reset and record execution count for fallback test
+        ggml_numa_reset_execution_count();
+        
+        // Clear result tensor
+        memset(tensor_data(result), 0, ggml_nbytes(result));
+        
+        // Create compute plan for fallback execution
+        struct ggml_cplan fallback_plan = ggml_graph_plan(graph, 1, nullptr);  // Single thread for reference
+        
+        // Execute with fallback flag set - should use reference implementation
+        enum ggml_status status_fallback = ggml_graph_compute(graph, &fallback_plan);
+        
+        // Record NUMA execution count during fallback (should be 0)
+        int fallback_execution_count = ggml_numa_get_execution_count();
+        
+        // Store fallback results
+        std::vector<float> fallback_results(total_elements);
+        float * result_data = (float *)tensor_data(result);
+        memcpy(fallback_results.data(), result_data, total_elements * sizeof(float));
+        
+        // Test 2: Verify NUMA dispatch works when fallback is disabled (NUMA path)
+        printf("   🧪 Test 2: Verifying NUMA dispatch works when fallback disabled...\n");
+        ggml_numa_set_fallback_flag(false);  // Disable fallback - should enable NUMA
+        
+        // Reset execution count for NUMA test
+        ggml_numa_reset_execution_count();
+        
+        // Clear result tensor
+        memset(tensor_data(result), 0, ggml_nbytes(result));
+        
+        // Create compute plan for NUMA execution
+        struct ggml_cplan numa_plan = ggml_graph_plan(graph, 56, nullptr);  // Multi-threaded for NUMA
+        
+        // Execute with fallback flag disabled - should use NUMA implementation
+        enum ggml_status status_numa = ggml_graph_compute(graph, &numa_plan);
+        
+        // Record NUMA execution count during NUMA execution (should be > 0)
+        int numa_execution_count = ggml_numa_get_execution_count();
+        
+        // Store NUMA results
+        std::vector<float> numa_results(total_elements);
+        memcpy(numa_results.data(), result_data, total_elements * sizeof(float));
+        
+        // Test 3: Verify both execution paths succeeded
+        bool execution_success = (status_fallback == GGML_STATUS_SUCCESS) && 
+                               (status_numa == GGML_STATUS_SUCCESS);
+        
+        if (!execution_success) {
+            printf("   ❌ Execution failed: fallback_status=%d, numa_status=%d\n", 
+                   (int)status_fallback, (int)status_numa);
+            results.push_back({test_category, false, "Execution failure"});
+            ggml_free(ctx);
+            return;
+        }
+        
+        // Test 4: Verify mathematical equivalence between both paths
+        printf("   🧪 Test 3: Verifying mathematical equivalence between fallback and NUMA paths...\n");
+        bool mathematical_equivalence = true;
+        const float tolerance = 1e-6f;
+        
+        for (size_t i = 0; i < total_elements; i++) {
+            float expected = fallback_results[i];
+            float actual = numa_results[i];
+            float diff = fabsf(expected - actual);
+            
+            if (diff > tolerance) {
+                printf("   ❌ Mathematical mismatch at element %zu: fallback=%.6f, numa=%.6f, diff=%.6f\n",
+                       i, expected, actual, diff);
+                mathematical_equivalence = false;
+                break;
+            }
+        }
+        
+        // Test 5: Sanity check - verify we got expected mathematical results
+        printf("   🧪 Test 4: Verifying sanity check of mathematical results...\n");
+        bool sanity_check = true;
+        
+        // Check a few known values: result[i] should equal src0[i] + src1[i]
+        for (size_t i = 0; i < std::min(total_elements, size_t(4)); i++) {
+            float expected_value = (float)(i + 1) + (float)(i * 2 + 10);  // src0[i] + src1[i]
+            float actual_fallback = fallback_results[i];
+            float actual_numa = numa_results[i];
+            
+            if (fabsf(actual_fallback - expected_value) > tolerance ||
+                fabsf(actual_numa - expected_value) > tolerance) {
+                printf("   ❌ Sanity check failed at element %zu: expected=%.6f, fallback=%.6f, numa=%.6f\n",
+                       i, expected_value, actual_fallback, actual_numa);
+                sanity_check = false;
+                break;
+            }
+        }
+        
+        // Test 5: Validate that different execution paths were taken
+        printf("   🧪 Test 5: Validating execution path differences...\n");
+        printf("     Fallback execution count: %d (expected: 0)\n", fallback_execution_count);
+        printf("     NUMA execution count: %d (expected: > 0)\n", numa_execution_count);
+        
+        bool path_validation = true;
+        if (fallback_execution_count == numa_execution_count) {
+            printf("     ❌ Path validation failed: Both executions used same path (count: %d)\n", fallback_execution_count);
+            printf("     ❌ This indicates the fallback mechanism is broken!\n");
+            path_validation = false;
+        } else {
+            printf("     ✅ Path validation passed: Different execution paths detected\n");
+        }
+        
+        // Final assessment
+        bool canary_success = execution_success && mathematical_equivalence && sanity_check && path_validation;
+        
+        if (canary_success) {
+            printf("   ✅ Fallback canary test passed: Both execution paths work and produce identical results\n");
+            printf("   ✅ Verified: Fallback flag correctly controls NUMA dispatch behavior\n");
+            printf("   ✅ Verified: Different execution paths were taken (fallback: %d, NUMA: %d)\n", 
+                   fallback_execution_count, numa_execution_count);
+        } else {
+            printf("   ❌ Fallback canary test failed\n");
+            if (!execution_success) printf("   ❌ Execution issues detected\n");
+            if (!mathematical_equivalence) printf("   ❌ Mathematical equivalence failed\n");
+            if (!sanity_check) printf("   ❌ Sanity check failed\n");
+            if (!path_validation) printf("   ❌ Execution path validation failed\n");
+        }
+        
+        results.push_back({test_category, canary_success, canary_success ? "Passed" : "Fallback path verification failed"});
+        
+        ggml_free(ctx);
+    }
+    
+    /**
+     * Test for race condition in NUMA ADD data-parallel execution
+     * 
+     * This test reproduces the critical race condition where multiple threads
+     * in data-parallel mode process the same tensor and write to the same 
+     * output memory simultaneously, causing corruption and incorrect results.
+     */
+    void test_ADD_race_condition_detection() {
+        if (!matches_filter("race_condition")) {
+            return;
+        }
+        
+        std::string test_category = "ADD_race_condition_detection";
+        printf("\n🎯 Testing: %s\n", test_category.c_str());
+        
+        const size_t RACE_CONDITION_TENSOR_SIZE = 2048;  // > 1024 to trigger data-parallel
+        const int NUM_RACE_TESTS = 5;                    // Multiple runs to catch intermittent failures
+        const float TOLERANCE = 1e-6f;                   // Tolerance for floating point comparison
+        
+        printf("   📊 Race condition detection parameters:\n");
+        printf("     Tensor size: %zu elements (triggers data-parallel mode)\n", RACE_CONDITION_TENSOR_SIZE);
+        printf("     Test runs: %d (to catch intermittent race conditions)\n", NUM_RACE_TESTS);
+        printf("     Tolerance: %.2e (for mathematical verification)\n", TOLERANCE);
+        
+        bool overall_success = true;
+        int failed_runs = 0;
+        
+        for (int run = 0; run < NUM_RACE_TESTS; ++run) {
+            printf("   🔄 Race condition test run %d/%d...\n", run + 1, NUM_RACE_TESTS);
+            
+            // Create GGML context
+            size_t ctx_size = 1024 * 1024 * 10; // 10MB should be enough
+            struct ggml_init_params params = {
+                .mem_size = ctx_size,
+                .mem_buffer = nullptr,
+                .no_alloc = false,
+            };
+            struct ggml_context * ctx = ggml_init(params);
+            if (!ctx) {
+                printf("     ❌ Failed to create GGML context for run %d\n", run + 1);
+                overall_success = false;
+                failed_runs++;
+                continue;
+            }
+            
+            try {
+                // Create input tensors with known patterns
+                struct ggml_tensor * src0 = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, RACE_CONDITION_TENSOR_SIZE);
+                struct ggml_tensor * src1 = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, RACE_CONDITION_TENSOR_SIZE);
+                
+                if (!src0 || !src1) {
+                    printf("     ❌ Failed to create input tensors for run %d\n", run + 1);
+                    ggml_free(ctx);
+                    overall_success = false;
+                    failed_runs++;
+                    continue;
+                }
+                
+                float * src0_data = (float *)ggml_get_data(src0);
+                float * src1_data = (float *)ggml_get_data(src1);
+                
+                // Initialize with predictable patterns that will show corruption clearly
+                for (size_t i = 0; i < RACE_CONDITION_TENSOR_SIZE; ++i) {
+                    src0_data[i] = 1.0f + (float)(i % 100) * 0.01f;  // 1.00, 1.01, 1.02, ..., 1.99, 1.00, ...
+                    src1_data[i] = 2.0f + (float)(i % 50) * 0.01f;   // 2.00, 2.01, 2.02, ..., 2.49, 2.00, ...
+                }
+                
+                // Create result tensor
+                struct ggml_tensor * result = ggml_add(ctx, src0, src1);
+                if (!result) {
+                    printf("     ❌ Failed to create ADD operation for run %d\n", run + 1);
+                    ggml_free(ctx);
+                    overall_success = false;
+                    failed_runs++;
+                    continue;
+                }
+                
+                // Create compute plan and execute
+                struct ggml_cgraph * graph = ggml_new_graph(ctx);
+                ggml_build_forward_expand(graph, result);
+                
+                // Force NUMA execution with multi-threading like the server uses
+                // This better matches the server environment that triggers the race condition
+                int server_like_threads = 56;  // Use many threads like the server
+                ggml_graph_compute_with_ctx(ctx, graph, server_like_threads);
+                
+                // Verify the result matches expected pattern (src0 + src1)
+                const float * result_data = (const float *)ggml_get_data(result);
+                bool run_success = true;
+                int error_count = 0;
+                const int MAX_ERRORS_TO_SHOW = 5;
+                
+                for (size_t i = 0; i < RACE_CONDITION_TENSOR_SIZE && error_count < MAX_ERRORS_TO_SHOW; ++i) {
+                    float expected = src0_data[i] + src1_data[i];
+                    float actual = result_data[i];
+                    float diff = std::abs(actual - expected);
+                    
+                    if (diff > TOLERANCE) {
+                        if (error_count == 0) {
+                            printf("     ❌ Race condition detected in run %d!\n", run + 1);
+                            printf("       Mathematical errors indicate memory corruption:\n");
+                        }
+                        printf("       Index %zu: expected %.6f, got %.6f (diff: %.2e)\n", 
+                               i, expected, actual, diff);
+                        run_success = false;
+                        error_count++;
+                    }
+                }
+                
+                if (!run_success && error_count >= MAX_ERRORS_TO_SHOW) {
+                    printf("       ... (showing first %d errors)\n", MAX_ERRORS_TO_SHOW);
+                }
+                
+                if (!run_success) {
+                    printf("     ❌ Run %d failed: Multiple threads writing to same output memory\n", run + 1);
+                    overall_success = false;
+                    failed_runs++;
+                } else {
+                    printf("     ✅ Run %d passed: No race condition detected\n", run + 1);
+                }
+                
+            } catch (const std::exception& e) {
+                printf("     ❌ Exception in run %d: %s\n", run + 1, e.what());
+                overall_success = false;
+                failed_runs++;
+            }
+            
+            ggml_free(ctx);
+        }
+        
+        printf("   📊 Race condition test summary:\n");
+        if (overall_success) {
+            printf("     ✅ All %d test runs passed\n", NUM_RACE_TESTS);
+            printf("     ✅ No race condition detected in NUMA ADD data-parallel execution\n");
+            printf("     ✅ Data-parallel coordination is working correctly\n");
+        } else {
+            printf("     ❌ Race condition detected: %d/%d runs failed\n", failed_runs, NUM_RACE_TESTS);
+            printf("     ❌ Multiple threads are writing to the same output tensor memory\n");
+            printf("     ❌ This is a critical bug that corrupts computation results\n");
+            printf("     💡 Root cause: Same tensor processed multiple times by different threads\n");
+            printf("     💡 Expected: Each tensor should be processed exactly once\n");
+        }
+        
+        results.push_back({test_category, overall_success, 
+                          overall_success ? "No race condition detected" : 
+                          "Race condition: Multiple threads writing to same memory"});
+    }
+
+    /**
+     * Real tensor precision test using exact data from failing integration test
+     * This test reproduces the exact tensor values that caused integration test failure
+     */
+    void test_ADD_real_tensor_precision() {
+        std::string test_category = "ADD_real_tensor_precision";
+        printf("\n🔬 Testing ADD with Real Tensor Data from Integration Failure...\n");
+        
+        // Skip if filtered out
+        if (g_filter_enabled && !matches_filter(test_category)) {
+            printf("   ⏭️  Skipped due to filter\n");
+            return;
+        }
+        
+        bool overall_success = true;
+        
+        // Real tensor data extracted from data-parallel-failure-trace.log
+        // Broadcasting scenario: [896,2,1,1] + [896,1,1,1] 
+        struct RealTensorSample {
+            size_t index;
+            float src0_val;
+            float src1_val;
+            float expected;
+        };
+        
+        std::vector<RealTensorSample> real_samples = {
+            {1168, -0.006816f, 0.002730f, -0.004086f},
+            {864, -0.016606f, 0.011347f, -0.005259f},
+            {1616, -0.003922f, 0.002655f, -0.001267f},
+            {320, 0.014038f, -0.001221f, 0.012817f},
+            {1072, 0.009705f, -0.008270f, 0.001435f},
+            {1520, 0.001617f, -0.000305f, 0.001312f},
+            {928, 0.000244f, 0.002289f, 0.002533f},
+            {1376, 0.016113f, -0.003235f, 0.012878f},
+            {1824, -0.013367f, 0.001526f, -0.011841f},
+            {576, -0.001709f, -0.006439f, -0.008148f},
+            {1424, -0.009644f, 0.006226f, -0.003418f},
+            {1872, 0.003693f, -0.000458f, 0.003235f},
+            {1328, -0.000793f, 0.001526f, 0.000733f},
+            {80, 0.011597f, -0.002289f, 0.009308f},
+            {1776, 0.012024f, -0.003052f, 0.008972f},
+            {1232, 0.008057f, -0.007019f, 0.001038f},
+            {784, 0.007324f, -0.001038f, 0.006286f},
+            {1680, -0.003174f, 0.000793f, -0.002381f},
+            {1584, -0.004150f, 0.003784f, -0.000366f},
+            {336, 0.011047f, -0.001160f, 0.009887f}
+        };
+        
+        printf("   🎯 Broadcasting test case: [896,2,1,1] + [896,1,1,1]\n");
+        printf("   📊 Testing %zu real data samples from integration failure\n", real_samples.size());
+        
+        try {
+            // Create context
+            struct ggml_init_params params = {
+                .mem_size = 16 * 1024 * 1024, // 16MB
+                .mem_buffer = nullptr,
+                .no_alloc = false,
+            };
+            
+            struct ggml_context * ctx = ggml_init(params);
+            if (!ctx) {
+                printf("   ❌ Failed to create context\n");
+                results.push_back({test_category, false, "Context creation failed"});
+                return;
+            }
+            
+            // Create tensors with exact dimensions from integration failure
+            struct ggml_tensor * src0 = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 896, 2, 1, 1);  // [896,2,1,1]
+            struct ggml_tensor * src1 = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 896, 1, 1, 1);  // [896,1,1,1] 
+            struct ggml_tensor * result = ggml_add(ctx, src0, src1);
+            
+            // Initialize tensors with real data
+            float * src0_data = (float *)ggml_get_data(src0);
+            float * src1_data = (float *)ggml_get_data(src1);
+            
+            // Fill with pattern similar to integration test - most zeros with specific real values
+            size_t total_src0_elements = ggml_nelements(src0); // 896 * 2 = 1792 elements
+            size_t total_src1_elements = ggml_nelements(src1); // 896 * 1 = 896 elements
+            
+            // Initialize to zero
+            for (size_t i = 0; i < total_src0_elements; ++i) src0_data[i] = 0.0f;
+            for (size_t i = 0; i < total_src1_elements; ++i) src1_data[i] = 0.0f;
+            
+            // CRITICAL FIX: Handle src1 index collisions properly
+            // Since multiple src0 indices can map to the same src1 index (due to broadcasting),
+            // we need to track which src1 value should be used for each collision.
+            // Use the LATEST value for each src1 position (like real memory would work).
+            std::map<size_t, float> src1_final_values;
+            
+            // Set real values from integration failure at their exact indices
+            for (const auto& sample : real_samples) {
+                if (sample.index < total_src0_elements) {
+                    src0_data[sample.index] = sample.src0_val;
+                }
+                // For broadcasting [896,2,1,1] + [896,1,1,1], src1 index is sample.index % 896 
+                // since src1 has 896 elements and gets broadcasted across the 2 rows
+                size_t src1_index = sample.index % 896;
+                if (src1_index < total_src1_elements) {
+                    // Store the latest value for this src1 index (handles collisions)
+                    src1_final_values[src1_index] = sample.src1_val;
+                    NUMA_LOG_TRACE("REAL_DATA_INIT: Planning src0[%zu]=%f, src1[%zu]=%f (src0_idx=%zu->row %zu/col %zu)", 
+                                   sample.index, sample.src0_val, src1_index, sample.src1_val,
+                                   sample.index, sample.index / 896, sample.index % 896);
+                }
+            }
+            
+            // Apply the final src1 values (after resolving collisions)
+            for (const auto& pair : src1_final_values) {
+                src1_data[pair.first] = pair.second;
+                NUMA_LOG_TRACE("REAL_DATA_FINAL: src1[%zu] = %f (final value after collision resolution)", 
+                               pair.first, pair.second);
+            }
+            
+            printf("   🧮 Initialized tensors with real integration test data\n");
+            printf("   🎯 src0: [896,2,1,1] = %zu elements\n", total_src0_elements);
+            printf("   🎯 src1: [896,1,1,1] = %zu elements (broadcasts to src0)\n", total_src1_elements);
+            
+            // Force data-parallel execution (strategy should automatically select this for large tensors)
+            struct ggml_cgraph * cgraph = ggml_new_graph(ctx);
+            ggml_build_forward_expand(cgraph, result);
+            
+            printf("   🚀 Executing NUMA ADD with data-parallel strategy...\n");
+            
+            // Execute with NUMA using context-based computation (like other tests)
+            // Use many threads to force data-parallel execution like in server environment
+            int threads_for_data_parallel = 56;  // Force data-parallel with many threads
+            ggml_graph_compute_with_ctx(ctx, cgraph, threads_for_data_parallel);
+            
+            // Verify results using real samples
+            float * result_data = (float *)ggml_get_data(result);
+            int error_count = 0;
+            const int MAX_ERRORS_TO_SHOW = 10;
+            const float PRECISION_TOLERANCE = 1e-6f;
+            
+            printf("   🔍 Verifying precision with real integration test samples...\n");
+            
+            for (const auto& sample : real_samples) {
+                if (sample.index >= total_src0_elements) continue;
+                
+                float actual = result_data[sample.index];
+                
+                // CRITICAL FIX: Calculate expected value using ACTUAL final src1 value after collision resolution
+                size_t src1_index = sample.index % 896;
+                float actual_src0_val = src0_data[sample.index];
+                float actual_src1_val = src1_data[src1_index];  // Use actual final src1 value
+                float expected = actual_src0_val + actual_src1_val;  // Recalculate expected
+                
+                float diff = std::abs(actual - expected);
+                
+                if (diff > PRECISION_TOLERANCE) {
+                    if (error_count == 0) {
+                        printf("   ❌ Precision errors detected in real tensor data!\n");
+                        printf("     Index    | Expected    | Actual      | Diff        | Src0        | Src1 (final)\n");
+                        printf("     ---------|-------------|-------------|-------------|-------------|-------------\n");
+                    }
+                    if (error_count < MAX_ERRORS_TO_SHOW) {
+                        printf("     %-8zu | %11.6f | %11.6f | %11.2e | %11.6f | %11.6f\n", 
+                               sample.index, expected, actual, diff, 
+                               actual_src0_val, actual_src1_val);
+                    }
+                    error_count++;
+                    overall_success = false;
+                }
+            }
+            
+            if (error_count > MAX_ERRORS_TO_SHOW) {
+                printf("     ... (showing first %d errors out of %d total)\n", 
+                       MAX_ERRORS_TO_SHOW, error_count);
+            }
+            
+            if (overall_success) {
+                printf("   ✅ All %zu real samples match expected values (tolerance: %.0e)\n", 
+                       real_samples.size(), PRECISION_TOLERANCE);
+                printf("   ✅ NUMA ADD broadcasting works correctly with real integration data\n");
+            } else {
+                printf("   ❌ %d/%zu real samples failed precision check\n", 
+                       error_count, real_samples.size());
+                printf("   ❌ This reproduces the integration test failure!\n");
+                printf("   💡 Broadcasting in data-parallel mode has precision/memory access issues\n");
+            }
+            
+            ggml_free(ctx);
+            
+        } catch (const std::exception& e) {
+            printf("   ❌ Exception during real tensor test: %s\n", e.what());
+            overall_success = false;
+        }
+        
+        results.push_back({test_category, overall_success, 
+                          overall_success ? "Real tensor data matches expected values" : 
+                          "Real tensor precision errors - reproduces integration failure"});
     }
     
     /**
@@ -686,6 +1660,11 @@ public:
         test_ADD_mathematical_equivalence();
         test_ADD_quantization_type_coverage();
         test_ADD_broadcasting_regression();
+        test_ADD_threshold_regression();  // Test for threshold bug that caused integration test failures
+        test_ADD_extreme_edge_cases();    // NEW: Test ridiculously small tensors in data-parallel mode
+        test_ADD_fallback_canary();       // NEW: Canary test to verify fallback path execution
+        test_ADD_race_condition_detection(); // NEW: Critical test to detect data-parallel race conditions
+        test_ADD_real_tensor_precision(); // NEW: Test with exact data from failing integration test
         
         return results;
     }

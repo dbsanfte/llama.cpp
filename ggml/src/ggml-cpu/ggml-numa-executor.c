@@ -479,6 +479,23 @@ enum ggml_status ggml_numa_executor_execute_tensor(struct ggml_tensor * tensor, 
     
     NUMA_LOG_DEBUG("DEBUG: NUMA Executor: Starting execution for %s, threads=%d\n", op_name, cplan->n_threads);
     
+    // TRACE: Log complete tensor information for debugging inference issues
+    NUMA_LOG_TRACE("EXECUTOR_TENSOR_START: op=%s tensor=%p size=%zu bytes elements=%ld threads=%d", 
+                   op_name, (void*)tensor, tensor_size, ggml_nelements(tensor), cplan->n_threads);
+    NUMA_LOG_TRACE("EXECUTOR_TENSOR_SHAPE: %s shape=[%ld,%ld,%ld,%ld] strides=[%zu,%zu,%zu,%zu]",
+                   op_name, tensor->ne[0], tensor->ne[1], tensor->ne[2], tensor->ne[3],
+                   tensor->nb[0], tensor->nb[1], tensor->nb[2], tensor->nb[3]);
+    if (tensor->src[0]) {
+        NUMA_LOG_TRACE("EXECUTOR_SRC0_SHAPE: src0=[%ld,%ld,%ld,%ld] elements=%ld",
+                       tensor->src[0]->ne[0], tensor->src[0]->ne[1], tensor->src[0]->ne[2], tensor->src[0]->ne[3],
+                       ggml_nelements(tensor->src[0]));
+    }
+    if (tensor->src[1]) {
+        NUMA_LOG_TRACE("EXECUTOR_SRC1_SHAPE: src1=[%ld,%ld,%ld,%ld] elements=%ld",
+                       tensor->src[1]->ne[0], tensor->src[1]->ne[1], tensor->src[1]->ne[2], tensor->src[1]->ne[3],
+                       ggml_nelements(tensor->src[1]));
+    }
+    
     // Check NUMA environment
     #ifdef __linux__
     int current_cpu = sched_getcpu();
@@ -564,6 +581,12 @@ enum ggml_status ggml_numa_executor_execute_tensor(struct ggml_tensor * tensor, 
             work_buffer_size);
             
         NUMA_LOG_DEBUG("DEBUG: NUMA Executor: Data-parallel execution result=%d\n", result);
+        
+        // TRACE: Log execution completion details for debugging
+        NUMA_LOG_TRACE("EXECUTOR_DATA_PARALLEL_COMPLETE: op=%s result=%s tensor=%p elements=%ld nodes=%d total_threads=%d",
+                       op_name, (result == GGML_STATUS_SUCCESS) ? "SUCCESS" : "FAILED", 
+                       (void*)tensor, ggml_nelements(tensor), num_numa_nodes, total_threads);
+        
         NUMA_PERF_END();
         
     } else {
@@ -627,6 +650,13 @@ enum ggml_status ggml_numa_executor_execute_tensor(struct ggml_tensor * tensor, 
         }
         
         NUMA_LOG_DEBUG("DEBUG: NUMA Executor: Single-node execution result=%d\n", result);
+        
+        // TRACE: Log single-node execution completion details for debugging
+        NUMA_LOG_TRACE("EXECUTOR_SINGLE_NODE_COMPLETE: op=%s result=%s tensor=%p elements=%ld target_node=%d threads=%d",
+                       op_name, (result == GGML_STATUS_SUCCESS) ? "SUCCESS" : "FAILED", 
+                       (void*)tensor, ggml_nelements(tensor), target_node,
+                       (query_result.strategy.on_node_strategy == NUMA_ON_NODE_STRATEGY_SINGLE_THREAD) ? 1 : config.threads_per_node);
+        
         NUMA_PERF_END();
     }
     
@@ -639,6 +669,120 @@ enum ggml_status ggml_numa_executor_execute_tensor(struct ggml_tensor * tensor, 
         NUMA_LOG_DEBUG("DEBUG: NUMA Executor: FAILURE - returning status %d\n", result);
         GGML_LOG_ERROR("NUMA Executor: Failed to execute %s using %s (status=%d)\n", 
                        op_name, query_result.kernel_name, (int)result);
+    }
+    
+    NUMA_PERF_END();
+    return result;
+}
+
+/**
+ * @brief Execute a single tensor operation with forced NUMA strategy
+ * 
+ * This function is identical to ggml_numa_executor_execute_tensor() except it 
+ * overrides the automatic strategy selection with a forced strategy. This is 
+ * primarily used for testing to validate specific execution paths.
+ */
+enum ggml_status ggml_numa_executor_execute_tensor_forced_strategy(
+    struct ggml_tensor * tensor,
+    struct ggml_cplan * cplan,
+    ggml_numa_execution_strategy_t forced_strategy) {
+    
+    // Start performance tracking
+    NUMA_PERF_START(NUMA_PERF_EXECUTOR_KERNEL_EXEC, ggml_op_name(tensor->op), "forced_strategy", -1, 0, 0);
+    
+    const char* op_name = ggml_op_name(tensor->op);
+    NUMA_LOG_DEBUG("DEBUG: NUMA Executor (FORCED): Starting execution for %s with forced strategy (node=%s, on_node=%s)\n", 
+           op_name,
+           (forced_strategy.node_strategy == NUMA_NODE_STRATEGY_DATA_PARALLEL) ? "data-parallel" : "single",
+           (forced_strategy.on_node_strategy == NUMA_ON_NODE_STRATEGY_MULTI_THREAD) ? "multi-thread" : "single-thread");
+    
+    // Query the kernel registry for execution information (but override strategy)
+    NUMA_PERF_START(NUMA_PERF_EXECUTOR_QUERY, op_name, "kernel_registry", -1, 0, 0);
+    ggml_numa_kernel_query_result_t query_result = ggml_numa_kernels_query(tensor);
+    NUMA_PERF_END();
+    
+    if (!query_result.supported) {
+        GGML_LOG_DEBUG("NUMA Executor (FORCED): Operation %s not supported by NUMA kernels, using direct kernel dispatch\n", 
+                      op_name);
+        enum ggml_status result = ggml_numa_executor_direct_kernel_dispatch(tensor, cplan);
+        NUMA_PERF_END();
+        return result;
+    }
+    
+    // Check if this is a no-op kernel
+    if (ggml_numa_is_kernel_noop(tensor->op)) {
+        NUMA_LOG_DEBUG("DEBUG: NUMA Executor (FORCED): Operation %s is a no-op kernel, skipping coordinator dispatch\n", op_name);
+        NUMA_PERF_END();
+        return GGML_STATUS_SUCCESS;
+    }
+    
+    // Override the strategy with the forced one
+    query_result.strategy = forced_strategy;
+    
+    GGML_LOG_DEBUG("NUMA Executor (FORCED): %s kernel selected for %s with forced strategy=%s\n",
+                   query_result.kernel_name,
+                   op_name,
+                   (query_result.strategy.node_strategy == NUMA_NODE_STRATEGY_DATA_PARALLEL) ? "data-parallel" : "single-node");
+    
+    enum ggml_status result = GGML_STATUS_SUCCESS;
+    
+    // Get NUMA topology information
+    int num_numa_nodes = numa_max_node() + 1;
+    
+    NUMA_LOG_DEBUG("DEBUG: NUMA Executor (FORCED): num_numa_nodes=%d, strategy=%s\n", 
+           num_numa_nodes,
+           (query_result.strategy.node_strategy == NUMA_NODE_STRATEGY_DATA_PARALLEL) ? "data-parallel" : "single-node");
+    
+    if (query_result.strategy.node_strategy == NUMA_NODE_STRATEGY_DATA_PARALLEL && num_numa_nodes > 1) {
+        // Data-parallel execution across multiple NUMA nodes
+        NUMA_LOG_DEBUG("DEBUG: NUMA Executor (FORCED): Using data-parallel execution across %d nodes\n", num_numa_nodes);
+        
+        NUMA_PERF_START(NUMA_PERF_COORDINATOR_DISPATCH, op_name, "data_parallel", num_numa_nodes, 0, 0);
+        
+        // Calculate work buffer size for data-parallel execution
+        size_t work_buffer_size = ggml_numa_calculate_work_size(tensor, cplan->n_threads);
+        
+        result = ggml_numa_openmp_execute_data_parallel(
+            tensor, query_result.work_function, work_buffer_size);
+            
+        NUMA_LOG_DEBUG("DEBUG: NUMA Executor (FORCED): Data-parallel execution result=%d\n", result);
+        NUMA_PERF_END();
+    } else {
+        // Single-node execution (either forced or fallback from data-parallel)
+        NUMA_PERF_START(NUMA_PERF_COORDINATOR_DISPATCH, op_name, "single_node", 1, 0, 0);
+        
+        // Choose target NUMA node (simplified for forced strategy - use node 0)
+        int target_node = 0;
+        
+        if (query_result.strategy.on_node_strategy == NUMA_ON_NODE_STRATEGY_SINGLE_THREAD) {
+            NUMA_LOG_DEBUG("DEBUG: NUMA Executor (FORCED): Using single-thread execution on node %d\n", target_node);
+            
+            // Calculate work buffer size for single-thread execution
+            size_t work_buffer_size = ggml_numa_calculate_work_size(tensor, 1);
+            
+            result = ggml_numa_openmp_execute_single_thread(tensor, query_result.work_function, target_node, work_buffer_size);
+        } else {
+            NUMA_LOG_DEBUG("DEBUG: NUMA Executor (FORCED): Using multi-thread execution on node %d\n", target_node);
+            
+            // Calculate work buffer size for multi-thread single-node
+            size_t work_buffer_size = ggml_numa_calculate_work_size(tensor, cplan->n_threads);
+            
+            result = ggml_numa_openmp_execute_single_node(
+                tensor, query_result.work_function, target_node, cplan->n_threads, work_buffer_size);
+        }
+        
+        NUMA_LOG_DEBUG("DEBUG: NUMA Executor (FORCED): Single-node execution result=%d\n", result);
+        NUMA_PERF_END();
+    }
+    
+    NUMA_LOG_DEBUG("DEBUG: NUMA Executor (FORCED): Final result=%d for %s\n", result, op_name);
+    if (result == GGML_STATUS_SUCCESS) {
+        NUMA_LOG_DEBUG("DEBUG: NUMA Executor (FORCED): SUCCESS - returning GGML_STATUS_SUCCESS\n");
+        GGML_LOG_DEBUG("NUMA Executor (FORCED): Successfully completed %s using forced strategy\n", op_name);
+    } else {
+        NUMA_LOG_DEBUG("DEBUG: NUMA Executor (FORCED): FAILURE - returning status %d\n", result);
+        GGML_LOG_ERROR("NUMA Executor (FORCED): Failed to execute %s using forced strategy (status=%d)\n", 
+                       op_name, (int)result);
     }
     
     NUMA_PERF_END();
@@ -831,8 +975,8 @@ enum ggml_status ggml_numa_executor_direct_kernel_dispatch(struct ggml_tensor * 
     // Try to get the dedicated fallback threadpool from coordinator
     fallback_threadpool = ggml_numa_openmp_get_fallback_threadpool();
     if (fallback_threadpool) {
-        // Use the fallback threadpool's actual thread count for optimal NUMA binding
-        // fallback_thread_count = ggml_numa_simple_coordinator_get_fallback_thread_count();
+        // Use the fallback threadpool's actual thread count
+        fallback_thread_count = ggml_numa_openmp_get_fallback_thread_count();
         
         GGML_LOG_DEBUG("🚀 Using dedicated fallback threadpool: %p (bound to NUMA node 0)\n", (void*)fallback_threadpool);
         GGML_LOG_DEBUG("📊 Direct Kernel Execution: threads=%d (fallback capacity), threadpool=%p\n", 
@@ -845,17 +989,17 @@ enum ggml_status ggml_numa_executor_direct_kernel_dispatch(struct ggml_tensor * 
         return GGML_STATUS_FAILED;
     }
     
-    // Set up compute params for direct kernel execution - use full threadpool capacity
+    // Set up compute params for direct kernel execution - use single thread with fallback threadpool
     struct ggml_compute_params params = {
         .ith = 0,
-        .nth = 1, // Single-threaded for now to avoid threading conflicts
+        .nth = 1, // Single-threaded fallback execution 
         .wsize = needed_work_size,
         .wdata = work_data,
-        .threadpool = fallback_threadpool  // Use the fallback threadpool to avoid NULL pointer access
+        .threadpool = fallback_threadpool  // Must provide valid threadpool for barrier operations
     };
     
     GGML_LOG_INFO("🚀 NUMA Direct Kernel Dispatch: Executing operation %s (work_size=%zu, threads=%d, threadpool=%p)\n", 
-                   ggml_op_name(tensor->op), needed_work_size, fallback_thread_count, (void*)fallback_threadpool);
+                   ggml_op_name(tensor->op), needed_work_size, params.nth, (void*)params.threadpool);
     
     // OPTIMIZATION: Direct kernel dispatch - call the operation's compute function directly
     // This eliminates temporary graph creation, temporary compute plan creation, and graph computation pipeline overhead
@@ -951,9 +1095,8 @@ enum ggml_status ggml_numa_executor_fallback_to_cpu(struct ggml_tensor * tensor,
     // Try to get the dedicated fallback threadpool from coordinator
     fallback_threadpool = ggml_numa_openmp_get_fallback_threadpool();
     if (fallback_threadpool) {
-        // CRITICAL FIX: Use the fallback threadpool's actual thread count instead of the original plan's thread count
-        // The fallback threadpool is bound to NUMA node 0 and only has that node's threads available
-        // fallback_thread_count = ggml_numa_simple_coordinator_get_fallback_thread_count();
+        // Use the fallback threadpool's actual thread count
+        fallback_thread_count = ggml_numa_openmp_get_fallback_thread_count();
         
         GGML_LOG_DEBUG("🔧 Using dedicated fallback threadpool: %p (bound to NUMA node 0)\n", (void*)fallback_threadpool);
         GGML_LOG_DEBUG("📊 Fallback Execution (Legacy): threads=%d (fallback capacity), threadpool=%p (disposable=false)\n", 

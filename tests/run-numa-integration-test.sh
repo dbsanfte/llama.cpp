@@ -9,6 +9,28 @@ set -e
 # Parse command line arguments
 VERBOSE_MODE=false
 NUMA_OPTION=""
+    # Configure NUMA debug logging for operation analysis
+    # Respect existing GGML_NUMA_DEBUG setting if higher than default, otherwise use level 1
+    # For data-parallel testing (mirror/distribute), automatically enable trace logging
+    if [ -z "$GGML_NUMA_DEBUG" ]; then
+        if [ "$NUMA_OPTION" = "--numa mirror" ] || [ "$NUMA_OPTION" = "--numa distribute" ]; then
+            # Data-parallel mode - enable trace logging to debug coordination issues
+            export GGML_NUMA_DEBUG=3
+            echo "    🔬 NUMA trace logging enabled (level=3, auto-enabled for data-parallel debugging)"
+        else
+            # Non-data-parallel mode - use default level 1 for basic operation analysis  
+            export GGML_NUMA_DEBUG=1
+            echo "    📊 NUMA debug logging enabled (level=1, default) for operation analysis"
+        fi
+    elif [ "$GGML_NUMA_DEBUG" = "0" ]; then
+        # Explicitly disabled - respect that choice
+        echo "    🔕 NUMA debug logging disabled (level=0) - respecting user setting"
+    else
+        # Already set to a higher level - respect and use existing value
+        echo "    📊 NUMA debug logging enabled (level=$GGML_NUMA_DEBUG, user-specified) for operation analysis"
+    fi
+
+# Parse command line arguments
 while [[ $# -gt 0 ]]; do
     case $1 in
         --verbose)
@@ -45,7 +67,7 @@ while [[ $# -gt 0 ]]; do
             echo "Environment Variables:"
             echo "  All environment variables are passed through to llama-server, including:"
             echo "  GGML_NUMA_DEBUG   Control NUMA debug output (0=off, 1=info, 2=verbose, 3=trace)"
-            echo "                     Default: 1 (automatically enabled for operation analysis)"
+            echo "                     Default: 1 (auto-enabled for analysis, respects higher user settings)"
             echo "  GGML_LOG_DEBUG    Control general debug logging"
             echo "  GGML_OPENMP       Control OpenMP threading behavior"
             echo ""
@@ -306,12 +328,18 @@ test_single_model() {
         echo "    🚀 Starting llama-server without NUMA options..."
     fi
     
-    # Enable NUMA debug logging by default for operation analysis
-    # Set GGML_NUMA_DEBUG=1 if not already set to capture operation statistics
-    local numa_debug_level="${GGML_NUMA_DEBUG:-1}"
-    if [ "$numa_debug_level" != "0" ]; then
-        echo "    📊 NUMA debug logging enabled (level=$numa_debug_level) for operation analysis"
-        export GGML_NUMA_DEBUG="$numa_debug_level"
+    # Configure NUMA debug logging for operation analysis
+    # Respect existing GGML_NUMA_DEBUG setting if higher than default, otherwise use level 1
+    if [ -z "$GGML_NUMA_DEBUG" ]; then
+        # Not set - use default level 1 for basic operation analysis
+        export GGML_NUMA_DEBUG=1
+        echo "    📊 NUMA debug logging enabled (level=1, default) for operation analysis"
+    elif [ "$GGML_NUMA_DEBUG" = "0" ]; then
+        # Explicitly disabled - respect that choice
+        echo "    � NUMA debug logging disabled (level=0) - respecting user setting"
+    else
+        # Already set to a higher level - respect and use existing value
+        echo "    📊 NUMA debug logging enabled (level=$GGML_NUMA_DEBUG, user-specified) for operation analysis"
     fi
     
     # Show relevant environment variables in verbose mode

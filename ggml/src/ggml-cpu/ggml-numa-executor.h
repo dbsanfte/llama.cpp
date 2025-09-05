@@ -25,6 +25,7 @@
 #include "../ggml-impl.h"
 #include "ggml-cpu.h"  // For complete ggml_cplan definition
 #include "ggml-cpu-impl.h"  // For ggml_compute_params definition
+#include "ggml-numa-shared.h"  // For ggml_numa_execution_strategy_t
 
 #ifdef __cplusplus
 extern "C" {
@@ -103,6 +104,23 @@ enum ggml_status ggml_numa_executor_compute_graph(
 enum ggml_status ggml_numa_executor_execute_tensor(
     struct ggml_tensor * tensor,
     struct ggml_cplan * cplan);
+
+/**
+ * @brief Execute a single tensor operation with forced NUMA strategy
+ * 
+ * Similar to ggml_numa_executor_execute_tensor() but forces a specific
+ * execution strategy instead of using automatic strategy selection.
+ * This is primarily used for testing to validate specific execution paths.
+ * 
+ * @param tensor The operation tensor to execute
+ * @param cplan The compute plan with resources
+ * @param forced_strategy The strategy to force (overrides automatic selection)
+ * @return GGML_STATUS_SUCCESS on success, error code on failure
+ */
+enum ggml_status ggml_numa_executor_execute_tensor_forced_strategy(
+    struct ggml_tensor * tensor,
+    struct ggml_cplan * cplan,
+    ggml_numa_execution_strategy_t forced_strategy);
 
 /**
  * @brief Execute compute graph using NUMA-aware executor

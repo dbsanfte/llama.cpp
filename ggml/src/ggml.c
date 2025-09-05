@@ -67,6 +67,9 @@
 // Thread-local variable to prevent infinite recursion during fallback
 _Thread_local bool in_numa_fallback = false;
 
+// Thread-local counter for NUMA kernel executions (for testing)
+_Thread_local int numa_kernel_execution_count = 0;
+
 // Static variables for performance testing dispatch control
 static bool numa_dispatch_override_enabled = false;
 static bool numa_dispatch_override_value = true;
@@ -430,6 +433,19 @@ void ggml_numa_set_fallback_flag(bool value) {
 
 bool ggml_numa_is_fallback_active(void) {
     return in_numa_fallback;
+}
+
+// Functions to track NUMA kernel executions (for testing)
+void ggml_numa_reset_execution_count(void) {
+    numa_kernel_execution_count = 0;
+}
+
+int ggml_numa_get_execution_count(void) {
+    return numa_kernel_execution_count;
+}
+
+void ggml_numa_increment_execution_count(void) {
+    numa_kernel_execution_count++;
 }
 
 // Functions to control NUMA dispatch for performance testing

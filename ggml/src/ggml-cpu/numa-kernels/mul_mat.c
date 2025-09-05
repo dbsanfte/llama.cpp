@@ -402,6 +402,20 @@ enum ggml_status ggml_numa_kernel_mul_mat_execute(void * work_context, struct gg
     const int ith = params->ith;
     const int nth = params->nth;
     
+    // Calculate global thread coordinates for data-parallel execution
+    int global_ith, global_nth;
+    if (ggml_numa_is_data_parallel_execution) {
+        // Global thread index across all NUMA nodes
+        global_ith = ggml_current_numa_node * nth + ith;
+        global_nth = ggml_numa_total_nodes_for_data_parallel * nth;
+        NUMA_LOG_TRACE("MUL_MAT execution: NUMA node %d, local thread %d/%d, global thread %d/%d",
+                      ggml_current_numa_node, ith, nth, global_ith, global_nth);
+    } else {
+        // Single NUMA node execution - use local coordinates
+        global_ith = ith;
+        global_nth = nth;
+    }
+    
     // Log execution strategy in standardized format for integration test parsing
     // Only log once per operation (thread 0 of NUMA node 0) to avoid inflated counts
     if (ith == 0 && ggml_current_numa_node == 0) {
@@ -432,14 +446,15 @@ enum ggml_status ggml_numa_kernel_mul_mat_execute(void * work_context, struct gg
         NUMA_ASSERT(src1->type == GGML_TYPE_F32, "Type conversion only supports F32 source");
         NUMA_ASSERT(from_float != NULL, "No conversion function available");
         
-        // Convert src1 tensor to vec_dot_type using thread coordination (exact mirror of reference)
+        // Convert src1 tensor to vec_dot_type using global thread coordination
         for (int64_t i13 = 0; i13 < ne13; ++i13) {
             for (int64_t i12 = 0; i12 < ne12; ++i12) {
                 for (int64_t i11 = 0; i11 < ne11; ++i11) {
                     // Thread coordination: each thread processes different blocks within each row
+                    // Use global thread coordinates to avoid race conditions across NUMA nodes
                     size_t bs = ggml_blck_size(vec_dot_type);
-                    int64_t ne10_block_start = (ith * ne10/bs) / nth;
-                    int64_t ne10_block_end   = ((ith + 1) * ne10/bs) / nth;
+                    int64_t ne10_block_start = (global_ith * ne10/bs) / global_nth;
+                    int64_t ne10_block_end   = ((global_ith + 1) * ne10/bs) / global_nth;
                     
                     // Skip if this thread has no work for this block
                     if (ne10_block_start >= ne10_block_end) {
@@ -459,23 +474,35 @@ enum ggml_status ggml_numa_kernel_mul_mat_execute(void * work_context, struct gg
             }
         }
         
-        NUMA_LOG_VERBOSE("MUL_MAT: Thread %d/%d converted src1 blocks [%ld-%ld) from F32 to vec_dot_type %d", 
-                         ith, nth, (ith * ne10/ggml_blck_size(vec_dot_type)) / nth, 
-                         ((ith + 1) * ne10/ggml_blck_size(vec_dot_type)) / nth, vec_dot_type);
+        NUMA_LOG_VERBOSE("MUL_MAT: Thread %d/%d (global %d/%d) converted src1 blocks [%ld-%ld) from F32 to vec_dot_type %d", 
+                         ith, nth, global_ith, global_nth, 
+                         (global_ith * ne10/ggml_blck_size(vec_dot_type)) / global_nth, 
+                         ((global_ith + 1) * ne10/ggml_blck_size(vec_dot_type)) / global_nth, vec_dot_type);
     }
     
     // Thread synchronization for type conversion - use OpenMP barrier
-    // Only synchronize if multiple threads are participating
-    if (nth > 1) {
+    // Synchronize ALL threads in data-parallel mode, or just local threads in single-node mode
+    if (ggml_numa_is_data_parallel_execution || nth > 1) {
         #pragma omp barrier
-        NUMA_LOG_DEBUG("MUL_MAT: Thread %d/%d completed type conversion using OpenMP barrier", ith, nth);
+        NUMA_LOG_DEBUG("MUL_MAT: Thread %d/%d (NUMA node %d) completed type conversion using OpenMP barrier", 
+                      ith, nth, ggml_current_numa_node);
     } else {
         NUMA_LOG_DEBUG("MUL_MAT: Single thread execution, skipping barrier synchronization");
     }
     
-    // Coordinate work distribution - exact mirror of reference logic
+    // Coordinate work distribution using global thread coordinates for consistency
     const int64_t nr0 = ne0;  // Rows in result
     const int64_t nr1 = ne1 * ne2 * ne3;  // Columns in result
+    
+    // Use the same global thread coordinates for work distribution consistency
+    int work_ith, work_nth;
+    if (ggml_numa_is_data_parallel_execution) {
+        work_ith = global_ith;
+        work_nth = global_nth;
+    } else {
+        work_ith = ith;
+        work_nth = nth;
+    }
     
     // Dynamic chunk sizing - exact mirror of reference
     int chunk_size = 16;
@@ -487,17 +514,17 @@ enum ggml_status ggml_numa_kernel_mul_mat_execute(void * work_context, struct gg
     int64_t nchunk1 = (nr1 + chunk_size - 1) / chunk_size;
     
     // NUMA-aware chunking adjustment
-    if (nchunk0 * nchunk1 < nth * 4 || ggml_numa_is_data_parallel_execution) {
-        nchunk0 = nr0 > nr1 ? nth : 1;
-        nchunk1 = nr0 > nr1 ? 1 : nth;
+    if (nchunk0 * nchunk1 < work_nth * 4 || ggml_numa_is_data_parallel_execution) {
+        nchunk0 = nr0 > nr1 ? work_nth : 1;
+        nchunk1 = nr0 > nr1 ? 1 : work_nth;
     }
     
     const int64_t dr0 = (nr0 + nchunk0 - 1) / nchunk0;
     const int64_t dr1 = (nr1 + nchunk1 - 1) / nchunk1;
     
-    // Calculate chunk assignment for this thread
-    const int64_t ith0 = ith % nchunk0;
-    const int64_t ith1 = ith / nchunk0;
+    // Calculate chunk assignment for this thread using global coordinates
+    const int64_t ith0 = work_ith % nchunk0;
+    const int64_t ith1 = work_ith / nchunk0;
     
     const int64_t ir0_start = dr0 * ith0;
     const int64_t ir0_end = MIN(ir0_start + dr0, nr0);
@@ -513,10 +540,22 @@ enum ggml_status ggml_numa_kernel_mul_mat_execute(void * work_context, struct gg
         num_rows_per_vec_dot = 1;
     }
     
-    NUMA_LOG_TRACE("MUL_MAT thread work: thread=%d/%d, chunks=[%ld,%ld), ir0=[%ld,%ld), ir1=[%ld,%ld), rows_per_vec_dot=%ld",
-                   ith, nth, ith0, ith1, ir0_start, ir0_end, ir1_start, ir1_end, num_rows_per_vec_dot);
+    NUMA_LOG_TRACE("MUL_MAT thread work: NUMA_node=%d, local_thread=%d/%d, global_thread=%d/%d, chunks=[%ld,%ld), ir0=[%ld,%ld), ir1=[%ld,%ld), rows_per_vec_dot=%ld",
+                   ggml_current_numa_node, ith, nth, work_ith, work_nth, ith0, ith1, ir0_start, ir0_end, ir1_start, ir1_end, num_rows_per_vec_dot);
     
     // Execute the chunk
-    return ggml_numa_kernel_mul_mat_one_chunk(params, dst, src0->type, num_rows_per_vec_dot, 
-                                             ir0_start, ir0_end, ir1_start, ir1_end);
+    enum ggml_status result = ggml_numa_kernel_mul_mat_one_chunk(params, dst, src0->type, num_rows_per_vec_dot, 
+                                                                ir0_start, ir0_end, ir1_start, ir1_end);
+    
+    // CRITICAL: Cross-NUMA barrier after matrix multiplication computation
+    // Ensure all threads complete their matrix multiplication before operation finishes
+    if (ggml_numa_is_data_parallel_execution || nth > 1) {
+        #pragma omp barrier
+        NUMA_LOG_DEBUG("MUL_MAT: Thread %d/%d (NUMA node %d) completed matrix multiplication using OpenMP barrier", 
+                      ith, nth, ggml_current_numa_node);
+    } else {
+        NUMA_LOG_DEBUG("MUL_MAT: Single thread execution, skipping matrix multiplication barrier");
+    }
+    
+    return result;
 }
