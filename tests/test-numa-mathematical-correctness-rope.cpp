@@ -8,7 +8,16 @@
  * TEST COVERAGE:
  * 1. Mathematical Equivalence (Simplified 3-Stage Approach):
  *    a) Single-thread Single-node: Tests basic kernel functionality and fallback mechanisms
- *    b) Multi-thread Single-node: Tests multi-threading coordination within single NUMA node  
+     }
+    
+    if (!g_summary_only) {
+        printf("==================================================================\n");
+        printf("🧮 NUMA ROPE MATHEMATICAL CORRECTNESS TEST SUITE\n");
+        if (g_filter_enabled) {
+            printf("🔍 Running filtered tests matching: '%s'\n", g_test_filter.c_str());
+        }
+        printf("==================================================================\n");
+    }Multi-thread Single-node: Tests multi-threading coordination within single NUMA node  
  *    c) Multi-thread Multi-node: Tests full NUMA data-parallel execution across multiple nodes
  *    - Tests across TINY → LARGE tensor sizes for comprehensive coverage
  *    - Eliminates artificial thread constraints, focuses on production execution modes
@@ -60,6 +69,10 @@
 // Global test filter
 std::string g_test_filter = "";
 bool g_filter_enabled = false;
+bool g_summary_only = false;
+
+// Conditional printf macro for summary-only mode
+#define TEST_PRINTF(...) do { if (!g_summary_only) printf(__VA_ARGS__); } while(0)
 
 /**
  * Check if a test name matches the current filter
@@ -434,6 +447,7 @@ void show_usage(const char* program_name) {
     printf("Usage: %s [OPTIONS]\n", program_name);
     printf("\nOptions:\n");
     printf("  --filter <pattern>  Run only tests matching the regex pattern\n");
+    printf("  --summary-only      Only print the summary table, not full test output\n");
     printf("  --help, -h         Show this help message\n");
     printf("\nExamples:\n");
     printf("  %s                                    # Run all tests\n", program_name);
@@ -461,12 +475,14 @@ int main(int argc, char** argv) {
         if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
             show_usage(argv[0]);
             return 0;
+        } else if (strcmp(argv[i], "--summary-only") == 0) {
+            g_summary_only = true;
         } else if (strcmp(argv[i], "--filter") == 0) {
             if (i + 1 < argc) {
                 g_test_filter = argv[i + 1];
                 g_filter_enabled = true;
                 i++; // Skip the filter argument
-                printf("🔍 Filter enabled: '%s'\n", g_test_filter.c_str());
+                TEST_PRINTF("🔍 Filter enabled: '%s'\n", g_test_filter.c_str());
             } else {
                 printf("❌ Error: --filter requires a regex pattern argument\n");
                 show_usage(argv[0]);
@@ -479,12 +495,14 @@ int main(int argc, char** argv) {
         }
     }
     
-    printf("==================================================================\n");
-    printf("🧮 NUMA ROPE MATHEMATICAL CORRECTNESS TEST SUITE\n");
-    if (g_filter_enabled) {
-        printf("🔍 Test filter: '%s'\n", g_test_filter.c_str());
+    if (!g_summary_only) {
+        printf("==================================================================\n");
+        printf("🧮 NUMA ROPE MATHEMATICAL CORRECTNESS TEST SUITE\n");
+        if (g_filter_enabled) {
+            printf("🔍 Test filter: '%s'\n", g_test_filter.c_str());
+        }
+        printf("==================================================================\n\n");
     }
-    printf("==================================================================\n\n");
     
     // Test tracking
     std::vector<TestResult> results;

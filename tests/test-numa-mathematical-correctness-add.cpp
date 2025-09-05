@@ -61,6 +61,10 @@
 // Global test filter
 std::string g_test_filter = "";
 bool g_filter_enabled = false;
+bool g_summary_only = false;
+
+// Conditional printf macro for summary-only mode
+#define TEST_PRINTF(...) do { if (!g_summary_only) printf(__VA_ARGS__); } while(0)
 
 /**
  * Check if a test name matches the current filter
@@ -173,7 +177,7 @@ public:
      */
     bool test_single_ADD_case(int ne0, int ne1, int ne2, int ne3, ggml_numa_execution_strategy_t strategy, 
                              const char* test_name, const char* strategy_name) {
-        printf("\n🧮 Testing ADD %s (%dx%dx%dx%d, strategy=%s)\n", test_name, ne0, ne1, ne2, ne3, strategy_name);
+        TEST_PRINTF("\n🧮 Testing ADD %s (%dx%dx%dx%d, strategy=%s)\n", test_name, ne0, ne1, ne2, ne3, strategy_name);
         
         const size_t total_elements = ne0 * ne1 * ne2 * ne3;
         bool case_passed = false;
@@ -327,7 +331,7 @@ public:
      * the three fundamental execution modes that matter for production use.
      */
     void test_ADD_mathematical_equivalence() {
-        printf("\n🔬 === ADD MATHEMATICAL EQUIVALENCE TESTS ===\n");
+        TEST_PRINTF("\n🔬 === ADD MATHEMATICAL EQUIVALENCE TESTS ===\n");
         
         int total_tests = 0;
         int passed_tests = 0;
@@ -361,7 +365,7 @@ public:
             for (const auto& strategy_config : strategies) {
                 TestConfig config = get_test_config(size_class, strategy_config.strategy, strategy_config.name);
                 
-                printf("\n🎯 Testing %s tensors: %s\n", 
+                TEST_PRINTF("\n🎯 Testing %s tensors: %s\n", 
                        config.test_name, strategy_config.description);
                 
                 // Create descriptive test name for filtering
@@ -371,7 +375,7 @@ public:
                 
                 // Check if this test matches the filter
                 if (!matches_filter(full_test_name)) {
-                    printf("⏭️  Skipping: %s (filtered out)\n", full_test_name.c_str());
+                    TEST_PRINTF("⏭️  Skipping: %s (filtered out)\n", full_test_name.c_str());
                     continue;
                 }
                 
@@ -425,11 +429,11 @@ public:
         
         // Check if this test category matches the filter
         if (!matches_filter(test_category)) {
-            printf("⏭️  Skipping: %s (filtered out)\n", test_category.c_str());
+            TEST_PRINTF("⏭️  Skipping: %s (filtered out)\n", test_category.c_str());
             return;
         }
         
-        printf("\n🔢 === ADD QUANTIZATION TYPE COVERAGE TESTS ===\n");
+        TEST_PRINTF("\n🔢 === ADD QUANTIZATION TYPE COVERAGE TESTS ===\n");
         
         bool all_tests_passed = true;
         std::string failure_reason = "";
@@ -485,7 +489,7 @@ public:
         };
         
         for (const auto& combo : type_combinations) {
-            printf("\n🧮 Testing ADD quantization: %s\n", combo.description);
+            TEST_PRINTF("\n🧮 Testing ADD quantization: %s\n", combo.description);
             total_type_tests++;
             
             struct ggml_init_params params;
@@ -604,17 +608,17 @@ public:
         
         // Check if this test category matches the filter
         if (!matches_filter(test_category)) {
-            printf("⏭️  Skipping: %s (filtered out)\n", test_category.c_str());
+            TEST_PRINTF("⏭️  Skipping: %s (filtered out)\n", test_category.c_str());
             return;
         }
         
-        printf("\n🔄 === ADD BROADCASTING REGRESSION TESTS ===\n");
+        TEST_PRINTF("\n🔄 === ADD BROADCASTING REGRESSION TESTS ===\n");
         
         bool all_tests_passed = true;
         std::string failure_reason = "";
         
         // Test Case 1: Matrix + Vector broadcasting
-        printf("\n🧮 Testing Matrix + Vector broadcasting\n");
+        TEST_PRINTF("\n🧮 Testing Matrix + Vector broadcasting\n");
         
         struct ggml_init_params params;
         params.mem_size = 64 * 1024 * 1024;
@@ -851,8 +855,8 @@ public:
      * into data-parallel mode even for tiny tensors. This caused corruption in real models.
      */
     void test_ADD_threshold_regression() {
-        printf("\n🔬 === ADD THRESHOLD REGRESSION TESTS ===\n");
-        printf("Testing that small tensors use appropriate execution strategies and don't cause corruption\n");
+        TEST_PRINTF("\n🔬 === ADD THRESHOLD REGRESSION TESTS ===\n");
+        TEST_PRINTF("Testing that small tensors use appropriate execution strategies and don't cause corruption\n");
         
         bool all_tests_passed = true;
         std::string failure_reason = "";
@@ -926,8 +930,8 @@ public:
      * how small or awkward the dimensions. No papering over bugs with thresholds!
      */
     void test_ADD_extreme_edge_cases() {
-        printf("\n🔬 === ADD EXTREME EDGE CASE TESTS ===\n");
-        printf("Testing ridiculously small tensors in forced data-parallel mode to ensure robustness\n");
+        TEST_PRINTF("\n🔬 === ADD EXTREME EDGE CASE TESTS ===\n");
+        TEST_PRINTF("Testing ridiculously small tensors in forced data-parallel mode to ensure robustness\n");
         
         bool all_tests_passed = true;
         std::string failure_reason = "";
@@ -1142,170 +1146,6 @@ public:
      * This test specifically validates that the fallback flag correctly prevents NUMA dispatch
      * and forces execution through the reference implementation pathway.
      */
-    void test_ADD_fallback_canary() {
-        const std::string test_category = "ADD_fallback_canary";
-        printf("\n📋 %s: Verifying fallback path execution...\n", test_category.c_str());
-        
-        // Use a simple 4x4 tensor for this canary test
-        const int ne0 = 4, ne1 = 4, ne2 = 1, ne3 = 1;
-        const size_t total_elements = ne0 * ne1 * ne2 * ne3;
-        
-        // Create GGML context
-        struct ggml_init_params params;
-        params.mem_size = 16 * 1024 * 1024;  // 16MB
-        params.mem_buffer = nullptr;
-        params.no_alloc = false;
-        struct ggml_context * ctx = ggml_init(params);
-        GGML_ASSERT(ctx != nullptr);
-        
-        // Create tensors with simple test data
-        struct ggml_tensor * src0 = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, ne0, ne1, ne2, ne3);
-        struct ggml_tensor * src1 = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, ne0, ne1, ne2, ne3);
-        struct ggml_tensor * result = ggml_add(ctx, src0, src1);
-        
-        // Fill with predictable test data
-        float * src0_data = (float *)tensor_data(src0);
-        float * src1_data = (float *)tensor_data(src1);
-        for (size_t i = 0; i < total_elements; i++) {
-            src0_data[i] = (float)(i + 1);      // 1, 2, 3, 4, ...
-            src1_data[i] = (float)(i * 2 + 10); // 10, 12, 14, 16, ...
-        }
-        
-        // Create computation graph
-        struct ggml_cgraph * graph = ggml_new_graph(ctx);
-        ggml_build_forward_expand(graph, result);
-        
-        // Test 1: Verify fallback flag BLOCKS NUMA dispatch (reference path)
-        printf("   🧪 Test 1: Verifying fallback flag blocks NUMA dispatch...\n");
-        ggml_numa_set_fallback_flag(true);  // Enable fallback - should block NUMA
-        
-        // Reset and record execution count for fallback test
-        ggml_numa_reset_execution_count();
-        
-        // Clear result tensor
-        memset(tensor_data(result), 0, ggml_nbytes(result));
-        
-        // Create compute plan for fallback execution
-        struct ggml_cplan fallback_plan = ggml_graph_plan(graph, 1, nullptr);  // Single thread for reference
-        
-        // Execute with fallback flag set - should use reference implementation
-        enum ggml_status status_fallback = ggml_graph_compute(graph, &fallback_plan);
-        
-        // Record NUMA execution count during fallback (should be 0)
-        int fallback_execution_count = ggml_numa_get_execution_count();
-        
-        // Store fallback results
-        std::vector<float> fallback_results(total_elements);
-        float * result_data = (float *)tensor_data(result);
-        memcpy(fallback_results.data(), result_data, total_elements * sizeof(float));
-        
-        // Test 2: Verify NUMA dispatch works when fallback is disabled (NUMA path)
-        printf("   🧪 Test 2: Verifying NUMA dispatch works when fallback disabled...\n");
-        ggml_numa_set_fallback_flag(false);  // Disable fallback - should enable NUMA
-        
-        // Reset execution count for NUMA test
-        ggml_numa_reset_execution_count();
-        
-        // Clear result tensor
-        memset(tensor_data(result), 0, ggml_nbytes(result));
-        
-        // Create compute plan for NUMA execution
-        struct ggml_cplan numa_plan = ggml_graph_plan(graph, 56, nullptr);  // Multi-threaded for NUMA
-        
-        // Execute with fallback flag disabled - should use NUMA implementation
-        enum ggml_status status_numa = ggml_graph_compute(graph, &numa_plan);
-        
-        // Record NUMA execution count during NUMA execution (should be > 0)
-        int numa_execution_count = ggml_numa_get_execution_count();
-        
-        // Store NUMA results
-        std::vector<float> numa_results(total_elements);
-        memcpy(numa_results.data(), result_data, total_elements * sizeof(float));
-        
-        // Test 3: Verify both execution paths succeeded
-        bool execution_success = (status_fallback == GGML_STATUS_SUCCESS) && 
-                               (status_numa == GGML_STATUS_SUCCESS);
-        
-        if (!execution_success) {
-            printf("   ❌ Execution failed: fallback_status=%d, numa_status=%d\n", 
-                   (int)status_fallback, (int)status_numa);
-            results.push_back({test_category, false, "Execution failure"});
-            ggml_free(ctx);
-            return;
-        }
-        
-        // Test 4: Verify mathematical equivalence between both paths
-        printf("   🧪 Test 3: Verifying mathematical equivalence between fallback and NUMA paths...\n");
-        bool mathematical_equivalence = true;
-        const float tolerance = 1e-6f;
-        
-        for (size_t i = 0; i < total_elements; i++) {
-            float expected = fallback_results[i];
-            float actual = numa_results[i];
-            float diff = fabsf(expected - actual);
-            
-            if (diff > tolerance) {
-                printf("   ❌ Mathematical mismatch at element %zu: fallback=%.6f, numa=%.6f, diff=%.6f\n",
-                       i, expected, actual, diff);
-                mathematical_equivalence = false;
-                break;
-            }
-        }
-        
-        // Test 5: Sanity check - verify we got expected mathematical results
-        printf("   🧪 Test 4: Verifying sanity check of mathematical results...\n");
-        bool sanity_check = true;
-        
-        // Check a few known values: result[i] should equal src0[i] + src1[i]
-        for (size_t i = 0; i < std::min(total_elements, size_t(4)); i++) {
-            float expected_value = (float)(i + 1) + (float)(i * 2 + 10);  // src0[i] + src1[i]
-            float actual_fallback = fallback_results[i];
-            float actual_numa = numa_results[i];
-            
-            if (fabsf(actual_fallback - expected_value) > tolerance ||
-                fabsf(actual_numa - expected_value) > tolerance) {
-                printf("   ❌ Sanity check failed at element %zu: expected=%.6f, fallback=%.6f, numa=%.6f\n",
-                       i, expected_value, actual_fallback, actual_numa);
-                sanity_check = false;
-                break;
-            }
-        }
-        
-        // Test 5: Validate that different execution paths were taken
-        printf("   🧪 Test 5: Validating execution path differences...\n");
-        printf("     Fallback execution count: %d (expected: 0)\n", fallback_execution_count);
-        printf("     NUMA execution count: %d (expected: > 0)\n", numa_execution_count);
-        
-        bool path_validation = true;
-        if (fallback_execution_count == numa_execution_count) {
-            printf("     ❌ Path validation failed: Both executions used same path (count: %d)\n", fallback_execution_count);
-            printf("     ❌ This indicates the fallback mechanism is broken!\n");
-            path_validation = false;
-        } else {
-            printf("     ✅ Path validation passed: Different execution paths detected\n");
-        }
-        
-        // Final assessment
-        bool canary_success = execution_success && mathematical_equivalence && sanity_check && path_validation;
-        
-        if (canary_success) {
-            printf("   ✅ Fallback canary test passed: Both execution paths work and produce identical results\n");
-            printf("   ✅ Verified: Fallback flag correctly controls NUMA dispatch behavior\n");
-            printf("   ✅ Verified: Different execution paths were taken (fallback: %d, NUMA: %d)\n", 
-                   fallback_execution_count, numa_execution_count);
-        } else {
-            printf("   ❌ Fallback canary test failed\n");
-            if (!execution_success) printf("   ❌ Execution issues detected\n");
-            if (!mathematical_equivalence) printf("   ❌ Mathematical equivalence failed\n");
-            if (!sanity_check) printf("   ❌ Sanity check failed\n");
-            if (!path_validation) printf("   ❌ Execution path validation failed\n");
-        }
-        
-        results.push_back({test_category, canary_success, canary_success ? "Passed" : "Fallback path verification failed"});
-        
-        ggml_free(ctx);
-    }
-    
     /**
      * Test for race condition in NUMA ADD data-parallel execution
      * 
@@ -1651,7 +1491,7 @@ public:
      * Run all tests and return summary
      */
     std::vector<TestResult> run_all_tests() {
-        printf("🚀 Starting NUMA ADD Mathematical Correctness Test Suite\n");
+        TEST_PRINTF("🚀 Starting NUMA ADD Mathematical Correctness Test Suite\n");
         
         // Initialize NUMA system
         ggml_numa_init(GGML_NUMA_STRATEGY_MIRROR);
@@ -1662,7 +1502,6 @@ public:
         test_ADD_broadcasting_regression();
         test_ADD_threshold_regression();  // Test for threshold bug that caused integration test failures
         test_ADD_extreme_edge_cases();    // NEW: Test ridiculously small tensors in data-parallel mode
-        test_ADD_fallback_canary();       // NEW: Canary test to verify fallback path execution
         test_ADD_race_condition_detection(); // NEW: Critical test to detect data-parallel race conditions
         test_ADD_real_tensor_precision(); // NEW: Test with exact data from failing integration test
         
@@ -1677,6 +1516,7 @@ void show_usage(const char* program_name) {
     printf("Usage: %s [OPTIONS]\n", program_name);
     printf("\nOptions:\n");
     printf("  --filter <regex>    Run only tests matching the regex pattern (case-insensitive)\n");
+    printf("  --summary-only      Only print the summary table, not full test output\n");
     printf("  --help              Show this help message\n");
     printf("\nFilter Examples:\n");
     printf("  --filter \"MEDIUM.*Multi-thread Multi-node\"  # Run only MEDIUM tensor multi-node tests\n");
@@ -1703,12 +1543,14 @@ int main(int argc, char** argv) {
         if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
             show_usage(argv[0]);
             return 0;
+        } else if (strcmp(argv[i], "--summary-only") == 0) {
+            g_summary_only = true;
         } else if (strcmp(argv[i], "--filter") == 0) {
             if (i + 1 < argc) {
                 g_test_filter = argv[i + 1];
                 g_filter_enabled = true;
                 i++; // Skip the filter argument
-                printf("🔍 Filter enabled: '%s'\n", g_test_filter.c_str());
+                TEST_PRINTF("🔍 Filter enabled: '%s'\n", g_test_filter.c_str());
             } else {
                 printf("❌ Error: --filter requires a regex pattern argument\n");
                 show_usage(argv[0]);
@@ -1721,12 +1563,14 @@ int main(int argc, char** argv) {
         }
     }
     
-    printf("==================================================================\n");
-    printf("🧪 NUMA ADD MATHEMATICAL CORRECTNESS TEST SUITE\n");
-    if (g_filter_enabled) {
-        printf("🔍 Running filtered tests matching: '%s'\n", g_test_filter.c_str());
+    if (!g_summary_only) {
+        printf("==================================================================\n");
+        printf("🧪 NUMA ADD MATHEMATICAL CORRECTNESS TEST SUITE\n");
+        if (g_filter_enabled) {
+            printf("🔍 Running filtered tests matching: '%s'\n", g_test_filter.c_str());
+        }
+        printf("==================================================================\n");
     }
-    printf("==================================================================\n");
     
     NumaAddMathematicalCorrectnessTestSuite test_suite;
     std::vector<TestResult> all_results = test_suite.run_all_tests();

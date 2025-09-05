@@ -17,6 +17,7 @@
 #include <stdexcept>
 #include <cassert>
 #include <atomic>
+#include <mutex>
 #include <chrono>
 #include <thread>
 #include <regex>
@@ -38,6 +39,9 @@
 std::string g_test_filter = "";
 bool g_filter_enabled = false;
 bool g_summary_only = false;
+
+// Test utilities
+#define TEST_PRINTF(...) do { if (!g_summary_only) printf(__VA_ARGS__); } while(0)
 
 /**
  * @brief Check if a test name matches the current filter
@@ -88,21 +92,21 @@ bool verify_thread_numa_binding(int expected_numa_node, const char* test_context
     int actual_numa_node = get_current_thread_numa_node();
     
     if (actual_numa_node == -1) {
-        printf("   ⚠️  NUMA binding check failed: unable to determine current NUMA node (%s)\n", test_context);
+        TEST_PRINTF("   ⚠️  NUMA binding check failed: unable to determine current NUMA node (%s)\n", test_context);
         return false;  // Can't verify, but don't fail the test
     }
     
     if (actual_numa_node != expected_numa_node) {
-        printf("   ❌ NUMA binding VIOLATION: thread expected on node %d, actually on node %d (%s)\n", 
+        TEST_PRINTF("   ❌ NUMA binding VIOLATION: thread expected on node %d, actually on node %d (%s)\n", 
                expected_numa_node, actual_numa_node, test_context);
         return false;
     }
     
-    printf("   ✅ NUMA binding verified: thread correctly on node %d (%s)\n", 
+    TEST_PRINTF("   ✅ NUMA binding verified: thread correctly on node %d (%s)\n", 
            actual_numa_node, test_context);
     return true;
 #else
-    printf("   ⚠️  NUMA binding check skipped: not supported on this platform (%s)\n", test_context);
+    TEST_PRINTF("   ⚠️  NUMA binding check skipped: not supported on this platform (%s)\n", test_context);
     return true;  // Skip verification on non-Linux platforms
 #endif
 }
@@ -119,7 +123,8 @@ std::vector<TestResult> g_test_results;
 // Thread execution tracking for validation
 std::atomic<int> g_threads_executed{0};
 std::atomic<int> g_numa_nodes_used{0};
-std::vector<int> g_threads_per_numa;  // Use plain int, protected by synchronization
+std::vector<int> g_threads_per_numa;  // Protected by g_tracking_mutex
+std::mutex g_tracking_mutex;  // Protects g_threads_per_numa from race conditions
 std::vector<char> g_numa_node_active;  // Use char instead of bool to avoid vector<bool> issues
 
 // Test utilities
@@ -212,10 +217,9 @@ void init_tracking_arrays(int max_numa_nodes) {
     g_threads_per_numa.clear();
     g_numa_node_active.clear();
     
-    for (int i = 0; i < max_numa_nodes; i++) {
-        g_threads_per_numa.push_back(0);
-        g_numa_node_active.push_back(0);  // 0 = false, 1 = true
-    }
+    // Resize vectors to proper size and initialize
+    g_threads_per_numa.resize(max_numa_nodes, 0);  // Initialize with 0
+    g_numa_node_active.resize(max_numa_nodes, false);  // Initialize with false
 }
 
 /**
@@ -237,7 +241,7 @@ void reset_tracking() {
     g_threads_executed = 0;
     g_numa_nodes_used = 0;
     for (int i = 0; i < (int)g_threads_per_numa.size(); i++) {
-        g_threads_per_numa[i] = 0;
+        g_threads_per_numa[i] = 0;  // Regular assignment now (mutex will protect concurrent access)
     }
     for (int i = 0; i < (int)g_numa_node_active.size(); i++) {
         g_numa_node_active[i] = 0;  // 0 = false
@@ -248,7 +252,7 @@ void reset_tracking() {
  * @brief Test basic coordinator initialization without CPU mask
  */
 bool test_basic_initialization() {
-    printf("🧪 Testing basic coordinator initialization...\n");
+    TEST_PRINTF("🧪 Testing basic coordinator initialization...\n");
     
     // Shutdown any existing coordinator
     ggml_numa_openmp_coordinator_shutdown();
@@ -267,9 +271,9 @@ bool test_basic_initialization() {
     EXPECT_TRUE(config.threadpool_manager.teams_initialized, "Per-NUMA thread teams should be initialized");
     EXPECT_EQ(config.threadpool_manager.num_teams, config.total_numa_nodes, "Number of teams should match NUMA nodes");
     
-    printf("   📊 Configuration: %d NUMA nodes, %d threads per node\n", 
+    TEST_PRINTF("   📊 Configuration: %d NUMA nodes, %d threads per node\n", 
            config.total_numa_nodes, config.threads_per_node);
-    printf("   📊 Thread teams: %d teams initialized, barriers: %s\n",
+    TEST_PRINTF("   📊 Thread teams: %d teams initialized, barriers: %s\n",
            config.threadpool_manager.num_teams,
            config.threadpool_manager.barriers_initialized ? "Yes" : "No");
     
@@ -283,7 +287,7 @@ bool test_basic_initialization() {
  * @brief Test CPU mask creation and validation
  */
 bool test_cpu_mask_creation() {
-    printf("🧪 Testing CPU mask creation...\n");
+    TEST_PRINTF("🧪 Testing CPU mask creation...\n");
     
 #ifdef __linux__
     // Test valid CPU mask creation
@@ -310,9 +314,9 @@ bool test_cpu_mask_creation() {
     ggml_numa_free_cpu_mask(mask);
     ggml_numa_free_cpu_mask(mask2);
     
-    printf("   ✅ CPU mask creation and validation working\n");
+    TEST_PRINTF("   ✅ CPU mask creation and validation working\n");
 #else
-    printf("   ⚠️  CPU mask tests skipped (not on Linux)\n");
+    TEST_PRINTF("   ⚠️  CPU mask tests skipped (not on Linux)\n");
 #endif
     
     return true;
@@ -322,7 +326,7 @@ bool test_cpu_mask_creation() {
  * @brief Test CPU mask initialization and thread team binding
  */
 bool test_cpu_mask_initialization() {
-    printf("🧪 Testing CPU mask initialization and thread team binding...\n");
+    TEST_PRINTF("🧪 Testing CPU mask initialization and thread team binding...\n");
     
     // Shutdown any existing coordinator
     ggml_numa_openmp_coordinator_shutdown();
@@ -357,14 +361,14 @@ bool test_cpu_mask_initialization() {
         EXPECT_GE(team.num_cpus, 1, "Each team should have at least 1 CPU assigned");
         EXPECT_TRUE(team.cpu_ids != NULL, "Each team should have CPU ID array");
         
-        printf("   📊 Team %d: %d threads, %d CPUs, bound=%s\n", 
+        TEST_PRINTF("   📊 Team %d: %d threads, %d CPUs, bound=%s\n", 
                i, team.num_threads, team.num_cpus, team.threads_bound ? "Yes" : "No");
     }
     
     // Clean up
     ggml_numa_free_cpu_mask(mask);
 #else
-    printf("   ⚠️  CPU mask initialization tests skipped (not on Linux)\n");
+    TEST_PRINTF("   ⚠️  CPU mask initialization tests skipped (not on Linux)\n");
 #endif
     
     return true;
@@ -374,7 +378,7 @@ bool test_cpu_mask_initialization() {
  * @brief Test thread distribution validation
  */
 bool test_thread_distribution() {
-    printf("🧪 Testing thread distribution validation...\n");
+    TEST_PRINTF("🧪 Testing thread distribution validation...\n");
     
     // Shutdown and reinitialize
     ggml_numa_openmp_coordinator_shutdown();
@@ -385,12 +389,12 @@ bool test_thread_distribution() {
     // Validate thread distribution makes sense
     int total_threads = config.total_numa_nodes * config.threads_per_node;
     
-    printf("   📊 Thread distribution:\n");
-    printf("      - NUMA nodes: %d\n", config.total_numa_nodes);
-    printf("      - Threads per node: %d\n", config.threads_per_node);
-    printf("      - Total threads: %d\n", total_threads);
-    printf("      - NUMA available: %s\n", config.numa_available ? "Yes" : "No");
-    printf("      - Thread teams initialized: %s\n", config.threadpool_manager.teams_initialized ? "Yes" : "No");
+    TEST_PRINTF("   📊 Thread distribution:\n");
+    TEST_PRINTF("      - NUMA nodes: %d\n", config.total_numa_nodes);
+    TEST_PRINTF("      - Threads per node: %d\n", config.threads_per_node);
+    TEST_PRINTF("      - Total threads: %d\n", total_threads);
+    TEST_PRINTF("      - NUMA available: %s\n", config.numa_available ? "Yes" : "No");
+    TEST_PRINTF("      - Thread teams initialized: %s\n", config.threadpool_manager.teams_initialized ? "Yes" : "No");
     
     // Basic sanity checks
     EXPECT_GE(config.total_numa_nodes, 1, "Must have at least 1 NUMA node");
@@ -403,10 +407,10 @@ bool test_thread_distribution() {
     
     // Check for reasonable distribution
     if (config.numa_available && config.total_numa_nodes > 1) {
-        printf("   ✅ Multi-NUMA system detected - validating distribution\n");
+        TEST_PRINTF("   ✅ Multi-NUMA system detected - validating distribution\n");
         EXPECT_TRUE(config.threadpool_manager.barriers_initialized, "Barriers should be initialized for multi-NUMA");
     } else {
-        printf("   ✅ Single-node or non-NUMA system detected\n");
+        TEST_PRINTF("   ✅ Single-node or non-NUMA system detected\n");
     }
     
     return true;
@@ -440,14 +444,17 @@ enum ggml_status tracking_work_function(void* work_context, struct ggml_compute_
     
     // Bounds checking
     if (ggml_current_numa_node < 0 || ggml_current_numa_node >= (int)g_numa_node_active.size()) {
-        printf("❌ NUMA node %d out of bounds (max=%zu)\n", ggml_current_numa_node, g_numa_node_active.size());
+        TEST_PRINTF("❌ NUMA node %d out of bounds (max=%zu)\n", ggml_current_numa_node, g_numa_node_active.size());
         return GGML_STATUS_FAILED;
     }
     
-    // Track execution details
+    // Track execution details (use mutex to protect g_threads_per_numa)
     g_threads_executed++;
     g_numa_node_active[ggml_current_numa_node] = true;
-    g_threads_per_numa[ggml_current_numa_node]++;
+    {
+        std::lock_guard<std::mutex> lock(g_tracking_mutex);
+        g_threads_per_numa[ggml_current_numa_node]++;
+    }
     
     // Verify work buffer is available if needed
     if (params->wsize > 0 && params->wdata == NULL) {
@@ -512,10 +519,13 @@ enum ggml_status numa_binding_verification_work_function(void* work_context, str
         return GGML_STATUS_FAILED;  // Fail the test if binding is wrong
     }
     
-    // Track execution details (same as tracking_work_function)
+    // Track execution details (same as tracking_work_function, use mutex)
     g_threads_executed++;
     g_numa_node_active[ggml_current_numa_node] = true;
-    g_threads_per_numa[ggml_current_numa_node]++;
+    {
+        std::lock_guard<std::mutex> lock(g_tracking_mutex);
+        g_threads_per_numa[ggml_current_numa_node]++;
+    }
     
     // Verify work buffer is available if needed
     if (params->wsize > 0 && params->wdata == NULL) {
@@ -561,7 +571,7 @@ enum ggml_status numa_binding_verification_work_function(void* work_context, str
  * @brief Test single-thread strategy execution
  */
 bool test_single_thread_strategy() {
-    printf("🧪 Testing single-thread strategy execution...\n");
+TEST_PRINTF("🧪 Testing single-thread strategy execution...\n");
     
     // Create test context and tensor
     struct ggml_init_params init_params = {
@@ -600,7 +610,7 @@ bool test_single_thread_strategy() {
     }
     EXPECT_EQ(1, active_nodes, "Only 1 NUMA node should be active for single-thread strategy");
     
-    printf("   ✅ Single-thread strategy: %d threads on %d NUMA nodes\n", 
+TEST_PRINTF("   ✅ Single-thread strategy: %d threads on %d NUMA nodes\n", 
            g_threads_executed.load(), active_nodes);
     
     ggml_free(ctx);
@@ -611,7 +621,7 @@ bool test_single_thread_strategy() {
  * @brief Test single-node multi-thread strategy execution
  */
 bool test_single_node_strategy() {
-    printf("🧪 Testing single-node multi-thread strategy execution...\n");
+TEST_PRINTF("🧪 Testing single-node multi-thread strategy execution...\n");
     
     // Create test context and tensor
     struct ggml_init_params init_params = {
@@ -652,7 +662,7 @@ bool test_single_node_strategy() {
     }
     EXPECT_EQ(1, active_nodes, "Only 1 NUMA node should be active for single-node strategy");
     
-    printf("   ✅ Single-node strategy: %d threads on %d NUMA nodes\n", 
+TEST_PRINTF("   ✅ Single-node strategy: %d threads on %d NUMA nodes\n", 
            g_threads_executed.load(), active_nodes);
     
     ggml_free(ctx);
@@ -663,7 +673,7 @@ bool test_single_node_strategy() {
  * @brief Test data-parallel multi-node strategy execution
  */
 bool test_data_parallel_strategy() {
-    printf("🧪 Testing data-parallel multi-node strategy execution...\n");
+TEST_PRINTF("🧪 Testing data-parallel multi-node strategy execution...\n");
     
     // Create test context and tensor
     struct ggml_init_params init_params = {
@@ -717,7 +727,7 @@ bool test_data_parallel_strategy() {
         EXPECT_EQ(1, active_nodes, "Single NUMA node system should have 1 active node");
     }
     
-    printf("   ✅ Data-parallel strategy: %d threads on %d NUMA nodes (expected %d nodes)\n", 
+TEST_PRINTF("   ✅ Data-parallel strategy: %d threads on %d NUMA nodes (expected %d nodes)\n", 
            g_threads_executed.load(), active_nodes, config.total_numa_nodes);
     
     ggml_free(ctx);
@@ -732,7 +742,7 @@ bool test_data_parallel_strategy() {
  * data slice and create mathematical errors.
  */
 bool test_data_parallel_unique_thread_ids() {
-    printf("🧪 Testing data-parallel unique thread ID assignment...\n");
+TEST_PRINTF("🧪 Testing data-parallel unique thread ID assignment...\n");
     
     // Create test context and tensor
     struct ggml_init_params init_params = {
@@ -773,7 +783,7 @@ bool test_data_parallel_unique_thread_ids() {
         
         // Safety check for array bounds (prevent buffer overflow)
         if (ith >= 128) {
-            printf("❌ Thread ID too large: ith=%d >= 128 (array bounds)\n", ith);
+TEST_PRINTF("❌ Thread ID too large: ith=%d >= 128 (array bounds)\n", ith);
             return GGML_STATUS_FAILED;
         }
         
@@ -783,19 +793,19 @@ bool test_data_parallel_unique_thread_ids() {
         g_total_calls++;
         
         // Log detailed thread information
-        printf("      Thread execution: NUMA node %d, ith=%d, nth=%d, data_parallel=%s, total_nodes=%d\n",
+TEST_PRINTF("      Thread execution: NUMA node %d, ith=%d, nth=%d, data_parallel=%s, total_nodes=%d\n",
                numa_node, ith, nth,
                ggml_numa_is_data_parallel_execution ? "YES" : "NO",
                ggml_numa_total_nodes_for_data_parallel);
         
         // Validate thread context
         if (!ggml_numa_is_data_parallel_execution) {
-            printf("❌ Thread should be in data-parallel mode but data_parallel=false\n");
+TEST_PRINTF("❌ Thread should be in data-parallel mode but data_parallel=false\n");
             return GGML_STATUS_FAILED;
         }
         
         if (ith >= nth) {
-            printf("❌ Invalid thread ID: ith=%d >= nth=%d\n", ith, nth);
+TEST_PRINTF("❌ Invalid thread ID: ith=%d >= nth=%d\n", ith, nth);
             return GGML_STATUS_FAILED;
         }
         
@@ -815,7 +825,7 @@ bool test_data_parallel_unique_thread_ids() {
             size_t thread_start = node_start + ith * elements_per_thread;
             size_t thread_end = std::min(thread_start + elements_per_thread, node_end);
             
-            printf("      Data slice: total=%zu, node[%zu,%zu), thread[%zu,%zu) (%zu elements)\n",
+TEST_PRINTF("      Data slice: total=%zu, node[%zu,%zu), thread[%zu,%zu) (%zu elements)\n",
                    total_elements, node_start, node_end, thread_start, thread_end, thread_end - thread_start);
         }
         
@@ -823,7 +833,7 @@ bool test_data_parallel_unique_thread_ids() {
     };
     
     // Execute using data-parallel strategy
-    printf("   🔄 Executing data-parallel strategy with thread ID tracking...\n");
+TEST_PRINTF("   🔄 Executing data-parallel strategy with thread ID tracking...\n");
     enum ggml_status status = ggml_numa_openmp_execute_data_parallel(
         tensor,
         thread_id_tracking_fn,
@@ -836,10 +846,10 @@ bool test_data_parallel_unique_thread_ids() {
     ggml_numa_openmp_config_t config = ggml_numa_openmp_coordinator_get_config();
     int expected_total_threads = config.total_numa_nodes * config.threads_per_node;
     
-    printf("   📊 Thread ID distribution analysis:\n");
-    printf("      Expected: %d total threads (%d nodes × %d threads/node)\n",
+TEST_PRINTF("   📊 Thread ID distribution analysis:\n");
+TEST_PRINTF("      Expected: %d total threads (%d nodes × %d threads/node)\n",
            expected_total_threads, config.total_numa_nodes, config.threads_per_node);
-    printf("      Actual: %d total function calls\n", g_total_calls.load());
+TEST_PRINTF("      Actual: %d total function calls\n", g_total_calls.load());
     
     // Verify thread ID uniqueness within each NUMA node
     bool thread_ids_unique = true;
@@ -847,21 +857,21 @@ bool test_data_parallel_unique_thread_ids() {
         int count = g_thread_id_count[thread_id];
         int expected_count = config.total_numa_nodes;  // Each thread ID should appear once per NUMA node
         
-        printf("      Thread ID %d: appeared %d times (expected %d times)\n", 
+TEST_PRINTF("      Thread ID %d: appeared %d times (expected %d times)\n", 
                thread_id, count, expected_count);
         
         if (count != expected_count) {
-            printf("❌ Thread ID %d appeared %d times but expected %d (once per NUMA node)\n",
+TEST_PRINTF("❌ Thread ID %d appeared %d times but expected %d (once per NUMA node)\n",
                    thread_id, count, expected_count);
             thread_ids_unique = false;
         }
     }
     
     // Verify NUMA node distribution
-    printf("   📊 NUMA node distribution:\n");
+TEST_PRINTF("   📊 NUMA node distribution:\n");
     for (int node = 0; node < config.total_numa_nodes; node++) {
         int count = g_numa_node_count[node];
-        printf("      NUMA node %d: %d threads executed (expected %d)\n", 
+TEST_PRINTF("      NUMA node %d: %d threads executed (expected %d)\n", 
                node, count, config.threads_per_node);
         
         EXPECT_EQ(config.threads_per_node, count, 
@@ -874,9 +884,9 @@ bool test_data_parallel_unique_thread_ids() {
               "Total function calls should match expected thread count");
     
     if (thread_ids_unique && g_total_calls.load() == expected_total_threads) {
-        printf("   ✅ Thread ID assignment: All threads received unique IDs within their NUMA nodes\n");
+TEST_PRINTF("   ✅ Thread ID assignment: All threads received unique IDs within their NUMA nodes\n");
     } else {
-        printf("   ❌ Thread ID assignment: Race condition detected - multiple threads got same IDs\n");
+TEST_PRINTF("   ❌ Thread ID assignment: Race condition detected - multiple threads got same IDs\n");
     }
     
     ggml_free(ctx);
@@ -887,7 +897,7 @@ bool test_data_parallel_unique_thread_ids() {
  * @brief Test work buffer allocation and management
  */
 bool test_work_buffer_allocation() {
-    printf("🧪 Testing work buffer allocation and management...\n");
+TEST_PRINTF("🧪 Testing work buffer allocation and management...\n");
     
     // Create test context and tensor
     struct ggml_init_params init_params = {
@@ -905,7 +915,7 @@ bool test_work_buffer_allocation() {
     auto work_buffer_fn = [](void* work_context, struct ggml_compute_params* params) -> enum ggml_status {
         // Verify work buffer is allocated
         if (params->wsize == 0 || params->wdata == NULL) {
-            printf("❌ Work buffer not allocated: wsize=%zu, wdata=%p\n", params->wsize, params->wdata);
+TEST_PRINTF("❌ Work buffer not allocated: wsize=%zu, wdata=%p\n", params->wsize, params->wdata);
             return GGML_STATUS_FAILED;
         }
         
@@ -925,7 +935,7 @@ bool test_work_buffer_allocation() {
         for (size_t i = 0; i < std::min(per_thread_floats, (size_t)16); i++) {
             float expected = (float)(params->ith * 100 + i);
             if (thread_work_buffer[i] != expected) {
-                printf("❌ Work buffer verification failed at index %zu: expected %f, got %f\n", 
+TEST_PRINTF("❌ Work buffer verification failed at index %zu: expected %f, got %f\n", 
                        i, expected, thread_work_buffer[i]);
                 return GGML_STATUS_FAILED;
             }
@@ -938,7 +948,7 @@ bool test_work_buffer_allocation() {
     size_t work_buffer_sizes[] = {256, 1024, 4096, 16384};
     
     for (size_t buffer_size : work_buffer_sizes) {
-        printf("   🧪 Testing work buffer size: %zu bytes\n", buffer_size);
+TEST_PRINTF("   🧪 Testing work buffer size: %zu bytes\n", buffer_size);
         
         // Test single-thread execution with work buffer
         enum ggml_status status = ggml_numa_openmp_execute_single_thread(
@@ -960,7 +970,7 @@ bool test_work_buffer_allocation() {
         EXPECT_EQ(GGML_STATUS_SUCCESS, status, "Multi-thread work buffer execution should succeed");
     }
     
-    printf("   ✅ Work buffer allocation and management working correctly\n");
+TEST_PRINTF("   ✅ Work buffer allocation and management working correctly\n");
     
     ggml_free(ctx);
     return true;
@@ -970,7 +980,7 @@ bool test_work_buffer_allocation() {
  * @brief Test coordinator integration with different strategies
  */
 bool test_executor_integration() {
-    printf("🧪 Testing coordinator execution strategies...\n");
+TEST_PRINTF("🧪 Testing coordinator execution strategies...\n");
     
     // Create test context and tensors
     struct ggml_init_params init_params = {
@@ -994,7 +1004,7 @@ bool test_executor_integration() {
     ggml_numa_openmp_config_t config = ggml_numa_openmp_coordinator_get_config();
     
     for (auto test_case : test_cases) {
-        printf("   🧪 Testing %s strategy with %d threads\n", 
+TEST_PRINTF("   🧪 Testing %s strategy with %d threads\n", 
                test_case.strategy_name, test_case.threads);
         
         struct ggml_tensor* tensor = create_test_tensor(ctx, 1024);
@@ -1020,7 +1030,7 @@ bool test_executor_integration() {
             if (g_numa_node_active[i]) active_nodes++;
         }
         
-        printf("      📊 Execution: %d threads on %d NUMA nodes\n", 
+TEST_PRINTF("      📊 Execution: %d threads on %d NUMA nodes\n", 
                g_threads_executed.load(), active_nodes);
         
         // Verify single-node execution
@@ -1028,7 +1038,7 @@ bool test_executor_integration() {
     }
     
     // Test full system capacity
-    printf("   🧪 Testing FULL CAPACITY single-node execution with %d threads\n", 
+TEST_PRINTF("   🧪 Testing FULL CAPACITY single-node execution with %d threads\n", 
            config.threads_per_node);
     
     struct ggml_tensor* full_tensor = create_test_tensor(ctx, 2048);
@@ -1050,7 +1060,7 @@ bool test_executor_integration() {
     EXPECT_GE(g_threads_executed.load(), config.threads_per_node * 0.9, 
              "Should execute at least 90% of requested threads for full capacity");
     
-    printf("      📊 FULL CAPACITY: %d threads executed (requested %d)\n", 
+TEST_PRINTF("      📊 FULL CAPACITY: %d threads executed (requested %d)\n", 
            g_threads_executed.load(), config.threads_per_node);
     
     ggml_free(ctx);
@@ -1061,7 +1071,7 @@ bool test_executor_integration() {
  * @brief Test full system multi-NUMA execution capacity
  */
 bool test_full_system_capacity() {
-    printf("🧪 Testing FULL SYSTEM CAPACITY multi-NUMA execution...\n");
+TEST_PRINTF("🧪 Testing FULL SYSTEM CAPACITY multi-NUMA execution...\n");
     
     // Create test context and tensor
     struct ggml_init_params init_params = {
@@ -1075,7 +1085,7 @@ bool test_full_system_capacity() {
     ggml_numa_openmp_config_t config = ggml_numa_openmp_coordinator_get_config();
     int total_system_threads = config.total_numa_nodes * config.threads_per_node;
     
-    printf("   📊 System capacity: %d NUMA nodes × %d threads = %d total threads\n",
+TEST_PRINTF("   📊 System capacity: %d NUMA nodes × %d threads = %d total threads\n",
            config.total_numa_nodes, config.threads_per_node, total_system_threads);
     
     struct ggml_tensor* tensor = create_test_tensor(ctx, 4096);
@@ -1103,14 +1113,14 @@ bool test_full_system_capacity() {
     for (int i = 0; i < (int)g_numa_node_active.size(); i++) {
         if (g_numa_node_active[i]) {
             active_nodes++;
-            printf("      📊 NUMA Node %d: %d threads executed\n", i, g_threads_per_numa[i]);
+TEST_PRINTF("      📊 NUMA Node %d: %d threads executed\n", i, g_threads_per_numa[i]);
         }
     }
     
     EXPECT_GE(active_nodes, config.total_numa_nodes, 
              "All NUMA nodes should be active for full system execution");
     
-    printf("   ✅ FULL SYSTEM EXECUTION: %d threads across %d NUMA nodes (target: %d threads)\n", 
+TEST_PRINTF("   ✅ FULL SYSTEM EXECUTION: %d threads across %d NUMA nodes (target: %d threads)\n", 
            g_threads_executed.load(), active_nodes, expected_total_threads);
     
     ggml_free(ctx);
@@ -1147,7 +1157,7 @@ static enum ggml_status parallel_execution_work_function(void* work_context, str
  * @brief Test parallel execution verification with timing
  */
 bool test_parallel_execution_verification() {
-    printf("🧪 Testing parallel execution verification...\n");
+TEST_PRINTF("🧪 Testing parallel execution verification...\n");
     
     // Create test context and tensor
     struct ggml_init_params init_params = {
@@ -1177,7 +1187,7 @@ bool test_parallel_execution_verification() {
     };
     
     for (auto test : parallel_tests) {
-        printf("   🧪 Testing %s parallel execution with %d threads\n", 
+TEST_PRINTF("   🧪 Testing %s parallel execution with %d threads\n", 
                test.test_name, test.threads);
         
         struct ggml_tensor* tensor = create_test_tensor(ctx, 512);
@@ -1219,10 +1229,10 @@ bool test_parallel_execution_verification() {
                  "Should see sufficient concurrent threads for parallel execution");
         
         if (test.use_data_parallel) {
-            printf("      📊 DATA-PARALLEL: %d max concurrent threads observed across ALL NUMA nodes, %ld ms execution time\n", 
+TEST_PRINTF("      📊 DATA-PARALLEL: %d max concurrent threads observed across ALL NUMA nodes, %ld ms execution time\n", 
                    g_max_concurrent.load(), duration.count());
         } else {
-            printf("      📊 SINGLE-NODE: %d threads requested, %d max concurrent observed, %ld ms execution time\n", 
+TEST_PRINTF("      📊 SINGLE-NODE: %d threads requested, %d max concurrent observed, %ld ms execution time\n", 
                    test.threads, g_max_concurrent.load(), duration.count());
         }
         
@@ -1237,7 +1247,7 @@ bool test_parallel_execution_verification() {
         }
     }
     
-    printf("   ✅ Parallel execution verified successfully across all thread counts\n");
+TEST_PRINTF("   ✅ Parallel execution verified successfully across all thread counts\n");
     
     ggml_free(ctx);
     return true;
@@ -1257,25 +1267,25 @@ bool test_parallel_execution_verification() {
  * 4. Different thread counts work correctly with isolation
  */
 bool test_numa_isolate_strategy() {
-    printf("🧪 Testing NUMA ISOLATE strategy for all available nodes...\n");
+TEST_PRINTF("🧪 Testing NUMA ISOLATE strategy for all available nodes...\n");
     
     // Get system configuration
     ggml_numa_openmp_config_t config = ggml_numa_openmp_coordinator_get_config();
     int total_numa_nodes = config.total_numa_nodes;
     int threads_per_node = config.threads_per_node;
     
-    printf("   📊 System detected: %d NUMA nodes, %d threads per node\n", 
+TEST_PRINTF("   📊 System detected: %d NUMA nodes, %d threads per node\n", 
            total_numa_nodes, threads_per_node);
     
     if (total_numa_nodes < 2) {
-        printf("   ⚠️  Single NUMA node system - ISOLATE strategy testing limited\n");
-        printf("   ✅ ISOLATE strategy test completed (single node system)\n");
+TEST_PRINTF("   ⚠️  Single NUMA node system - ISOLATE strategy testing limited\n");
+TEST_PRINTF("   ✅ ISOLATE strategy test completed (single node system)\n");
         return true;
     }
     
     // Test ISOLATE strategy for each NUMA node
     for (int target_node = 0; target_node < total_numa_nodes; target_node++) {
-        printf("   🔍 Testing ISOLATE strategy on NUMA node %d...\n", target_node);
+TEST_PRINTF("   🔍 Testing ISOLATE strategy on NUMA node %d...\n", target_node);
         
         // Create test context and tensor
         struct ggml_init_params init_params = {
@@ -1304,7 +1314,7 @@ bool test_numa_isolate_strategy() {
                 continue;
             }
             
-            printf("      🧪 Testing %d threads isolated to NUMA node %d\n", n_threads, target_node);
+TEST_PRINTF("      🧪 Testing %d threads isolated to NUMA node %d\n", n_threads, target_node);
             
             // Reset tracking for this sub-test
             reset_tracking();
@@ -1333,17 +1343,17 @@ bool test_numa_isolate_strategy() {
                 }
             }
             
-            printf("         ✅ ISOLATE: %d threads correctly isolated to node %d\n", 
+TEST_PRINTF("         ✅ ISOLATE: %d threads correctly isolated to node %d\n", 
                    n_threads, target_node);
         }
         
         // Cleanup context
         ggml_free(ctx);
         
-        printf("      ✅ NUMA node %d isolation tests completed successfully\n", target_node);
+TEST_PRINTF("      ✅ NUMA node %d isolation tests completed successfully\n", target_node);
     }
     
-    printf("   ✅ NUMA ISOLATE strategy testing completed for all %d nodes\n", total_numa_nodes);
+TEST_PRINTF("   ✅ NUMA ISOLATE strategy testing completed for all %d nodes\n", total_numa_nodes);
     return true;
 }
 
@@ -1354,7 +1364,7 @@ bool test_numa_isolate_strategy() {
  * and performs cross-validation to ensure proper isolation.
  */
 bool test_numa_isolate_full_capacity() {
-    printf("🧪 Testing NUMA ISOLATE strategy at full node capacity...\n");
+TEST_PRINTF("🧪 Testing NUMA ISOLATE strategy at full node capacity...\n");
     
     // Get system configuration
     ggml_numa_openmp_config_t config = ggml_numa_openmp_coordinator_get_config();
@@ -1362,14 +1372,14 @@ bool test_numa_isolate_full_capacity() {
     int threads_per_node = config.threads_per_node;
     
     if (total_numa_nodes < 2) {
-        printf("   ⚠️  Single NUMA node system - full capacity ISOLATE testing limited\n");
-        printf("   ✅ ISOLATE full capacity test completed (single node system)\n");
+TEST_PRINTF("   ⚠️  Single NUMA node system - full capacity ISOLATE testing limited\n");
+TEST_PRINTF("   ✅ ISOLATE full capacity test completed (single node system)\n");
         return true;
     }
     
     // Test full capacity isolation for each NUMA node
     for (int target_node = 0; target_node < total_numa_nodes; target_node++) {
-        printf("   🔍 Testing FULL CAPACITY (%d threads) isolated to NUMA node %d...\n", 
+TEST_PRINTF("   🔍 Testing FULL CAPACITY (%d threads) isolated to NUMA node %d...\n", 
                threads_per_node, target_node);
         
         // Create test context and tensor
@@ -1419,14 +1429,14 @@ bool test_numa_isolate_full_capacity() {
         float isolation_efficiency = (float)g_threads_per_numa[target_node] / (float)g_threads_executed.load();
         EXPECT_NEAR(1.0f, isolation_efficiency, 0.01f, "Isolation efficiency should be 100%");
         
-        printf("      ✅ FULL CAPACITY ISOLATION: %d threads on node %d, 0 threads elsewhere\n", 
+TEST_PRINTF("      ✅ FULL CAPACITY ISOLATION: %d threads on node %d, 0 threads elsewhere\n", 
                threads_per_node, target_node);
         
         // Cleanup context
         ggml_free(ctx);
     }
     
-    printf("   ✅ NUMA ISOLATE full capacity testing completed for all %d nodes\n", total_numa_nodes);
+TEST_PRINTF("   ✅ NUMA ISOLATE full capacity testing completed for all %d nodes\n", total_numa_nodes);
     return true;
 }
 
@@ -1434,7 +1444,7 @@ bool test_numa_isolate_full_capacity() {
  * @brief Test NUMA ISOLATE strategy edge cases and boundary conditions
  */
 bool test_numa_isolate_error_handling() {
-    printf("🧪 Testing NUMA ISOLATE strategy edge cases...\n");
+TEST_PRINTF("🧪 Testing NUMA ISOLATE strategy edge cases...\n");
     
     // Get system configuration
     ggml_numa_openmp_config_t config = ggml_numa_openmp_coordinator_get_config();
@@ -1453,7 +1463,7 @@ bool test_numa_isolate_error_handling() {
     EXPECT_TRUE(tensor != NULL, "Tensor creation should succeed");
     
     // Test 1: Maximum valid NUMA node
-    printf("   🧪 Testing maximum valid NUMA node...\n");
+TEST_PRINTF("   🧪 Testing maximum valid NUMA node...\n");
     reset_tracking();
     
     enum ggml_status status = ggml_numa_openmp_execute_single_node(
@@ -1464,11 +1474,11 @@ bool test_numa_isolate_error_handling() {
         0
     );
     
-    printf("      📊 Max valid node test status: %d\n", status);
+TEST_PRINTF("      📊 Max valid node test status: %d\n", status);
     EXPECT_TRUE(status == GGML_STATUS_SUCCESS, "Max valid NUMA node should work");
     
     // Test 2: Minimum valid NUMA node 
-    printf("   🧪 Testing minimum valid NUMA node...\n");
+TEST_PRINTF("   🧪 Testing minimum valid NUMA node...\n");
     reset_tracking();
     
     status = ggml_numa_openmp_execute_single_node(
@@ -1479,12 +1489,12 @@ bool test_numa_isolate_error_handling() {
         0
     );
     
-    printf("      📊 Min valid node test status: %d\n", status);
+TEST_PRINTF("      📊 Min valid node test status: %d\n", status);
     EXPECT_TRUE(status == GGML_STATUS_SUCCESS, "Min valid NUMA node should work");
     
     // Test 3: Single thread execution
     if (total_numa_nodes > 0) {
-        printf("   🧪 Testing single thread execution...\n");
+TEST_PRINTF("   🧪 Testing single thread execution...\n");
         reset_tracking();
         
         status = ggml_numa_openmp_execute_single_node(
@@ -1495,12 +1505,12 @@ bool test_numa_isolate_error_handling() {
             0
         );
         
-        printf("      📊 Single thread test status: %d\n", status);
+TEST_PRINTF("      📊 Single thread test status: %d\n", status);
         EXPECT_TRUE(status == GGML_STATUS_SUCCESS, "Single thread execution should work");
     }
     
     // Test 4: Large work buffer size
-    printf("   🧪 Testing large work buffer allocation...\n");
+TEST_PRINTF("   🧪 Testing large work buffer allocation...\n");
     reset_tracking();
     
     status = ggml_numa_openmp_execute_single_node(
@@ -1511,17 +1521,17 @@ bool test_numa_isolate_error_handling() {
         1024 * 1024  // 1MB work buffer
     );
     
-    printf("      📊 Large buffer test status: %d\n", status);
+TEST_PRINTF("      📊 Large buffer test status: %d\n", status);
     EXPECT_TRUE(status == GGML_STATUS_SUCCESS, "Large work buffer should work");
     
     // Cleanup
     ggml_free(ctx);
     
-    printf("   ✅ NUMA ISOLATE edge case tests completed\n");
+TEST_PRINTF("   ✅ NUMA ISOLATE edge case tests completed\n");
     return true;
 }
 bool test_error_handling() {
-    printf("🧪 Testing error handling and edge cases...\n");
+TEST_PRINTF("🧪 Testing error handling and edge cases...\n");
     
     // Test with very small work buffer
     struct ggml_init_params init_params = {
@@ -1542,15 +1552,15 @@ bool test_error_handling() {
                 tensor, error_fn, 0, 0
             );
             // Should handle work function failures gracefully
-            printf("   📊 Error handling test status: %d\n", status);
+TEST_PRINTF("   📊 Error handling test status: %d\n", status);
         }
         ggml_free(ctx);
     }
     
     // Test with zero threads (should handle gracefully)
-    printf("   📊 Testing edge case handling...\n");
+TEST_PRINTF("   📊 Testing edge case handling...\n");
     
-    printf("   ✅ Error handling tests completed\n");
+TEST_PRINTF("   ✅ Error handling tests completed\n");
     
     return true;
 }
@@ -1562,7 +1572,7 @@ bool test_error_handling() {
  * assigned NUMA nodes by checking the CPU and NUMA node at runtime.
  */
 bool test_numa_binding_verification() {
-    printf("🧪 Testing NUMA thread binding verification...\n");
+TEST_PRINTF("🧪 Testing NUMA thread binding verification...\n");
     
     // Create test context and tensor
     struct ggml_init_params init_params = {
@@ -1588,7 +1598,7 @@ bool test_numa_binding_verification() {
     };
     
     for (auto test : binding_tests) {
-        printf("   🧪 Testing NUMA binding for %s with %d threads\n", test.test_name, test.threads);
+TEST_PRINTF("   🧪 Testing NUMA binding for %s with %d threads\n", test.test_name, test.threads);
         
         struct ggml_tensor* tensor = create_test_tensor(ctx, 256);
         EXPECT_TRUE(tensor != NULL, "Tensor creation should succeed");
@@ -1604,7 +1614,7 @@ bool test_numa_binding_verification() {
                 numa_binding_verification_work_function,
                 0   // No work buffer
             );
-            printf("      📊 Data-parallel execution with binding verification: %s\n", 
+TEST_PRINTF("      📊 Data-parallel execution with binding verification: %s\n", 
                    status == GGML_STATUS_SUCCESS ? "SUCCESS" : "FAILED");
         } else {
             status = ggml_numa_openmp_execute_single_node(
@@ -1614,7 +1624,7 @@ bool test_numa_binding_verification() {
                 test.threads,
                 0   // No work buffer
             );
-            printf("      📊 Single-node execution on node 0 with binding verification: %s\n", 
+TEST_PRINTF("      📊 Single-node execution on node 0 with binding verification: %s\n", 
                    status == GGML_STATUS_SUCCESS ? "SUCCESS" : "FAILED");
         }
         
@@ -1630,15 +1640,15 @@ bool test_numa_binding_verification() {
                 if (g_numa_node_active[i]) active_numa_nodes++;
             }
             EXPECT_GE(active_numa_nodes, 2, "Data-parallel should use multiple NUMA nodes");
-            printf("      📊 NUMA nodes utilized: %d/%d\n", active_numa_nodes, config.total_numa_nodes);
+TEST_PRINTF("      📊 NUMA nodes utilized: %d/%d\n", active_numa_nodes, config.total_numa_nodes);
         } else {
             // For single-node, should only use node 0
             EXPECT_TRUE(g_numa_node_active[0], "Should use NUMA node 0");
-            printf("      📊 Single-node execution verified on NUMA node 0\n");
+TEST_PRINTF("      📊 Single-node execution verified on NUMA node 0\n");
         }
     }
     
-    printf("   ✅ NUMA thread binding verification completed successfully\n");
+TEST_PRINTF("   ✅ NUMA thread binding verification completed successfully\n");
     
     ggml_free(ctx);
     return true;
@@ -1648,10 +1658,24 @@ bool test_numa_binding_verification() {
  * @brief Main test runner
  */
 void print_usage(const char *prog) {
-    printf("Usage: %s [--summary-only] [--filter <regex>] [--help]\n", prog);
-    printf("  --summary-only      Only print the summary table, not full test output.\n");
-    printf("  --filter <regex>    Only run tests whose name matches the regex.\n");
-    printf("  --help              Show this help message.\n");
+    printf("Usage: %s [OPTIONS]\n", prog);
+    printf("\nOptions:\n");
+    printf("  --summary-only      Only print the summary table, not full test output\n");
+    printf("  --filter <regex>    Only run tests whose name matches the regex pattern (case-insensitive)\n");
+    printf("  --help              Show this help message\n");
+    printf("\nFilter Examples:\n");
+    printf("  --filter \"initialization\"        # Run initialization tests only\n");
+    printf("  --filter \"cpu_mask\"              # Run CPU mask related tests\n");
+    printf("  --filter \"thread.*strategy\"      # Run strategy execution tests\n");
+    printf("  --filter \"numa.*binding\"         # Run NUMA binding tests\n");
+    printf("  --filter \"isolate\"               # Run NUMA isolation tests\n");
+    printf("\nTest Categories:\n");
+    printf("  - Initialization: basic_initialization, cpu_mask_creation, cpu_mask_initialization\n");
+    printf("  - Configuration: thread_distribution\n");
+    printf("  - Execution: single_thread_strategy, single_node_strategy, data_parallel_strategy\n");
+    printf("  - Validation: work_buffer_allocation, numa_binding_verification\n");
+    printf("  - Advanced: numa_isolate_strategy, parallel_execution_verification\n");
+    printf("  - Integration: executor_integration, full_system_capacity, error_handling\n");
 }
 
 int main(int argc, char **argv) {

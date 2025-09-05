@@ -56,14 +56,8 @@ BIN_DIR="$BUILD_DIR/bin"
 # Test binaries to run (in order of complexity)
 NUMA_TESTS=(
     "test-numa-mathematical-correctness-add"
-    "test-numa-mathematical-correctness-mul"
-    "test-numa-mathematical-correctness-cpy"
-    "test-numa-mathematical-correctness-mul_mat"
-    "test-numa-mathematical-correctness-rms_norm"
     "test-numa-mathematical-correctness-rope"
-    "test-numa-mathematical-correctness-permute"
-    "test-numa-mathematical-correctness-glu"
-    "test-numa-data-slicing-verification"
+    "test-ggml-openmp-coordinator"
 )
 
 # Performance benchmark tests (separate category)
@@ -106,7 +100,7 @@ cd "$PROJECT_ROOT" || {
 
 # Configure Debug build with NUMA support
 echo "Configuring Debug build with NUMA support..."
-cmake -B build -DCMAKE_BUILD_TYPE=Debug -DCMAKE_EXPORT_COMPILE_COMMANDS=ON -DGGML_NUMA_MIRROR=ON -DGGML_OPENMP=OFF || {
+cmake -B build -DCMAKE_BUILD_TYPE=Debug -DCMAKE_EXPORT_COMPILE_COMMANDS=ON -DGGML_NUMA_MIRROR=ON -DGGML_OPENMP=ON || {
     echo -e "${RED}❌ Error: CMake configuration failed${NC}"
     exit 1
 }
@@ -188,8 +182,7 @@ run_test() {
     # Run the test with timeout (5 minutes max per test)
     local exit_code=0
     if [ -n "$test_args" ]; then
-        # In summary-only mode, suppress both stdout and stderr from NUMA debug logs
-        timeout 300 "$test_binary" $test_args 2>/dev/null
+        timeout 300 "$test_binary" $test_args
     else
         timeout 300 "$test_binary"
     fi

@@ -383,7 +383,7 @@ cd "$PROJECT_ROOT" || {
 
 # Configure Release build with NUMA support and optimizations
 echo "Configuring Release build with NUMA support and optimizations..."
-cmake -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_EXPORT_COMPILE_COMMANDS=ON -DGGML_NUMA_MIRROR=ON -DGGML_OPENMP=OFF || {
+cmake -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_EXPORT_COMPILE_COMMANDS=ON -DGGML_NUMA_MIRROR=ON -DGGML_OPENMP=ON || {
     echo -e "${RED}❌ Error: CMake configuration failed${NC}"
     exit 1
 }
