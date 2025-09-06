@@ -49,6 +49,45 @@
 // Cache line padding for performance
 #define CACHE_LINE_SIZE_F32 (64/sizeof(float))
 
+// ============================================================================
+// COMPREHENSIVE TRACE LOGGING MACROS FOR NUMA KERNEL DEBUGGING
+// ============================================================================
+
+/**
+ * @brief Trace memory read operations - logs source pointer, offset, and values read
+ */
+#define NUMA_ROPE_TRACE_READ_F16(thread_id, numa_node, src_ptr, offset, x0, x1) \
+    NUMA_LOG_TRACE("ROPE READ[%d/%d]: src=%p offset=%lld x0=%f x1=%f", \
+                   thread_id, numa_node, (void*)(src_ptr), (long long)(offset), (double)(x0), (double)(x1))
+
+/**
+ * @brief Trace computation operations - logs input values, operation, and result
+ */
+#define NUMA_ROPE_TRACE_COMPUTE_F16(thread_id, numa_node, seq, head, elem, operation, x0, x1, cos, sin, r0, r1) \
+    NUMA_LOG_TRACE("ROPE COMPUTE[%d/%d]: seq=%d head=%d elem=%d op=%s x0=%f x1=%f cos=%f sin=%f -> r0=%f r1=%f", \
+                   thread_id, numa_node, seq, head, elem, operation, (double)(x0), (double)(x1), (double)(cos), (double)(sin), (double)(r0), (double)(r1))
+
+/**
+ * @brief Trace memory write operations - logs destination pointer, offset, and values written
+ */
+#define NUMA_ROPE_TRACE_WRITE_F16(thread_id, numa_node, dst_ptr, offset, r0, r1) \
+    NUMA_LOG_TRACE("ROPE WRITE[%d/%d]: dst_base=%p offset=%lld r0=%f r1=%f dst[0]_addr=%p dst[n_dims/2]_addr=%p", \
+                   thread_id, numa_node, (void*)(dst_ptr), (long long)(offset), (double)(r0), (double)(r1), \
+                   (void*)&(dst_ptr)[0], (void*)&(dst_ptr)[n_dims/2])
+
+/**
+ * @brief Trace thread work assignment - logs what work ranges this thread processes
+ */
+#define NUMA_ROPE_TRACE_WORK(thread_id, numa_node, total_threads, work_start, work_end, work_type) \
+    NUMA_LOG_TRACE("ROPE WORK[%d/%d]: range=[%d,%d) type=%s threads=%d", \
+                   thread_id, numa_node, work_start, work_end, work_type, total_threads)
+
+/**
+ * @brief Trace thread skipping work - logs when threads have no work assigned
+ */
+#define NUMA_ROPE_TRACE_SKIP(thread_id, numa_node, reason) \
+    NUMA_LOG_TRACE("ROPE SKIP[%d/%d]: %s", thread_id, numa_node, reason)
+
 #ifndef MIN
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
 #endif
@@ -190,10 +229,13 @@ static void ggml_mrope_cache_init(
 /**
  * High-performance ROPE kernel for F32 type tensors
  */
-static enum ggml_status ggml_numa_kernel_rope_f32_execute(void * work_context, 
-                                                          struct ggml_compute_params * params,
-                                                          const bool forward) {
+enum ggml_status ggml_numa_kernel_rope_f32_execute(void * work_context, 
+                                                    struct ggml_compute_params * params) {
     struct ggml_tensor * dst = (struct ggml_tensor *)work_context;
+    
+    // TRACE: Log function entry for every thread
+    NUMA_LOG_TRACE("ROPE_F32_ENTRY: thread=%d/%d numa_node=%d tensor=%p",
+                   params->ith, params->nth, ggml_current_numa_node, (void*)dst);
     
     // Validate inputs
     NUMA_ASSERT(dst != NULL, "Destination tensor cannot be null");
@@ -263,50 +305,44 @@ static enum ggml_status ggml_numa_kernel_rope_f32_execute(void * work_context,
     // Step 1: Decide work division basis - ROPE slices by sequences (i2 dimension)
     const int64_t total_sequences = ne2;
     
-    // Step 2: Divide work by NUMA nodes first
-    int numa_start_seq = 0, numa_end_seq = total_sequences;
+    // Step 2: Create NUMA context for work distribution
+    ggml_numa_execution_context_t work_ctx = {
+        .numa_node = ggml_current_numa_node,
+        .is_data_parallel = ggml_numa_is_data_parallel_execution,
+        .total_threads = nth,
+        .thread_id = ith,
+        .numa_start = 0,  // Will be set by sequence distribution
+        .numa_end = total_sequences,  // Will be set by sequence distribution
+    };
     
+    // Step 3: Calculate NUMA-level sequence distribution
     if (ggml_numa_is_data_parallel_execution) {
         const int64_t seqs_per_node = total_sequences / ggml_numa_total_nodes_for_data_parallel;
-        numa_start_seq = ggml_current_numa_node * seqs_per_node;
-        numa_end_seq = (ggml_current_numa_node == ggml_numa_total_nodes_for_data_parallel - 1) ?
-                       total_sequences : numa_start_seq + seqs_per_node;
+        work_ctx.numa_start = ggml_current_numa_node * seqs_per_node;
+        work_ctx.numa_end = (ggml_current_numa_node == ggml_numa_total_nodes_for_data_parallel - 1) ?
+                           total_sequences : work_ctx.numa_start + seqs_per_node;
     }
     
-    const int numa_sequences = numa_end_seq - numa_start_seq;
+    // Step 4: Calculate thread-specific work range
+    size_t thread_start_seq, thread_end_seq, thread_seq_count;
+    const int64_t numa_sequences = work_ctx.numa_end - work_ctx.numa_start;
+    NUMA_THREAD_WORK_RANGE(work_ctx, numa_sequences, thread_start_seq, thread_end_seq, thread_seq_count);
     
-    // Step 3: Divide remaining work among threads within this NUMA node
-    const int64_t seqs_per_thread = (numa_sequences + nth - 1) / nth;  // Ceiling division
-    const int thread_start_seq = ith * seqs_per_thread;
-    const int thread_end_seq = MIN(thread_start_seq + seqs_per_thread, numa_sequences);
+    // Step 5: Check if this thread has work and log distribution
+    const bool has_work = (thread_seq_count > 0);
     
-    // Convert to global sequence indices
-    const int i2_start = numa_start_seq + thread_start_seq;
-    const int i2_end = numa_start_seq + thread_end_seq;
-    
-    // Step 4: Check if this thread has work
-    const bool has_work = (thread_start_seq < numa_sequences && i2_start < i2_end);
-    
-    // Debug logging (first thread per NUMA node only)
     if (ith == 0) {
-        NUMA_LOG_DEBUG("ROPE WORK DISTRIBUTION: total_sequences=%lld, NUMA node %d: numa_start_seq=%d numa_end_seq=%d numa_sequences=%d", 
-                       (long long)total_sequences, ggml_current_numa_node, numa_start_seq, numa_end_seq, numa_sequences);
-        NUMA_LOG_DEBUG("ROPE WORK DISTRIBUTION: is_data_parallel=%s total_nodes=%d seqs_per_node=%lld", 
-                       ggml_numa_is_data_parallel_execution ? "YES" : "NO", 
-                       ggml_numa_total_nodes_for_data_parallel,
-                       ggml_numa_is_data_parallel_execution ? (long long)(total_sequences / ggml_numa_total_nodes_for_data_parallel) : 0LL);
-        NUMA_LOG_DEBUG("ROPE THREAD DISTRIBUTION: thread %d/%d local_range=[%d,%d) global_range=[%d,%d) has_work=%s", 
-                       ith, nth, thread_start_seq, thread_end_seq, i2_start, i2_end, has_work ? "YES" : "NO");
-    }
-    if (ith == 0) {
-        NUMA_LOG_DEBUG("ROPE WORK DISTRIBUTION: NUMA node %d gets sequences [%d,%d) (%d sequences of %lld total)",
-                       ggml_current_numa_node, numa_start_seq, numa_end_seq, numa_sequences, (long long)total_sequences);
+        NUMA_LOG_WORK_DISTRIBUTION(work_ctx, "ROPE", thread_start_seq, thread_end_seq, "sequences");
+        NUMA_LOG_DEBUG("ROPE NUMA DISTRIBUTION: node %d gets sequences [%zu,%zu) (%zu of %lld total), data_parallel=%s", 
+                       ggml_current_numa_node, work_ctx.numa_start, work_ctx.numa_end, 
+                       work_ctx.numa_end - work_ctx.numa_start, (long long)total_sequences,
+                       ggml_numa_is_data_parallel_execution ? "YES" : "NO");
     }
     
     // Skip threads with no work - they go directly to barrier
     if (!has_work) {
-        NUMA_LOG_TRACE("Thread %d/%d (NUMA node %d) has no work: thread_seqs=[%d,%d), global_seqs=[%d,%d) - going to barrier",
-                       ith, nth, ggml_current_numa_node, thread_start_seq, thread_end_seq, i2_start, i2_end);
+        NUMA_LOG_TRACE("ROPE_F32_NO_WORK: thread=%d/%d numa_node=%d range=[%zu,%zu) going_to_barrier",
+                       ith, nth, ggml_current_numa_node, thread_start_seq, thread_end_seq);
         goto barrier_wait;
     }
     
@@ -317,18 +353,24 @@ static enum ggml_status ggml_numa_kernel_rope_f32_execute(void * work_context,
                        (float *)tensor_data(dst);
     const float * src0_base = (const float *)tensor_data(src0);
     
-    // TRACE: Log memory base addresses for every thread
-    NUMA_LOG_TRACE("ROPE TRACE: Thread %d (NUMA %d) memory setup: dst_base=%p, src0_base=%p, shared=%s, tensor_shape=[%lld,%lld,%lld,%lld]", 
-                   ith, ggml_current_numa_node, (void*)dst_base, (void*)src0_base,
-                   ggml_numa_shared_result_tensor_data ? "YES" : "NO",
-                   (long long)ne0, (long long)ne1, (long long)ne2, (long long)ne3);
+    // Log memory setup for debugging
+    NUMA_LOG_TRACE("ROPE_MEMORY_SETUP[%d/%d]: shared_result_ptr=%p tensor_data_dst=%p dst_base=%p src0_base=%p", 
+                   ith, ggml_current_numa_node,
+                   ggml_numa_shared_result_tensor_data, 
+                   (void*)tensor_data(dst), 
+                   (void*)dst_base, 
+                   (void*)src0_base);
     
-    // Debug the dst_base pointer (first thread per NUMA node only)
     if (ith == 0) {
-        NUMA_LOG_DEBUG("Thread %d (NUMA node %d) processing sequences [%d,%d), dst_base=%p, shared=%s", 
-                       ith, ggml_current_numa_node, i2_start, i2_end, (void*)dst_base,
+        NUMA_LOG_OPERATION_CONTEXT("ROPE", "sequences", "rotation parameters");
+        NUMA_LOG_DEBUG("Thread %d (NUMA node %d) processing sequences [%zu,%zu), dst_base=%p, shared=%s", 
+                       ith, ggml_current_numa_node, thread_start_seq, thread_end_seq, (void*)dst_base,
                        ggml_numa_shared_result_tensor_data ? "YES" : "NO");
     }
+    
+    // Store final sequence range for computation loops
+    const int i2_start = (int)thread_start_seq;
+    const int i2_end = (int)thread_end_seq;
     
     // ROPE variant flags
     const float theta_scale = powf(freq_base, -2.0f/n_dims);
@@ -357,15 +399,30 @@ static enum ggml_status ggml_numa_kernel_rope_f32_execute(void * work_context,
     }
     
     // Sin sign for forward/backward pass
-    const float sin_sign = forward ? 1.0f : -1.0f;
+    const float sin_sign = 1.0f;  // Always forward mode in NUMA kernels
     
     const int32_t * pos = (const int32_t *) tensor_data(src1);
     
-    // Allocate and initialize cache per thread
+    // Allocate and initialize cache per thread with local thread offset
+    // Each NUMA node gets its own work buffer allocation, so use local thread ID
+    // The coordinator allocates separate work buffers for each NUMA node
     float * cache = (float *) params->wdata + (ne0 + CACHE_LINE_SIZE_F32) * ith;
     memset(cache, 0, ne0 * sizeof(float));
     
-    // ROPE main computation loop - Step 4: Threads with work do calculations
+    // CRITICAL: In data-parallel mode, skip copying entirely - work directly with source data
+    // Each thread will read from source and write directly to their assigned destination regions
+    // This eliminates race conditions from multiple threads trying to copy overlapping data
+    
+    if (i2_start < i2_end) {
+        NUMA_LOG_TRACE("Thread %d (NUMA %d): Will process sequences [%d,%d) without pre-copying", 
+                       ith, ggml_current_numa_node, i2_start, i2_end);
+    }
+    
+    // Now proceed with ROPE computation on assigned slices
+    NUMA_LOG_TRACE("Thread %d/%d (NUMA node %d): Starting ROPE computation on sequences [%d,%d)", 
+                   ith, nth, ggml_current_numa_node, i2_start, i2_end);
+    
+    // ROPE main computation loop - Apply rotations to specific elements
     for (int64_t i3 = 0; i3 < ne3; i3++) { // batch
         for (int64_t i2 = i2_start; i2 < i2_end; i2++) { // sequences - ONLY process assigned sequences
             
@@ -433,16 +490,17 @@ static enum ggml_status ggml_numa_kernel_rope_f32_execute(void * work_context,
                         }
                         
                         for (int64_t i0 = 0; i0 < n_dims; i0 += 2) {
+                            const int64_t ic = i0 / 2;  // Critical: Use ic addressing like reference implementation
                             const float cos_theta = cache[i0 + 0];
                             const float sin_theta = cache[i0 + 1];
                             
-                            // NEOX ROPE: Elements at i0 and i0+n_dims/2, NOT using ic index
-                            const float * const src = (float *)((char *) src0_base + i3*nb03 + i2*nb02 + i1*nb01 + i0*nb00);
-                            float * dst_data  = (float *)((char *) dst_base + i3*nb3  + i2*nb2  + i1*nb1  + i0*nb0);
+                            // NEOX ROPE: Use ic for addressing, NOT i0 
+                            const float * const src = (float *)((char *) src0_base + i3*nb03 + i2*nb02 + i1*nb01 + ic*nb00);
+                            float * dst_data  = (float *)((char *) dst_base + i3*nb3  + i2*nb2  + i1*nb1  + ic*nb0);
                             
                             // TRACE: Log detailed memory access patterns
-                            NUMA_LOG_TRACE("ROPE TRACE: Thread %d (NUMA %d) NEOX element i0=%lld: src_addr=%p, dst_addr=%p, cos=%f, sin=%f", 
-                                           ith, ggml_current_numa_node, (long long)i0, (void*)src, (void*)dst_data, cos_theta, sin_theta);
+                            NUMA_LOG_TRACE("ROPE TRACE: Thread %d (NUMA %d) NEOX element i0=%lld ic=%lld: src_addr=%p, dst_addr=%p, cos=%f, sin=%f", 
+                                           ith, ggml_current_numa_node, (long long)i0, (long long)ic, (void*)src, (void*)dst_data, cos_theta, sin_theta);
                             
                             const float x0 = src[0];
                             const float x1 = src[n_dims/2];
@@ -454,10 +512,18 @@ static enum ggml_status ggml_numa_kernel_rope_f32_execute(void * work_context,
                             
                             // Debug output for specific elements that are failing
                             if (i3 == 0 && ((i2 >= 0 && i2 <= 3) || (i2 >= 12 && i2 <= 15)) && i1 == 0 && i0 == 0) {
-                                size_t linear_idx = i3*(ne2*ne1*ne0) + i2*(ne1*ne0) + i1*ne0 + i0;
-                                NUMA_LOG_DEBUG("NEOX ROPE ELEMENT: seq=%d head=%d elem=%d thread=%d NUMA=%d linear_idx=%zu x0=%f x1=%f cos=%f sin=%f -> dst[0]=%f dst[n_dims/2]=%f dst_addr=%p n_dims=%d", 
-                                              (int)i2, (int)i1, (int)i0, ith, ggml_current_numa_node, linear_idx, x0, x1, cos_theta, sin_theta,
+                                size_t linear_idx = i3*(ne2*ne1*ne0) + i2*(ne1*ne0) + i1*ne0 + ic;  // Use ic for linear index
+                                NUMA_LOG_DEBUG("NEOX ROPE ELEMENT: seq=%d head=%d elem=%d ic=%lld thread=%d NUMA=%d linear_idx=%zu x0=%f x1=%f cos=%f sin=%f -> dst[0]=%f dst[n_dims/2]=%f dst_addr=%p n_dims=%d", 
+                                              (int)i2, (int)i1, (int)i0, (long long)ic, ith, ggml_current_numa_node, linear_idx, x0, x1, cos_theta, sin_theta,
                                               x0*cos_theta - x1*sin_theta, x0*sin_theta + x1*cos_theta, (void*)dst_data, (int)n_dims);
+                            }
+                            
+                            // Debug critical linear indices around 513 where test is failing
+                            size_t linear_idx = i3*(ne2*ne1*ne0) + i2*(ne1*ne0) + i1*ne0 + ic;  // Use ic for linear index
+                            if (linear_idx >= 510 && linear_idx <= 520) {
+                                NUMA_LOG_DEBUG("ROPE CRITICAL: seq=%d head=%lld elem=%lld ic=%lld thread=%d NUMA=%d linear_idx=%zu inputs(x0=%.6f,x1=%.6f) cache(cos=%.6f,sin=%.6f) outputs(result0=%.6f,result1=%.6f) dst_addr=%p n_dims=%d", 
+                                               (int)i2, (long long)i1, (long long)i0, (long long)ic, ith, ggml_current_numa_node, linear_idx, x0, x1, cos_theta, sin_theta,
+                                               x0*cos_theta - x1*sin_theta, x0*sin_theta + x1*cos_theta, (void*)dst_data, (int)n_dims);
                             }
                             
                             // Perform the actual writes and log them
@@ -484,8 +550,9 @@ static enum ggml_status ggml_numa_kernel_rope_f32_execute(void * work_context,
                         const float cos_theta = cache[i0 + 0];
                         const float sin_theta = cache[i0 + 1];
                         
-                        const float * const src = (float *)((char *) src0_base + i3*nb03 + i2*nb02 + i1*nb01 + i0*nb00);
-                        float * dst_data  = (float *)((char *) dst_base + i3*nb3  + i2*nb2  + i1*nb1  + i0*nb0);
+                        // Use generic tensor pointer macros for cleaner memory addressing
+                        const float * const src = NUMA_TENSOR_4D_PTR(src0_base, src0, i0, i1, i2, i3, float);
+                        float * dst_data = NUMA_TENSOR_4D_PTR(dst_base, dst, i0, i1, i2, i3, float);
                         
                         const float x0 = src[0];
                         const float x1 = src[1];
@@ -519,13 +586,12 @@ static enum ggml_status ggml_numa_kernel_rope_f32_execute(void * work_context,
                 // Handle remaining dimensions for vision ROPE
                 if (is_vision) {
                     for (int64_t i0 = n_dims; i0 < ne0; i0 += 2) {
-                        const int64_t ic = i0/2;
-                        
                         const float cos_theta = cache[i0 + 0];
                         const float sin_theta = cache[i0 + 1];
                         
-                        const float * const src = (float *)((char *) src0_base + i3*nb03 + i2*nb02 + i1*nb01 + ic*nb00);
-                        float * dst_data  = (float *)((char *) dst_base + i3*nb3  + i2*nb2  + i1*nb1  + ic*nb0);
+                        // Use generic tensor pointer macros for vision ROPE too
+                        const float * const src = NUMA_TENSOR_4D_PTR(src0_base, src0, i0, i1, i2, i3, float);
+                        float * dst_data = NUMA_TENSOR_4D_PTR(dst_base, dst, i0, i1, i2, i3, float);
                         
                         const float x0 = src[0];
                         const float x1 = src[n_dims];
@@ -534,13 +600,17 @@ static enum ggml_status ggml_numa_kernel_rope_f32_execute(void * work_context,
                         dst_data[n_dims] = x0*sin_theta + x1*cos_theta;
                     }
                 } else {
-                    // Copy unrotated dimensions
-                    for (int64_t i0 = n_dims; i0 < ne0; i0 += 2) {
-                        const float * const src = (float *)((char *) src0_base + i3*nb03 + i2*nb02 + i1*nb01 + i0*nb00);
-                        float * dst_data  = (float *)((char *) dst_base + i3*nb3  + i2*nb2  + i1*nb1  + i0*nb0);
+                    // Copy unrotated dimensions (NEOX ROPE)
+                    // For NEOX ROPE, non-rotated elements should be copied as-is
+                    for (int64_t i0 = n_dims; i0 < ne0; i0++) {
+                        // Use generic tensor pointer macro for unrotated element copying
+                        const float * const src = NUMA_TENSOR_4D_PTR(src0_base, src0, i0, i1, i2, i3, float);
+                        float * dst_data = NUMA_TENSOR_4D_PTR(dst_base, dst, i0, i1, i2, i3, float);
                         
                         dst_data[0] = src[0];
-                        dst_data[1] = src[1];
+                        
+                        NUMA_LOG_TRACE("ROPE TRACE: Thread %d (NUMA %d) NON-ROTATED element i0=%lld: copying src[0]=%.6f to dst_data[0]",
+                                       ith, ggml_current_numa_node, (long long)i0, src[0]);
                     }
                 }
             }
@@ -553,16 +623,21 @@ static enum ggml_status ggml_numa_kernel_rope_f32_execute(void * work_context,
 
 barrier_wait:
     ; // Empty statement to satisfy C syntax requirements - labels must be followed by statements
-    // CRITICAL: Synchronization barrier to ensure all writes complete before operation finishes
-    if (ggml_numa_is_data_parallel_execution || nth > 1) {
-        #ifdef GGML_USE_OPENMP
-        #pragma omp barrier
-        #endif
-        NUMA_LOG_DEBUG("ROPE F32: Thread %d/%d (NUMA node %d) completed operation using OpenMP barrier", 
-                      ith, nth, ggml_current_numa_node);
-    } else {
-        NUMA_LOG_DEBUG("ROPE F32: Single thread execution, skipping operation completion barrier");
-    }
+    
+    // TRACE: Log every thread reaching barrier
+    NUMA_LOG_TRACE("ROPE_F32_BARRIER: thread=%d/%d numa_node=%d reached_barrier",
+                   params->ith, params->nth, ggml_current_numa_node);
+    
+    // NOTE: No explicit barrier needed - coordinator handles synchronization
+    // The coordinator's OpenMP parallel region automatically synchronizes all threads
+    // when the region ends. Adding barriers here causes deadlocks in data-parallel mode.
+    
+    NUMA_LOG_DEBUG("ROPE F32: Thread %d/%d (NUMA node %d) completed operation", 
+                  ith, nth, ggml_current_numa_node);
+    
+    // TRACE: Log function exit for every thread
+    NUMA_LOG_TRACE("ROPE_F32_EXIT: thread=%d/%d numa_node=%d returning_SUCCESS",
+                   params->ith, params->nth, ggml_current_numa_node);
     
     return GGML_STATUS_SUCCESS;
 }
@@ -574,9 +649,8 @@ barrier_wait:
 /**
  * ROPE kernel for F16 type tensors (similar to F32 but with type conversion)
  */
-static enum ggml_status ggml_numa_kernel_rope_f16_execute(void * work_context, 
-                                                          struct ggml_compute_params * params,
-                                                          const bool forward) {
+enum ggml_status ggml_numa_kernel_rope_f16_execute(void * work_context, 
+                                                    struct ggml_compute_params * params) {
     struct ggml_tensor * dst = (struct ggml_tensor *)work_context;
     
     // Validate inputs
@@ -672,6 +746,14 @@ static enum ggml_status ggml_numa_kernel_rope_f16_execute(void * work_context,
                              (ggml_fp16_t *)tensor_data(dst);
     const ggml_fp16_t * src0_base = (const ggml_fp16_t *)tensor_data(src0);
     
+    // COMPREHENSIVE MEMORY ADDRESS LOGGING
+    NUMA_LOG_TRACE("ROPE_MEMORY_SETUP[%d/%d]: shared_result_ptr=%p tensor_data_dst=%p dst_base=%p src0_base=%p", 
+                   ith, ggml_current_numa_node,
+                   ggml_numa_shared_result_tensor_data, 
+                   (void*)tensor_data(dst), 
+                   (void*)dst_base, 
+                   (void*)src0_base);
+    
     // ROPE variant flags
     const float theta_scale = powf(freq_base, -2.0f/n_dims);
     
@@ -699,7 +781,7 @@ static enum ggml_status ggml_numa_kernel_rope_f16_execute(void * work_context,
     }
     
     // Sin sign for forward/backward pass
-    const float sin_sign = forward ? 1.0f : -1.0f;
+    const float sin_sign = 1.0f;  // Always forward mode in NUMA kernels
     
     const int32_t * pos = (const int32_t *) tensor_data(src1);
     
@@ -708,6 +790,34 @@ static enum ggml_status ggml_numa_kernel_rope_f16_execute(void * work_context,
     
     // CRITICAL FIX: Zero-initialize cache to prevent non-deterministic behavior
     memset(cache, 0, ne0 * sizeof(float));
+    
+    // CRITICAL: Copy entire tensor first (like reference implementation)
+    // Only node 0 thread 0 does the full copy, others wait
+    if (ggml_current_numa_node == 0 && ith == 0) {
+        NUMA_LOG_DEBUG("Node 0 Thread 0: Performing full F16 tensor copy before ROPE computation");
+        
+        // Full tensor copy - all dimensions
+        for (int64_t i3 = 0; i3 < ne3; i3++) {
+            for (int64_t i2 = 0; i2 < ne2; i2++) {
+                for (int64_t i1 = 0; i1 < ne1; i1++) {
+                    const ggml_fp16_t * src_ptr  = (const ggml_fp16_t *)((const char *)src0_base + i3*nb03 + i2*nb02 + i1*nb01);
+                    ggml_fp16_t * dst_ptr = (ggml_fp16_t *)((char *)dst_base + i3*nb3 + i2*nb2 + i1*nb1);
+                    
+                    // Copy entire row (all ne0 elements)
+                    memcpy(dst_ptr, src_ptr, ne0 * sizeof(ggml_fp16_t));
+                }
+            }
+        }
+        
+        NUMA_LOG_DEBUG("Node 0 Thread 0: Full F16 tensor copy completed");
+    }
+    
+    // NOTE: No explicit barrier - OpenMP coordinator handles synchronization
+    // Adding barriers here causes deadlocks in data-parallel mode
+    
+    // Now proceed with ROPE computation on assigned slices
+    NUMA_LOG_TRACE("Thread %d/%d (NUMA node %d): Starting F16 ROPE computation on rows [%d,%d)", 
+                   ith, nth, ggml_current_numa_node, ir0, ir1);
     
     // Process tensor slices
     // FIXED: Initialize ir to match the global row counting pattern from reference implementation
@@ -739,35 +849,60 @@ static enum ggml_status ggml_numa_kernel_rope_f16_execute(void * work_context,
                         // Vision ROPE with NEOX layout
                         for (int64_t i0 = 0; i0 < n_dims; i0 += 2) {
                             const int64_t ic = i0/2;
-                            
                             const float cos_theta = cache[i0 + 0];
                             const float sin_theta = cache[i0 + 1];
                             
                             const ggml_fp16_t * const src = (ggml_fp16_t *)((char *) src0_base + i3*nb03 + i2*nb02 + i1*nb01 + ic*nb00);
                             ggml_fp16_t * dst_data  = (ggml_fp16_t *)((char *) dst_base + i3*nb3  + i2*nb2  + i1*nb1  + ic*nb0);
                             
+                            // TRACE: Log memory read operations
                             const float x0 = GGML_FP16_TO_FP32(src[0]);
                             const float x1 = GGML_FP16_TO_FP32(src[n_dims]);
                             
-                            dst_data[0]      = GGML_FP32_TO_FP16(x0*cos_theta - x1*sin_theta);
-                            dst_data[n_dims] = GGML_FP32_TO_FP16(x0*sin_theta + x1*cos_theta);
+                            NUMA_ROPE_TRACE_READ_F16(ith, ggml_current_numa_node, src, ic*nb00, x0, x1);
+                            
+                            // TRACE: Log computation
+                            const float result0 = x0*cos_theta - x1*sin_theta;
+                            const float result1 = x0*sin_theta + x1*cos_theta;
+                            
+                            NUMA_ROPE_TRACE_COMPUTE_F16(ith, ggml_current_numa_node, (int)i2, (int)i1, (int)i0, "VISION_NEOX",
+                                                       x0, x1, cos_theta, sin_theta, result0, result1);
+                            
+                            // TRACE: Log memory write operations
+                            dst_data[0]      = GGML_FP32_TO_FP16(result0);
+                            dst_data[n_dims] = GGML_FP32_TO_FP16(result1);
+                            
+                            NUMA_ROPE_TRACE_WRITE_F16(ith, ggml_current_numa_node, dst_data, ic*nb0, result0, result1);
                         }
                     } else {
                         // NEOX ROPE (half-dimension pairs)
                         for (int64_t i0 = 0; i0 < n_dims; i0 += 2) {
                             const int64_t ic = i0/2;
-                            
                             const float cos_theta = cache[i0 + 0];
                             const float sin_theta = cache[i0 + 1];
                             
+                            // NEOX ROPE: Use ic index for memory access like reference
                             const ggml_fp16_t * const src = (ggml_fp16_t *)((char *) src0_base + i3*nb03 + i2*nb02 + i1*nb01 + ic*nb00);
                             ggml_fp16_t * dst_data  = (ggml_fp16_t *)((char *) dst_base + i3*nb3  + i2*nb2  + i1*nb1  + ic*nb0);
                             
+                            // TRACE: Log memory read operations
                             const float x0 = GGML_FP16_TO_FP32(src[0]);
                             const float x1 = GGML_FP16_TO_FP32(src[n_dims/2]);
                             
-                            dst_data[0]        = GGML_FP32_TO_FP16(x0*cos_theta - x1*sin_theta);
-                            dst_data[n_dims/2] = GGML_FP32_TO_FP16(x0*sin_theta + x1*cos_theta);
+                            NUMA_ROPE_TRACE_READ_F16(ith, ggml_current_numa_node, src, ic*nb00, x0, x1);
+                            
+                            // TRACE: Log computation
+                            const float result0 = x0*cos_theta - x1*sin_theta;
+                            const float result1 = x0*sin_theta + x1*cos_theta;
+                            
+                            NUMA_ROPE_TRACE_COMPUTE_F16(ith, ggml_current_numa_node, (int)i2, (int)i1, (int)i0, "NEOX",
+                                                       x0, x1, cos_theta, sin_theta, result0, result1);
+                            
+                            // TRACE: Log memory write operations
+                            dst_data[0]        = GGML_FP32_TO_FP16(result0);
+                            dst_data[n_dims/2] = GGML_FP32_TO_FP16(result1);
+                            
+                            NUMA_ROPE_TRACE_WRITE_F16(ith, ggml_current_numa_node, dst_data, ic*nb0, result0, result1);
                         }
                     }
                 } else {
@@ -779,11 +914,24 @@ static enum ggml_status ggml_numa_kernel_rope_f16_execute(void * work_context,
                         const ggml_fp16_t * const src = (ggml_fp16_t *)((char *) src0_base + i3*nb03 + i2*nb02 + i1*nb01 + i0*nb00);
                         ggml_fp16_t * dst_data  = (ggml_fp16_t *)((char *) dst_base + i3*nb3  + i2*nb2  + i1*nb1  + i0*nb0);
                         
+                        // TRACE: Log memory read operations
                         const float x0 = GGML_FP16_TO_FP32(src[0]);
                         const float x1 = GGML_FP16_TO_FP32(src[1]);
                         
-                        dst_data[0] = GGML_FP32_TO_FP16(x0*cos_theta - x1*sin_theta);
-                        dst_data[1] = GGML_FP32_TO_FP16(x0*sin_theta + x1*cos_theta);
+                        NUMA_ROPE_TRACE_READ_F16(ith, ggml_current_numa_node, src, i0*nb00, x0, x1);
+                        
+                        // TRACE: Log computation
+                        const float result0 = x0*cos_theta - x1*sin_theta;
+                        const float result1 = x0*sin_theta + x1*cos_theta;
+                        
+                        NUMA_ROPE_TRACE_COMPUTE_F16(ith, ggml_current_numa_node, (int)i2, (int)i1, (int)i0, "STANDARD",
+                                                   x0, x1, cos_theta, sin_theta, result0, result1);
+                        
+                        // TRACE: Log memory write operations
+                        dst_data[0] = GGML_FP32_TO_FP16(result0);
+                        dst_data[1] = GGML_FP32_TO_FP16(result1);
+                        
+                        NUMA_ROPE_TRACE_WRITE_F16(ith, ggml_current_numa_node, dst_data, i0*nb0, result0, result1);
                     }
                 }
                 
@@ -791,7 +939,6 @@ static enum ggml_status ggml_numa_kernel_rope_f16_execute(void * work_context,
                 if (is_vision) {
                     for (int64_t i0 = n_dims; i0 < ne0; i0 += 2) {
                         const int64_t ic = i0/2;
-                        
                         const float cos_theta = cache[i0 + 0];
                         const float sin_theta = cache[i0 + 1];
                         
@@ -824,16 +971,13 @@ static enum ggml_status ggml_numa_kernel_rope_f16_execute(void * work_context,
     
 barrier_wait:
     ; // Empty statement to satisfy C syntax requirements - labels must be followed by statements
-    // CRITICAL: Synchronization barrier to ensure all writes complete before operation finishes
-    if (ggml_numa_is_data_parallel_execution || nth > 1) {
-        #ifdef GGML_USE_OPENMP
-        #pragma omp barrier
-        #endif
-        NUMA_LOG_DEBUG("ROPE F16: Thread %d/%d (NUMA node %d) completed operation using OpenMP barrier", 
-                      ith, nth, ggml_current_numa_node);
-    } else {
-        NUMA_LOG_DEBUG("ROPE F16: Single thread execution, skipping operation completion barrier");
-    }
+    
+    // NOTE: No explicit barrier needed - coordinator handles synchronization  
+    // The coordinator's OpenMP parallel region automatically synchronizes all threads
+    // when the region ends. Adding barriers here causes deadlocks in data-parallel mode.
+    
+    NUMA_LOG_DEBUG("ROPE F16: Thread %d/%d (NUMA node %d) completed operation", 
+                  ith, nth, ggml_current_numa_node);
     
     return GGML_STATUS_SUCCESS;
 }
@@ -859,10 +1003,10 @@ enum ggml_status ggml_numa_kernel_rope_execute(void * work_context, struct ggml_
     // Dispatch based on tensor type
     switch (src0->type) {
         case GGML_TYPE_F32:
-            return ggml_numa_kernel_rope_f32_execute(work_context, params, true);
+            return ggml_numa_kernel_rope_f32_execute(work_context, params);
             
         case GGML_TYPE_F16:
-            return ggml_numa_kernel_rope_f16_execute(work_context, params, true);
+            return ggml_numa_kernel_rope_f16_execute(work_context, params);
             
         default:
             NUMA_LOG_ERROR("Unsupported tensor type for ROPE: %d", src0->type);

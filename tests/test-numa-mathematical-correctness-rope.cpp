@@ -57,6 +57,7 @@
 #include <algorithm>
 #include <stdexcept>
 #include <regex>
+#include <thread>
 
 // GGML includes
 #include "ggml.h"
@@ -307,6 +308,11 @@ TestResult test_rope_operation(const TestConfig& config, bool enable_numa, const
         struct ggml_tensor* result_numa = create_rope_operation(ctx_numa, config, input_numa, pos_numa);
         struct ggml_tensor* result_ref = create_rope_operation(ctx_ref, config, input_ref, pos_ref);
         
+        // CRITICAL: Initialize result tensors to zero before computation
+        // This ensures that unprocessed regions in data-parallel mode have known values
+        memset(ggml_get_data(result_numa), 0, ggml_nbytes(result_numa));
+        memset(ggml_get_data(result_ref), 0, ggml_nbytes(result_ref));
+        
         // Query the NUMA kernel to see if it's supported
         ggml_numa_kernel_query_result_t query_result = ggml_numa_kernels_query(result_numa);
         
@@ -328,12 +334,13 @@ TestResult test_rope_operation(const TestConfig& config, bool enable_numa, const
         
         // Ensure NUMA dispatch is enabled for our test
         ggml_numa_set_fallback_flag(false);  // Ensure NUMA dispatch is enabled
+        ggml_numa_set_dispatch_enabled(true);  // Enable NUMA dispatch for NUMA computation
         
         // Setup threading for reference computation
         (void)enable_numa;  // Suppress unused variable warning
         
-        // Use reasonable default thread count for operations
-        int default_threads = 16;
+        // Use hardware-appropriate thread count (similar to other tests)
+        int default_threads = std::max(1u, std::thread::hardware_concurrency());
         
         // Execute NUMA computation using NUMA executor
         if (enable_numa) {
@@ -369,36 +376,43 @@ TestResult test_rope_operation(const TestConfig& config, bool enable_numa, const
             }
         }
         
-        // Execute reference computation using direct function call
-        // ROPE requires a work buffer for cache computation
-        const size_t ne0 = config.ne0;
-        const size_t cache_line_size_f32 = 16; // CACHE_LINE_SIZE_F32 approximation
-        const size_t work_buffer_size = (ne0 + cache_line_size_f32) * sizeof(float);
+        // Execute reference computation using graph-based approach (proper method)
+        // CRITICAL: Disable NUMA for reference computation to get pure reference results
+        ggml_numa_set_dispatch_enabled(false);
         
-        std::vector<char> work_buffer(work_buffer_size);
+        // Create ROPE operation using ggml_rope() function
+        struct ggml_tensor* rope_op_ref = ggml_rope(ctx_ref, input_ref, pos_ref, config.n_dims, config.rope_mode);
         
-        struct ggml_compute_params ref_compute_params;
-        ref_compute_params.ith = 0;
-        ref_compute_params.nth = 1;  // Single-threaded reference
-        ref_compute_params.wsize = work_buffer_size;
-        ref_compute_params.wdata = work_buffer.data();
-        ref_compute_params.threadpool = nullptr;
+        // Build computation graph
+        ggml_cgraph* graph_ref = ggml_new_graph(ctx_ref);
+        ggml_build_forward_expand(graph_ref, rope_op_ref);
         
-        // Initialize result_ref with input data (ROPE is typically an in-place or copy operation)
-        if (config.tensor_type == GGML_TYPE_F32) {
-            const float* src_data = (const float*)ggml_get_data(input_ref);
-            float* dst_data = (float*)ggml_get_data(result_ref);
-            size_t total_elements = ggml_nelements(result_ref);
-            memcpy(dst_data, src_data, total_elements * sizeof(float));
-        } else if (config.tensor_type == GGML_TYPE_F16) {
-            const ggml_fp16_t* src_data = (const ggml_fp16_t*)ggml_get_data(input_ref);
-            ggml_fp16_t* dst_data = (ggml_fp16_t*)ggml_get_data(result_ref);
-            size_t total_elements = ggml_nelements(result_ref);
-            memcpy(dst_data, src_data, total_elements * sizeof(ggml_fp16_t));
+        // Create work buffer for graph computation (proper approach)
+        std::vector<uint8_t> work_buffer;
+        struct ggml_cplan plan = ggml_graph_plan(graph_ref, 1, nullptr);  // Single-threaded reference
+        if (plan.work_size > 0) {
+            work_buffer.resize(plan.work_size);
+            plan.work_data = work_buffer.data();
         }
         
-        // Call the reference ROPE implementation directly
-        ggml_compute_forward_rope(&ref_compute_params, result_ref);
+        // Execute the graph computation (proper method) - should use fallback path
+        ggml_graph_compute(graph_ref, &plan);
+        
+        // Re-enable NUMA for subsequent operations
+        ggml_numa_set_dispatch_enabled(true);
+        
+        // Copy result to our result tensor
+        if (config.tensor_type == GGML_TYPE_F32) {
+            const float* graph_result = (const float*)ggml_get_data(rope_op_ref);
+            float* dst_data = (float*)ggml_get_data(result_ref);
+            size_t total_elements = ggml_nelements(result_ref);
+            memcpy(dst_data, graph_result, total_elements * sizeof(float));
+        } else if (config.tensor_type == GGML_TYPE_F16) {
+            const ggml_fp16_t* graph_result = (const ggml_fp16_t*)ggml_get_data(rope_op_ref);
+            ggml_fp16_t* dst_data = (ggml_fp16_t*)ggml_get_data(result_ref);
+            size_t total_elements = ggml_nelements(result_ref);
+            memcpy(dst_data, graph_result, total_elements * sizeof(ggml_fp16_t));
+        }
         
         // Compare results based on tensor type
         bool comparison_passed = false;
@@ -407,11 +421,34 @@ TestResult test_rope_operation(const TestConfig& config, bool enable_numa, const
         if (config.tensor_type == GGML_TYPE_F32) {
             const float* numa_data = (const float*)ggml_get_data(result_numa);
             const float* ref_data = (const float*)ggml_get_data(result_ref);
+            
+            // Also check tensor_data() function for comparison
+            const float* numa_tensor_data = (const float*)tensor_data(result_numa);
+            printf("🔍 MEMORY DEBUG: ggml_get_data ptr=%p, tensor_data ptr=%p\n", (void*)numa_data, (void*)numa_tensor_data);
+            printf("🔍 MEMORY DEBUG: ggml_get_data[0]=%f, tensor_data[0]=%f\n", numa_data[0], numa_tensor_data[0]);
+            printf("🔍 MEMORY DEBUG: numa_data ptr=%p, ref_data ptr=%p\n", (void*)numa_data, (void*)ref_data);
+            
+            // Debug ROPE variant indexing
+            if (config.rope_mode == GGML_ROPE_TYPE_NEOX) {
+                int neox_pair_index = config.n_dims / 2;  // For NEOX, second element is at n_dims/2
+                printf("🔍 NEOX DEBUG: n_dims=%d, neox_pair_index=%d\n", config.n_dims, neox_pair_index);
+                printf("🔍 NEOX DEBUG: numa_data[0]=%f, numa_data[%d]=%f, ref_data[0]=%f, ref_data[%d]=%f\n", 
+                       numa_data[0], neox_pair_index, numa_data[neox_pair_index], 
+                       ref_data[0], neox_pair_index, ref_data[neox_pair_index]);
+            } else {
+                printf("🔍 STANDARD DEBUG: numa_data[0]=%f, numa_data[1]=%f, ref_data[0]=%f, ref_data[1]=%f\n", 
+                       numa_data[0], numa_data[1], ref_data[0], ref_data[1]);
+            }
+            
             comparison_passed = compare_float_arrays(numa_data, ref_data, total_elements, "ROPE F32");
         } else if (config.tensor_type == GGML_TYPE_F16) {
-            // TODO: F16 reference implementation appears to have issues - skip for now
-            printf("⚠️  F16 testing skipped due to reference implementation issues\n");
-            comparison_passed = true;  // Skip F16 validation until reference is fixed
+            const ggml_fp16_t* numa_data = (const ggml_fp16_t*)ggml_get_data(result_numa);
+            const ggml_fp16_t* ref_data = (const ggml_fp16_t*)ggml_get_data(result_ref);
+            printf("🔍 MEMORY DEBUG: numa_data ptr=%p, ref_data ptr=%p\n", numa_data, ref_data);
+            printf("🔍 MEMORY DEBUG: numa_data[0]=%f, numa_data[1]=%f, ref_data[0]=%f, ref_data[1]=%f\n", 
+                   GGML_FP16_TO_FP32(numa_data[0]), GGML_FP16_TO_FP32(numa_data[1]), 
+                   GGML_FP16_TO_FP32(ref_data[0]), GGML_FP16_TO_FP32(ref_data[1]));
+            comparison_passed = compare_f16_arrays(numa_data, ref_data, total_elements, "ROPE F16");
         }
         
         if (comparison_passed) {

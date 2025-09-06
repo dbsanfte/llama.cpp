@@ -1,14 +1,223 @@
 /**
  * @file rope.h
- * @brief NUMA ROPE (Rotary Position Embedding) Kernel Interface
- * 
- * NUMA-aware implementation of ROPE operations with support for:
- * - Standard ROPE (original and NEOX variants)
- * - Multi-modal ROPE (mrope)
- * - Vision ROPE 
- * - Forward and backward passes
- * - NUMA-optimized data-parallel execution
+ * @brief NUMA ROPE kernel header with function prototypes and reusable macros
+ * @author David Sanftenberg
  */
+
+#pragma once
+
+#include "numa-kernels.h"
+
+// ============================================================================
+// NUMA Work Distribution Macros
+// ============================================================================
+
+/**
+ * Calculate NUMA work distribution for sequence-based operations like ROPE
+ * @param total_sequences Total number of sequences (ne2)
+ * @param ith Thread index within NUMA node
+ * @param nth Total threads per NUMA node  
+ * @param i2_start [OUT] Starting sequence index for this thread
+ * @param i2_end [OUT] Ending sequence index for this thread
+ * @param has_work [OUT] Whether this thread has any work to do
+ */
+#define NUMA_SEQUENCE_WORK_DISTRIBUTION(total_sequences, ith, nth, i2_start, i2_end, has_work) do { \
+    /* Step 1: Divide work by NUMA nodes first */ \
+    int numa_start_seq = 0, numa_end_seq = (total_sequences); \
+    \
+    if (ggml_numa_is_data_parallel_execution) { \
+        const int64_t seqs_per_node = (total_sequences) / ggml_numa_total_nodes_for_data_parallel; \
+        numa_start_seq = ggml_current_numa_node * seqs_per_node; \
+        numa_end_seq = (ggml_current_numa_node == ggml_numa_total_nodes_for_data_parallel - 1) ? \
+                       (total_sequences) : numa_start_seq + seqs_per_node; \
+    } \
+    \
+    const int numa_sequences = numa_end_seq - numa_start_seq; \
+    \
+    /* Step 2: Divide remaining work among threads within this NUMA node */ \
+    const int64_t seqs_per_thread = (numa_sequences + (nth) - 1) / (nth);  /* Ceiling division */ \
+    const int thread_start_seq = (ith) * seqs_per_thread; \
+    const int thread_end_seq = MIN(thread_start_seq + seqs_per_thread, numa_sequences); \
+    \
+    /* Step 3: Convert to global sequence indices */ \
+    (i2_start) = numa_start_seq + thread_start_seq; \
+    (i2_end) = numa_start_seq + thread_end_seq; \
+    \
+    /* Step 4: Check if this thread has work */ \
+    (has_work) = (thread_start_seq < numa_sequences && (i2_start) < (i2_end)); \
+    \
+    /* Debug logging (first thread per NUMA node only) */ \
+    if ((ith) == 0) { \
+        NUMA_LOG_DEBUG("WORK DISTRIBUTION: total_sequences=%lld, NUMA node %d: numa_start_seq=%d numa_end_seq=%d numa_sequences=%d", \
+                       (long long)(total_sequences), ggml_current_numa_node, numa_start_seq, numa_end_seq, numa_sequences); \
+        NUMA_LOG_DEBUG("THREAD DISTRIBUTION: thread %d/%d local_range=[%d,%d) global_range=[%d,%d) has_work=%s", \
+                       (ith), (nth), thread_start_seq, thread_end_seq, (i2_start), (i2_end), (has_work) ? "YES" : "NO"); \
+    } \
+} while(0)
+
+// ============================================================================
+// Memory Address Calculation Macros
+// ============================================================================
+
+/**
+ * Calculate tensor element pointer with 4D strides
+ * @param base_ptr Base pointer to tensor data
+ * @param i3 Batch index
+ * @param i2 Sequence index
+ * @param i1 Head index
+ * @param i0 Element index
+ * @param nb3 Batch stride
+ * @param nb2 Sequence stride
+ * @param nb1 Head stride
+ * @param nb0 Element stride
+ * @return Pointer to the specific tensor element
+ */
+#define TENSOR_ELEMENT_PTR(base_ptr, i3, i2, i1, i0, nb3, nb2, nb1, nb0) \
+    ((void*)((char*)(base_ptr) + (i3)*(nb3) + (i2)*(nb2) + (i1)*(nb1) + (i0)*(nb0)))
+
+/**
+ * Calculate typed tensor element pointer with 4D strides
+ */
+#define TENSOR_ELEMENT_PTR_TYPED(type, base_ptr, i3, i2, i1, i0, nb3, nb2, nb1, nb0) \
+    ((type*)TENSOR_ELEMENT_PTR(base_ptr, i3, i2, i1, i0, nb3, nb2, nb1, nb0))
+
+/**
+ * Get source and destination pointers for ROPE computation
+ * @param src_ptr [OUT] Source pointer
+ * @param dst_ptr [OUT] Destination pointer
+ * @param src_base Source tensor base
+ * @param dst_base Destination tensor base
+ * @param i3 Batch index
+ * @param i2 Sequence index
+ * @param i1 Head index
+ * @param i0 Element index
+ */
+#define ROPE_GET_SRC_DST_PTRS(src_ptr, dst_ptr, src_base, dst_base, i3, i2, i1, i0, \
+                              src_nb3, src_nb2, src_nb1, src_nb0, dst_nb3, dst_nb2, dst_nb1, dst_nb0) do { \
+    (src_ptr) = TENSOR_ELEMENT_PTR_TYPED(const float, src_base, i3, i2, i1, i0, src_nb3, src_nb2, src_nb1, src_nb0); \
+    (dst_ptr) = TENSOR_ELEMENT_PTR_TYPED(float, dst_base, i3, i2, i1, i0, dst_nb3, dst_nb2, dst_nb1, dst_nb0); \
+} while(0)
+
+// ============================================================================
+// ROPE Computation Macros
+// ============================================================================
+
+/**
+ * Standard ROPE rotation computation (adjacent pairs)
+ * @param x0 First input value
+ * @param x1 Second input value  
+ * @param cos_theta Cosine value from cache
+ * @param sin_theta Sine value from cache
+ * @param result0 [OUT] First output value
+ * @param result1 [OUT] Second output value
+ */
+#define ROPE_STANDARD_ROTATION(x0, x1, cos_theta, sin_theta, result0, result1) do { \
+    (result0) = (x0) * (cos_theta) - (x1) * (sin_theta); \
+    (result1) = (x0) * (sin_theta) + (x1) * (cos_theta); \
+} while(0)
+
+/**
+ * NEOX ROPE rotation computation (half-dimension pairs)
+ * @param x0 First input value (from src[0])
+ * @param x1 Second input value (from src[n_dims/2])
+ * @param cos_theta Cosine value from cache
+ * @param sin_theta Sine value from cache
+ * @param result0 [OUT] First output value (to dst[0])
+ * @param result1 [OUT] Second output value (to dst[n_dims/2])
+ */
+#define ROPE_NEOX_ROTATION(x0, x1, cos_theta, sin_theta, result0, result1) \
+    ROPE_STANDARD_ROTATION(x0, x1, cos_theta, sin_theta, result0, result1)
+
+// ============================================================================
+// Multi-dimensional Loop Macros
+// ============================================================================
+
+/**
+ * Standard 4D tensor iteration loop with sequence range filtering
+ * @param i3_start Starting batch index
+ * @param i3_end Ending batch index
+ * @param i2_start Starting sequence index (from work distribution)
+ * @param i2_end Ending sequence index (from work distribution)
+ * @param i1_start Starting head index
+ * @param i1_end Ending head index
+ * @param loop_body Code block to execute for each iteration
+ */
+#define NUMA_TENSOR_4D_LOOP(i3_start, i3_end, i2_start, i2_end, i1_start, i1_end, loop_body) \
+    for (int64_t i3 = (i3_start); i3 < (i3_end); i3++) { \
+        for (int64_t i2 = (i2_start); i2 < (i2_end); i2++) { \
+            for (int64_t i1 = (i1_start); i1 < (i1_end); i1++) { \
+                loop_body \
+            } \
+        } \
+    }
+
+/**
+ * ROPE dimension iteration (processes pairs)
+ * @param n_dims Number of rotated dimensions
+ * @param step Step size (usually 2 for pairs)
+ * @param loop_body Code block to execute for each dimension pair
+ */
+#define ROPE_DIMENSION_LOOP(n_dims, step, loop_body) \
+    for (int64_t i0 = 0; i0 < (n_dims); i0 += (step)) { \
+        loop_body \
+    }
+
+// ============================================================================
+// Debug and Trace Macros
+// ============================================================================
+
+/**
+ * Log ROPE computation details with context
+ */
+#define ROPE_LOG_COMPUTATION(variant, thread_id, numa_node, seq, head, elem, x0, x1, cos_val, sin_val, result0, result1) \
+    NUMA_LOG_TRACE("ROPE TRACE: Thread %d (NUMA %d) %s computation: seq=%d head=%d elem=%d inputs(x0=%f,x1=%f) cache(cos=%f,sin=%f) outputs(result0=%f,result1=%f)", \
+                   (thread_id), (numa_node), (variant), (int)(seq), (int)(head), (int)(elem), (float)(x0), (float)(x1), (float)(cos_val), (float)(sin_val), (float)(result0), (float)(result1))
+
+/**
+ * Log memory writes with addresses
+ */
+#define ROPE_LOG_WRITES(variant, thread_id, numa_node, result0, dst_addr0, result1, dst_addr1) \
+    NUMA_LOG_TRACE("ROPE TRACE: Thread %d (NUMA %d) %s writes: dst[0]=%f written to %p, dst[1]=%f written to %p", \
+                   (thread_id), (numa_node), (variant), (float)(result0), (void*)(dst_addr0), (float)(result1), (void*)(dst_addr1))
+
+/**
+ * Log processing start for variant
+ */
+#define ROPE_LOG_VARIANT_START(variant, numa_node, thread_id, i2_start, i2_end) \
+    if (i2 == (i2_start)) { \
+        NUMA_LOG_DEBUG("%s ROPE: Starting processing on NUMA node %d, thread %d, sequence range [%d,%d)", \
+                      (variant), (numa_node), (thread_id), (i2_start), (i2_end)); \
+    }
+
+/**
+ * Main ROPE kernel execution function (supports F32 and F16)
+ */
+enum ggml_status ggml_numa_kernel_rope_execute(void * work_context, struct ggml_compute_params * params);
+
+/**
+ * ROPE F32 kernel execution function
+ */
+enum ggml_status ggml_numa_kernel_rope_f32_execute(void * work_context, struct ggml_compute_params * params);
+
+/**
+ * ROPE F16 kernel execution function
+ */
+enum ggml_status ggml_numa_kernel_rope_f16_execute(void * work_context, struct ggml_compute_params * params);
+
+/**
+ * Query function for ROPE kernel strategy selection
+ */
+ggml_numa_kernel_query_result_t ggml_numa_kernel_rope_query(const struct ggml_tensor * tensor);
+
+/**
+ * Work buffer calculation function for ROPE kernels
+ */
+size_t ggml_numa_kernel_rope_work_buffer_calc(const struct ggml_tensor * tensor, int total_numa_nodes, int total_threads);
+
+/**
+ * Registration function for ROPE kernel
+ */
+ggml_numa_kernel_registration_info_t ggml_numa_kernel_rope_register(void);
 
 #pragma once
 

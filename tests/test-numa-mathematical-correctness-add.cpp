@@ -48,6 +48,7 @@
 #include <algorithm>
 #include <stdexcept>
 #include <regex>
+#include <thread>
 
 // GGML includes
 #include "ggml.h"
@@ -244,7 +245,7 @@ public:
         ggml_numa_set_fallback_flag(false);  // Ensure NUMA dispatch is enabled
         
         // Setup compute plan for NUMA execution (let coordinator choose thread count)
-        int default_threads = 16;  // Use reasonable default thread count
+        int default_threads = std::max(1u, std::thread::hardware_concurrency());  // Use hardware-appropriate thread count
         struct ggml_cplan cplan = ggml_graph_plan(ggml_new_graph(test_ctx), default_threads, nullptr);
         cplan.work_size = 0;
         cplan.work_data = nullptr;

@@ -270,7 +270,7 @@ enum ggml_status ggml_numa_kernels_init(void) {
     // This allows kernels to define their own strategies and function pointers
     
     // Register ROPE kernel 
-    // NUMA_REGISTER_KERNEL(rope);
+    NUMA_REGISTER_KERNEL(rope);
 
     // Register MUL_MAT kernel
     // NUMA_REGISTER_KERNEL(mul_mat);  // Temporarily disabled - debugging cross-NUMA race conditions

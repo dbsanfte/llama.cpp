@@ -46,6 +46,22 @@ typedef ggml_numa_kernel_query_result_t (*ggml_numa_kernel_query_fn_t)(const str
 typedef size_t (*ggml_numa_kernel_work_buffer_calc_fn_t)(const struct ggml_tensor * tensor, int total_numa_nodes, int total_threads);
 
 /**
+ * @brief Execution context for NUMA work distribution
+ * Contains all necessary information for kernels to distribute work across NUMA nodes and threads
+ */
+typedef struct {
+    int numa_node;                    ///< Current NUMA node identifier
+    bool is_data_parallel;            ///< True if executing across multiple NUMA nodes
+    int total_threads;                ///< Total threads on this NUMA node
+    int thread_id;                    ///< Thread identifier within this NUMA node (0-based)
+    size_t numa_start;                ///< Start index for this NUMA node's work
+    size_t numa_end;                  ///< End index for this NUMA node's work
+    size_t thread_start;              ///< Start index for this thread's work (set by macros)
+    size_t thread_end;                ///< End index for this thread's work (set by macros)
+    size_t thread_elements;           ///< Number of elements for this thread (set by macros)
+} ggml_numa_execution_context_t;
+
+/**
  * Kernel array entry for O(1) kernel lookup and dispatch
  * Contains direct function pointers for maximum performance
  */
@@ -507,10 +523,11 @@ typedef struct {
  */
 #define NUMA_GET_SHARED_DATA(tensor, dst_ptr, data_type) do { \
     extern __thread void * ggml_numa_shared_result_tensor_data; \
-    if (ggml_numa_shared_result_tensor_data != NULL) { \
+    extern __thread bool ggml_numa_is_data_parallel_execution; \
+    if (ggml_numa_shared_result_tensor_data != NULL && !ggml_numa_is_data_parallel_execution) { \
         (dst_ptr) = (data_type *)ggml_numa_shared_result_tensor_data; \
     } else { \
-        (dst_ptr) = (data_type *)ggml_get_data(tensor); \
+        (dst_ptr) = (data_type *)tensor_data(tensor); \
     } \
 } while(0)
 
@@ -556,7 +573,7 @@ typedef struct {
  * proper OpenMP barrier synchronization for edge cases
  */
 #define NUMA_KERNEL_ROW_WISE_SETUP(ctx, tensor, params, dst_ptr, data_type) do { \
-    NUMA_SLICE_ROWS(ctx, tensor, params); \
+    NUMA_SLICE_ROWS_1D(ctx, tensor, params); \
     NUMA_GET_SHARED_DATA(tensor, dst_ptr, data_type); \
     \
     /* Handle threads with no work - must participate in barrier */ \
@@ -587,6 +604,24 @@ typedef struct {
 } while(0)
 
 /**
+ * Row-based kernel template with barrier handling for total rows (ggml_nrows)
+ * This macro provides the complete setup for operations that use row-based threading
+ * like ROPE, matching the reference implementation pattern
+ */
+#define NUMA_KERNEL_ROW_BASED_SETUP(ctx, tensor, params, dst_ptr, data_type) do { \
+    NUMA_SLICE_ROWS(ctx, tensor, params); \
+    NUMA_GET_SHARED_DATA(tensor, dst_ptr, data_type); \
+    \
+    /* Handle threads with no work - must participate in barrier */ \
+    if (!(ctx).has_work) { \
+        if ((ctx).is_data_parallel || (ctx).total_threads > 1) { \
+            NUMA_OPENMP_BARRIER(); \
+        } \
+        return GGML_STATUS_SUCCESS; \
+    } \
+} while(0)
+
+/**
  * End-of-kernel barrier for kernels that completed work
  * All kernels should call this at the end to ensure synchronization
  */
@@ -605,10 +640,10 @@ typedef struct {
 } while(0)
 
 /**
- * Calculate NUMA slice context for row-wise operations
+ * Calculate NUMA slice context for row-wise operations (1D - ne1 dimension only)
  * This handles operations that work on rows (dimension ne1)
  */
-#define NUMA_SLICE_ROWS(ctx, tensor, params) do { \
+#define NUMA_SLICE_ROWS_1D(ctx, tensor, params) do { \
     /* Get thread parameters */ \
     (ctx).thread_id = (params)->ith; \
     (ctx).total_threads = (params)->nth; \
@@ -699,23 +734,51 @@ typedef struct {
 } while(0)
 
 /**
- * Simplified row-wise kernel template
- * This macro provides the complete setup for row-wise operations
- * NOTE: Does NOT include early return - caller must handle has_work check
+ * Calculate NUMA slice context for total row operations
+ * This handles operations that work on all rows (ggml_nrows = ne1 * ne2 * ne3)
+ * Used by operations like ROPE that use row-based threading like the reference implementation
  */
-#define NUMA_KERNEL_ROW_WISE_SETUP(ctx, tensor, params, dst_ptr, data_type) do { \
-    NUMA_SLICE_ROWS(ctx, tensor, params); \
-    NUMA_GET_SHARED_DATA(tensor, dst_ptr, data_type); \
-} while(0)
-
-/**
- * Simplified column-wise kernel template
- * This macro provides the complete setup for column-wise operations
- * NOTE: Does NOT include early return - caller must handle has_work check
- */
-#define NUMA_KERNEL_COLUMN_WISE_SETUP(ctx, tensor, params, dst_ptr, data_type) do { \
-    NUMA_SLICE_COLUMNS(ctx, tensor, params); \
-    NUMA_GET_SHARED_DATA(tensor, dst_ptr, data_type); \
+#define NUMA_SLICE_ROWS(ctx, tensor, params) do { \
+    /* Get thread parameters */ \
+    (ctx).thread_id = (params)->ith; \
+    (ctx).total_threads = (params)->nth; \
+    \
+    /* Get NUMA execution context from thread-local variables */ \
+    extern __thread int ggml_current_numa_node; \
+    extern __thread bool ggml_numa_is_data_parallel_execution; \
+    extern __thread int ggml_numa_total_nodes_for_data_parallel; \
+    \
+    (ctx).numa_node = ggml_current_numa_node; \
+    (ctx).is_data_parallel = ggml_numa_is_data_parallel_execution; \
+    \
+    /* Calculate total rows to process (ggml_nrows = ne1 * ne2 * ne3) */ \
+    size_t total_rows = ggml_nrows(tensor); \
+    \
+    /* Step 1: NUMA-level slicing (across nodes) */ \
+    if ((ctx).is_data_parallel) { \
+        size_t rows_per_node = total_rows / ggml_numa_total_nodes_for_data_parallel; \
+        (ctx).numa_start = (ctx).numa_node * rows_per_node; \
+        (ctx).numa_end = ((ctx).numa_node == ggml_numa_total_nodes_for_data_parallel - 1) ? \
+                         total_rows : (ctx).numa_start + rows_per_node; \
+    } else { \
+        (ctx).numa_start = 0; \
+        (ctx).numa_end = total_rows; \
+    } \
+    (ctx).numa_elements = (ctx).numa_end - (ctx).numa_start; \
+    \
+    /* Step 2: Thread-level slicing (within NUMA node) */ \
+    size_t rows_per_thread = ((ctx).numa_elements + (ctx).total_threads - 1) / (ctx).total_threads; \
+    size_t thread_start_local = (ctx).thread_id * rows_per_thread; \
+    size_t thread_end_local = (thread_start_local + rows_per_thread > (ctx).numa_elements) ? \
+                              (ctx).numa_elements : thread_start_local + rows_per_thread; \
+    \
+    /* Convert to global row indices */ \
+    (ctx).thread_start = (ctx).numa_start + thread_start_local; \
+    (ctx).thread_end = (ctx).numa_start + thread_end_local; \
+    (ctx).thread_elements = (ctx).thread_end - (ctx).thread_start; \
+    \
+    /* Check if thread has work */ \
+    (ctx).has_work = ((ctx).thread_elements > 0); \
 } while(0)
 
 /**
@@ -728,6 +791,153 @@ typedef struct {
                        (ctx).thread_id, (ctx).total_threads, (ctx).thread_start, (ctx).thread_end, (ctx).thread_elements, \
                        (ctx).is_data_parallel ? "YES" : "NO"); \
     } \
+} while(0)
+
+// ========================================================================
+// GENERIC TENSOR MANIPULATION MACROS
+// ========================================================================
+
+/**
+ * @brief Generic 4D tensor element pointer calculation with stride support
+ * @param tensor_data Base tensor data pointer
+ * @param tensor Tensor structure for stride information
+ * @param i0,i1,i2,i3 4D indices
+ * @param element_type Type to cast the result to (float, ggml_fp16_t, etc.)
+ */
+#define NUMA_TENSOR_4D_PTR(tensor_data, tensor, i0, i1, i2, i3, element_type) \
+    ((element_type*)((char*)(tensor_data) + \
+     (i3)*(tensor)->nb[3] + (i2)*(tensor)->nb[2] + (i1)*(tensor)->nb[1] + (i0)*(tensor)->nb[0]))
+
+/**
+ * @brief Generic 3D tensor element pointer calculation with stride support  
+ * @param tensor_data Base tensor data pointer
+ * @param tensor Tensor structure for stride information
+ * @param i0,i1,i2 3D indices
+ * @param element_type Type to cast the result to
+ */
+#define NUMA_TENSOR_3D_PTR(tensor_data, tensor, i0, i1, i2, element_type) \
+    ((element_type*)((char*)(tensor_data) + \
+     (i2)*(tensor)->nb[2] + (i1)*(tensor)->nb[1] + (i0)*(tensor)->nb[0]))
+
+/**
+ * @brief Generic 2D tensor element pointer calculation with stride support
+ * @param tensor_data Base tensor data pointer  
+ * @param tensor Tensor structure for stride information
+ * @param i0,i1 2D indices
+ * @param element_type Type to cast the result to
+ */
+#define NUMA_TENSOR_2D_PTR(tensor_data, tensor, i0, i1, element_type) \
+    ((element_type*)((char*)(tensor_data) + \
+     (i1)*(tensor)->nb[1] + (i0)*(tensor)->nb[0]))
+
+/**
+ * @brief Generic nested loop for 4D tensor iteration with customizable body
+ * @param tensor Tensor to iterate over
+ * @param i0_var,i1_var,i2_var,i3_var Variable names for loop indices
+ * @param loop_body Code block to execute for each iteration
+ */
+#define NUMA_TENSOR_4D_LOOP(tensor, i0_var, i1_var, i2_var, i3_var, loop_body) do { \
+    const int64_t ne0 = (tensor)->ne[0]; \
+    const int64_t ne1 = (tensor)->ne[1]; \
+    const int64_t ne2 = (tensor)->ne[2]; \
+    const int64_t ne3 = (tensor)->ne[3]; \
+    for (int64_t i3_var = 0; i3_var < ne3; i3_var++) { \
+        for (int64_t i2_var = 0; i2_var < ne2; i2_var++) { \
+            for (int64_t i1_var = 0; i1_var < ne1; i1_var++) { \
+                for (int64_t i0_var = 0; i0_var < ne0; i0_var++) { \
+                    loop_body \
+                } \
+            } \
+        } \
+    } \
+} while(0)
+
+/**
+ * @brief Generic nested loop for 3D tensor iteration with customizable body
+ * @param tensor Tensor to iterate over
+ * @param i0_var,i1_var,i2_var Variable names for loop indices
+ * @param loop_body Code block to execute for each iteration
+ */
+#define NUMA_TENSOR_3D_LOOP(tensor, i0_var, i1_var, i2_var, loop_body) do { \
+    const int64_t ne0 = (tensor)->ne[0]; \
+    const int64_t ne1 = (tensor)->ne[1]; \
+    const int64_t ne2 = (tensor)->ne[2]; \
+    for (int64_t i2_var = 0; i2_var < ne2; i2_var++) { \
+        for (int64_t i1_var = 0; i1_var < ne1; i1_var++) { \
+            for (int64_t i0_var = 0; i0_var < ne0; i0_var++) { \
+                loop_body \
+            } \
+        } \
+    } \
+} while(0)
+
+// ========================================================================
+// NUMA WORK DISTRIBUTION MACROS
+// ========================================================================
+
+/**
+ * @brief Generic work distribution calculation for any dimension/unit
+ * @param ctx NUMA execution context (must have numa_start, numa_end set)
+ * @param total_units Total number of work units to distribute
+ * @param thread_start_var Variable to store thread's start unit
+ * @param thread_end_var Variable to store thread's end unit
+ */
+#define NUMA_CALCULATE_WORK_DISTRIBUTION(ctx, total_units, thread_start_var, thread_end_var) do { \
+    const size_t numa_units = (ctx).numa_end - (ctx).numa_start; \
+    const size_t units_per_thread = numa_units / (ctx).total_threads; \
+    const size_t remainder = numa_units % (ctx).total_threads; \
+    thread_start_var = (ctx).numa_start + (ctx).thread_id * units_per_thread + ((ctx).thread_id < remainder ? (ctx).thread_id : remainder); \
+    thread_end_var = thread_start_var + units_per_thread + ((ctx).thread_id < remainder ? 1 : 0); \
+} while(0)
+
+/**
+ * @brief Calculate thread-specific range for any work units with bounds checking
+ * @param ctx NUMA execution context  
+ * @param total_units Total number of work units
+ * @param start_var Variable to store start index
+ * @param end_var Variable to store end index
+ * @param count_var Variable to store count of units
+ */
+#define NUMA_THREAD_WORK_RANGE(ctx, total_units, start_var, end_var, count_var) do { \
+    if ((ctx).is_data_parallel) { \
+        NUMA_CALCULATE_WORK_DISTRIBUTION(ctx, total_units, start_var, end_var); \
+    } else { \
+        const size_t units_per_thread = (total_units) / (ctx).total_threads; \
+        const size_t remainder = (total_units) % (ctx).total_threads; \
+        start_var = (ctx).thread_id * units_per_thread + ((ctx).thread_id < remainder ? (ctx).thread_id : remainder); \
+        end_var = start_var + units_per_thread + ((ctx).thread_id < remainder ? 1 : 0); \
+    } \
+    if (end_var > (total_units)) end_var = (total_units); \
+    count_var = (end_var > start_var) ? (end_var - start_var) : 0; \
+} while(0)
+
+// ========================================================================
+// DEBUGGING AND LOGGING MACROS  
+// ========================================================================
+
+/**
+ * @brief Log work distribution details for debugging
+ * @param ctx NUMA execution context
+ * @param operation_name Name of the operation for logging
+ * @param start_unit Thread's start work unit
+ * @param end_unit Thread's end work unit
+ * @param unit_name Name of the work unit type (e.g., "sequences", "elements", "rows")
+ */
+#define NUMA_LOG_WORK_DISTRIBUTION(ctx, operation_name, start_unit, end_unit, unit_name) do { \
+    NUMA_LOG_TRACE("%s: Thread %d/%d on NUMA %d processing %s [%zu,%zu) (%zu %s)", \
+                   operation_name, (ctx).thread_id, (ctx).total_threads, (ctx).numa_node, \
+                   unit_name, (size_t)(start_unit), (size_t)(end_unit), \
+                   (size_t)((end_unit) - (start_unit)), unit_name); \
+} while(0)
+
+/**
+ * @brief Log mathematical operation context for debugging
+ * @param operation_name Name of the operation
+ * @param tensor_info Brief description of tensor being processed
+ * @param params_info Brief description of operation parameters
+ */
+#define NUMA_LOG_OPERATION_CONTEXT(operation_name, tensor_info, params_info) do { \
+    NUMA_LOG_DEBUG("%s: Processing %s with %s", operation_name, tensor_info, params_info); \
 } while(0)
 
 #ifdef __cplusplus

@@ -988,6 +988,10 @@ enum ggml_status ggml_numa_openmp_execute_data_parallel(
         int numa_node = omp_thread_id / threads_per_node;
         int local_task_id = omp_thread_id % threads_per_node;
 
+        // TRACE: Log every thread entry into parallel region
+        NUMA_LOG_TRACE("PARALLEL_REGION_ENTRY: omp_thread=%d numa_node=%d local_task=%d total_threads=%d",
+                       omp_thread_id, numa_node, local_task_id, total_threads);
+
         // CRITICAL BOUNDS CHECK: Ensure numa_node doesn't exceed available nodes
         if (numa_node < total_nodes) {
             // DEBUG: Log logical vs physical thread assignment
@@ -1031,6 +1035,10 @@ enum ggml_status ggml_numa_openmp_execute_data_parallel(
                 .wsize = thread_work_size       // Full work buffer size
             };
 
+            // TRACE: Log before calling work function
+            NUMA_LOG_TRACE("CALLING_WORK_FUNCTION: omp_thread=%d numa_node=%d local_task=%d about_to_call_work_fn",
+                           omp_thread_id, numa_node, local_task_id);
+
             // Each thread calls work function
             enum ggml_status thread_result = work_fn(tensor, &params);
             
@@ -1050,8 +1058,19 @@ enum ggml_status ggml_numa_openmp_execute_data_parallel(
                     result = thread_result;
                 }
             }
+        } else {
+            // TRACE: Log threads that are excluded by bounds check
+            NUMA_LOG_TRACE("THREAD_EXCLUDED: omp_thread=%d numa_node=%d >= total_nodes=%d (excluded from work)",
+                           omp_thread_id, numa_node, total_nodes);
         }
+        
+        // TRACE: Log every thread reaching barrier
+        NUMA_LOG_TRACE("PARALLEL_REGION_BARRIER: omp_thread=%d numa_node=%d reaching_implicit_barrier",
+                       omp_thread_id, numa_node);
     }
+    
+    // TRACE: Log completion of parallel region
+    NUMA_LOG_TRACE("PARALLEL_REGION_COMPLETE: all_threads_synchronized");
 #else
     // Fallback without OpenMP - single thread execution
     // Set thread-local context for fallback execution
