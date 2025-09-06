@@ -65,6 +65,7 @@
 #include "ggml-cpu/numa-kernels/numa-kernels.h"
 #include "ggml-cpu/ops.h"
 #include "ggml-cpu/ggml-numa-openmp-coordinator.h"
+#include "ggml-cpu/ggml-numa-shared.h"  // For ggml_numa_execution_strategy_t
 
 // Global test filter
 std::string g_test_filter = "";
@@ -103,7 +104,8 @@ struct TestResult {
 struct TestConfig {
     int ne0, ne1, ne2, ne3;       // Tensor dimensions: [head_dim, num_heads, seq_len, batch]
     int n_dims;                   // Dimensions to apply ROPE (usually ne0 or ne0/2)
-    int num_threads;
+    ggml_numa_execution_strategy_t strategy; // NUMA execution strategy
+    const char* strategy_name;    // Strategy name for reporting
     const char* test_name;
     enum ggml_type tensor_type;   // F32 or F16
     int rope_mode;                // ROPE variant (standard, NEOX, etc.)
@@ -117,10 +119,11 @@ enum TestSizeClass {
     LARGE      // Very large tensors for stress testing
 };
 
-// Get tensor dimensions based on size class
-TestConfig get_test_config(TestSizeClass size_class, int num_threads, enum ggml_type type = GGML_TYPE_F32, int rope_mode = 0) {
+// Get tensor dimensions based on size class and strategy
+TestConfig get_test_config(TestSizeClass size_class, ggml_numa_execution_strategy_t strategy, const char* strategy_name, enum ggml_type type = GGML_TYPE_F32, int rope_mode = 0) {
     TestConfig config;
-    config.num_threads = num_threads;
+    config.strategy = strategy;
+    config.strategy_name = strategy_name;
     config.tensor_type = type;
     config.rope_mode = rope_mode;
     
@@ -266,9 +269,10 @@ struct ggml_tensor* create_rope_operation(struct ggml_context* ctx, const TestCo
 /**
  * Test ROPE operation with both NUMA and reference implementations
  */
-TestResult test_rope_operation(const TestConfig& config, bool enable_numa, const char* test_description, const std::string& stage_name = "") {
+TestResult test_rope_operation(const TestConfig& config, bool enable_numa, const char* test_description, 
+                               ggml_numa_execution_strategy_t strategy, const char* strategy_name) {
     TestResult result;
-    result.test_name = std::string(test_description) + " (" + config.test_name + ", " + std::to_string(config.num_threads) + " threads)";
+    result.test_name = std::string(test_description) + " (" + config.test_name + ", " + strategy_name + ")";
     result.passed = false;
     
     try {
@@ -316,54 +320,44 @@ TestResult test_rope_operation(const TestConfig& config, bool enable_numa, const
         
         printf("📊 NUMA Strategy: %s\n", query_result.kernel_name);
         
-        // Initialize NUMA system with strategy based on execution stage
-        if (config.num_threads == 1) {
-            // Stage 1: Single-thread Single-node
-            ggml_numa_init(GGML_NUMA_STRATEGY_MIRROR);
-            // Note: Thread constraints removed - using forced strategy executor instead
-        } else if (stage_name.find("Single-node") != std::string::npos) {
-            // Stage 2: Multi-thread Single-node - use ISOLATE mode to force single-node execution
-            ggml_numa_init(GGML_NUMA_STRATEGY_ISOLATE);
-            // Note: Thread constraints removed - using forced strategy executor instead
-        } else {
-            // Stage 3: Multi-thread Multi-node - use MIRROR mode for full multi-node execution  
-            ggml_numa_init(GGML_NUMA_STRATEGY_MIRROR);
-            // Note: Thread constraints removed - using forced strategy executor instead
-        }
+        // Initialize NUMA system - always use MIRROR for strategy testing
+        ggml_numa_init(GGML_NUMA_STRATEGY_MIRROR);
         
         // Explain execution mode for clarity
-        if (config.num_threads == 1) {
-            printf("🔧 Thread Constraint Test: Executor strategy may show 'data-parallel' but coordinator will enforce single-node execution\n");
-        } else {
-            printf("🌐 Multi-thread Test: Full NUMA capabilities enabled for %d threads\n", config.num_threads);
-        }
+        printf("🔧 Strategy Test: Forcing execution strategy to %s\n", strategy_name);
+        
+        // Ensure NUMA dispatch is enabled for our test
+        ggml_numa_set_fallback_flag(false);  // Ensure NUMA dispatch is enabled
         
         // Setup threading for reference computation
         (void)enable_numa;  // Suppress unused variable warning
         
+        // Use reasonable default thread count for operations
+        int default_threads = 16;
+        
         // Execute NUMA computation using NUMA executor
         if (enable_numa) {
-            // Setup compute plan for NUMA execution
-            struct ggml_cplan cplan = ggml_graph_plan(ggml_new_graph(ctx_numa), config.num_threads, nullptr);
+            // Setup compute plan for NUMA execution (let coordinator choose thread count)
+            struct ggml_cplan cplan = ggml_graph_plan(ggml_new_graph(ctx_numa), default_threads, nullptr);
             cplan.work_size = 0;
             cplan.work_data = nullptr;
-            cplan.n_threads = config.num_threads;
+            cplan.n_threads = default_threads;
             cplan.threadpool = nullptr;
             cplan.abort_callback = nullptr;
             cplan.abort_callback_data = nullptr;
             
-            // Execute using NUMA executor
-            enum ggml_status dispatch_result = ggml_numa_executor_execute_tensor(result_numa, &cplan);
+            // Execute using NUMA executor with forced strategy
+            enum ggml_status dispatch_result = ggml_numa_executor_execute_tensor_forced_strategy(result_numa, &cplan, strategy);
             
             if (dispatch_result != GGML_STATUS_SUCCESS) {
                 throw std::runtime_error("NUMA execution failed");
             }
         } else {
             // Execute with standard backend
-            struct ggml_cplan cplan = ggml_graph_plan(ggml_new_graph(ctx_numa), config.num_threads, nullptr);
+            struct ggml_cplan cplan = ggml_graph_plan(ggml_new_graph(ctx_numa), default_threads, nullptr);
             cplan.work_size = 0;
             cplan.work_data = nullptr;
-            cplan.n_threads = config.num_threads;
+            cplan.n_threads = default_threads;
             cplan.threadpool = nullptr;
             cplan.abort_callback = nullptr;
             cplan.abort_callback_data = nullptr;
@@ -510,80 +504,78 @@ int main(int argc, char** argv) {
     int passed_tests = 0;
     
     // ========================================================================
-    // PART 1: Mathematical Equivalence Testing (3-Stage Approach)
+    // PART 1: Mathematical Equivalence Testing (Strategy-Based Approach)
     // ========================================================================
     printf("📊 PART 1: Mathematical Equivalence Testing\n");
     printf("─────────────────────────────────────────────\n");
     
-    // 3-Stage execution testing approach (matches coordinator strategies)
+    // Strategy-based execution testing approach (matches coordinator strategies)
     TestSizeClass size_classes[] = {TINY, SMALL, MEDIUM, LARGE};
     
-    struct ExecutionStage {
-        std::vector<int> thread_counts;
-        std::string description;
-        std::string explanation;
-    } stages[] = {
-        // Stage 1: Single-thread single-node - tests basic functionality
-        {{1}, "Single-thread Single-node", 
-         "Tests basic kernel functionality and fallback mechanisms"},
+    // Test Configuration: Strategy-based testing (eliminates thread count constraints)
+    struct ExecutionStrategy {
+        ggml_numa_execution_strategy_t strategy;
+        const char* name;
+        const char* description;
+    };
+    
+    std::vector<ExecutionStrategy> strategies = {
+        // Strategy 1: Single-thread, single-node
+        {{NUMA_NODE_STRATEGY_SINGLE, NUMA_ON_NODE_STRATEGY_SINGLE_THREAD}, 
+         "Single-Single", "Single-thread execution on single NUMA node"},
         
-        // Stage 2: Multi-thread single-node - tests threading without NUMA complexity
-        {{4, 8}, "Multi-thread Single-node", 
-         "Tests multi-threading coordination within single NUMA node"},
+        // Strategy 2: Multi-thread, single-node
+        {{NUMA_NODE_STRATEGY_SINGLE, NUMA_ON_NODE_STRATEGY_MULTI_THREAD}, 
+         "Single-Multi", "Multi-thread execution within single NUMA node"},
         
-        // Stage 3: Multi-thread multi-node - tests full NUMA capabilities  
-        {{8, 16}, "Multi-thread Multi-node", 
-         "Tests full NUMA data-parallel execution across multiple nodes"}
+        // Strategy 3: Multi-thread, multi-node (data-parallel)
+        {{NUMA_NODE_STRATEGY_DATA_PARALLEL, NUMA_ON_NODE_STRATEGY_MULTI_THREAD}, 
+         "Data-Parallel", "Data-parallel execution across multiple NUMA nodes"}
     };
     
     for (TestSizeClass size_class : size_classes) {
-        for (const auto& stage : stages) {
-            printf("\n🎯 Testing %s tensors: %s\n", 
-                   get_test_config(size_class, 1, GGML_TYPE_F32, 0).test_name, stage.description);
-            printf("   %s\n", stage.explanation);
+        for (const auto& strategy : strategies) {
+            printf("\n🎯 Testing %s tensors: %s strategy\n", 
+                   get_test_config(size_class, strategy.strategy, strategy.name).test_name, strategy.name);
+            printf("   %s\n", strategy.description);
             
-            for (int num_threads : stage.thread_counts) {
-                // Standard ROPE F32 test
-                TestConfig config = get_test_config(size_class, num_threads, GGML_TYPE_F32, 0);
-                std::string test_name = "Standard ROPE F32";
-                std::string full_test_name = test_name + " (" + get_test_config(size_class, 1, GGML_TYPE_F32, 0).test_name + 
-                                           ", " + std::to_string(num_threads) + " threads)";
+            // Standard ROPE F32 test
+            TestConfig config = get_test_config(size_class, strategy.strategy, strategy.name, GGML_TYPE_F32, 0);
+            std::string test_name = "Standard ROPE F32";
+            std::string full_test_name = test_name + " (" + config.test_name + ", " + strategy.name + ")";
+            
+            if (matches_filter(full_test_name)) {
+                TestResult result = test_rope_operation(config, true, test_name.c_str(), strategy.strategy, strategy.name);
+                results.push_back(result);
+                total_tests++;
+                if (result.passed) passed_tests++;
+            }
+            
+            // NEOX ROPE F32 test
+            TestConfig config_neox = get_test_config(size_class, strategy.strategy, strategy.name, GGML_TYPE_F32, GGML_ROPE_TYPE_NEOX);
+            config_neox.n_dims = config_neox.ne0; // NEOX uses full dimensions
+            test_name = "NEOX ROPE F32";
+            full_test_name = test_name + " (" + config.test_name + ", " + strategy.name + ")";
+            
+            if (matches_filter(full_test_name)) {
+                TestResult result = test_rope_operation(config_neox, true, test_name.c_str(), strategy.strategy, strategy.name);
+                results.push_back(result);
+                total_tests++;
+                if (result.passed) passed_tests++;
+            }
+            
+            // Only test F16 for smaller sizes and single-node strategies to keep test time reasonable
+            if (size_class <= SMALL && std::string(strategy.name).find("Single") != std::string::npos) {
+                // Standard ROPE F16 test
+                TestConfig config_f16 = get_test_config(size_class, strategy.strategy, strategy.name, GGML_TYPE_F16, 0);
+                test_name = "Standard ROPE F16";
+                full_test_name = test_name + " (" + config.test_name + ", " + strategy.name + ")";
                 
                 if (matches_filter(full_test_name)) {
-                    TestResult result = test_rope_operation(config, true, test_name.c_str(), stage.description);
+                    TestResult result = test_rope_operation(config_f16, true, test_name.c_str(), strategy.strategy, strategy.name);
                     results.push_back(result);
                     total_tests++;
                     if (result.passed) passed_tests++;
-                }
-                
-                // NEOX ROPE F32 test
-                TestConfig config_neox = get_test_config(size_class, num_threads, GGML_TYPE_F32, GGML_ROPE_TYPE_NEOX);
-                config_neox.n_dims = config_neox.ne0; // NEOX uses full dimensions
-                test_name = "NEOX ROPE F32";
-                full_test_name = test_name + " (" + get_test_config(size_class, 1, GGML_TYPE_F32, 0).test_name + 
-                               ", " + std::to_string(num_threads) + " threads)";
-                
-                if (matches_filter(full_test_name)) {
-                    TestResult result = test_rope_operation(config_neox, true, test_name.c_str(), stage.description);
-                    results.push_back(result);
-                    total_tests++;
-                    if (result.passed) passed_tests++;
-                }
-                
-                // Only test F16 for smaller sizes and single-node stages to keep test time reasonable
-                if (size_class <= SMALL && stage.description.find("Single-node") != std::string::npos) {
-                    // Standard ROPE F16 test
-                    TestConfig config_f16 = get_test_config(size_class, num_threads, GGML_TYPE_F16, 0);
-                    test_name = "Standard ROPE F16";
-                    full_test_name = test_name + " (" + get_test_config(size_class, 1, GGML_TYPE_F32, 0).test_name + 
-                                   ", " + std::to_string(num_threads) + " threads)";
-                    
-                    if (matches_filter(full_test_name)) {
-                        TestResult result = test_rope_operation(config_f16, true, test_name.c_str(), stage.description);
-                        results.push_back(result);
-                        total_tests++;
-                        if (result.passed) passed_tests++;
-                    }
                 }
             }
         }
@@ -614,13 +606,14 @@ int main(int argc, char** argv) {
         config.ne2 = 32;
         config.ne3 = 1;
         config.n_dims = variant.n_dims;
-        config.num_threads = 4;  // Multi-thread single-node
+        config.strategy = {NUMA_NODE_STRATEGY_SINGLE, NUMA_ON_NODE_STRATEGY_MULTI_THREAD};  // Multi-thread single-node
+        config.strategy_name = "Single-Multi";
         config.tensor_type = GGML_TYPE_F32;
         config.rope_mode = 0;  // Standard ROPE
         config.test_name = "VARIANT";
         
         if (matches_filter(variant.name)) {
-            TestResult result = test_rope_operation(config, true, variant.name, "Multi-thread Single-node");
+            TestResult result = test_rope_operation(config, true, variant.name, config.strategy, config.strategy_name);
             results.push_back(result);
             total_tests++;
             if (result.passed) passed_tests++;

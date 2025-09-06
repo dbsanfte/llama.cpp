@@ -574,6 +574,14 @@ bool ggml_numa_openmp_coordinator_init(void) {
     // Set threads per node based on system topology and NUMA distribution
 #ifdef GGML_USE_OPENMP
     int total_cores = omp_get_max_threads();
+    
+    // CRITICAL: Cap total threads to avoid memory issues during testing
+    // Large servers can have many cores (112+) which causes memory allocation problems
+    const int MAX_REASONABLE_THREADS = 32;  // Reasonable upper limit for stability
+    if (total_cores > MAX_REASONABLE_THREADS) {
+        NUMA_LOG_DEBUG("Capping threads from %d to %d for system stability\n", total_cores, MAX_REASONABLE_THREADS);
+        total_cores = MAX_REASONABLE_THREADS;
+    }
 #else
     int total_cores = 1;  // Fallback to single thread
 #endif
@@ -948,6 +956,10 @@ enum ggml_status ggml_numa_openmp_execute_data_parallel(
     NUMA_LOG_DEBUG("Executing data-parallel strategy: %d nodes, %d threads per node (%d total, work_buffer_size=%zu)\n",
                    total_nodes, threads_per_node, total_threads, work_buffer_size);
     
+    // TRACE: Very explicit data-parallel coordinator entry tracking
+    NUMA_LOG_DEBUG("🎯 DATA_PARALLEL_COORDINATOR_ENTRY: op=%s nodes=%d threads_per_node=%d", 
+                   ggml_op_name(tensor->op), total_nodes, threads_per_node);
+    
     // TRACE: Log detailed data-parallel coordination setup for debugging
     NUMA_LOG_TRACE("COORDINATOR_DATA_PARALLEL_START: tensor=%p op=%s total_nodes=%d threads_per_node=%d total_threads=%d",
                    (void*)tensor, ggml_op_name(tensor->op), total_nodes, threads_per_node, total_threads);
@@ -976,60 +988,67 @@ enum ggml_status ggml_numa_openmp_execute_data_parallel(
         int numa_node = omp_thread_id / threads_per_node;
         int local_task_id = omp_thread_id % threads_per_node;
 
-        // DEBUG: Log logical vs physical thread assignment
-        NUMA_LOG_DEBUG("DATA_PARALLEL_TASK: OpenMP thread %d mapped to NUMA %d, local task %d/%d\n",
-                       omp_thread_id, numa_node, local_task_id, threads_per_node);
-        
-        // TRACE: Log detailed thread coordination for debugging data-parallel issues
-        NUMA_LOG_TRACE("COORDINATOR_THREAD_SETUP: omp_thread_id=%d numa_node=%d local_task_id=%d total_nodes=%d",
-                       omp_thread_id, numa_node, local_task_id, total_nodes);
-        NUMA_LOG_TRACE("COORDINATOR_THREAD_CONTEXT: tensor_data=%p elements=%ld data_parallel=true",
-                       ggml_get_data(tensor), ggml_nelements(tensor));
+        // CRITICAL BOUNDS CHECK: Ensure numa_node doesn't exceed available nodes
+        if (numa_node < total_nodes) {
+            // DEBUG: Log logical vs physical thread assignment
+            NUMA_LOG_DEBUG("DATA_PARALLEL_TASK: OpenMP thread %d mapped to NUMA %d, local task %d/%d\n",
+                           omp_thread_id, numa_node, local_task_id, threads_per_node);
+            
+            // TRACE: Log detailed thread coordination for debugging data-parallel issues
+            NUMA_LOG_TRACE("COORDINATOR_THREAD_SETUP: omp_thread_id=%d numa_node=%d local_task_id=%d total_nodes=%d",
+                           omp_thread_id, numa_node, local_task_id, total_nodes);
+            NUMA_LOG_TRACE("COORDINATOR_THREAD_CONTEXT: tensor_data=%p elements=%ld data_parallel=true",
+                           ggml_get_data(tensor), ggml_nelements(tensor));
 
-        // Set thread-local context for data-parallel execution (must be inside parallel region)
-        ggml_current_numa_node = numa_node;
-        ggml_numa_is_data_parallel_execution = true;
-        ggml_numa_total_nodes_for_data_parallel = total_nodes;
-        ggml_numa_shared_result_tensor_data = ggml_get_data(tensor);
+            // Set thread-local context for data-parallel execution (must be inside parallel region)
+            ggml_current_numa_node = numa_node;
+            ggml_numa_is_data_parallel_execution = true;
+            ggml_numa_total_nodes_for_data_parallel = total_nodes;
+            // OPTIMAL DATA-PARALLEL SETUP: Use shared destination memory for all NUMA nodes
+            // - Source reads: Each NUMA node reads from local tensor->__data[numa_node] (optimal bandwidth)
+            // - Destination writes: All NUMA nodes write to shared tensor->__data[0] at non-overlapping offsets
+            // - No race conditions: Kernels must ensure proper slice partitioning with no overlap
+            ggml_numa_shared_result_tensor_data = tensor->__data[0];  // Shared destination for all nodes
 
-        // Bind thread to its NUMA node
-        bind_thread_to_numa_node(numa_node);
+            // Bind thread to its NUMA node
+            bind_thread_to_numa_node(numa_node);
 
-        // Set up compute params with shared work buffer
-        char* thread_work_buffer = NULL;
-        size_t thread_work_size = 0;
-        if (work_buffer && work_buffer_size > 0) {
-            // For MUL_MAT and similar operations, all threads share the same work buffer
-            // For other operations, threads would get slices
-            // TODO: Make this configurable per operation type  
-            thread_work_buffer = (char*)work_buffer;  // Shared work buffer
-            thread_work_size = work_buffer_size;       // Full size for each thread
-        }
-        
-        struct ggml_compute_params params = {
-            .ith = local_task_id,           // Logical task index within NUMA node
-            .nth = threads_per_node,        // Threads per NUMA node
-            .wdata = thread_work_buffer,    // Shared work buffer (not sliced)
-            .wsize = thread_work_size       // Full work buffer size
-        };
+            // Set up compute params with shared work buffer
+            char* thread_work_buffer = NULL;
+            size_t thread_work_size = 0;
+            if (work_buffer && work_buffer_size > 0) {
+                // For MUL_MAT and similar operations, all threads share the same work buffer
+                // For other operations, threads would get slices
+                // TODO: Make this configurable per operation type  
+                thread_work_buffer = (char*)work_buffer;  // Shared work buffer
+                thread_work_size = work_buffer_size;       // Full size for each thread
+            }
+            
+            struct ggml_compute_params params = {
+                .ith = local_task_id,           // Logical task index within NUMA node
+                .nth = threads_per_node,        // Threads per NUMA node
+                .wdata = thread_work_buffer,    // Shared work buffer (not sliced)
+                .wsize = thread_work_size       // Full work buffer size
+            };
 
-        // Each thread calls work function
-        enum ggml_status thread_result = work_fn(tensor, &params);
-        
-        // TRACE: Log work function completion for debugging
-        NUMA_LOG_TRACE("COORDINATOR_WORK_COMPLETE: omp_id=%d numa_node=%d local_id=%d result=%s",
-                       omp_thread_id, numa_node, local_task_id, 
-                       (thread_result == GGML_STATUS_SUCCESS) ? "SUCCESS" : "FAILED");
-        
-        // DEBUG: Log thread completion
-        NUMA_LOG_DEBUG("OPENMP_THREAD_END: OpenMP=%d, NUMA=%d, Result=%d\n", 
-                       omp_thread_id, numa_node, thread_result);
-        
-        // Collect results
-        #pragma omp critical
-        {
-            if (thread_result != GGML_STATUS_SUCCESS) {
-                result = thread_result;
+            // Each thread calls work function
+            enum ggml_status thread_result = work_fn(tensor, &params);
+            
+            // TRACE: Log work function completion for debugging
+            NUMA_LOG_TRACE("COORDINATOR_WORK_COMPLETE: omp_id=%d numa_node=%d local_id=%d result=%s",
+                           omp_thread_id, numa_node, local_task_id, 
+                           (thread_result == GGML_STATUS_SUCCESS) ? "SUCCESS" : "FAILED");
+            
+            // DEBUG: Log thread completion
+            NUMA_LOG_DEBUG("OPENMP_THREAD_END: OpenMP=%d, NUMA=%d, Result=%d\n", 
+                           omp_thread_id, numa_node, thread_result);
+            
+            // Collect results
+            #pragma omp critical
+            {
+                if (thread_result != GGML_STATUS_SUCCESS) {
+                    result = thread_result;
+                }
             }
         }
     }

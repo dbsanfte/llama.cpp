@@ -68,81 +68,6 @@ extern const struct ggml_type_traits * ggml_get_type_traits(enum ggml_type type)
 #endif
 
 // ============================================================================
-// NUMA Data Slicing Helper Functions
-// ============================================================================
-
-typedef struct {
-    int64_t start;
-    int64_t end;
-    bool has_work;
-} numa_slice_t;
-
-/**
- * Calculate NUMA-aware data slice for current thread
- * Handles both element-wise and row-based (broadcasting) slicing
- */
-static numa_slice_t calculate_numa_slice(const struct ggml_tensor * tensor, 
-                                         const struct ggml_tensor * src1,
-                                         struct ggml_compute_params * params,
-                                         bool use_row_based_slicing) {
-    numa_slice_t slice = {0};
-    
-    // Get NUMA execution context
-    extern __thread bool ggml_numa_is_data_parallel_execution;
-    extern __thread int ggml_numa_total_nodes_for_data_parallel;
-    extern __thread int ggml_current_numa_node;
-    
-    const int current_node = ggml_current_numa_node;
-    const int thread_id = params->ith;
-    const int num_threads = params->nth;
-    const bool is_data_parallel = ggml_numa_is_data_parallel_execution;
-    const int total_nodes = is_data_parallel ? ggml_numa_total_nodes_for_data_parallel : 1;
-    
-    int64_t total_work_units, work_unit_size;
-    if (use_row_based_slicing) {
-        total_work_units = ggml_nrows(tensor->src[0]);
-        work_unit_size = tensor->ne[0];  // elements per row
-    } else {
-        total_work_units = ggml_nelements(tensor);
-        work_unit_size = 1;  // each element is a work unit
-    }
-    
-    // Calculate work slice
-    if (is_data_parallel && total_nodes > 1) {
-        // Multi-node: distribute work units across NUMA nodes first
-        const int64_t units_per_node = total_work_units / total_nodes;
-        const int64_t node_start = current_node * units_per_node;
-        const int64_t node_end = (current_node == total_nodes - 1) ? 
-                                 total_work_units : node_start + units_per_node;
-        const int64_t node_units = node_end - node_start;
-        
-        // Then distribute among threads within this node
-        if (thread_id >= node_units) {
-            slice.has_work = false;
-            return slice;
-        }
-        
-        const int64_t units_per_thread = (node_units + num_threads - 1) / num_threads;
-        const int64_t thread_start_unit = node_start + thread_id * units_per_thread;
-        const int64_t thread_end_unit = MIN(thread_start_unit + units_per_thread, node_end);
-        
-        slice.start = thread_start_unit * work_unit_size;
-        slice.end = thread_end_unit * work_unit_size;
-    } else {
-        // Single node: distribute work units among threads
-        const int64_t units_per_thread = (total_work_units + num_threads - 1) / num_threads;
-        const int64_t thread_start_unit = thread_id * units_per_thread;
-        const int64_t thread_end_unit = MIN(thread_start_unit + units_per_thread, total_work_units);
-        
-        slice.start = thread_start_unit * work_unit_size;
-        slice.end = thread_end_unit * work_unit_size;
-    }
-    
-    slice.has_work = (slice.start < slice.end);
-    return slice;
-}
-
-// ============================================================================
 // Unified ADD Kernel Implementation
 // ============================================================================
 
@@ -161,78 +86,66 @@ enum ggml_status ggml_numa_kernel_add_unified_execute(void * work_context,
     const struct ggml_tensor * src0 = tensor->src[0];
     const struct ggml_tensor * src1 = tensor->src[1];
     
-    // Get NUMA execution context
-    extern __thread bool ggml_numa_is_data_parallel_execution;
-    extern __thread int ggml_current_numa_node;
-    extern __thread void * ggml_numa_shared_result_tensor_data;
-    
-    const int current_node = ggml_current_numa_node;
-    const int thread_id = params->ith;
-    const int num_threads = params->nth;
-    const int64_t total_elements = ggml_nelements(tensor);
-    const int64_t src1_elements = ggml_nelements(src1);
+    // Set up NUMA slice using enhanced utilities with built-in barrier handling
+    ggml_numa_slice_context_t slice_ctx;
+    float * dst_data;
+    NUMA_KERNEL_ELEMENT_WISE_SETUP(slice_ctx, tensor, params, dst_data, float);
     
     // Log execution strategy (once per operation)
-    if (thread_id == 0 && current_node == 0) {
-        if (ggml_numa_is_data_parallel_execution) {
+    if (slice_ctx.thread_id == 0 && slice_ctx.numa_node == 0) {
+        if (slice_ctx.is_data_parallel) {
             NUMA_LOG_STRATEGY_DATA_PARALLEL("ADD");
-        } else if (num_threads > 1) {
+        } else if (slice_ctx.total_threads > 1) {
             NUMA_LOG_STRATEGY_SINGLE_MULTI("ADD");
         } else {
             NUMA_LOG_STRATEGY_SINGLE_SINGLE("ADD");
         }
     }
     
-    // Determine operation type and slicing strategy
+    // Optional: Log slice details for debugging
+    NUMA_LOG_SLICE_DEBUG(slice_ctx, "ADD");
+    
+    const int64_t total_elements = ggml_nelements(tensor);
+    const int64_t src1_elements = ggml_nelements(src1);
+    
+    // Determine operation type
     bool is_scalar = (src1_elements == 1);
     bool is_elementwise = (src1_elements == total_elements);
     bool is_broadcasting = (!is_scalar && !is_elementwise);
-    bool use_row_slicing = is_broadcasting;
     
-    // Calculate data slice for this thread
-    numa_slice_t slice = calculate_numa_slice(tensor, src1, params, use_row_slicing);
+    // Convert slice context to work indices
+    const int64_t slice_start = slice_ctx.thread_start;
+    const int64_t slice_end = slice_ctx.thread_end;
     
-    // Handle threads with no work
-    if (!slice.has_work) {
-        if (ggml_numa_is_data_parallel_execution || num_threads > 1) {
-            #ifdef GGML_USE_OPENMP
-            #pragma omp barrier
-            #endif
-        }
-        return GGML_STATUS_SUCCESS;
-    }
+    // Only do work if this thread has elements to process
+    enum ggml_status status = GGML_STATUS_SUCCESS;
     
-    // Get destination pointer (shared memory optimization)
-    void * dst_data = ggml_numa_shared_result_tensor_data ? 
-                      ggml_numa_shared_result_tensor_data : 
-                      tensor_data(tensor);
+    if (slice_ctx.has_work) {
     
     // Execute ADD operation based on data types
-    enum ggml_status status = GGML_STATUS_SUCCESS;
     
     if (src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32 && tensor->type == GGML_TYPE_F32) {
         // F32 path - direct SIMD operations
         const float * src0_data = (const float *)tensor_data(src0);
         const float * src1_data = (const float *)tensor_data(src1);
-        float * dst_f32 = (float *)dst_data;
         
         if (is_scalar) {
             const float scalar = src1_data[0];
-            for (int64_t i = slice.start; i < slice.end; ++i) {
-                dst_f32[i] = src0_data[i] + scalar;
+            for (int64_t i = slice_start; i < slice_end; ++i) {
+                dst_data[i] = src0_data[i] + scalar;
             }
         } else if (is_elementwise) {
-            ggml_vec_add_f32(slice.end - slice.start, dst_f32 + slice.start, 
-                           src0_data + slice.start, src1_data + slice.start);
+            ggml_vec_add_f32(slice_end - slice_start, dst_data + slice_start, 
+                           src0_data + slice_start, src1_data + slice_start);
         } else {
             // Broadcasting - process rows
             const int64_t ne0 = tensor->ne[0];
-            const int64_t start_row = slice.start / ne0;
-            const int64_t end_row = slice.end / ne0;
+            const int64_t start_row = slice_start / ne0;
+            const int64_t end_row = slice_end / ne0;
             
             for (int64_t row = start_row; row < end_row; ++row) {
                 const float * src0_row = src0_data + row * ne0;
-                float * dst_row = dst_f32 + row * ne0;
+                float * dst_row = dst_data + row * ne0;
                 
                 // Simple broadcasting: assume src1 broadcasts across the row
                 if (src1_elements == ne0) {
@@ -252,7 +165,7 @@ enum ggml_status ggml_numa_kernel_add_unified_execute(void * work_context,
         const struct ggml_type_traits * src1_traits = ggml_get_type_traits(src1->type);
         const struct ggml_type_traits * dst_traits = ggml_get_type_traits(tensor->type);
         
-        const size_t slice_elements = slice.end - slice.start;
+        const size_t slice_elements = slice_end - slice_start;
         
         // Allocate temporary F32 buffers
         float * temp_src0 = malloc(slice_elements * sizeof(float));
@@ -266,17 +179,17 @@ enum ggml_status ggml_numa_kernel_add_unified_execute(void * work_context,
         
         // Convert src0 to F32
         if (src0->type == GGML_TYPE_F32) {
-            memcpy(temp_src0, (const float *)tensor_data(src0) + slice.start, slice_elements * sizeof(float));
+            memcpy(temp_src0, (const float *)tensor_data(src0) + slice_start, slice_elements * sizeof(float));
         } else if (ggml_is_quantized(src0->type)) {
             // Quantized dequantization
             const size_t block_size = src0_traits->blck_size;
             const size_t type_size = src0_traits->type_size;
             const char * src0_data = (const char *)tensor_data(src0);
-            src0_traits->to_float(src0_data + (slice.start * type_size / block_size), temp_src0, slice_elements);
+            src0_traits->to_float(src0_data + (slice_start * type_size / block_size), temp_src0, slice_elements);
         } else {
             // Non-quantized type conversion
             const char * src0_data = (const char *)tensor_data(src0);
-            src0_traits->to_float(src0_data + slice.start * src0_traits->type_size, temp_src0, slice_elements);
+            src0_traits->to_float(src0_data + slice_start * src0_traits->type_size, temp_src0, slice_elements);
         }
         
         // Convert src1 to F32 (handle broadcasting)
@@ -292,16 +205,16 @@ enum ggml_status ggml_numa_kernel_add_unified_execute(void * work_context,
             }
         } else if (is_elementwise) {
             if (src1->type == GGML_TYPE_F32) {
-                memcpy(temp_src1, (const float *)tensor_data(src1) + slice.start, slice_elements * sizeof(float));
+                memcpy(temp_src1, (const float *)tensor_data(src1) + slice_start, slice_elements * sizeof(float));
             } else {
                 const char * src1_data = (const char *)tensor_data(src1);
-                src1_traits->to_float(src1_data + slice.start * src1_traits->type_size, temp_src1, slice_elements);
+                src1_traits->to_float(src1_data + slice_start * src1_traits->type_size, temp_src1, slice_elements);
             }
         } else {
             // Broadcasting - simplified version
             const float * src1_f32 = (const float *)tensor_data(src1);
             for (size_t i = 0; i < slice_elements; ++i) {
-                size_t src1_idx = (slice.start + i) % src1_elements;
+                size_t src1_idx = (slice_start + i) % src1_elements;
                 temp_src1[i] = src1_f32[src1_idx];
             }
         }
@@ -311,17 +224,17 @@ enum ggml_status ggml_numa_kernel_add_unified_execute(void * work_context,
         
         // Convert result back to destination type
         if (tensor->type == GGML_TYPE_F32) {
-            memcpy((float *)dst_data + slice.start, temp_dst, slice_elements * sizeof(float));
+            memcpy((float *)dst_data + slice_start, temp_dst, slice_elements * sizeof(float));
         } else if (ggml_is_quantized(tensor->type)) {
             // Quantized requantization
             const size_t block_size = dst_traits->blck_size;
             const size_t type_size = dst_traits->type_size;
             char * dst_bytes = (char *)dst_data;
-            dst_traits->from_float_ref(temp_dst, dst_bytes + (slice.start * type_size / block_size), slice_elements);
+            dst_traits->from_float_ref(temp_dst, dst_bytes + (slice_start * type_size / block_size), slice_elements);
         } else {
             // Non-quantized type conversion
             char * dst_bytes = (char *)dst_data;
-            dst_traits->from_float_ref(temp_dst, dst_bytes + slice.start * dst_traits->type_size, slice_elements);
+            dst_traits->from_float_ref(temp_dst, dst_bytes + slice_start * dst_traits->type_size, slice_elements);
         }
         
         free(temp_src0);
@@ -329,14 +242,11 @@ enum ggml_status ggml_numa_kernel_add_unified_execute(void * work_context,
         free(temp_dst);
     }
     
-    // Synchronization barrier
-    if (ggml_numa_is_data_parallel_execution || num_threads > 1) {
-        #ifdef GGML_USE_OPENMP
-        #pragma omp barrier
-        #endif
-    }
+    } // End of if (slice_ctx.has_work) block
     
-    return status;
+    // End of kernel with proper barrier handling
+    NUMA_KERNEL_END_BARRIER(slice_ctx);
+    return GGML_STATUS_SUCCESS;
 }
 
 // ============================================================================

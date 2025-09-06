@@ -372,6 +372,364 @@ bool ggml_numa_apply_kernel_force_strategy(ggml_numa_kernel_query_result_t * res
     } \
 } while(0)
 
+// =============================================================================
+// NUMA SLICING UTILITIES - Reusable Data Partitioning Macros
+// =============================================================================
+
+/**
+ * NUMA slicing context structure
+ * Contains all calculated slice boundaries for element-wise and sequence-wise operations
+ */
+typedef struct {
+    // NUMA-level slicing (across nodes)
+    size_t numa_start;           // Start index for this NUMA node
+    size_t numa_end;             // End index for this NUMA node  
+    size_t numa_elements;        // Total elements for this NUMA node
+    
+    // Thread-level slicing (within NUMA node)
+    size_t thread_start;         // Start index for this thread
+    size_t thread_end;           // End index for this thread
+    size_t thread_elements;      // Total elements for this thread
+    
+    // Execution context
+    int numa_node;               // Current NUMA node ID
+    int thread_id;               // Thread ID within NUMA node
+    int total_threads;           // Total threads on this NUMA node
+    bool has_work;               // Whether this thread has work to do
+    bool is_data_parallel;       // Whether data-parallel execution is active
+} ggml_numa_slice_context_t;
+
+/**
+ * Calculate NUMA slice context for element-wise operations (like ADD, MUL)
+ * This handles the dual-level slicing pattern used in most kernels
+ */
+#define NUMA_SLICE_ELEMENTS(ctx, tensor, params) do { \
+    /* Get thread parameters */ \
+    (ctx).thread_id = (params)->ith; \
+    (ctx).total_threads = (params)->nth; \
+    \
+    /* Get NUMA execution context from thread-local variables */ \
+    extern __thread int ggml_current_numa_node; \
+    extern __thread bool ggml_numa_is_data_parallel_execution; \
+    extern __thread int ggml_numa_total_nodes_for_data_parallel; \
+    \
+    (ctx).numa_node = ggml_current_numa_node; \
+    (ctx).is_data_parallel = ggml_numa_is_data_parallel_execution; \
+    \
+    /* Calculate total elements to process */ \
+    size_t total_elements = ggml_nelements(tensor); \
+    \
+    /* Step 1: NUMA-level slicing (across nodes) */ \
+    if ((ctx).is_data_parallel) { \
+        size_t elements_per_node = total_elements / ggml_numa_total_nodes_for_data_parallel; \
+        (ctx).numa_start = (ctx).numa_node * elements_per_node; \
+        (ctx).numa_end = ((ctx).numa_node == ggml_numa_total_nodes_for_data_parallel - 1) ? \
+                         total_elements : (ctx).numa_start + elements_per_node; \
+    } else { \
+        (ctx).numa_start = 0; \
+        (ctx).numa_end = total_elements; \
+    } \
+    (ctx).numa_elements = (ctx).numa_end - (ctx).numa_start; \
+    \
+    /* Step 2: Thread-level slicing (within NUMA node) */ \
+    size_t elements_per_thread = ((ctx).numa_elements + (ctx).total_threads - 1) / (ctx).total_threads; \
+    size_t thread_start_local = (ctx).thread_id * elements_per_thread; \
+    size_t thread_end_local; \
+    \
+    /* Handle case where thread starts beyond available elements */ \
+    if (thread_start_local >= (ctx).numa_elements) { \
+        thread_start_local = (ctx).numa_elements; \
+        thread_end_local = (ctx).numa_elements; \
+    } else { \
+        thread_end_local = (thread_start_local + elements_per_thread > (ctx).numa_elements) ? \
+                           (ctx).numa_elements : thread_start_local + elements_per_thread; \
+    } \
+    \
+    /* Convert to global indices */ \
+    (ctx).thread_start = (ctx).numa_start + thread_start_local; \
+    (ctx).thread_end = (ctx).numa_start + thread_end_local; \
+    (ctx).thread_elements = (ctx).thread_end - (ctx).thread_start; \
+    \
+    /* Check if thread has work */ \
+    (ctx).has_work = ((ctx).thread_elements > 0); \
+} while(0)
+
+/**
+ * Calculate NUMA slice context for sequence-wise operations (like ROPE)
+ * This handles operations that work on sequences (dimension i2)
+ */
+#define NUMA_SLICE_SEQUENCES(ctx, tensor, params) do { \
+    /* Get thread parameters */ \
+    (ctx).thread_id = (params)->ith; \
+    (ctx).total_threads = (params)->nth; \
+    \
+    /* Get NUMA execution context from thread-local variables */ \
+    extern __thread int ggml_current_numa_node; \
+    extern __thread bool ggml_numa_is_data_parallel_execution; \
+    extern __thread int ggml_numa_total_nodes_for_data_parallel; \
+    \
+    (ctx).numa_node = ggml_current_numa_node; \
+    (ctx).is_data_parallel = ggml_numa_is_data_parallel_execution; \
+    \
+    /* Calculate total sequences to process (ne2 dimension) */ \
+    size_t total_sequences = (tensor)->ne[2]; \
+    \
+    /* Step 1: NUMA-level slicing (across nodes) */ \
+    if ((ctx).is_data_parallel) { \
+        size_t seqs_per_node = total_sequences / ggml_numa_total_nodes_for_data_parallel; \
+        (ctx).numa_start = (ctx).numa_node * seqs_per_node; \
+        (ctx).numa_end = ((ctx).numa_node == ggml_numa_total_nodes_for_data_parallel - 1) ? \
+                         total_sequences : (ctx).numa_start + seqs_per_node; \
+    } else { \
+        (ctx).numa_start = 0; \
+        (ctx).numa_end = total_sequences; \
+    } \
+    (ctx).numa_elements = (ctx).numa_end - (ctx).numa_start; \
+    \
+    /* Step 2: Thread-level slicing (within NUMA node) */ \
+    size_t seqs_per_thread = ((ctx).numa_elements + (ctx).total_threads - 1) / (ctx).total_threads; \
+    size_t thread_start_local = (ctx).thread_id * seqs_per_thread; \
+    size_t thread_end_local = (thread_start_local + seqs_per_thread > (ctx).numa_elements) ? \
+                              (ctx).numa_elements : thread_start_local + seqs_per_thread; \
+    \
+    /* Convert to global sequence indices */ \
+    (ctx).thread_start = (ctx).numa_start + thread_start_local; \
+    (ctx).thread_end = (ctx).numa_start + thread_end_local; \
+    (ctx).thread_elements = (ctx).thread_end - (ctx).thread_start; \
+    \
+    /* Check if thread has work */ \
+    (ctx).has_work = ((ctx).thread_elements > 0); \
+} while(0)
+
+/**
+ * Get shared result tensor data for direct writes (eliminates aggregation)
+ * This is the common pattern for accessing shared destination memory
+ */
+#define NUMA_GET_SHARED_DATA(tensor, dst_ptr, data_type) do { \
+    extern __thread void * ggml_numa_shared_result_tensor_data; \
+    if (ggml_numa_shared_result_tensor_data != NULL) { \
+        (dst_ptr) = (data_type *)ggml_numa_shared_result_tensor_data; \
+    } else { \
+        (dst_ptr) = (data_type *)ggml_get_data(tensor); \
+    } \
+} while(0)
+
+/**
+ * Simplified element-wise kernel template with barrier handling
+ * This macro provides the complete setup for element-wise operations including
+ * proper OpenMP barrier synchronization for edge cases
+ */
+#define NUMA_KERNEL_ELEMENT_WISE_SETUP(ctx, tensor, params, dst_ptr, data_type) do { \
+    NUMA_SLICE_ELEMENTS(ctx, tensor, params); \
+    NUMA_GET_SHARED_DATA(tensor, dst_ptr, data_type); \
+    \
+    /* Handle threads with no work - must participate in barrier */ \
+    if (!(ctx).has_work) { \
+        if ((ctx).is_data_parallel || (ctx).total_threads > 1) { \
+            NUMA_OPENMP_BARRIER(); \
+        } \
+        return GGML_STATUS_SUCCESS; \
+    } \
+} while(0)
+
+/**
+ * Simplified sequence-wise kernel template with barrier handling
+ * This macro provides the complete setup for sequence-wise operations including
+ * proper OpenMP barrier synchronization for edge cases
+ */
+#define NUMA_KERNEL_SEQUENCE_WISE_SETUP(ctx, tensor, params, dst_ptr, data_type) do { \
+    NUMA_SLICE_SEQUENCES(ctx, tensor, params); \
+    NUMA_GET_SHARED_DATA(tensor, dst_ptr, data_type); \
+    \
+    /* Handle threads with no work - must participate in barrier */ \
+    if (!(ctx).has_work) { \
+        if ((ctx).is_data_parallel || (ctx).total_threads > 1) { \
+            NUMA_OPENMP_BARRIER(); \
+        } \
+        return GGML_STATUS_SUCCESS; \
+    } \
+} while(0)
+
+/**
+ * Simplified row-wise kernel template with barrier handling  
+ * This macro provides the complete setup for row-wise operations including
+ * proper OpenMP barrier synchronization for edge cases
+ */
+#define NUMA_KERNEL_ROW_WISE_SETUP(ctx, tensor, params, dst_ptr, data_type) do { \
+    NUMA_SLICE_ROWS(ctx, tensor, params); \
+    NUMA_GET_SHARED_DATA(tensor, dst_ptr, data_type); \
+    \
+    /* Handle threads with no work - must participate in barrier */ \
+    if (!(ctx).has_work) { \
+        if ((ctx).is_data_parallel || (ctx).total_threads > 1) { \
+            NUMA_OPENMP_BARRIER(); \
+        } \
+        return GGML_STATUS_SUCCESS; \
+    } \
+} while(0)
+
+/**
+ * Simplified column-wise kernel template with barrier handling
+ * This macro provides the complete setup for column-wise operations including  
+ * proper OpenMP barrier synchronization for edge cases
+ */
+#define NUMA_KERNEL_COLUMN_WISE_SETUP(ctx, tensor, params, dst_ptr, data_type) do { \
+    NUMA_SLICE_COLUMNS(ctx, tensor, params); \
+    NUMA_GET_SHARED_DATA(tensor, dst_ptr, data_type); \
+    \
+    /* Handle threads with no work - must participate in barrier */ \
+    if (!(ctx).has_work) { \
+        if ((ctx).is_data_parallel || (ctx).total_threads > 1) { \
+            NUMA_OPENMP_BARRIER(); \
+        } \
+        return GGML_STATUS_SUCCESS; \
+    } \
+} while(0)
+
+/**
+ * End-of-kernel barrier for kernels that completed work
+ * All kernels should call this at the end to ensure synchronization
+ */
+#define NUMA_KERNEL_END_BARRIER(ctx) do { \
+    /* Simple barrier for all threads that completed work */ \
+    if ((ctx).is_data_parallel || (ctx).total_threads > 1) { \
+        NUMA_OPENMP_BARRIER(); \
+    } \
+} while(0)
+
+/**
+ * OpenMP barrier abstraction for consistent barrier usage
+ */
+#define NUMA_OPENMP_BARRIER() do { \
+    _Pragma("omp barrier") \
+} while(0)
+
+/**
+ * Calculate NUMA slice context for row-wise operations
+ * This handles operations that work on rows (dimension ne1)
+ */
+#define NUMA_SLICE_ROWS(ctx, tensor, params) do { \
+    /* Get thread parameters */ \
+    (ctx).thread_id = (params)->ith; \
+    (ctx).total_threads = (params)->nth; \
+    \
+    /* Get NUMA execution context from thread-local variables */ \
+    extern __thread int ggml_current_numa_node; \
+    extern __thread bool ggml_numa_is_data_parallel_execution; \
+    extern __thread int ggml_numa_total_nodes_for_data_parallel; \
+    \
+    (ctx).numa_node = ggml_current_numa_node; \
+    (ctx).is_data_parallel = ggml_numa_is_data_parallel_execution; \
+    \
+    /* Calculate total rows to process (ne1 dimension) */ \
+    size_t total_rows = (tensor)->ne[1]; \
+    \
+    /* Step 1: NUMA-level slicing (across nodes) */ \
+    if ((ctx).is_data_parallel) { \
+        size_t rows_per_node = total_rows / ggml_numa_total_nodes_for_data_parallel; \
+        (ctx).numa_start = (ctx).numa_node * rows_per_node; \
+        (ctx).numa_end = ((ctx).numa_node == ggml_numa_total_nodes_for_data_parallel - 1) ? \
+                         total_rows : (ctx).numa_start + rows_per_node; \
+    } else { \
+        (ctx).numa_start = 0; \
+        (ctx).numa_end = total_rows; \
+    } \
+    (ctx).numa_elements = (ctx).numa_end - (ctx).numa_start; \
+    \
+    /* Step 2: Thread-level slicing (within NUMA node) */ \
+    size_t rows_per_thread = ((ctx).numa_elements + (ctx).total_threads - 1) / (ctx).total_threads; \
+    size_t thread_start_local = (ctx).thread_id * rows_per_thread; \
+    size_t thread_end_local = (thread_start_local + rows_per_thread > (ctx).numa_elements) ? \
+                              (ctx).numa_elements : thread_start_local + rows_per_thread; \
+    \
+    /* Convert to global row indices */ \
+    (ctx).thread_start = (ctx).numa_start + thread_start_local; \
+    (ctx).thread_end = (ctx).numa_start + thread_end_local; \
+    (ctx).thread_elements = (ctx).thread_end - (ctx).thread_start; \
+    \
+    /* Check if thread has work */ \
+    (ctx).has_work = ((ctx).thread_elements > 0); \
+} while(0)
+
+/**
+ * Calculate NUMA slice context for column-wise operations
+ * This handles operations that work on columns (dimension ne0)
+ */
+#define NUMA_SLICE_COLUMNS(ctx, tensor, params) do { \
+    /* Get thread parameters */ \
+    (ctx).thread_id = (params)->ith; \
+    (ctx).total_threads = (params)->nth; \
+    \
+    /* Get NUMA execution context from thread-local variables */ \
+    extern __thread int ggml_current_numa_node; \
+    extern __thread bool ggml_numa_is_data_parallel_execution; \
+    extern __thread int ggml_numa_total_nodes_for_data_parallel; \
+    \
+    (ctx).numa_node = ggml_current_numa_node; \
+    (ctx).is_data_parallel = ggml_numa_is_data_parallel_execution; \
+    \
+    /* Calculate total columns to process (ne0 dimension) */ \
+    size_t total_columns = (tensor)->ne[0]; \
+    \
+    /* Step 1: NUMA-level slicing (across nodes) */ \
+    if ((ctx).is_data_parallel) { \
+        size_t cols_per_node = total_columns / ggml_numa_total_nodes_for_data_parallel; \
+        (ctx).numa_start = (ctx).numa_node * cols_per_node; \
+        (ctx).numa_end = ((ctx).numa_node == ggml_numa_total_nodes_for_data_parallel - 1) ? \
+                         total_columns : (ctx).numa_start + cols_per_node; \
+    } else { \
+        (ctx).numa_start = 0; \
+        (ctx).numa_end = total_columns; \
+    } \
+    (ctx).numa_elements = (ctx).numa_end - (ctx).numa_start; \
+    \
+    /* Step 2: Thread-level slicing (within NUMA node) */ \
+    size_t cols_per_thread = ((ctx).numa_elements + (ctx).total_threads - 1) / (ctx).total_threads; \
+    size_t thread_start_local = (ctx).thread_id * cols_per_thread; \
+    size_t thread_end_local = (thread_start_local + cols_per_thread > (ctx).numa_elements) ? \
+                              (ctx).numa_elements : thread_start_local + cols_per_thread; \
+    \
+    /* Convert to global column indices */ \
+    (ctx).thread_start = (ctx).numa_start + thread_start_local; \
+    (ctx).thread_end = (ctx).numa_start + thread_end_local; \
+    (ctx).thread_elements = (ctx).thread_end - (ctx).thread_start; \
+    \
+    /* Check if thread has work */ \
+    (ctx).has_work = ((ctx).thread_elements > 0); \
+} while(0)
+
+/**
+ * Simplified row-wise kernel template
+ * This macro provides the complete setup for row-wise operations
+ * NOTE: Does NOT include early return - caller must handle has_work check
+ */
+#define NUMA_KERNEL_ROW_WISE_SETUP(ctx, tensor, params, dst_ptr, data_type) do { \
+    NUMA_SLICE_ROWS(ctx, tensor, params); \
+    NUMA_GET_SHARED_DATA(tensor, dst_ptr, data_type); \
+} while(0)
+
+/**
+ * Simplified column-wise kernel template
+ * This macro provides the complete setup for column-wise operations
+ * NOTE: Does NOT include early return - caller must handle has_work check
+ */
+#define NUMA_KERNEL_COLUMN_WISE_SETUP(ctx, tensor, params, dst_ptr, data_type) do { \
+    NUMA_SLICE_COLUMNS(ctx, tensor, params); \
+    NUMA_GET_SHARED_DATA(tensor, dst_ptr, data_type); \
+} while(0)
+
+/**
+ * Debug logging for slice context (optional)
+ */
+#define NUMA_LOG_SLICE_DEBUG(ctx, operation_name) do { \
+    if ((ctx).thread_id == 0) { \
+        NUMA_LOG_DEBUG("%s SLICE: NUMA %d: [%zu,%zu) (%zu elements), thread %d/%d: [%zu,%zu) (%zu elements), data_parallel=%s", \
+                       operation_name, (ctx).numa_node, (ctx).numa_start, (ctx).numa_end, (ctx).numa_elements, \
+                       (ctx).thread_id, (ctx).total_threads, (ctx).thread_start, (ctx).thread_end, (ctx).thread_elements, \
+                       (ctx).is_data_parallel ? "YES" : "NO"); \
+    } \
+} while(0)
+
 #ifdef __cplusplus
 }
 #endif

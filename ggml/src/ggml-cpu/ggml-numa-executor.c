@@ -696,6 +696,10 @@ enum ggml_status ggml_numa_executor_execute_tensor_forced_strategy(
            (forced_strategy.node_strategy == NUMA_NODE_STRATEGY_DATA_PARALLEL) ? "data-parallel" : "single",
            (forced_strategy.on_node_strategy == NUMA_ON_NODE_STRATEGY_MULTI_THREAD) ? "multi-thread" : "single-thread");
     
+    // TRACE: Very explicit forced strategy execution tracking
+    NUMA_LOG_DEBUG("🔥 FORCED STRATEGY EXECUTION PATH: op=%s node_strategy=%d on_node_strategy=%d", 
+                   op_name, (int)forced_strategy.node_strategy, (int)forced_strategy.on_node_strategy);
+    
     // Query the kernel registry for execution information (but override strategy)
     NUMA_PERF_START(NUMA_PERF_EXECUTOR_QUERY, op_name, "kernel_registry", -1, 0, 0);
     ggml_numa_kernel_query_result_t query_result = ggml_numa_kernels_query(tensor);
@@ -736,6 +740,9 @@ enum ggml_status ggml_numa_executor_execute_tensor_forced_strategy(
     if (query_result.strategy.node_strategy == NUMA_NODE_STRATEGY_DATA_PARALLEL && num_numa_nodes > 1) {
         // Data-parallel execution across multiple NUMA nodes
         NUMA_LOG_DEBUG("DEBUG: NUMA Executor (FORCED): Using data-parallel execution across %d nodes\n", num_numa_nodes);
+        
+        // TRACE: Very explicit data-parallel path tracking
+        NUMA_LOG_DEBUG("🚀 DATA_PARALLEL_PATH_TAKEN: About to call ggml_numa_openmp_execute_data_parallel");
         
         NUMA_PERF_START(NUMA_PERF_COORDINATOR_DISPATCH, op_name, "data_parallel", num_numa_nodes, 0, 0);
         
