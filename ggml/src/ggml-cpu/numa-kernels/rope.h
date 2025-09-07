@@ -142,14 +142,11 @@
  * @param i1_end Ending head index
  * @param loop_body Code block to execute for each iteration
  */
-#define NUMA_TENSOR_4D_LOOP(i3_start, i3_end, i2_start, i2_end, i1_start, i1_end, loop_body) \
-    for (int64_t i3 = (i3_start); i3 < (i3_end); i3++) { \
-        for (int64_t i2 = (i2_start); i2 < (i2_end); i2++) { \
-            for (int64_t i1 = (i1_start); i1 < (i1_end); i1++) { \
-                loop_body \
-            } \
-        } \
-    }
+/**
+ * @brief Type-generic ROPE computation macros
+ * These macros allow the same computation logic to work with both F32 and F16 types
+ * by parameterizing the type conversion functions
+ */
 
 /**
  * ROPE dimension iteration (processes pairs)
@@ -161,6 +158,114 @@
     for (int64_t i0 = 0; i0 < (n_dims); i0 += (step)) { \
         loop_body \
     }
+
+// ============================================================================
+// Common Data Structures for Refactored Implementation
+// ============================================================================
+
+/**
+ * @brief Consolidated ROPE parameters structure
+ * Eliminates the 60+ lines of duplicated parameter extraction in F32/F16 implementations
+ */
+typedef struct {
+    // Tensor dimensions  
+    int64_t ne0, ne1, ne2, ne3;
+    int64_t n_dims;
+    
+    // Source tensor strides
+    size_t src_nb0, src_nb1, src_nb2, src_nb3;
+    
+    // Destination tensor strides
+    size_t dst_nb0, dst_nb1, dst_nb2, dst_nb3;
+    
+    // ROPE configuration
+    int mode;
+    float freq_base;
+    float freq_scale;
+    float ext_factor;
+    float attn_factor;
+    float beta_fast;
+    float beta_slow;
+    float sin_sign;
+    float theta_scale;      // Added: calculated as powf(freq_base, -2.0f/n_dims)
+    int64_t n_ctx_orig;
+    int sections[4];        // Multi-rope sections
+    
+    // Optional multi-rope configuration
+    bool is_mrope;
+    bool is_vision;
+    
+    // Derived values
+    bool is_neox;
+    bool is_glm;
+    
+    // Work calculation
+    int64_t total_rows;
+} numa_rope_params_t;
+
+/**
+ * @brief Thread work distribution structure
+ * Defines what work range each thread should process
+ */
+typedef struct {
+    int ir0, ir1;        // Row range for this thread [ir0, ir1)
+    int i2_start, i2_end; // Sequence range for debugging
+    bool has_work;       // Whether thread has any work assigned
+    int total_rows;      // Total rows across all threads
+} numa_rope_thread_work_t;
+
+// ============================================================================
+// Type-Generic Computation Macros
+// ============================================================================
+
+/**
+ * @brief Standard ROPE rotation computation (adjacent pairs)
+ * Supports both F32 and F16 through type conversion macros
+ */
+#define ROPE_STANDARD_COMPUTE_CORE(TYPE, SRC_PTR, DST_PTR, TO_F32, FROM_F32, \
+                                   cos_theta, sin_theta, trace_prefix) do { \
+    const float x0 = TO_F32((SRC_PTR)[0]); \
+    const float x1 = TO_F32((SRC_PTR)[1]); \
+    \
+    const float result0 = x0 * (cos_theta) - x1 * (sin_theta); \
+    const float result1 = x0 * (sin_theta) + x1 * (cos_theta); \
+    \
+    (DST_PTR)[0] = FROM_F32(result0); \
+    (DST_PTR)[1] = FROM_F32(result1); \
+    \
+    NUMA_LOG_TRACE("%s STANDARD: x0=%f x1=%f cos=%f sin=%f -> r0=%f r1=%f", \
+                   trace_prefix, (double)x0, (double)x1, (double)(cos_theta), \
+                   (double)(sin_theta), (double)result0, (double)result1); \
+} while(0)
+
+/**
+ * @brief NEOX ROPE rotation computation (half-dimension pairs)
+ * Supports both F32 and F16 through type conversion macros
+ */
+#define ROPE_NEOX_COMPUTE_CORE(TYPE, SRC_PTR, DST_PTR, TO_F32, FROM_F32, \
+                               n_dims, cos_theta, sin_theta, trace_prefix) do { \
+    const float x0 = TO_F32((SRC_PTR)[0]); \
+    const float x1 = TO_F32((SRC_PTR)[(n_dims)/2]); \
+    \
+    const float result0 = x0 * (cos_theta) - x1 * (sin_theta); \
+    const float result1 = x0 * (sin_theta) + x1 * (cos_theta); \
+    \
+    (DST_PTR)[0] = FROM_F32(result0); \
+    (DST_PTR)[(n_dims)/2] = FROM_F32(result1); \
+    \
+    NUMA_LOG_TRACE("%s NEOX: x0=%f x1=%f cos=%f sin=%f -> r0=%f r1=%f", \
+                   trace_prefix, (double)x0, (double)x1, (double)(cos_theta), \
+                   (double)(sin_theta), (double)result0, (double)result1); \
+} while(0)
+
+/**
+ * @brief Copy non-rotated elements (beyond n_dims)
+ * Type-generic macro for copying unchanged elements
+ */
+#define ROPE_COPY_NONROTATED(TYPE, SRC_PTR, DST_PTR) do { \
+    (DST_PTR)[0] = (SRC_PTR)[0]; \
+    (DST_PTR)[1] = (SRC_PTR)[1]; \
+} while(0)
 
 // ============================================================================
 // Debug and Trace Macros
@@ -188,6 +293,45 @@
         NUMA_LOG_DEBUG("%s ROPE: Starting processing on NUMA node %d, thread %d, sequence range [%d,%d)", \
                       (variant), (numa_node), (thread_id), (i2_start), (i2_end)); \
     }
+
+// ============================================================================
+// Helper Function Prototypes
+// ============================================================================
+
+/**
+ * @brief Extract all ROPE parameters from tensor
+ * Consolidates parameter extraction logic shared between F32/F16 implementations
+ * @param dst Destination tensor containing ROPE operation parameters
+ * @return Populated numa_rope_params_t structure
+ */
+static numa_rope_params_t extract_rope_params(const struct ggml_tensor* dst);
+
+/**
+ * @brief Calculate thread work distribution for ROPE operation
+ * Determines which rows each thread should process
+ * @param params ROPE parameters structure
+ * @param ith Thread index within NUMA node
+ * @param nth Total threads per NUMA node
+ * @return Thread work assignment structure
+ */
+static numa_rope_thread_work_t calculate_rope_thread_work(
+    const numa_rope_params_t* params, int ith, int nth);
+
+/**
+ * @brief Setup ROPE cache for specific position
+ * Handles cache computation for given sequence position
+ * @param cache Pre-allocated cache buffer
+ * @param params ROPE parameters
+ * @param i1 Head index
+ * @param i2 Sequence index  
+ * @param i3 Batch index
+ * @param pos Position data array
+ * @param freq_factors Frequency factors (optional)
+ */
+static void setup_rope_cache_for_position(
+    float* cache, const numa_rope_params_t* params,
+    int64_t i1, int64_t i2, int64_t i3,
+    const int32_t* pos, const float* freq_factors);
 
 /**
  * Main ROPE kernel execution function (supports F32 and F16)
