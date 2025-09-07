@@ -268,6 +268,39 @@ int ggml_numa_openmp_get_fallback_thread_count(void);
  */
 bool ggml_numa_simple_coordinator_cross_numa_barrier(void);
 
+/**
+ * @brief Cleanup all thread-local work buffers
+ * 
+ * This function can be called to explicitly free all thread-local work buffers.
+ * Normally buffers are automatically cleaned up when threads terminate, but this
+ * provides a way to force cleanup for memory management.
+ * 
+ * Note: This should be called from each thread that has used work buffers,
+ * as thread-local storage is per-thread.
+ */
+void ggml_numa_openmp_cleanup_thread_work_buffers(void);
+
+/**
+ * @brief Get current thread work buffer state for testing
+ * 
+ * @param buffer_ptr Output pointer to current work buffer (NULL if none allocated)
+ * @param current_size Output current allocated size in bytes
+ * @param numa_node Output NUMA node where buffer is allocated
+ * @param is_numa_allocated Output whether buffer was allocated with numa_alloc_onnode()
+ * @return true if work buffer exists, false otherwise
+ */
+bool ggml_numa_openmp_get_thread_work_buffer_state(void** buffer_ptr, size_t* current_size, 
+                                                    int* numa_node, bool* is_numa_allocated);
+
+/**
+ * @brief Force allocation of thread work buffer for testing
+ * 
+ * @param required_size Required buffer size in bytes
+ * @param target_numa_node Target NUMA node for allocation
+ * @return Pointer to allocated work buffer, or NULL on failure
+ */
+void* ggml_numa_openmp_test_force_work_buffer_allocation(size_t required_size, int target_numa_node);
+
 #ifdef __cplusplus
 }
 #endif

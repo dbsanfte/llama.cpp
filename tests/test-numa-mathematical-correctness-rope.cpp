@@ -277,6 +277,9 @@ TestResult test_rope_operation(const TestConfig& config, bool enable_numa, const
     result.passed = false;
     
     try {
+        // CRITICAL: Reset fallback flag at start of each test to ensure clean state
+        ggml_numa_set_fallback_flag(false);
+        
         // Create contexts
         struct ggml_init_params params;
         params.mem_size = 512 * 1024 * 1024;  // 512MB
@@ -334,7 +337,6 @@ TestResult test_rope_operation(const TestConfig& config, bool enable_numa, const
         
         // Ensure NUMA dispatch is enabled for our test
         ggml_numa_set_fallback_flag(false);  // Ensure NUMA dispatch is enabled
-        ggml_numa_set_dispatch_enabled(true);  // Enable NUMA dispatch for NUMA computation
         
         // Setup threading for reference computation
         (void)enable_numa;  // Suppress unused variable warning
@@ -377,8 +379,8 @@ TestResult test_rope_operation(const TestConfig& config, bool enable_numa, const
         }
         
         // Execute reference computation using graph-based approach (proper method)
-        // CRITICAL: Disable NUMA for reference computation to get pure reference results
-        ggml_numa_set_dispatch_enabled(false);
+        // CRITICAL: Force fallback to reference implementation for pure reference results
+        ggml_numa_set_fallback_flag(true);  // Force fallback to reference implementation
         
         // Create ROPE operation using ggml_rope() function
         struct ggml_tensor* rope_op_ref = ggml_rope(ctx_ref, input_ref, pos_ref, config.n_dims, config.rope_mode);
@@ -389,7 +391,7 @@ TestResult test_rope_operation(const TestConfig& config, bool enable_numa, const
         
         // Create work buffer for graph computation (proper approach)
         std::vector<uint8_t> work_buffer;
-        struct ggml_cplan plan = ggml_graph_plan(graph_ref, 1, nullptr);  // Single-threaded reference
+        struct ggml_cplan plan = ggml_graph_plan(graph_ref, default_threads, nullptr);  // Use same thread count as NUMA
         if (plan.work_size > 0) {
             work_buffer.resize(plan.work_size);
             plan.work_data = work_buffer.data();
@@ -398,8 +400,8 @@ TestResult test_rope_operation(const TestConfig& config, bool enable_numa, const
         // Execute the graph computation (proper method) - should use fallback path
         ggml_graph_compute(graph_ref, &plan);
         
-        // Re-enable NUMA for subsequent operations
-        ggml_numa_set_dispatch_enabled(true);
+        // Re-enable NUMA dispatch for next test
+        ggml_numa_set_fallback_flag(false);  // Re-enable NUMA dispatch
         
         // Copy result to our result tensor
         if (config.tensor_type == GGML_TYPE_F32) {
@@ -463,9 +465,15 @@ TestResult test_rope_operation(const TestConfig& config, bool enable_numa, const
         ggml_free(ctx_numa);
         ggml_free(ctx_ref);
         
+        // CRITICAL: Reset fallback flag to ensure clean state for next test
+        ggml_numa_set_fallback_flag(false);
+        
     } catch (const std::exception& e) {
         result.failure_reason = std::string("Exception: ") + e.what();
         printf("❌ %s: FAILED - %s\n", result.test_name.c_str(), result.failure_reason.c_str());
+        
+        // CRITICAL: Reset fallback flag even on exception to ensure clean state
+        ggml_numa_set_fallback_flag(false);
     }
     
     return result;

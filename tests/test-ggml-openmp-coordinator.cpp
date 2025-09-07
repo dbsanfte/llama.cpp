@@ -21,6 +21,8 @@
 #include <chrono>
 #include <thread>
 #include <regex>
+#include <set>
+#include <unordered_set>
 
 #include "ggml.h"
 #include "ggml-impl.h"
@@ -147,7 +149,15 @@ std::vector<char> g_numa_node_active;  // Use char instead of bool to avoid vect
 #define EXPECT_EQ(expected, actual, message) \
     do { \
         if ((expected) != (actual)) { \
-            printf("❌ FAILED: %s - %s (expected %d, got %d)\n", __func__, message, (int)(expected), (int)(actual)); \
+            printf("❌ FAILED: %s - %s (expected %ld, got %ld)\n", __func__, message, (long)(expected), (long)(actual)); \
+            return false; \
+        } \
+    } while(0)
+
+#define EXPECT_PTR_EQ(expected, actual, message) \
+    do { \
+        if ((expected) != (actual)) { \
+            printf("❌ FAILED: %s - %s (expected %p, got %p)\n", __func__, message, (void*)(expected), (void*)(actual)); \
             return false; \
         } \
     } while(0)
@@ -156,6 +166,14 @@ std::vector<char> g_numa_node_active;  // Use char instead of bool to avoid vect
     do { \
         if ((value) < (minimum)) { \
             printf("❌ FAILED: %s - %s (value %d < minimum %d)\n", __func__, message, (int)(value), (int)(minimum)); \
+            return false; \
+        } \
+    } while(0)
+
+#define EXPECT_GT(value, minimum, message) \
+    do { \
+        if ((value) <= (minimum)) { \
+            printf("❌ FAILED: %s - %s (value %d <= minimum %d)\n", __func__, message, (int)(value), (int)(minimum)); \
             return false; \
         } \
     } while(0)
@@ -977,6 +995,402 @@ TEST_PRINTF("   ✅ Work buffer allocation and management working correctly\n");
 }
 
 /**
+ * @brief Test reusable work buffer functionality
+ */
+bool test_reusable_work_buffers() {
+    TEST_PRINTF("🧪 Testing reusable work buffer functionality...\n");
+    
+    // Clean up any existing work buffers first
+    ggml_numa_openmp_cleanup_thread_work_buffers();
+    
+    // Initially, no work buffer should exist
+    void* buffer_ptr = nullptr;
+    size_t current_size = 0;
+    int numa_node = -1;
+    bool is_numa_allocated = false;
+    
+    bool buffer_exists = ggml_numa_openmp_get_thread_work_buffer_state(
+        &buffer_ptr, &current_size, &numa_node, &is_numa_allocated);
+    
+    EXPECT_FALSE(buffer_exists, "Initially no work buffer should exist");
+    EXPECT_PTR_EQ(nullptr, buffer_ptr, "Initial buffer pointer should be NULL");
+    EXPECT_EQ(0, current_size, "Initial buffer size should be 0");
+    
+    TEST_PRINTF("   ✅ Initial state: No work buffer exists\n");
+    
+    // Test first allocation
+    size_t first_size = 1024;
+    int target_node = 0;
+    void* first_buffer = ggml_numa_openmp_test_force_work_buffer_allocation(first_size, target_node);
+    
+    EXPECT_TRUE(first_buffer != nullptr, "First allocation should succeed");
+    
+    // Check buffer state after first allocation
+    buffer_exists = ggml_numa_openmp_get_thread_work_buffer_state(
+        &buffer_ptr, &current_size, &numa_node, &is_numa_allocated);
+    
+    EXPECT_TRUE(buffer_exists, "Buffer should exist after first allocation");
+    EXPECT_PTR_EQ(first_buffer, buffer_ptr, "Buffer pointer should match first allocation");
+    EXPECT_GE(current_size, first_size, "Buffer size should be at least requested size");
+    EXPECT_EQ(target_node, numa_node, "Buffer should be on target NUMA node");
+    
+    TEST_PRINTF("   ✅ First allocation: %zu bytes on node %d at %p\n", 
+                current_size, numa_node, buffer_ptr);
+    
+    // Test buffer reuse with same size
+    void* reused_buffer = ggml_numa_openmp_test_force_work_buffer_allocation(first_size, target_node);
+    
+    EXPECT_PTR_EQ(first_buffer, reused_buffer, "Buffer should be reused for same size request");
+    
+    // Check that buffer state hasn't changed
+    void* check_buffer_ptr = nullptr;
+    size_t check_size = 0;
+    ggml_numa_openmp_get_thread_work_buffer_state(&check_buffer_ptr, &check_size, nullptr, nullptr);
+    
+    EXPECT_PTR_EQ(first_buffer, check_buffer_ptr, "Buffer pointer should remain unchanged on reuse");
+    EXPECT_EQ(current_size, check_size, "Buffer size should remain unchanged on reuse");
+    
+    TEST_PRINTF("   ✅ Buffer reuse: Same buffer reused for same size request\n");
+    
+    // Test buffer growth
+    size_t larger_size = first_size * 3;  // Request significantly larger buffer
+    void* grown_buffer = ggml_numa_openmp_test_force_work_buffer_allocation(larger_size, target_node);
+    
+    EXPECT_TRUE(grown_buffer != nullptr, "Buffer growth allocation should succeed");
+    
+    // Buffer might be reallocated for growth
+    size_t new_size = 0;
+    ggml_numa_openmp_get_thread_work_buffer_state(&buffer_ptr, &new_size, nullptr, nullptr);
+    
+    EXPECT_GE(new_size, larger_size, "New buffer size should accommodate larger request");
+    EXPECT_GT(new_size, current_size, "Buffer should have grown");
+    
+    TEST_PRINTF("   ✅ Buffer growth: Grew from %zu to %zu bytes for %zu byte request\n", 
+                current_size, new_size, larger_size);
+    
+    // Test buffer reuse after growth
+    void* reused_after_growth = ggml_numa_openmp_test_force_work_buffer_allocation(first_size, target_node);
+    
+    EXPECT_PTR_EQ(grown_buffer, reused_after_growth, "Grown buffer should be reused for smaller requests");
+    
+    // Verify buffer size hasn't changed
+    size_t final_size = 0;
+    ggml_numa_openmp_get_thread_work_buffer_state(nullptr, &final_size, nullptr, nullptr);
+    
+    EXPECT_EQ(new_size, final_size, "Buffer size should remain unchanged for smaller reuse");
+    
+    TEST_PRINTF("   ✅ Post-growth reuse: Large buffer reused for smaller requests\n");
+    
+    // Test NUMA node switching (should cause reallocation)
+    int different_node = (target_node == 0) ? 1 : 0;
+    void* different_node_buffer = ggml_numa_openmp_test_force_work_buffer_allocation(first_size, different_node);
+    
+    EXPECT_TRUE(different_node_buffer != nullptr, "Different NUMA node allocation should succeed");
+    
+    int actual_numa_node = -1;
+    ggml_numa_openmp_get_thread_work_buffer_state(nullptr, nullptr, &actual_numa_node, nullptr);
+    
+    EXPECT_EQ(different_node, actual_numa_node, "Buffer should be allocated on different NUMA node");
+    
+    TEST_PRINTF("   ✅ NUMA node switching: Buffer reallocated for different NUMA node\n");
+    
+    // Cleanup
+    ggml_numa_openmp_cleanup_thread_work_buffers();
+    
+    // Verify cleanup
+    buffer_exists = ggml_numa_openmp_get_thread_work_buffer_state(nullptr, nullptr, nullptr, nullptr);
+    EXPECT_FALSE(buffer_exists, "Buffer should not exist after cleanup");
+    
+    TEST_PRINTF("   ✅ Cleanup: Work buffer successfully freed\n");
+    
+    return true;
+}
+
+/**
+ * @brief Test work buffer thread isolation
+ */
+
+// Thread context for isolation test
+struct ThreadBufferInfo {
+    std::thread::id thread_id;
+    void* buffer_ptr;
+    size_t buffer_size;
+    int numa_node;
+    bool allocation_success;
+    std::mutex* mutex;
+    std::vector<ThreadBufferInfo>* results;
+};
+
+// Global static variables for test contexts
+static std::vector<ThreadBufferInfo>* g_thread_results = nullptr;
+static std::mutex* g_results_mutex = nullptr;
+static std::vector<void*>* g_operation_buffers = nullptr;
+static std::vector<size_t>* g_operation_sizes = nullptr;
+
+// Work function for thread isolation test
+static enum ggml_status thread_isolation_work_function(void* context, struct ggml_compute_params* params) {
+    (void)context; // Tensor pointer - not used in this test
+    (void)params;  // Parameters - not used in this test
+    
+    // Access static test data
+    if (!g_thread_results || !g_results_mutex) {
+        return GGML_STATUS_FAILED;
+    }
+    
+    // Clean up any existing work buffer for this thread
+    ggml_numa_openmp_cleanup_thread_work_buffers();
+    
+    // Allocate work buffer for this thread
+    const size_t buffer_size = 2048;
+    void* buffer = ggml_numa_openmp_test_force_work_buffer_allocation(buffer_size, 0);
+    
+    // Record buffer information
+    void* buffer_ptr = nullptr;
+    size_t current_size = 0;
+    int numa_node = -1;
+    bool exists = ggml_numa_openmp_get_thread_work_buffer_state(
+        &buffer_ptr, &current_size, &numa_node, nullptr);
+    
+    // Store results thread-safely
+    {
+        std::lock_guard<std::mutex> lock(*g_results_mutex);
+        ThreadBufferInfo info;
+        info.thread_id = std::this_thread::get_id();
+        info.buffer_ptr = buffer_ptr;
+        info.buffer_size = current_size;
+        info.numa_node = numa_node;
+        info.allocation_success = exists && (buffer != nullptr);
+        g_thread_results->push_back(info);
+    }
+    
+    return GGML_STATUS_SUCCESS;
+}
+
+// Helper to set global pointers for thread isolation test
+static void set_thread_isolation_test_context(std::vector<ThreadBufferInfo>* results, std::mutex* mutex) {
+    g_thread_results = results;
+    g_results_mutex = mutex;
+}
+
+bool test_work_buffer_thread_isolation() {
+    TEST_PRINTF("🧪 Testing work buffer thread isolation...\n");
+    
+    std::vector<ThreadBufferInfo> thread_results;
+    std::mutex results_mutex;
+    
+    const int num_threads = 4;
+    const size_t buffer_size = 2048;
+    
+    // Create test context and tensor
+    struct ggml_init_params init_params = {
+        .mem_size = 1024 * 1024,
+        .mem_buffer = NULL,
+        .no_alloc = false
+    };
+    struct ggml_context* ctx = ggml_init(init_params);
+    EXPECT_TRUE(ctx != NULL, "Context creation should succeed");
+    
+    struct ggml_tensor* tensor = create_test_tensor(ctx, 64);
+    EXPECT_TRUE(tensor != NULL, "Tensor creation should succeed");
+    
+    // Set context for thread isolation test
+    set_thread_isolation_test_context(&thread_results, &results_mutex);
+    
+    // Execute multi-threaded work function
+    enum ggml_status status = ggml_numa_openmp_execute_single_node(
+        tensor,
+        thread_isolation_work_function,
+        0,  // NUMA node 0
+        num_threads,
+        buffer_size  // Work buffer size
+    );
+    
+    EXPECT_EQ(GGML_STATUS_SUCCESS, status, "Multi-thread execution should succeed");
+    EXPECT_EQ(num_threads, (int)thread_results.size(), "Should have results from all threads");
+    
+    TEST_PRINTF("   📊 Collected buffer info from %d threads\n", (int)thread_results.size());
+    
+    // Verify each thread got its own unique buffer
+    std::set<void*> unique_buffers;
+    std::set<std::thread::id> unique_thread_ids;
+    
+    for (const auto& result : thread_results) {
+        EXPECT_TRUE(result.allocation_success, "Each thread should successfully allocate buffer");
+        EXPECT_TRUE(result.buffer_ptr != nullptr, "Each thread should have valid buffer pointer");
+        EXPECT_GE(result.buffer_size, buffer_size, "Each buffer should be at least requested size");
+        
+        // Check uniqueness
+        EXPECT_TRUE(unique_buffers.find(result.buffer_ptr) == unique_buffers.end(), 
+                    "Each thread should have unique buffer pointer");
+        EXPECT_TRUE(unique_thread_ids.find(result.thread_id) == unique_thread_ids.end(),
+                    "Each thread ID should be unique");
+        
+        unique_buffers.insert(result.buffer_ptr);
+        unique_thread_ids.insert(result.thread_id);
+        
+        TEST_PRINTF("   🧵 Thread %zu: buffer=%p, size=%zu, node=%d\n", 
+                    std::hash<std::thread::id>{}(result.thread_id) % 1000,
+                    result.buffer_ptr, result.buffer_size, result.numa_node);
+    }
+    
+    EXPECT_EQ(num_threads, (int)unique_buffers.size(), "All buffers should be unique");
+    EXPECT_EQ(num_threads, (int)unique_thread_ids.size(), "All thread IDs should be unique");
+    
+    TEST_PRINTF("   ✅ Thread isolation: %d unique buffers for %d threads\n", 
+                (int)unique_buffers.size(), num_threads);
+    
+    ggml_free(ctx);
+    return true;
+}
+
+/**
+ * @brief Test work buffer persistence across multiple operations
+ */
+
+// Context for persistence test
+struct PersistenceTestContext {
+    std::vector<void*>* operation_buffers;
+    std::vector<size_t>* operation_sizes;
+};
+
+// Work function for persistence test
+static enum ggml_status persistence_test_work_function(void* context, struct ggml_compute_params* params) {
+    (void)context; // Tensor pointer - not used in this test
+    
+    // Get test context from global variable (this is just for testing)
+    if (g_operation_buffers && g_operation_sizes) {
+        // Record current work buffer state
+        void* buffer_ptr = nullptr;
+        size_t current_size = 0;
+        ggml_numa_openmp_get_thread_work_buffer_state(&buffer_ptr, &current_size, nullptr, nullptr);
+        
+        g_operation_buffers->push_back(buffer_ptr);
+        g_operation_sizes->push_back(current_size);
+    }
+    
+    // Use the work buffer to verify it's functional
+    if (params->wdata && params->wsize > 0) {
+        uint32_t* test_buffer = (uint32_t*)params->wdata;
+        size_t words_available = params->wsize / sizeof(uint32_t);
+        
+        // Write test pattern
+        for (size_t i = 0; i < std::min(words_available, (size_t)32); i++) {
+            test_buffer[i] = 0xCAFEBABE + (uint32_t)i;
+        }
+        
+        // Verify test pattern
+        for (size_t i = 0; i < std::min(words_available, (size_t)32); i++) {
+            if (test_buffer[i] != 0xCAFEBABE + (uint32_t)i) {
+                return GGML_STATUS_FAILED;
+            }
+        }
+    }
+    
+    return GGML_STATUS_SUCCESS;
+}
+
+// Helper to set global pointers for persistence test
+static void set_persistence_test_context(std::vector<void*>* buffers, std::vector<size_t>* sizes) {
+    g_operation_buffers = buffers;
+    g_operation_sizes = sizes;
+}
+
+bool test_work_buffer_persistence() {
+    TEST_PRINTF("🧪 Testing work buffer persistence across operations...\n");
+    
+    // Clean up any existing work buffers
+    ggml_numa_openmp_cleanup_thread_work_buffers();
+    
+    // Create test context and tensor
+    struct ggml_init_params init_params = {
+        .mem_size = 1024 * 1024,
+        .mem_buffer = NULL,
+        .no_alloc = false
+    };
+    struct ggml_context* ctx = ggml_init(init_params);
+    EXPECT_TRUE(ctx != NULL, "Context creation should succeed");
+    
+    struct ggml_tensor* tensor = create_test_tensor(ctx, 128);
+    EXPECT_TRUE(tensor != NULL, "Tensor creation should succeed");
+    
+    // Track buffer pointers across operations
+    std::vector<void*> operation_buffers;
+    std::vector<size_t> operation_sizes;
+    
+    // Set context for persistence test
+    set_persistence_test_context(&operation_buffers, &operation_sizes);
+    
+    // Test series of operations with different buffer sizes
+    size_t test_sizes[] = {512, 1024, 2048, 1024, 4096, 1024};
+    const int num_operations = sizeof(test_sizes) / sizeof(test_sizes[0]);
+    
+    for (int op = 0; op < num_operations; op++) {
+        TEST_PRINTF("   🔄 Operation %d: requesting %zu bytes\n", op + 1, test_sizes[op]);
+        
+        enum ggml_status status = ggml_numa_openmp_execute_single_thread(
+            tensor,
+            persistence_test_work_function,
+            0,  // NUMA node 0
+            test_sizes[op]  // Work buffer size
+        );
+        
+        EXPECT_EQ(GGML_STATUS_SUCCESS, status, "Operation should succeed");
+    }
+    
+    EXPECT_EQ(num_operations, (int)operation_buffers.size(), "Should have buffer info from all operations");
+    EXPECT_EQ(num_operations, (int)operation_sizes.size(), "Should have size info from all operations");
+    
+    TEST_PRINTF("   📊 Buffer persistence analysis:\n");
+    
+    // Analyze buffer reuse patterns
+    int reuse_count = 0;
+    int growth_count = 0;
+    
+    for (int i = 0; i < num_operations; i++) {
+        TEST_PRINTF("     Op %d: buffer=%p, size=%zu (requested %zu)\n", 
+                    i + 1, operation_buffers[i], operation_sizes[i], test_sizes[i]);
+        
+        if (i > 0) {
+            if (operation_buffers[i] == operation_buffers[i-1]) {
+                reuse_count++;
+                TEST_PRINTF("       ✅ Buffer reused from previous operation\n");
+            } else {
+                TEST_PRINTF("       🔄 Buffer reallocated (growth or other reason)\n");
+            }
+            
+            if (operation_sizes[i] > operation_sizes[i-1]) {
+                growth_count++;
+                TEST_PRINTF("       📈 Buffer size increased from %zu to %zu\n", 
+                            operation_sizes[i-1], operation_sizes[i]);
+            }
+        }
+        
+        // Verify buffer size is adequate for request
+        EXPECT_GE(operation_sizes[i], test_sizes[i], "Buffer size should accommodate request");
+    }
+    
+    TEST_PRINTF("   📈 Persistence stats: %d reuses, %d growth events out of %d operations\n", 
+                reuse_count, growth_count, num_operations - 1);
+    
+    // We expect some reuse (operations 4 and 6 request smaller sizes than previous)
+    EXPECT_GT(reuse_count, 0, "Should have some buffer reuse for smaller requests");
+    
+    // We expect some growth (operation 3 and 5 request larger sizes)
+    EXPECT_GT(growth_count, 0, "Should have some buffer growth for larger requests");
+    
+    // Test final cleanup
+    ggml_numa_openmp_cleanup_thread_work_buffers();
+    
+    bool buffer_exists = ggml_numa_openmp_get_thread_work_buffer_state(nullptr, nullptr, nullptr, nullptr);
+    EXPECT_FALSE(buffer_exists, "Buffer should not exist after final cleanup");
+    
+    TEST_PRINTF("   ✅ Persistence test completed successfully\n");
+    
+    ggml_free(ctx);
+    return true;
+}
+
+/**
  * @brief Test coordinator integration with different strategies
  */
 bool test_executor_integration() {
@@ -1720,6 +2134,9 @@ int main(int argc, char **argv) {
     run_test_if_matches("data_parallel_strategy", test_data_parallel_strategy);
     run_test_if_matches("data_parallel_unique_thread_ids", test_data_parallel_unique_thread_ids);
     run_test_if_matches("work_buffer_allocation", test_work_buffer_allocation);
+    run_test_if_matches("reusable_work_buffers", test_reusable_work_buffers);
+    run_test_if_matches("work_buffer_thread_isolation", test_work_buffer_thread_isolation);
+    run_test_if_matches("work_buffer_persistence", test_work_buffer_persistence);
     run_test_if_matches("executor_integration", test_executor_integration);
     run_test_if_matches("full_system_capacity", test_full_system_capacity);
     run_test_if_matches("parallel_execution_verification", test_parallel_execution_verification);

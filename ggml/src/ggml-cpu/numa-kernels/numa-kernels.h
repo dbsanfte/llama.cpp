@@ -901,13 +901,16 @@ typedef struct {
 #define NUMA_THREAD_WORK_RANGE(ctx, total_units, start_var, end_var, count_var) do { \
     if ((ctx).is_data_parallel) { \
         NUMA_CALCULATE_WORK_DISTRIBUTION(ctx, total_units, start_var, end_var); \
+        /* In data-parallel mode, bounds check against NUMA end, not total_units */ \
+        if (end_var > (ctx).numa_end) end_var = (ctx).numa_end; \
     } else { \
         const size_t units_per_thread = (total_units) / (ctx).total_threads; \
         const size_t remainder = (total_units) % (ctx).total_threads; \
         start_var = (ctx).thread_id * units_per_thread + ((ctx).thread_id < remainder ? (ctx).thread_id : remainder); \
         end_var = start_var + units_per_thread + ((ctx).thread_id < remainder ? 1 : 0); \
+        /* In non-data-parallel mode, bounds check against total_units */ \
+        if (end_var > (total_units)) end_var = (total_units); \
     } \
-    if (end_var > (total_units)) end_var = (total_units); \
     count_var = (end_var > start_var) ? (end_var - start_var) : 0; \
 } while(0)
 

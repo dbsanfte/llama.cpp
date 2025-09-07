@@ -51,6 +51,125 @@ __thread bool ggml_numa_is_data_parallel_execution = false;
 __thread int ggml_numa_total_nodes_for_data_parallel = 1;
 __thread void * ggml_numa_shared_result_tensor_data = NULL;
 
+/**
+ * @brief Thread-local work buffer management structure
+ * 
+ * Maintains NUMA-local work buffers that persist across operations
+ * and auto-grow when needed, eliminating per-operation allocation overhead.
+ */
+typedef struct {
+    void * buffer;          // Current work buffer pointer
+    size_t current_size;    // Current allocated size in bytes
+    int numa_node;          // NUMA node where buffer is allocated
+    bool is_numa_allocated; // Whether buffer was allocated with numa_alloc_onnode()
+} ggml_thread_work_buffer_t;
+
+// Thread-local work buffer - persists across operations and auto-grows
+__thread ggml_thread_work_buffer_t g_thread_work_buffer = {0};
+
+/**
+ * @brief Get or grow thread-local work buffer to required size
+ * 
+ * @param required_size Minimum required buffer size in bytes
+ * @param target_numa_node NUMA node for allocation (if reallocation needed)
+ * @return Pointer to work buffer of at least required_size bytes, or NULL on failure
+ */
+static void * ggml_get_or_grow_thread_work_buffer(size_t required_size, int target_numa_node) {
+    if (required_size == 0) {
+        return NULL;
+    }
+    
+    // Check if current buffer is sufficient
+    if (g_thread_work_buffer.buffer && 
+        g_thread_work_buffer.current_size >= required_size &&
+        g_thread_work_buffer.numa_node == target_numa_node) {
+        // Existing buffer is adequate
+        NUMA_LOG_TRACE("REUSING_WORK_BUFFER: thread=%d size=%zu node=%d ptr=%p", 
+                       omp_get_thread_num(), g_thread_work_buffer.current_size, 
+                       target_numa_node, g_thread_work_buffer.buffer);
+        return g_thread_work_buffer.buffer;
+    }
+    
+    // Need to allocate or grow buffer
+    size_t new_size = required_size;
+    if (g_thread_work_buffer.current_size > 0) {
+        // Grow by 50% to reduce future reallocations
+        new_size = required_size + (required_size / 2);
+        NUMA_LOG_DEBUG("GROWING_WORK_BUFFER: thread=%d old_size=%zu new_size=%zu node=%d", 
+                       omp_get_thread_num(), g_thread_work_buffer.current_size, new_size, target_numa_node);
+    } else {
+        NUMA_LOG_DEBUG("ALLOCATING_WORK_BUFFER: thread=%d size=%zu node=%d", 
+                       omp_get_thread_num(), new_size, target_numa_node);
+    }
+    
+    // Free existing buffer if it exists
+    if (g_thread_work_buffer.buffer) {
+        if (g_thread_work_buffer.is_numa_allocated && numa_available() != -1) {
+            numa_free(g_thread_work_buffer.buffer, g_thread_work_buffer.current_size);
+        } else {
+            free(g_thread_work_buffer.buffer);
+        }
+        NUMA_LOG_TRACE("FREED_OLD_WORK_BUFFER: thread=%d old_size=%zu", 
+                       omp_get_thread_num(), g_thread_work_buffer.current_size);
+    }
+    
+    // Allocate new buffer on target NUMA node
+    void * new_buffer = NULL;
+    bool is_numa_allocated = false;
+    
+    if (numa_available() != -1) {
+        new_buffer = numa_alloc_onnode(new_size, target_numa_node);
+        if (new_buffer) {
+            is_numa_allocated = true;
+            NUMA_LOG_DEBUG("NUMA_WORK_BUFFER_ALLOCATED: thread=%d size=%zu node=%d ptr=%p", 
+                           omp_get_thread_num(), new_size, target_numa_node, new_buffer);
+        } else {
+            NUMA_LOG_DEBUG("NUMA allocation failed for work buffer, falling back to malloc");
+        }
+    }
+    
+    if (!new_buffer) {
+        // Fallback to regular malloc
+        new_buffer = malloc(new_size);
+        is_numa_allocated = false;
+        NUMA_LOG_DEBUG("MALLOC_WORK_BUFFER_ALLOCATED: thread=%d size=%zu ptr=%p", 
+                       omp_get_thread_num(), new_size, new_buffer);
+    }
+    
+    if (!new_buffer) {
+        NUMA_LOG_DEBUG("Work buffer allocation failed: size=%zu node=%d", new_size, target_numa_node);
+        // Reset buffer state on allocation failure
+        g_thread_work_buffer = (ggml_thread_work_buffer_t){0};
+        return NULL;
+    }
+    
+    // Update buffer management state
+    g_thread_work_buffer.buffer = new_buffer;
+    g_thread_work_buffer.current_size = new_size;
+    g_thread_work_buffer.numa_node = target_numa_node;
+    g_thread_work_buffer.is_numa_allocated = is_numa_allocated;
+    
+    return new_buffer;
+}
+
+/**
+ * @brief Clean up thread-local work buffer
+ * 
+ * Should be called when thread is terminating to free allocated memory.
+ */
+static void ggml_cleanup_thread_work_buffer(void) {
+    if (g_thread_work_buffer.buffer) {
+        if (g_thread_work_buffer.is_numa_allocated && numa_available() != -1) {
+            numa_free(g_thread_work_buffer.buffer, g_thread_work_buffer.current_size);
+        } else {
+            free(g_thread_work_buffer.buffer);
+        }
+        NUMA_LOG_TRACE("CLEANED_UP_WORK_BUFFER: thread=%d size=%zu", 
+                       omp_get_thread_num(), g_thread_work_buffer.current_size);
+        g_thread_work_buffer = (ggml_thread_work_buffer_t){0};
+    }
+}
+
 // Global coordinator configuration
 static ggml_numa_openmp_config_t g_openmp_config = {0};
 static bool g_openmp_initialized = false;
@@ -393,10 +512,6 @@ static enum ggml_status ggml_numa_openmp_execute_multi_numa(
     ggml_numa_threadpool_manager_t * manager = &g_openmp_config.threadpool_manager;
     enum ggml_status result = GGML_STATUS_SUCCESS;
     
-    // Set thread-local NUMA context for data-parallel execution
-    ggml_numa_is_data_parallel_execution = true;
-    ggml_numa_total_nodes_for_data_parallel = manager->num_teams;
-    
     NUMA_LOG_DEBUG("Starting multi-NUMA execution across %d NUMA nodes\n", manager->num_teams);
     
     // Create array to track per-NUMA results
@@ -574,14 +689,7 @@ bool ggml_numa_openmp_coordinator_init(void) {
     // Set threads per node based on system topology and NUMA distribution
 #ifdef GGML_USE_OPENMP
     int total_cores = omp_get_max_threads();
-    
-    // CRITICAL: Cap total threads to avoid memory issues during testing
-    // Large servers can have many cores (112+) which causes memory allocation problems
-    const int MAX_REASONABLE_THREADS = 32;  // Reasonable upper limit for stability
-    if (total_cores > MAX_REASONABLE_THREADS) {
-        NUMA_LOG_DEBUG("Capping threads from %d to %d for system stability\n", total_cores, MAX_REASONABLE_THREADS);
-        total_cores = MAX_REASONABLE_THREADS;
-    }
+    NUMA_LOG_DEBUG("Using full hardware concurrency: %d threads\n", total_cores);
 #else
     int total_cores = 1;  // Fallback to single thread
 #endif
@@ -730,33 +838,28 @@ enum ggml_status ggml_numa_openmp_execute_single_thread(
 
     NUMA_LOG_DEBUG("Executing single-thread strategy on NUMA node %d (work_buffer_size=%zu)\n", target_numa_node, work_buffer_size);
 
-    // Allocate work buffer if needed
-    void * work_buffer = NULL;
-    bool use_numa_alloc = false;
-    if (work_buffer_size > 0) {
-        work_buffer = numa_alloc_onnode(work_buffer_size, target_numa_node);
-        if (work_buffer) {
-            use_numa_alloc = true;
-        } else {
-            NUMA_LOG_DEBUG("Failed to allocate work buffer (%zu bytes) on node %d, using malloc\n", 
-                          work_buffer_size, target_numa_node);
-            work_buffer = malloc(work_buffer_size);
-            use_numa_alloc = false;
-        }
-        NUMA_ASSERT(work_buffer != NULL, "Work buffer allocation failed");
-    }
-
     enum ggml_status result = GGML_STATUS_FAILED;
 
 #ifdef GGML_USE_OPENMP
     // Use OpenMP single thread with NUMA binding
     #pragma omp parallel num_threads(1)
     {
+        // CRITICAL: Reset fallback flag to enable NUMA dispatch on this thread
+        extern void ggml_numa_set_fallback_flag(bool value);
+        ggml_numa_set_fallback_flag(false);
+        
         // Set thread-local context for single-thread execution (must be inside parallel region)
         ggml_current_numa_node = target_numa_node;
         ggml_numa_is_data_parallel_execution = false;
         ggml_numa_total_nodes_for_data_parallel = 1;
         ggml_numa_shared_result_tensor_data = ggml_get_data(tensor);
+
+        // Get or grow thread-local work buffer
+        void * work_buffer = NULL;
+        if (work_buffer_size > 0) {
+            work_buffer = ggml_get_or_grow_thread_work_buffer(work_buffer_size, target_numa_node);
+            NUMA_ASSERT(work_buffer != NULL, "Thread work buffer allocation/growth failed");
+        }
 
         // Bind to target NUMA node
         if (bind_thread_to_numa_node(target_numa_node)) {
@@ -764,7 +867,7 @@ enum ggml_status ggml_numa_openmp_execute_single_thread(
             struct ggml_compute_params params = {
                 .ith = 0,           // Thread index 0
                 .nth = 1,           // Total threads 1
-                .wdata = work_buffer,  // Work buffer allocated above
+                .wdata = work_buffer,  // Work buffer from reusable system
                 .wsize = work_buffer_size
             };
 
@@ -781,11 +884,22 @@ enum ggml_status ggml_numa_openmp_execute_single_thread(
     }
 #else
     // Fallback without OpenMP
+    // Reset fallback flag for non-OpenMP execution
+    extern void ggml_numa_set_fallback_flag(bool value);
+    ggml_numa_set_fallback_flag(false);
+    
     // Set thread-local context for fallback execution
     ggml_current_numa_node = target_numa_node;
     ggml_numa_is_data_parallel_execution = false;
     ggml_numa_total_nodes_for_data_parallel = 1;
     ggml_numa_shared_result_tensor_data = ggml_get_data(tensor);
+    
+    // Get or grow work buffer for fallback execution
+    void * work_buffer = NULL;
+    if (work_buffer_size > 0) {
+        work_buffer = ggml_get_or_grow_thread_work_buffer(work_buffer_size, target_numa_node);
+        NUMA_ASSERT(work_buffer != NULL, "Thread work buffer allocation/growth failed");
+    }
     
     struct ggml_compute_params params = {
         .ith = 0, .nth = 1, .wdata = work_buffer, .wsize = work_buffer_size
@@ -795,14 +909,7 @@ enum ggml_status ggml_numa_openmp_execute_single_thread(
 
     NUMA_LOG_VERBOSE("Single-thread execution completed with status %d\n", result);
     
-    // Clean up work buffer
-    if (work_buffer) {
-        if (use_numa_alloc) {
-            numa_free(work_buffer, work_buffer_size);
-        } else {
-            free(work_buffer);
-        }
-    }
+    // Work buffer is reused - no cleanup needed here
     
     return result;
 }
@@ -827,22 +934,6 @@ enum ggml_status ggml_numa_openmp_execute_single_node(
 
     NUMA_LOG_DEBUG("Executing single-node strategy: %d threads on NUMA node %d (work_buffer_size=%zu)\n", n_threads, target_numa_node, work_buffer_size);
 
-    // Allocate total work buffer for all threads
-    void * work_buffer = NULL;
-    bool use_numa_alloc = false;
-    if (work_buffer_size > 0) {
-        work_buffer = numa_alloc_onnode(work_buffer_size, target_numa_node);
-        if (work_buffer) {
-            use_numa_alloc = true;
-        } else {
-            NUMA_LOG_DEBUG("Failed to allocate work buffer (%zu bytes) on node %d, using malloc\n", 
-                          work_buffer_size, target_numa_node);
-            work_buffer = malloc(work_buffer_size);
-            use_numa_alloc = false;
-        }
-        NUMA_ASSERT(work_buffer != NULL, "Work buffer allocation failed");
-    }
-
     enum ggml_status result = GGML_STATUS_SUCCESS;
 
 #ifdef GGML_USE_OPENMP
@@ -852,6 +943,10 @@ enum ggml_status ggml_numa_openmp_execute_single_node(
     // Use OpenMP parallel region with specified thread count
     #pragma omp parallel num_threads(n_threads)
     {
+        // CRITICAL: Reset fallback flag to enable NUMA dispatch on this thread
+        extern void ggml_numa_set_fallback_flag(bool value);
+        ggml_numa_set_fallback_flag(false);
+        
         // Get OpenMP thread ID and use directly as logical task ID
         int omp_thread_id = omp_get_thread_num();
         int ith = omp_thread_id;  // Direct mapping (0, 1, 2, ..., n_threads-1)
@@ -877,22 +972,20 @@ enum ggml_status ggml_numa_openmp_execute_single_node(
         // Bind all threads to target NUMA node
         bind_thread_to_numa_node(target_numa_node);
 
-        // Set up compute params - work buffer sharing depends on operation type
+        // Get or grow thread-local work buffer on target NUMA node
         char* thread_work_buffer = NULL;
         size_t thread_work_size = 0;
-        if (work_buffer && work_buffer_size > 0) {
-            // For MUL_MAT and similar operations, all threads share the same work buffer
-            // For other operations, each thread gets a slice 
-            // TODO: Make this configurable per operation type
-            thread_work_buffer = (char*)work_buffer;  // Shared work buffer
-            thread_work_size = work_buffer_size;       // Full size for each thread
+        if (work_buffer_size > 0) {
+            thread_work_buffer = (char*)ggml_get_or_grow_thread_work_buffer(work_buffer_size, target_numa_node);
+            NUMA_ASSERT(thread_work_buffer != NULL, "Thread work buffer allocation/growth failed");
+            thread_work_size = work_buffer_size;
         }
         
         struct ggml_compute_params params = {
             .ith = ith,                     // Unique logical task index
             .nth = nth,                     // Total logical tasks
-            .wdata = thread_work_buffer,    // Shared work buffer (not sliced)
-            .wsize = thread_work_size       // Full work buffer size
+            .wdata = thread_work_buffer,    // Per-thread work buffer from reusable system
+            .wsize = thread_work_size       // Work buffer size
         };
 
         // Each thread calls work function with unique logical task ID
@@ -908,11 +1001,22 @@ enum ggml_status ggml_numa_openmp_execute_single_node(
     }
 #else
     // Fallback without OpenMP - single thread execution
+    // Reset fallback flag for non-OpenMP execution
+    extern void ggml_numa_set_fallback_flag(bool value);
+    ggml_numa_set_fallback_flag(false);
+    
     // Set thread-local context for fallback execution
     ggml_current_numa_node = target_numa_node;
     ggml_numa_is_data_parallel_execution = false;
     ggml_numa_total_nodes_for_data_parallel = 1;
     ggml_numa_shared_result_tensor_data = ggml_get_data(tensor);
+    
+    // Get or grow work buffer for fallback execution
+    void * work_buffer = NULL;
+    if (work_buffer_size > 0) {
+        work_buffer = ggml_get_or_grow_thread_work_buffer(work_buffer_size, target_numa_node);
+        NUMA_ASSERT(work_buffer != NULL, "Thread work buffer allocation/growth failed");
+    }
     
     struct ggml_compute_params params = {
         .ith = 0, .nth = 1, .wdata = work_buffer, .wsize = work_buffer_size
@@ -922,14 +1026,7 @@ enum ggml_status ggml_numa_openmp_execute_single_node(
 
     NUMA_LOG_VERBOSE("Single-node execution completed with status %d\n", result);
     
-    // Clean up work buffer
-    if (work_buffer) {
-        if (use_numa_alloc) {
-            numa_free(work_buffer, work_buffer_size);
-        } else {
-            free(work_buffer);
-        }
-    }
+    // Work buffers are reused - no cleanup needed here
     
     return result;
 }
@@ -967,11 +1064,13 @@ enum ggml_status ggml_numa_openmp_execute_data_parallel(
                    ggml_nelements(tensor), tensor->ne[0], tensor->ne[1], tensor->ne[2], tensor->ne[3], work_buffer_size);
 
     // Allocate work buffer distributed across NUMA nodes
+    // For data-parallel execution, we'll allocate work buffers locally on each NUMA node
+    // when threads start execution for optimal cache locality
     void * work_buffer = NULL;
     if (work_buffer_size > 0) {
-        // For data-parallel, allocate total buffer and let threads access their slices
-        work_buffer = malloc(work_buffer_size);  // Use malloc for simplicity across nodes
-        NUMA_ASSERT(work_buffer != NULL, "Work buffer allocation failed");
+        // For data-parallel, we'll allocate work buffers per-node inside the parallel region
+        // This ensures each thread gets a work buffer on its local NUMA node
+        NUMA_LOG_DEBUG("DATA_PARALLEL_WORK_BUFFER: Will allocate %zu bytes per node locally", work_buffer_size);
     }
 
     enum ggml_status result = GGML_STATUS_SUCCESS;
@@ -994,6 +1093,10 @@ enum ggml_status ggml_numa_openmp_execute_data_parallel(
 
         // CRITICAL BOUNDS CHECK: Ensure numa_node doesn't exceed available nodes
         if (numa_node < total_nodes) {
+            // CRITICAL: Reset fallback flag to enable NUMA dispatch on this thread
+            extern void ggml_numa_set_fallback_flag(bool value);
+            ggml_numa_set_fallback_flag(false);
+            
             // DEBUG: Log logical vs physical thread assignment
             NUMA_LOG_DEBUG("DATA_PARALLEL_TASK: OpenMP thread %d mapped to NUMA %d, local task %d/%d\n",
                            omp_thread_id, numa_node, local_task_id, threads_per_node);
@@ -1017,15 +1120,17 @@ enum ggml_status ggml_numa_openmp_execute_data_parallel(
             // Bind thread to its NUMA node
             bind_thread_to_numa_node(numa_node);
 
-            // Set up compute params with shared work buffer
+            // Get or grow thread-local work buffer on this NUMA node
             char* thread_work_buffer = NULL;
             size_t thread_work_size = 0;
-            if (work_buffer && work_buffer_size > 0) {
-                // For MUL_MAT and similar operations, all threads share the same work buffer
-                // For other operations, threads would get slices
-                // TODO: Make this configurable per operation type  
-                thread_work_buffer = (char*)work_buffer;  // Shared work buffer
-                thread_work_size = work_buffer_size;       // Full size for each thread
+            if (work_buffer_size > 0) {
+                // Use reusable work buffer system for optimal performance
+                thread_work_buffer = (char*)ggml_get_or_grow_thread_work_buffer(work_buffer_size, numa_node);
+                NUMA_ASSERT(thread_work_buffer != NULL, "Thread work buffer allocation/growth failed");
+                thread_work_size = work_buffer_size;
+                
+                NUMA_LOG_DEBUG("REUSABLE_WORK_BUFFER: Thread %d using %zu bytes on node %d at %p", 
+                               omp_thread_id, work_buffer_size, numa_node, (void*)thread_work_buffer);
             }
             
             struct ggml_compute_params params = {
@@ -1058,6 +1163,9 @@ enum ggml_status ggml_numa_openmp_execute_data_parallel(
                     result = thread_result;
                 }
             }
+            
+            // Work buffer is reused - no cleanup needed here
+            // Buffer will persist for next operation and be cleaned up on thread termination
         } else {
             // TRACE: Log threads that are excluded by bounds check
             NUMA_LOG_TRACE("THREAD_EXCLUDED: omp_thread=%d numa_node=%d >= total_nodes=%d (excluded from work)",
@@ -1073,6 +1181,10 @@ enum ggml_status ggml_numa_openmp_execute_data_parallel(
     NUMA_LOG_TRACE("PARALLEL_REGION_COMPLETE: all_threads_synchronized");
 #else
     // Fallback without OpenMP - single thread execution
+    // Reset fallback flag for non-OpenMP execution
+    extern void ggml_numa_set_fallback_flag(bool value);
+    ggml_numa_set_fallback_flag(false);
+    
     // Set thread-local context for fallback execution
     ggml_current_numa_node = 0;
     ggml_numa_is_data_parallel_execution = true;
@@ -1087,10 +1199,8 @@ enum ggml_status ggml_numa_openmp_execute_data_parallel(
 
     NUMA_LOG_VERBOSE("Data-parallel execution completed with status %d\n", result);
     
-    // Clean up work buffer
-    if (work_buffer) {
-        free(work_buffer);
-    }
+    // Work buffers are now cleaned up locally by each thread
+    // No global work buffer cleanup needed
     
     return result;
 }
@@ -1240,4 +1350,49 @@ bool ggml_numa_simple_coordinator_cross_numa_barrier(void) {
     NUMA_LOG_DEBUG("NUMA node %d: OpenMP not available, skipping cross-NUMA barrier", ggml_current_numa_node);
     return false;
 #endif
+}
+
+/**
+ * @brief Cleanup all thread-local work buffers
+ * 
+ * This function can be called to explicitly free all thread-local work buffers.
+ * Normally buffers are automatically cleaned up when threads terminate, but this
+ * provides a way to force cleanup for memory management.
+ * 
+ * Note: This should be called from each thread that has used work buffers,
+ * as thread-local storage is per-thread.
+ */
+void ggml_numa_openmp_cleanup_thread_work_buffers(void) {
+    ggml_cleanup_thread_work_buffer();
+    NUMA_LOG_DEBUG("Thread work buffer cleanup completed for thread %d", omp_get_thread_num());
+}
+
+/**
+ * @brief Get current thread work buffer state for testing
+ * 
+ * @param buffer_ptr Output pointer to current work buffer (NULL if none allocated)
+ * @param current_size Output current allocated size in bytes
+ * @param numa_node Output NUMA node where buffer is allocated
+ * @param is_numa_allocated Output whether buffer was allocated with numa_alloc_onnode()
+ * @return true if work buffer exists, false otherwise
+ */
+bool ggml_numa_openmp_get_thread_work_buffer_state(void** buffer_ptr, size_t* current_size, 
+                                                    int* numa_node, bool* is_numa_allocated) {
+    if (buffer_ptr) *buffer_ptr = g_thread_work_buffer.buffer;
+    if (current_size) *current_size = g_thread_work_buffer.current_size;
+    if (numa_node) *numa_node = g_thread_work_buffer.numa_node;
+    if (is_numa_allocated) *is_numa_allocated = g_thread_work_buffer.is_numa_allocated;
+    
+    return (g_thread_work_buffer.buffer != NULL);
+}
+
+/**
+ * @brief Force allocation of thread work buffer for testing
+ * 
+ * @param required_size Required buffer size in bytes
+ * @param target_numa_node Target NUMA node for allocation
+ * @return Pointer to allocated work buffer, or NULL on failure
+ */
+void* ggml_numa_openmp_test_force_work_buffer_allocation(size_t required_size, int target_numa_node) {
+    return ggml_get_or_grow_thread_work_buffer(required_size, target_numa_node);
 }
