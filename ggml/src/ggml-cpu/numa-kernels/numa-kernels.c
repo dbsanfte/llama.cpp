@@ -18,6 +18,7 @@
 #include "rope.h"
 #include "noop.h"
 #include "../ggml-impl.h"
+#include "../ggml-vec-numa.h"
 
 // ============================================================================
 // Direct Array Cache System - Maximum Performance
@@ -265,6 +266,10 @@ enum ggml_status ggml_numa_kernels_init(void) {
         NUMA_LOG_ERROR("Failed to initialize kernel array cache");
         return cache_result;
     }
+    
+    // Initialize NUMA vector operations for SIMD transcendental functions
+    ggml_vec_numa_init();
+    NUMA_LOG_DEBUG("NUMA vector operations initialized with runtime SIMD dispatch");
     
     // Register each kernel using their own registration functions
     // This allows kernels to define their own strategies and function pointers

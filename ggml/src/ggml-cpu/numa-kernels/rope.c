@@ -45,10 +45,15 @@
 #include "../ggml-numa-openmp-coordinator.h"
 #include "../ggml-cpu-impl.h"
 #include "../ggml-impl.h"
+#include "../ggml-vec-numa.h"
 #include "ggml.h"  // For GGML_MIN macro
 
 // Cache line padding for performance
-#define CACHE_LINE_SIZE_F32 (64/sizeof(float))
+#define CACHE_LINE_SIZE_F32 16
+
+// NUMA optimization thresholds and memory helpers
+#define GGML_NUMA_MALLOC(size) malloc(size)
+#define GGML_NUMA_FREE(ptr) free(ptr)
 
 // ============================================================================
 // COMPREHENSIVE TRACE LOGGING MACROS FOR NUMA KERNEL DEBUGGING
@@ -130,13 +135,81 @@ static void rope_yarn(
 
 /**
  * Initialize ROPE cache for standard/NEOX variants - FIXED to match reference implementation exactly
+ * NUMA OPTIMIZATION: Uses SIMD-accelerated sin/cos computations for improved performance
  */
 static void ggml_rope_cache_init(
         const float theta_base, const float freq_scale, const float * freq_factors,
         const float corr_dims[2], const int64_t ne0, const float ext_factor, const float mscale,
         float * cache, const float sin_sign, const float theta_scale) {
     
-    // FIXED: Use reference implementation logic exactly
+    // Check if SIMD optimization is beneficial (threshold for SIMD effectiveness)
+    if (ne0 >= GGML_VEC_NUMA_AVX2_THRESHOLD) {
+        // NUMA OPTIMIZATION: Vectorized sin/cos computation for cache initialization
+        const int64_t simd_pairs = (ne0 / 2);
+        
+        // Temporary arrays for SIMD batch processing
+        float * theta_values = GGML_NUMA_MALLOC(simd_pairs * sizeof(float));
+        float * cos_values = GGML_NUMA_MALLOC(simd_pairs * sizeof(float));
+        float * sin_values = GGML_NUMA_MALLOC(simd_pairs * sizeof(float));
+        
+        if (theta_values && cos_values && sin_values) {
+            // Prepare theta values for vectorized computation
+            float theta = theta_base;
+            for (int64_t pair_idx = 0; pair_idx < simd_pairs; pair_idx++) {
+                int64_t i0 = pair_idx * 2;
+                const float ff = freq_factors ? freq_factors[pair_idx] : 1.0f;
+                
+                // Apply the same rope_yarn logic but only compute theta
+                float theta_interp = freq_scale * (theta / ff);
+                float final_theta = theta_interp;
+                
+                if (ext_factor != 0.0f) {
+                    float theta_extrap = theta / ff;
+                    float ramp_mix = rope_yarn_ramp(corr_dims[0], corr_dims[1], i0) * ext_factor;
+                    final_theta = theta_interp * (1 - ramp_mix) + theta_extrap * ramp_mix;
+                }
+                
+                theta_values[pair_idx] = final_theta;
+                theta *= theta_scale;
+            }
+            
+            // NUMA VECTOR OPTIMIZATION: Use SIMD sin/cos for batch computation
+            GGML_VEC_SINCOS_F32_NUMA(simd_pairs, sin_values, cos_values, theta_values);
+            
+            // Apply mscale and populate cache with vectorized results
+            theta = theta_base;
+            for (int64_t pair_idx = 0; pair_idx < simd_pairs; pair_idx++) {
+                int64_t i0 = pair_idx * 2;
+                
+                // Calculate mscale for this pair (same logic as rope_yarn)
+                float local_mscale = mscale;
+                if (ext_factor != 0.0f) {
+                    local_mscale *= 1.0f + 0.1f * logf(1.0f / freq_scale);
+                }
+                
+                // Apply scaling and write to cache
+                cache[i0 + 0] = cos_values[pair_idx] * local_mscale;
+                cache[i0 + 1] = sin_values[pair_idx] * local_mscale * sin_sign;
+                
+                theta *= theta_scale;
+            }
+            
+            GGML_NUMA_FREE(theta_values);
+            GGML_NUMA_FREE(cos_values);
+            GGML_NUMA_FREE(sin_values);
+            
+            NUMA_LOG_TRACE("ROPE cache init: SIMD optimized %ld pairs", simd_pairs);
+            return;
+        } else {
+            // Memory allocation failed, fall back to scalar
+            NUMA_LOG_DEBUG("ROPE cache init: SIMD memory allocation failed, using scalar fallback");
+            if (theta_values) GGML_NUMA_FREE(theta_values);
+            if (cos_values) GGML_NUMA_FREE(cos_values);
+            if (sin_values) GGML_NUMA_FREE(sin_values);
+        }
+    }
+    
+    // REFERENCE IMPLEMENTATION: Scalar fallback (unchanged reference logic)
     float theta = theta_base;
     for (int64_t i0 = 0; i0 < ne0; i0 += 2) {
         const float ff = freq_factors ? freq_factors[i0/2] : 1.0f;

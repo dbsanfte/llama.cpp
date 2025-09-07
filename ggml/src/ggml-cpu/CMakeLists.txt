@@ -35,6 +35,9 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
         ggml-cpu/ggml-numa-executor.h
         ggml-cpu/ggml-numa-perf.c
         ggml-cpu/ggml-numa-perf.h
+        # NUMA Vector Operations - SIMD-optimized transcendental functions
+        ggml-cpu/ggml-vec-numa.c
+        ggml-cpu/ggml-vec-numa.h
         # NUMA Kernels - Implementations for data-parallel execution
         ggml-cpu/numa-kernels/numa-kernels.c
         ggml-cpu/numa-kernels/numa-kernels.h
@@ -643,5 +646,27 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
         else()
             message(WARNING "NUMA library not found for ${GGML_CPU_NAME}")
         endif()
+    endif()
+
+    # GNU libmvec support for vectorized transcendental functions
+    if (CMAKE_C_COMPILER_ID STREQUAL "GNU" AND UNIX AND NOT APPLE)
+        find_library(MVEC_LIBRARY NAMES mvec)
+        if (MVEC_LIBRARY)
+            message(STATUS "Adding GNU libmvec vectorized math support to ${GGML_CPU_NAME}")
+            # Use selective fast-math flags that don't conflict with GGML
+            # Avoid -ffast-math as it enables -ffinite-math-only which conflicts with GGML
+            target_compile_options(${GGML_CPU_NAME} PRIVATE 
+                -fno-math-errno 
+                -fno-trapping-math 
+                -ftree-vectorize 
+                -funsafe-math-optimizations)
+            target_link_libraries(${GGML_CPU_NAME} PRIVATE ${MVEC_LIBRARY})
+            # Enable auto-vectorization of math functions
+            target_compile_definitions(${GGML_CPU_NAME} PRIVATE GGML_NUMA_LIBMVEC_ENABLED)
+        else()
+            message(STATUS "GNU libmvec not found for ${GGML_CPU_NAME} - using scalar transcendental fallbacks")
+        endif()
+    else()
+        message(STATUS "GNU libmvec not available (requires GCC on Linux) for ${GGML_CPU_NAME}")
     endif()
 endfunction()
