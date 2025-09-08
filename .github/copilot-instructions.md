@@ -144,7 +144,7 @@ Choose the appropriate template and leverage shared macros for efficient develop
 - **Use for**: ADD, MUL, SUB, DIV and similar simple element-wise operations
 - **Pattern**: `NUMA_KERNEL_ELEMENT_WISE_SETUP()` macro for automatic slice setup
 - **Characteristics**: Single-pass algorithms, no aggregation needed
-- **Modern Implementation**: Uses `ggml_numa_slice_context_t` and `NUMA_SLICE_ELEMENTS()` macro
+- **Modern Implementation**: Uses `ggml_numa_slice_context_t` and automatic barrier handling
 
 **🔹 Sequence-wise Operations Template**: `numa-kernels/rope.c`
 - **Use for**: ROPE, attention operations, sequence-based transformations
@@ -171,7 +171,7 @@ Choose the appropriate template and leverage shared macros for efficient develop
 - **Modern Implementation**: `NUMA_OPENMP_STRATEGY_SINGLE_THREAD` with metadata-only logic
 
 **Modern Shared Macro System:**
-The NUMA framework now provides powerful shared macros that eliminate boilerplate and ensure consistent behavior:
+The NUMA framework provides powerful shared macros that eliminate boilerplate and ensure consistent behavior:
 
 ```c
 // 1. NUMA_KERNEL_ELEMENT_WISE_SETUP() - Complete setup for element-wise operations
@@ -229,80 +229,37 @@ NUMA_GET_SHARED_DATA(tensor, dst_data, float);  // Handles shared memory logic a
 - **Maintenance**: Changes to slicing logic only need updates in one place
 - **Performance**: Compiled-time optimizations, zero runtime overhead
 - **Debugging**: Centralized debug logging with `NUMA_LOG_SLICE_DEBUG()` macro
-
-**📚 NUMA Kernel Template System:**
-Choose the appropriate template based on operation characteristics:
-
-**🔹 Binary Element-wise Operations Template**: `numa-kernels/add.c`
-- **Use for**: ADD, MUL, SUB, DIV and similar simple element-wise operations
-- **Pattern**: Uniform memory access, simple data-parallel execution
-- **Characteristics**: Single-pass algorithms, no aggregation needed
-- **NUMA Strategy**: Direct element slicing across NUMA nodes
-
-**🔹 Complex Operations Template**: `numa-kernels/mul_mat.c`
-- **Use for**: Matrix multiplication, convolutions, complex transformations
-- **Pattern**: Multidimensional slicing, specialized SIMD patterns  
-- **Characteristics**: Non-uniform memory access, chunk-based processing
-- **NUMA Strategy**: Sophisticated work distribution algorithms
-
-**🔹 Reduction Operations Template**: `numa-kernels/rms_norm.c`
-- **Use for**: Normalization, statistical operations, dimension-wise reductions
-- **Pattern**: Row-wise/column-wise processing, potential aggregation
-- **Characteristics**: Multi-pass algorithms, cache-optimized access patterns
-- **NUMA Strategy**: Dimension-aware parallelization with optional aggregation
-
-**🔹 View Operations Template**: `numa-kernels/reshape.c`
-- **Use for**: RESHAPE, PERMUTE, VIEW, TRANSPOSE and similar metadata-only operations
-- **Pattern**: No-op execution, metadata transformation only
-- **Characteristics**: Zero computational overhead, single-node execution
-- **NUMA Strategy**: `NUMA_NODE_STRATEGY_SINGLE` with `NUMA_ON_NODE_STRATEGY_SINGLE_THREAD`
-
-**Critical NUMA Data Slicing Pattern:**
-```c
-// NUMA kernel implementation with dual-level data slicing
-enum ggml_status ggml_numa_kernel_your_operation_execute(void * work_context, struct ggml_compute_params * params) {
+enum ggml_status ggml_numa_kernel_rope_execute(void * work_context, struct ggml_compute_params * params) {
     struct ggml_tensor * tensor = (struct ggml_tensor *)work_context;
     
-    // Get thread-local NUMA context (set by coordinator)
-    extern __thread int ggml_current_numa_node;
-    extern __thread bool ggml_numa_is_data_parallel_execution;
-    extern __thread int ggml_numa_total_nodes_for_data_parallel;
-    extern __thread void * ggml_numa_shared_result_tensor_data;
+    // Setup sequence-wise slicing
+    ggml_numa_slice_context_t slice_ctx;
+    NUMA_SLICE_SEQUENCES(slice_ctx, tensor, params);
     
-    size_t total_elements = ggml_nelements(tensor);
-    size_t numa_start = 0, numa_end = total_elements;
-    
-    // NUMA-level slicing (across nodes)
-    if (ggml_numa_is_data_parallel_execution) {
-        size_t elements_per_node = total_elements / ggml_numa_total_nodes_for_data_parallel;
-        numa_start = ggml_current_numa_node * elements_per_node;
-        numa_end = (ggml_current_numa_node == ggml_numa_total_nodes_for_data_parallel - 1) ? 
-                   total_elements : numa_start + elements_per_node;
+    if (!slice_ctx.has_work) {
+        NUMA_OPENMP_BARRIER();  // Participate in barrier even without work
+        return GGML_STATUS_SUCCESS;
     }
     
-    // Thread-level slicing (within this NUMA node)
-    int ith = params->ith;         // Thread index within NUMA node
-    int nth = params->nth;         // Total threads on this NUMA node
-    
-    size_t slice_elements = numa_end - numa_start;
-    size_t elements_per_thread = slice_elements / nth;
-    size_t thread_start = numa_start + (ith * elements_per_thread);
-    size_t thread_end = (ith == nth - 1) ? numa_end : thread_start + elements_per_thread;
-    
-    // Use shared memory for direct writes (eliminates aggregation)
-    float * dst_data;
-    if (ggml_numa_shared_result_tensor_data != NULL) {
-        dst_data = (float *)ggml_numa_shared_result_tensor_data;
-    } else {
-        dst_data = (float *)tensor_data(tensor);
+    // Process sequences from slice_ctx.thread_start to slice_ctx.thread_end
+    for (int seq = slice_ctx.thread_start; seq < slice_ctx.thread_end; seq++) {
+        // ... sequence processing logic ...
     }
-    
-    // SIMD operation on thread's slice
-    ggml_vec_add_f32(thread_end - thread_start, dst_data + thread_start, src0 + thread_start, src1 + thread_start);
     
     return GGML_STATUS_SUCCESS;
 }
+
+// 3. NUMA_GET_SHARED_DATA() - For accessing shared result memory
+float * dst_data;
+NUMA_GET_SHARED_DATA(tensor, dst_data, float);  // Handles shared memory logic automatically
 ```
+
+**Shared Macro Benefits:**
+- **Consistency**: All kernels use identical slice calculation logic
+- **Error Prevention**: Built-in barrier handling and edge case management
+- **Maintenance**: Changes to slicing logic only need updates in one place
+- **Performance**: Compiled-time optimizations, zero runtime overhead
+- **Debugging**: Centralized debug logging with `NUMA_LOG_SLICE_DEBUG()` macro
 
 **NUMA Kernel Implementation Pattern with Modern Macros:**
 ```c
@@ -473,12 +430,11 @@ cp tests/test-numa-mathematical-correctness-template.cpp tests/test-numa-mathema
 **✅ Supported Operations:**
 - **ADD** - Element-wise addition with SIMD optimization and shared memory approach
 - **MUL** - Element-wise multiplication with optimized data-parallel execution
-- **GLU** - Gated Linear Unit activation with specialized SIMD patterns
-- **ROPE** - Rotary Position Embedding with complex mathematical transformations
-- **PERMUTE** - Tensor axis permutation for view operations (no-op pattern)
-- **RMS_NORM** - Root mean square normalization with row-wise NUMA distribution (critical for transformers)
-- **MUL_MAT** - Matrix multiplication with chunk-based work distribution and type-specific SIMD operations
-- **RESHAPE** - Tensor shape transformation for view operations (no-op metadata-only)
+- **DIV** - Element-wise division with comprehensive quantization support
+- **SUB** - Element-wise subtraction with mathematical correctness validation
+- **ROPE** - Rotary Position Embedding with sequence-wise slicing and complex mathematical transformations
+- **NOOP** - No-operation for testing and debugging framework functionality
+- **MUL_MAT** - Matrix multiplication (temporarily disabled - debugging cross-NUMA race conditions)
 
 **🚀 Performance Characteristics:**
 - **O(1) Strategy Lookups** - Direct function pointer dispatch eliminates all search overhead
@@ -487,15 +443,15 @@ cp tests/test-numa-mathematical-correctness-template.cpp tests/test-numa-mathema
 - **NUMA-Aware Scheduling** - Optimal thread and memory placement
 - **Shared Memory Optimization** - Direct memory writes eliminate aggregation overhead for most operations
 - **3-Level Debug System** - Clean output at levels 1-2, detailed tracing at level 3
-- **Work Function Architecture** - Clean separation between computation (work functions) and result combination (aggregation functions)
+- **Shared Macro Architecture** - Consistent slicing logic across all kernels with centralized maintenance
 - **Registry-Based Scalability** - Easy addition of new kernels with consistent patterns
 
 **📊 Current System Status:**
-- **Total Registered Kernels**: 8 active (ADD, MUL, GLU, ROPE, PERMUTE, RMS_NORM, MUL_MAT, RESHAPE)
-- **Kernel Implementation Files**: 18 files (9 headers + 9 implementations, plus system files)
-- **Template Categories**: 4 types (Binary Element-wise, Complex, Reduction, View operations)
+- **Total Active Kernels**: 6 registered (ADD, MUL, DIV, SUB, ROPE, NOOP)
+- **Kernel Template Categories**: 5 types (Element-wise, Sequence-wise, Complex, Reduction, View operations)
+- **Shared Macro System**: NUMA_KERNEL_ELEMENT_WISE_SETUP(), NUMA_SLICE_SEQUENCES(), NUMA_SLICE_ROWS() for consistent implementation
 - **Registry Architecture**: NUMA_REGISTER_KERNEL() macro with automatic query dispatch
-- **Test Coverage**: Mathematical correctness and performance benchmarks for all kernels
+- **Test Coverage**: Mathematical correctness and performance benchmarks with comprehensive test template
 
 ## 🏗️ Build Environment & Commands
 
@@ -641,27 +597,6 @@ ggml_numa_kernel_registration_info_t info = {
         .valid = true
     },
     .agg_funcs = {
-        .aggregation_fn = ggml_numa_kernel_rms_norm_aggregate,  // Custom aggregation
-        .valid = true
-    },
-    .kernel_name = "NUMA RMS_NORM Kernel",
-    .supported = true
-};
-
-// Row-wise processing with NUMA distribution
-for (int row = numa_start_row; row < numa_end_row; row++) {
-    float* row_data = (float*)((char*)src + row * src->nb[1]);
-    float* dst_row = (float*)((char*)dst + row * dst->nb[1]);
-    
-    // SIMD dot product for sum of squares
-    float sum_squares = ggml_vec_dot_f32(row_size, row_data, row_data);
-    float scale = 1.0f / sqrtf(sum_squares / row_size + eps);
-    
-    // SIMD scaling
-    ggml_vec_scale_f32(row_size, dst_row, scale);
-}
-```
-
 **Critical SIMD Requirements:**
 - Always prefer `ggml_vec_*` over manual loops
 - Ensure mathematical equivalence with reference implementation
@@ -670,45 +605,38 @@ for (int row = numa_start_row; row < numa_end_row; row++) {
 
 ### GB-Scale Tensor Infrastructure & Shared Memory Optimization
 
-**Complexity Classification System:**
-The NUMA framework now supports 10 complexity levels for optimal strategy selection:
-- `COMPLEXITY_TINY` → `COMPLEXITY_HUGE`: Traditional levels for smaller tensors
-- `COMPLEXITY_GIGANTIC_1GB` through `COMPLEXITY_GIGANTIC_16GB`: New GB-scale levels
-
 **Shared Memory Optimization:**
 For large tensors (1GB+), the shared memory approach provides significant performance improvements:
 - **Direct memory writes** to final tensor memory locations
 - **Zero-copy architecture** with proper NUMA memory locality
 - **Eliminates aggregation overhead** by writing directly to shared result tensor
 
-**Pattern: Shared Memory Kernel Implementation**
+**Pattern: Shared Memory Kernel Implementation with Modern Macros**
 Note: F32 example is shown but all quant types in `quants.c` must be supported.
 
 ```c
-// Shared memory kernel for GB-scale tensors
-enum ggml_status ggml_numa_kernel_add_shared_memory_execute(void * work_context, struct ggml_compute_params * params) {
+// Modern shared memory kernel using macros
+enum ggml_status ggml_numa_kernel_add_execute(void * work_context, struct ggml_compute_params * params) {
     struct ggml_tensor * tensor = (struct ggml_tensor *)work_context;
     
-    // Get NUMA execution context from thread-local variables
-    extern __thread void * ggml_numa_shared_result_tensor_data;
-    extern __thread bool ggml_numa_is_data_parallel_execution;
-    extern __thread int ggml_current_numa_node;
-    
-    // Use shared memory for direct writes in data-parallel mode
+    // Complete setup with shared macro - handles shared memory automatically
+    ggml_numa_slice_context_t slice_ctx;
     float * dst_data;
-    if (ggml_numa_shared_result_tensor_data != NULL) {
-        dst_data = (float *)ggml_numa_shared_result_tensor_data;
-    } else {
-        dst_data = (float *)tensor_data(tensor);
-    }
+    NUMA_KERNEL_ELEMENT_WISE_SETUP(slice_ctx, tensor, params, dst_data, float);
     
-    // Direct SIMD operation on final tensor memory (no aggregation needed)
-    ggml_vec_add_f32(numa_end - numa_start, dst_data + numa_start, src0 + numa_start, src1 + numa_start);
+    // Extract source data
+    const float * src0_data = (const float *)tensor_data(tensor->src[0]);
+    const float * src1_data = (const float *)tensor_data(tensor->src[1]);
+    
+    // Direct SIMD operation on shared memory (no aggregation needed)
+    ggml_vec_add_f32(slice_ctx.thread_elements, 
+                     dst_data + slice_ctx.thread_start, 
+                     src0_data + slice_ctx.thread_start, 
+                     src1_data + slice_ctx.thread_start);
     
     return GGML_STATUS_SUCCESS;
 }
 ```
-
 **GB-Scale Tensor Dimension Calculation:**
 ```c
 // For GB-scale test tensors, use cube root for balanced dimensions
@@ -789,36 +717,37 @@ if (total_elements < 1024) {
 }
 ```
 
-**Kernel Data Slicing Implementation:**
+**Modern Kernel Data Slicing with Shared Macros:**
 ```c
-// Thread-local variables automatically set by coordinator
-extern __thread int ggml_current_numa_node;                    // 0, 1, 2, ...
-extern __thread bool ggml_numa_is_data_parallel_execution;     // true/false
-extern __thread int ggml_numa_total_nodes_for_data_parallel;   // total participating nodes
-extern __thread void * ggml_numa_shared_result_tensor_data;    // shared memory pointer
-
-// Dual-level data slicing in kernels
-size_t total_elements = ggml_nelements(tensor);
-size_t numa_start = 0, numa_end = total_elements;
-
-// Level 1: NUMA node slicing (for data-parallel only)
-if (ggml_numa_is_data_parallel_execution) {
-    size_t elements_per_node = total_elements / ggml_numa_total_nodes_for_data_parallel;
-    numa_start = ggml_current_numa_node * elements_per_node;
-    numa_end = (ggml_current_numa_node == ggml_numa_total_nodes_for_data_parallel - 1) ? 
-               total_elements : numa_start + elements_per_node;
+// Modern approach: Use shared macros that handle all slicing automatically
+enum ggml_status ggml_numa_kernel_operation_execute(void * work_context, struct ggml_compute_params * params) {
+    struct ggml_tensor * tensor = (struct ggml_tensor *)work_context;
+    
+    // Shared macro handles all slicing logic automatically
+    ggml_numa_slice_context_t slice_ctx;
+    float * dst_data;
+    NUMA_KERNEL_ELEMENT_WISE_SETUP(slice_ctx, tensor, params, dst_data, float);
+    
+    // slice_ctx now contains: thread_start, thread_end, thread_elements, numa_node, etc.
+    // All thread-local variables are automatically set by the coordinator
+    
+    // Extract source data and perform SIMD operation on thread's slice
+    const float * src_data = (const float *)tensor_data(tensor->src[0]);
+    ggml_vec_operation(slice_ctx.thread_elements, 
+                       dst_data + slice_ctx.thread_start, 
+                       src_data + slice_ctx.thread_start);
+    
+    return GGML_STATUS_SUCCESS;
 }
-
-// Level 2: Thread slicing within NUMA node
-int ith = params->ith, nth = params->nth;
-size_t slice_elements = numa_end - numa_start;
-size_t elements_per_thread = slice_elements / nth;
-size_t thread_start = numa_start + (ith * elements_per_thread);
-size_t thread_end = (ith == nth - 1) ? numa_end : thread_start + elements_per_thread;
-
-// Process thread's slice with SIMD optimization
-ggml_vec_operation(thread_end - thread_start, dst + thread_start, src + thread_start);
 ```
+
+**Shared Macro Advantages:**
+- **NUMA_KERNEL_ELEMENT_WISE_SETUP()**: Complete setup for element-wise operations with automatic barrier handling
+- **NUMA_SLICE_SEQUENCES()**: Sequence-wise slicing for operations like ROPE that work on ne[2] dimension  
+- **NUMA_SLICE_ROWS()**/**NUMA_SLICE_COLUMNS()**: Row/column-wise slicing for matrix operations
+- **Built-in edge case handling**: Threads with no work automatically participate in OpenMP barriers
+- **Consistent debug logging**: Centralized debug output with `NUMA_LOG_SLICE_DEBUG()` macro
+- **Zero maintenance overhead**: All slicing logic centralized in shared macros
 
 **Execution Flow:**
 1. **Registry Query**: O(1) threshold lookup determines optimal strategy
@@ -856,36 +785,30 @@ cmake --build build --target ggml-cpu llama && echo "🎉 Complete!" || echo "�
 - **Validate with real models** - not just compilation
 - **Check exit codes** - tests must properly signal failures
 - **SIMD First**: Always use `ggml_vec_*` functions instead of scalar loops
+- **Use Shared Macros**: Leverage `NUMA_KERNEL_ELEMENT_WISE_SETUP()`, `NUMA_SLICE_SEQUENCES()`, etc. instead of manual slicing
 - **Registry Integration**: Add cache entries for all complexity classes
 - **Architecture Flow**: Follow Executor → Registry Direct Dispatch → Coordinator pattern
 - **Debug Control**: Use `GGML_NUMA_DEBUG=1` for development debugging, unset for performance testing
 - **Kernel Registration**: Always use `NUMA_REGISTER_KERNEL()` macro, never legacy function-based registration
 - **Strategy Selection**: Use `NUMA_SELECT_STRATEGY_FROM_CACHE()` macro for unified threshold-based strategy selection
 
-### Strategy Selection Pattern
-All kernels using cache-based thresholds should use the shared macro for consistency:
+### Modern Shared Macro Implementation Pattern
+All new kernels should use the shared macro system for consistency and maintainability:
 ```c
-// Get cache entry for this operation
-const ggml_numa_kernel_cache_entry_t * cache_entry = ggml_numa_lookup_kernel_direct(tensor->op);
-
-// Calculate total elements for threshold comparison
-size_t total_elements = ggml_nelements(tensor);
-
-// Use shared macro for unified strategy selection
-ggml_numa_execution_strategy_t selected_strategy;
-NUMA_SELECT_STRATEGY_FROM_CACHE(cache_entry, total_elements, selected_strategy);
-
-// selected_strategy now contains the optimal strategy:
-// - Below threshold[0]: Single node, single thread (fastest for tiny tensors)
-// - Below threshold[1]: Single node, multi-thread (good for small-medium tensors)  
-// - Above threshold[1]: Data-parallel across NUMA nodes (optimal for large tensors)
+// Choose appropriate macro based on operation characteristics:
+NUMA_KERNEL_ELEMENT_WISE_SETUP(slice_ctx, tensor, params, dst_data, float);     // Element-wise operations
+NUMA_SLICE_SEQUENCES(slice_ctx, tensor, params);                               // Sequence-based operations  
+NUMA_SLICE_ROWS(slice_ctx, tensor, params);                                   // Row-wise operations
+NUMA_SLICE_COLUMNS(slice_ctx, tensor, params);                                // Column-wise operations
+NUMA_GET_SHARED_DATA(tensor, dst_data, float);                                // Manual shared memory access
 ```
 
 **Benefits:**
-- **Single Source of Logic**: Strategy selection logic centralized in one macro
-- **Consistent Behavior**: All kernels using this macro behave identically  
-- **Maintainability**: Changes to strategy logic only need to be made in one place
-- **Zero Performance Impact**: Macro expands to identical code at compile time
+- **Single Source of Logic**: Slicing logic centralized in one place
+- **Consistent Behavior**: All kernels using macros behave identically  
+- **Maintainability**: Changes to slicing logic only need to be made in shared macros
+- **Zero Performance Impact**: Macros expand to identical code at compile time
+- **Built-in Safety**: Automatic barrier handling and edge case management
 
 ### Debug Message Implementation
 When adding new NUMA components, always use the centralized debug control system:
@@ -918,10 +841,12 @@ tests/test-numa-execution-modes.cpp               # Runs individual op performan
 docs/numa-architecture.md                         # Architecture documentation
 
 # NUMA Kernel Templates (Choose Based on Operation Type)
-ggml/src/ggml-cpu/numa-kernels/add.c              # Template: Binary element-wise operations
+ggml/src/ggml-cpu/numa-kernels/add.c              # Template: Element-wise operations (ADD, MUL, SUB, DIV)
+ggml/src/ggml-cpu/numa-kernels/rope.c             # Template: Sequence-wise operations (ROPE, attention ops)
 ggml/src/ggml-cpu/numa-kernels/mul_mat.c          # Template: Complex operations & matrix ops
 ggml/src/ggml-cpu/numa-kernels/rms_norm.c         # Template: Reduction operations & normalizations
 ggml/src/ggml-cpu/numa-kernels/reshape.c          # Template: View operations & metadata transformations
+tests/test-numa-mathematical-correctness-template.cpp  # Comprehensive test template for new operations
 ```
 
 ### Implementation Checklist
@@ -930,8 +855,11 @@ ggml/src/ggml-cpu/numa-kernels/reshape.c          # Template: View operations & 
 - [ ] Extract pure mathematical operations (no ggml threading)
 - [ ] Replace scalar loops with SIMD `ggml_vec_*` functions
 - [ ] **Copy template and adapt** for your operation type
-- [ ] Implement kernel function in `numa-kernels/` directory using shared macros
-- [ ] Use `NUMA_KERNEL_ELEMENT_WISE_SETUP()`, `NUMA_SLICE_SEQUENCES()`, or `NUMA_SLICE_ROWS()` macros as appropriate
+- [ ] Implement kernel function in `numa-kernels/` directory using shared macros:
+  - [ ] Use `NUMA_KERNEL_ELEMENT_WISE_SETUP()` for element-wise operations
+  - [ ] Use `NUMA_SLICE_SEQUENCES()` for sequence-based operations like ROPE
+  - [ ] Use `NUMA_SLICE_ROWS()` or `NUMA_SLICE_COLUMNS()` for matrix operations
+  - [ ] Use `NUMA_GET_SHARED_DATA()` for manual shared memory access
 - [ ] Check `ggml_numa_shared_result_tensor_data` for direct writes (shared memory optimization)
 - [ ] Create `ggml_numa_kernel_{operation}_register()` function that returns registration info
 - [ ] Create `ggml_numa_kernel_{operation}_query()` function using `NUMA_SELECT_STRATEGY_FROM_CACHE()` macro
@@ -940,7 +868,7 @@ ggml/src/ggml-cpu/numa-kernels/reshape.c          # Template: View operations & 
 - [ ] Enable in `numa-kernels.c` using `NUMA_REGISTER_KERNEL(operation)` macro
 - [ ] Use `NUMA_ASSERT` for validation with proper coordinator signaling
 - [ ] Use `NUMA_LOG_DEBUG` macros instead of printf for debug messages
-- [ ] Create test from template with multi-dimensional validation
+- [ ] Create test from mathematical correctness template with multi-dimensional validation
 - [ ] Add to CMake and verify builds successfully
 - [ ] Verify core architecture builds: `cmake --build build --target ggml-cpu llama`
 - [ ] Add the new test to `tests/run-numa-tests.sh` and verify it and the entire suite passes
