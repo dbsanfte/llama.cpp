@@ -14,6 +14,9 @@
 
 #include "numa-kernels.h"
 #include "add.h"
+#include "mul.h"
+#include "div.h"
+#include "sub.h"
 #include "mul_mat.h"
 #include "rope.h"
 #include "noop.h"
@@ -258,31 +261,6 @@ const char * ggml_numa_get_kernel_name_from_cache(
 }
 
 /**
- * Returns aggregation function pointer based on operation and strategy
- * Temporarily disabled - simplified architecture doesn't need this variant
- */
-/*
-enum ggml_status (*ggml_numa_lookup_aggregation_direct(
-    enum ggml_op op_type,
-    const ggml_numa_execution_strategy_t * strategy
-))(void *, int, struct ggml_tensor *, struct ggml_cplan *) {
-    
-    if (!strategy) {
-        return NULL;
-    }
-    
-    // Direct array access - no hash computation!
-    const ggml_numa_kernel_cache_entry_t * entry = ggml_numa_lookup_kernel_direct(op_type);
-    if (!entry || !entry->agg_funcs.valid) {
-        return NULL;
-    }
-    
-    // Use the same fast function selection as before
-    return numa_get_aggregation_func_fast(&entry->agg_funcs, strategy);
-}
-*/
-
-/**
  * Array-based work function lookup - direct access using operation type as index
  * Returns work function pointer for execution based on operation and strategy
  */
@@ -343,8 +321,11 @@ enum ggml_status ggml_numa_kernels_init(void) {
     // Register MUL_MAT kernel
     // NUMA_REGISTER_KERNEL(mul_mat);  // Temporarily disabled - debugging cross-NUMA race conditions
     
-    // Enable ADD kernel for multi-threaded data-parallel testing
-    NUMA_REGISTER_KERNEL(add);  // Re-enabled to confirm this is corruption source  // Re-enabled to debug data slicing issue
+    // Register the binary op kernels:
+    NUMA_REGISTER_KERNEL(add); 
+    NUMA_REGISTER_KERNEL(mul);
+    NUMA_REGISTER_KERNEL(div);
+    NUMA_REGISTER_KERNEL(sub);
     
     // Register NOOP kernel for performance testing
     NUMA_REGISTER_KERNEL(noop);
@@ -361,79 +342,6 @@ enum ggml_status ggml_numa_kernels_init(void) {
 // ============================================================================
 // Modern Direct Array Lookup System
 // ============================================================================
-
-/*
- * Legacy function temporarily disabled during query simplification
- */
-/*
-ggml_numa_kernel_query_result_t ggml_numa_kernels_strategy_lookup(const struct ggml_tensor * tensor) {
-    // Default fallback result for safety
-    ggml_numa_kernel_query_result_t default_result = {
-        .kernel_name = "Fallback-Standard",
-        .aggregation_policy = GGML_NUMA_AGGREGATION_NONE,
-        .work_buffer_size_per_thread = 0,
-        .efficiency_score = 0.5f,
-        .strategy = {
-            .node_strategy = NUMA_NODE_STRATEGY_SINGLE,
-            .on_node_strategy = NUMA_ON_NODE_STRATEGY_MULTI_THREAD
-        },
-        .aggregation_function = NULL,
-        .supported = false,
-        .work_function = NULL
-    };
-    
-    if (!tensor) {
-        NUMA_LOG_ERROR("NULL tensor in strategy lookup");
-        return default_result;
-    }
-    
-    // Ensure kernel system is initialized
-    if (!g_numa_kernels_initialized) {
-        enum ggml_status init_result = ggml_numa_kernels_init();
-        if (init_result != GGML_STATUS_SUCCESS) {
-            NUMA_LOG_ERROR("Failed to initialize kernel system");
-            return default_result;
-        }
-    }
-    
-    // Calculate total element count
-    size_t total_elements = ggml_nelements(tensor);
-    
-    // Direct array strategy lookup - single memory access!
-    const ggml_numa_execution_strategy_t * strategy = ggml_numa_lookup_strategy_direct(tensor->op, total_elements);
-    if (!strategy) {
-        NUMA_LOG_DEBUG("No strategy found for op %s", ggml_op_name(tensor->op));
-        return default_result;
-    }
-
-    // Get function pointers using direct array lookups
-    void * work_func = ggml_numa_lookup_work_function_direct(tensor->op, strategy);
-    if (!work_func) {
-        NUMA_LOG_DEBUG("No work function found for op %s", ggml_op_name(tensor->op));
-        return default_result;
-    }
-
-    // Create optimized result based on strategy (only if we have valid functions)
-    ggml_numa_kernel_query_result_t result = default_result;
-    result.supported = true;
-    result.strategy = *strategy;
-    result.work_function = work_func;
-    result.aggregation_function = ggml_numa_lookup_aggregation_direct(tensor->op, strategy);
-    
-    // Generic kernel information for direct array lookup
-    result.kernel_name = "NUMA Generic (Direct Array Lookup)";
-    result.efficiency_score = 0.85f;  // Conservative generic efficiency
-    result.aggregation_policy = GGML_NUMA_AGGREGATION_NONE;
-    
-    NUMA_LOG_DEBUG("Direct array lookup: op=%d, elements=%zu, strategy=%s/%s, efficiency=%.2f", 
-                  (int)tensor->op, total_elements,
-                  strategy->node_strategy == NUMA_NODE_STRATEGY_SINGLE ? "single" : "data-parallel",
-                  strategy->on_node_strategy == NUMA_ON_NODE_STRATEGY_SINGLE_THREAD ? "single-thread" : "multi-thread",
-                  result.efficiency_score);
-    
-    return result;
-}
-*/
 
 /**
  * Cleanup function for the direct array cache system

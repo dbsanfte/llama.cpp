@@ -43,6 +43,12 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
         ggml-cpu/numa-kernels/numa-kernels.h
         ggml-cpu/numa-kernels/add.c
         ggml-cpu/numa-kernels/add.h
+        ggml-cpu/numa-kernels/mul.c
+        ggml-cpu/numa-kernels/mul.h
+        ggml-cpu/numa-kernels/div.c
+        ggml-cpu/numa-kernels/div.h
+        ggml-cpu/numa-kernels/sub.c
+        ggml-cpu/numa-kernels/sub.h
         ggml-cpu/numa-kernels/mul_mat.c
         ggml-cpu/numa-kernels/mul_mat.h
         ggml-cpu/numa-kernels/rope.c

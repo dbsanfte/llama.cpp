@@ -14,69 +14,6 @@ As an AI agent working in this repo, you should observe the following behaviours
 
 ## 🎯 Project Overview
 
-This is a fork of llama.cpp with **NUMA-aware execution architecture** for optimal CPU inferencing in a NUMA environment.
-
-### Pattern: Element-wise Operations (ADD, MUL, etc.) - Modern Macro-Based Implementation
-```c
-// Modern kernel implementation using shared macros for NUMA work distribution
-enum ggml_status ggml_numa_kernel_add_unified_execute(void * work_context, struct ggml_compute_params * params) {
-    struct ggml_tensor * tensor = (struct ggml_tensor *)work_context;
-    
-    // Fast validation
-    if (!tensor || !tensor->src[0] || !tensor->src[1]) {
-        return GGML_STATUS_FAILED;
-    }
-    
-    // Set up NUMA slice using enhanced utilities with built-in barrier handling
-    ggml_numa_slice_context_t slice_ctx;
-    float * dst_data;
-    NUMA_KERNEL_ELEMENT_WISE_SETUP(slice_ctx, tensor, params, dst_data, float);
-    
-    // Extract source tensors for processing
-    const struct ggml_tensor * src0 = tensor->src[0];
-    const struct ggml_tensor * src1 = tensor->src[1];
-    const float * src0_data = (const float *)tensor_data(src0);
-    const float * src1_data = (const float *)tensor_data(src1);
-    
-    // SIMD operation on thread's NUMA slice (slice_ctx contains all slice info)
-    ggml_vec_add_f32(slice_ctx.thread_elements, 
-                     dst_data + slice_ctx.thread_start, 
-                     src0_data + slice_ctx.thread_start, 
-                     src1_data + slice_ctx.thread_start);
-    
-    return GGML_STATUS_SUCCESS;
-}
-
-// Registry pattern - simplified with NUMA_REGISTER_KERNEL macro
-ggml_numa_kernel_registration_info_t ggml_numa_kernel_add_register(void) {
-    ggml_numa_kernel_registration_info_t info = {0};
-    
-    info.op_type = GGML_OP_ADD;
-    info.supported = true;
-    info.kernel_name = "NUMA ADD Kernel";
-    
-    // Strategy thresholds for operation
-    info.strategy_array.thresholds[NUMA_STRATEGY_IDX_SINGLE_SINGLE] = 1024;      
-    info.strategy_array.thresholds[NUMA_STRATEGY_IDX_SINGLE_MULTI] = 262144;     
-    info.strategy_array.valid = true;
-    
-    // Unified function handles all strategies
-    info.work_funcs.single_single_fn = ggml_numa_kernel_add_unified_execute;
-    info.work_funcs.single_multi_fn = ggml_numa_kernel_add_unified_execute;
-    info.work_funcs.data_parallel_fn = ggml_numa_kernel_add_unified_execute;
-    info.work_funcs.valid = true;
-    
-    // Query and work buffer function pointers
-    info.query_fn = (void*)ggml_numa_kernel_add_query;
-    info.work_buffer_calc_fn = (void*)ggml_numa_kernel_add_work_buffer_calc;
-    
-    // Element-wise operations don't need aggregation
-    info.agg_funcs.valid = false;
-    
-    return info;
-}
-```
-
 This is a fork of llama.cpp with **NUMA-aware execution architecture** for optimal CPU inferencing in a NUMA environment featuring kernel-based work buffer allocation:
 
 - **NUMA Kernel Registry** - `ggml/src/ggml-cpu/numa-kernels/` - O(1) cache database with direct function pointer dispatch
@@ -464,7 +401,7 @@ size_t ggml_numa_kernel_your_operation_work_buffer_calc(const struct ggml_tensor
 
 // Step 3: Add function declarations to your kernel .h file (e.g., add.h, mul.h, etc.)
 ggml_numa_kernel_registration_info_t ggml_numa_kernel_your_operation_register(void);
-ggml_numa_kernel_query_result_t ggml_numa_kernel_your_operation_query(const struct ggml_tensor * tensor);
+ggml_numa_execution_strategy_t ggml_numa_kernel_your_operation_query(const struct ggml_tensor * tensor);
 size_t ggml_numa_kernel_your_operation_work_buffer_calc(const struct ggml_tensor * tensor, int total_numa_nodes, int total_threads);
 
 // Step 4: Enable in numa-kernels.c using NUMA_REGISTER_KERNEL macro

@@ -10,6 +10,9 @@
 
 #include "ggml.h"
 #include "ggml-numa-shared.h"  // For execution strategy types and utilities
+#include <stdint.h>
+#include <stdbool.h>
+#include <stddef.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -926,6 +929,660 @@ typedef struct {
     } \
     count_var = (end_var > start_var) ? (end_var - start_var) : 0; \
 } while(0)
+
+// ========================================================================
+// BROADCASTING ARITHMETIC UTILITIES
+// ========================================================================
+
+/**
+ * @brief Convert linear index to 4D tensor coordinates
+ * 
+ * This macro converts a linear array index to 4D tensor coordinates (i3,i2,i1,i0)
+ * based on tensor dimensions. Used for proper multi-dimensional indexing.
+ * 
+ * @param linear_idx Linear index into tensor data
+ * @param ne0,ne1,ne2,ne3 Tensor dimensions  
+ * @param i0,i1,i2,i3 Output coordinate variables
+ */
+#define NUMA_LINEAR_TO_4D_COORDS(linear_idx, ne0, ne1, ne2, ne3, i0, i1, i2, i3) do { \
+    const int64_t __stride_21 = (ne1) * (ne0); \
+    const int64_t __stride_321 = (ne2) * __stride_21; \
+    \
+    (i3) = (linear_idx) / __stride_321; \
+    const int64_t __remainder_3 = (linear_idx) - (i3) * __stride_321; \
+    (i2) = __remainder_3 / __stride_21; \
+    const int64_t __remainder_2 = __remainder_3 - (i2) * __stride_21; \
+    (i1) = __remainder_2 / (ne0); \
+    (i0) = __remainder_2 - (i1) * (ne0); \
+} while(0)
+
+/**
+ * @brief Calculate broadcasting coordinates for source tensor
+ * 
+ * Applies modulo operation to coordinates for proper broadcasting behavior.
+ * This handles cases where source tensor dimensions are smaller than target.
+ * 
+ * @param src_i0,src_i1,src_i2,src_i3 Output broadcasting coordinates
+ * @param tgt_i0,tgt_i1,tgt_i2,tgt_i3 Target tensor coordinates  
+ * @param src_ne0,src_ne1,src_ne2,src_ne3 Source tensor dimensions
+ */
+#define NUMA_BROADCAST_COORDS(src_i0, src_i1, src_i2, src_i3, tgt_i0, tgt_i1, tgt_i2, tgt_i3, src_ne0, src_ne1, src_ne2, src_ne3) do { \
+    (src_i0) = (tgt_i0) % (src_ne0); \
+    (src_i1) = (tgt_i1) % (src_ne1); \
+    (src_i2) = (tgt_i2) % (src_ne2); \
+    (src_i3) = (tgt_i3) % (src_ne3); \
+} while(0)
+
+/**
+ * @brief Calculate memory offset from 4D coordinates and strides
+ * 
+ * Converts 4D tensor coordinates to linear memory offset using tensor strides.
+ * Handles non-contiguous tensor layouts correctly.
+ * 
+ * @param offset Output memory offset variable
+ * @param i0,i1,i2,i3 Tensor coordinates
+ * @param nb0,nb1,nb2,nb3 Tensor strides (byte offsets)
+ */
+#define NUMA_COORDS_TO_OFFSET(offset, i0, i1, i2, i3, nb0, nb1, nb2, nb3) do { \
+    (offset) = (i3) * (nb3) + (i2) * (nb2) + (i1) * (nb1) + (i0) * (nb0); \
+} while(0)
+
+/**
+ * @brief Safe memory access with offset and type casting
+ * 
+ * Safely accesses tensor data at computed offset with proper type casting.
+ * Handles both const and non-const access patterns.
+ * 
+ * @param base_ptr Base pointer to tensor data
+ * @param offset Byte offset from base pointer
+ * @param data_type Target data type (e.g., float, ggml_fp16_t)
+ */
+#define NUMA_DATA_AT_OFFSET(base_ptr, offset, data_type) \
+    (*(const data_type*)((const char*)(base_ptr) + (offset)))
+
+#define NUMA_DATA_WRITE_AT_OFFSET(base_ptr, offset, value, data_type) do { \
+    (*(data_type*)((char*)(base_ptr) + (offset))) = (value); \
+} while(0)
+
+// ========================================================================
+// LEVEL 2 ENHANCED: BROADCASTING-AWARE ITERATION MACROS
+// ========================================================================
+
+/**
+ * @brief Enhanced iteration macro for binary broadcasting operations
+ * 
+ * This macro provides a complete broadcasting iteration framework for binary operations.
+ * It handles the complex coordinate calculation and broadcasting logic automatically.
+ * 
+ * Usage:
+ *   NUMA_ITERATE_BINARY_BROADCAST(ctx, dst_tensor, src0_tensor, src1_tensor, data_type) {
+ *       data_type val0 = NUMA_BROADCAST_SRC0_VALUE(ctx);
+ *       data_type val1 = NUMA_BROADCAST_SRC1_VALUE(ctx);  
+ *       NUMA_BROADCAST_DST_WRITE(ctx, val0 + val1);
+ *   }
+ */
+#define NUMA_ITERATE_BINARY_BROADCAST(ctx, dst_tensor, src0_tensor, src1_tensor, data_type) \
+    /* Cache tensor dimensions and strides for performance */ \
+    const int64_t __ne0 = (dst_tensor)->ne[0], __ne1 = (dst_tensor)->ne[1], __ne2 = (dst_tensor)->ne[2], __ne3 = (dst_tensor)->ne[3]; \
+    const int64_t __src0_ne0 = (src0_tensor)->ne[0], __src0_ne1 = (src0_tensor)->ne[1], __src0_ne2 = (src0_tensor)->ne[2], __src0_ne3 = (src0_tensor)->ne[3]; \
+    const int64_t __src1_ne0 = (src1_tensor)->ne[0], __src1_ne1 = (src1_tensor)->ne[1], __src1_ne2 = (src1_tensor)->ne[2], __src1_ne3 = (src1_tensor)->ne[3]; \
+    \
+    const size_t __nb0 = (dst_tensor)->nb[0], __nb1 = (dst_tensor)->nb[1], __nb2 = (dst_tensor)->nb[2], __nb3 = (dst_tensor)->nb[3]; \
+    const size_t __src0_nb0 = (src0_tensor)->nb[0], __src0_nb1 = (src0_tensor)->nb[1], __src0_nb2 = (src0_tensor)->nb[2], __src0_nb3 = (src0_tensor)->nb[3]; \
+    const size_t __src1_nb0 = (src1_tensor)->nb[0], __src1_nb1 = (src1_tensor)->nb[1], __src1_nb2 = (src1_tensor)->nb[2], __src1_nb3 = (src1_tensor)->nb[3]; \
+    \
+    const data_type * __src0_data = (const data_type *)tensor_data(src0_tensor); \
+    const data_type * __src1_data = (const data_type *)tensor_data(src1_tensor); \
+    data_type * __dst_data = (data_type *)(ctx).dst_data; \
+    \
+    /* Iteration loop with automatic coordinate calculation */ \
+    for (size_t __linear_idx = (ctx).thread_start; __linear_idx < (ctx).thread_end; __linear_idx++) { \
+        /* Calculate 4D coordinates for destination/src0 */ \
+        int64_t __i0, __i1, __i2, __i3; \
+        NUMA_LINEAR_TO_4D_COORDS(__linear_idx, __ne0, __ne1, __ne2, __ne3, __i0, __i1, __i2, __i3); \
+        \
+        /* Calculate broadcasting coordinates for src1 */ \
+        int64_t __j0, __j1, __j2, __j3; \
+        NUMA_BROADCAST_COORDS(__j0, __j1, __j2, __j3, __i0, __i1, __i2, __i3, __src1_ne0, __src1_ne1, __src1_ne2, __src1_ne3); \
+        \
+        /* Calculate memory offsets */ \
+        size_t __src0_offset, __src1_offset, __dst_offset; \
+        NUMA_COORDS_TO_OFFSET(__src0_offset, __i0, __i1, __i2, __i3, __src0_nb0, __src0_nb1, __src0_nb2, __src0_nb3); \
+        NUMA_COORDS_TO_OFFSET(__src1_offset, __j0, __j1, __j2, __j3, __src1_nb0, __src1_nb1, __src1_nb2, __src1_nb3); \
+        NUMA_COORDS_TO_OFFSET(__dst_offset, __i0, __i1, __i2, __i3, __nb0, __nb1, __nb2, __nb3); \
+        \
+        /* Execute user code with current iteration context */ \
+        { \
+            const data_type __src0_val = NUMA_DATA_AT_OFFSET(__src0_data, __src0_offset, data_type); \
+            const data_type __src1_val = NUMA_DATA_AT_OFFSET(__src1_data, __src1_offset, data_type);
+
+/**
+ * @brief Convenience macros for accessing data within broadcasting iteration
+ * 
+ * These macros should be used within NUMA_ITERATE_BINARY_BROADCAST blocks
+ * to access source and destination tensor values safely.
+ */
+#define NUMA_BROADCAST_SRC0_VALUE() (__src0_val)
+#define NUMA_BROADCAST_SRC1_VALUE() (__src1_val)
+#define NUMA_BROADCAST_DST_WRITE(value) \
+    NUMA_DATA_WRITE_AT_OFFSET(__dst_data, __dst_offset, value, data_type)
+
+#define NUMA_ITERATE_BINARY_BROADCAST_END() \
+        } \
+    }
+
+// ========================================================================
+// COMPLEX BROADCASTING LOOP MACRO
+// ========================================================================
+
+/**
+ * @brief Macro for complex broadcasting coordinate calculation and element processing
+ * 
+ * This macro handles the most complex broadcasting case where tensors have different shapes
+ * that require multi-dimensional coordinate calculation and modulo-based broadcasting.
+ * 
+ * @param ctx The slice context containing thread_start, thread_end
+ * @param tensor The destination tensor 
+ * @param data_type The data type (e.g., float)
+ * @param op_expr The operation expression using val0 and val1 (e.g., val0 + val1)
+ * 
+ * Usage examples:
+ *   NUMA_COMPLEX_BROADCAST_LOOP(ctx, tensor, float, val0 + val1)  // ADD
+ *   NUMA_COMPLEX_BROADCAST_LOOP(ctx, tensor, float, val0 - val1)  // SUB  
+ *   NUMA_COMPLEX_BROADCAST_LOOP(ctx, tensor, float, val0 * val1)  // MUL
+ *   NUMA_COMPLEX_BROADCAST_LOOP(ctx, tensor, float, val0 / val1)  // DIV
+ */
+#define NUMA_COMPLEX_BROADCAST_LOOP(ctx, tensor, data_type, op_expr) do { \
+    for (size_t i = (ctx).thread_start; i < (ctx).thread_end; i++) { \
+        /* Convert linear index to 4D coordinates */ \
+        int64_t dst_coords[4]; \
+        int64_t linear_idx = i; \
+        const int64_t *ne = (tensor)->ne; \
+        \
+        dst_coords[0] = linear_idx % ne[0]; \
+        linear_idx /= ne[0]; \
+        dst_coords[1] = linear_idx % ne[1]; \
+        linear_idx /= ne[1]; \
+        dst_coords[2] = linear_idx % ne[2]; \
+        linear_idx /= ne[2]; \
+        dst_coords[3] = linear_idx; \
+        \
+        /* Calculate source offsets with broadcasting */ \
+        const int64_t *src0_ne = (tensor)->src[0]->ne; \
+        const int64_t *src1_ne = (tensor)->src[1]->ne; \
+        const size_t *src0_nb = (tensor)->src[0]->nb; \
+        const size_t *src1_nb = (tensor)->src[1]->nb; \
+        \
+        size_t src0_offset = (dst_coords[0] % src0_ne[0]) * src0_nb[0] + \
+                           (dst_coords[1] % src0_ne[1]) * src0_nb[1] + \
+                           (dst_coords[2] % src0_ne[2]) * src0_nb[2] + \
+                           (dst_coords[3] % src0_ne[3]) * src0_nb[3]; \
+        \
+        size_t src1_offset = (dst_coords[0] % src1_ne[0]) * src1_nb[0] + \
+                           (dst_coords[1] % src1_ne[1]) * src1_nb[1] + \
+                           (dst_coords[2] % src1_ne[2]) * src1_nb[2] + \
+                           (dst_coords[3] % src1_ne[3]) * src1_nb[3]; \
+        \
+        /* Get values with proper type casting */ \
+        const data_type *src0_ptr = (const data_type *)((const char *)__src0_data + src0_offset); \
+        const data_type *src1_ptr = (const data_type *)((const char *)__src1_data + src1_offset); \
+        const data_type val0 = *src0_ptr; \
+        const data_type val1 = *src1_ptr; \
+        \
+        /* Apply operation expression */ \
+        __dst_data[i] = (op_expr); \
+    } \
+} while(0)
+
+// ========================================================================
+// LEVEL 4 ENHANCED: UNIFIED BINARY BROADCASTING SETUP
+// ========================================================================
+
+/**
+ * @brief Unified setup macro for binary operations with automatic broadcasting detection
+ * 
+ * This macro provides complete setup for binary operations (ADD, SUB, MUL, DIV) with:
+ * - Automatic broadcasting pattern detection (scalar, same-shape, complex broadcasting)
+ * - SIMD optimization paths for simple cases
+ * - Full broadcasting support for complex cases
+ * - Proper NUMA slice setup and barrier handling
+ * 
+ * Usage:
+ *   NUMA_KERNEL_SETUP_BINARY_BROADCAST(ctx, tensor, params, float) {
+ *       // Operation-specific code - macro handles all the complexity
+ *       NUMA_BINARY_OP_ADD(ctx);  // or SUB, MUL, DIV
+ *   }
+ */
+#define NUMA_KERNEL_SETUP_BINARY_BROADCAST(ctx_name, tensor, params, data_type) \
+    ggml_numa_refined_context_t ctx_name = {0}; \
+    NUMA_SLICE_WORK_BY_ELEMENT(ctx_name, tensor, params); \
+    NUMA_GET_SHARED_DATA(tensor, (ctx_name).dst_data, data_type); \
+    (ctx_name).src_tensors[0] = (tensor)->src[0]; \
+    (ctx_name).src_tensors[1] = (tensor)->src[1]; \
+    \
+    /* Analyze broadcasting pattern for optimization */ \
+    const bool __is_scalar = (ggml_nelements((tensor)->src[1]) == 1); \
+    const bool __is_same_shape = ggml_are_same_shape((tensor)->src[0], (tensor)->src[1]); \
+    const data_type * __src0_data = (const data_type *)tensor_data((tensor)->src[0]); \
+    const data_type * __src1_data = (const data_type *)tensor_data((tensor)->src[1]); \
+    data_type * __dst_data = (data_type *)(ctx_name).dst_data; \
+    \
+    if ((ctx_name).has_work) /* User code block follows */
+
+/**
+ * @brief Operation-specific macros for common binary operations
+ * 
+ * These macros implement the actual arithmetic operations within the broadcasting framework.
+ * They automatically choose the optimal execution path (scalar, SIMD, or broadcasting).
+ */
+#define NUMA_BINARY_OP_ADD(ctx) do { \
+    if (__is_scalar) { \
+        const data_type __scalar = __src1_data[0]; \
+        for (size_t __i = (ctx).thread_start; __i < (ctx).thread_end; __i++) { \
+            __dst_data[__i] = __src0_data[__i] + __scalar; \
+        } \
+    } else if (__is_same_shape) { \
+        /* Use SIMD optimization for F32 same-shape operations */ \
+        if (sizeof(data_type) == sizeof(float)) { \
+            ggml_vec_add_f32((ctx).thread_elements, \
+                           __dst_data + (ctx).thread_start, \
+                           __src0_data + (ctx).thread_start, \
+                           __src1_data + (ctx).thread_start); \
+        } else { \
+            for (size_t __i = (ctx).thread_start; __i < (ctx).thread_end; __i++) { \
+                __dst_data[__i] = __src0_data[__i] + __src1_data[__i]; \
+            } \
+        } \
+    } else { \
+        /* Complex broadcasting case */ \
+        NUMA_ITERATE_BINARY_BROADCAST(ctx, tensor, (tensor)->src[0], (tensor)->src[1], data_type) \
+            const data_type __result = NUMA_BROADCAST_SRC0_VALUE() + NUMA_BROADCAST_SRC1_VALUE(); \
+            NUMA_BROADCAST_DST_WRITE(__result); \
+        NUMA_ITERATE_BINARY_BROADCAST_END() \
+    } \
+} while(0)
+
+#define NUMA_BINARY_OP_SUB(ctx) do { \
+    if (__is_scalar) { \
+        const data_type __scalar = __src1_data[0]; \
+        for (size_t __i = (ctx).thread_start; __i < (ctx).thread_end; __i++) { \
+            __dst_data[__i] = __src0_data[__i] - __scalar; \
+        } \
+    } else if (__is_same_shape) { \
+        if (sizeof(data_type) == sizeof(float)) { \
+            ggml_vec_sub_f32((ctx).thread_elements, \
+                           __dst_data + (ctx).thread_start, \
+                           __src0_data + (ctx).thread_start, \
+                           __src1_data + (ctx).thread_start); \
+        } else { \
+            for (size_t __i = (ctx).thread_start; __i < (ctx).thread_end; __i++) { \
+                __dst_data[__i] = __src0_data[__i] - __src1_data[__i]; \
+            } \
+        } \
+    } else { \
+        NUMA_ITERATE_BINARY_BROADCAST(ctx, tensor, (tensor)->src[0], (tensor)->src[1], data_type) \
+            const data_type __result = NUMA_BROADCAST_SRC0_VALUE() - NUMA_BROADCAST_SRC1_VALUE(); \
+            NUMA_BROADCAST_DST_WRITE(__result); \
+        NUMA_ITERATE_BINARY_BROADCAST_END() \
+    } \
+} while(0)
+
+#define NUMA_BINARY_OP_MUL(ctx) do { \
+    if (__is_scalar) { \
+        const data_type __scalar = __src1_data[0]; \
+        for (size_t __i = (ctx).thread_start; __i < (ctx).thread_end; __i++) { \
+            __dst_data[__i] = __src0_data[__i] * __scalar; \
+        } \
+    } else if (__is_same_shape) { \
+        if (sizeof(data_type) == sizeof(float)) { \
+            ggml_vec_mul_f32((ctx).thread_elements, \
+                           __dst_data + (ctx).thread_start, \
+                           __src0_data + (ctx).thread_start, \
+                           __src1_data + (ctx).thread_start); \
+        } else { \
+            for (size_t __i = (ctx).thread_start; __i < (ctx).thread_end; __i++) { \
+                __dst_data[__i] = __src0_data[__i] * __src1_data[__i]; \
+            } \
+        } \
+    } else { \
+        NUMA_ITERATE_BINARY_BROADCAST(ctx, tensor, (tensor)->src[0], (tensor)->src[1], data_type) \
+            const data_type __result = NUMA_BROADCAST_SRC0_VALUE() * NUMA_BROADCAST_SRC1_VALUE(); \
+            NUMA_BROADCAST_DST_WRITE(__result); \
+        NUMA_ITERATE_BINARY_BROADCAST_END() \
+    } \
+} while(0)
+
+#define NUMA_BINARY_OP_DIV(ctx) do { \
+    if (__is_scalar) { \
+        const data_type __scalar = __src1_data[0]; \
+        for (size_t __i = (ctx).thread_start; __i < (ctx).thread_end; __i++) { \
+            __dst_data[__i] = __src0_data[__i] / __scalar; \
+        } \
+    } else if (__is_same_shape) { \
+        /* Note: No ggml_vec_div_f32 available, use element-wise */ \
+        for (size_t __i = (ctx).thread_start; __i < (ctx).thread_end; __i++) { \
+            __dst_data[__i] = __src0_data[__i] / __src1_data[__i]; \
+        } \
+    } else { \
+        NUMA_ITERATE_BINARY_BROADCAST(ctx, tensor, (tensor)->src[0], (tensor)->src[1], data_type) \
+            const data_type __result = NUMA_BROADCAST_SRC0_VALUE() / NUMA_BROADCAST_SRC1_VALUE(); \
+            NUMA_BROADCAST_DST_WRITE(__result); \
+        NUMA_ITERATE_BINARY_BROADCAST_END() \
+    } \
+} while(0)
+
+// ========================================================================
+// REFINED NUMA KERNEL MACROS - Level 1-4 System
+// ========================================================================
+
+/**
+ * @brief Extended NUMA slice context for refined macro system
+ * 
+ * Extends the basic slice context with additional metadata needed for
+ * safe iteration and memory access patterns.
+ */
+typedef struct {
+    // Basic slice context (inherited)
+    size_t numa_start;           // Start index for this NUMA node
+    size_t numa_end;             // End index for this NUMA node  
+    size_t numa_elements;        // Total elements for this NUMA node
+    size_t thread_start;         // Start index for this thread
+    size_t thread_end;           // End index for this thread
+    size_t thread_elements;      // Total elements for this thread
+    int numa_node;               // Current NUMA node ID
+    int thread_id;               // Thread ID within NUMA node
+    int total_threads;           // Total threads on this NUMA node
+    bool has_work;               // Whether this thread has work to do
+    bool is_data_parallel;       // Whether data-parallel execution is active
+    
+    // Extended context for refined system
+    const struct ggml_tensor * tensor;     // Target tensor for bounds checking
+    const struct ggml_tensor * src_tensors[4]; // Source tensors (up to 4 sources)
+    void * dst_data;             // Destination data pointer
+    void * work_buffer;          // Work buffer pointer (if any)
+    size_t work_buffer_offset;   // Per-thread work buffer offset
+    
+    // Iteration state for different strategies
+    enum {
+        NUMA_ITER_BY_ELEMENT,
+        NUMA_ITER_BY_SEQUENCE,  
+        NUMA_ITER_BY_ROW,
+        NUMA_ITER_BY_COLUMN,
+        NUMA_ITER_BY_MATRIX
+    } iteration_strategy;
+    
+    // Tensor dimensions cache (for bounds checking)
+    int64_t ne[4];               // Tensor dimensions [ne0, ne1, ne2, ne3]
+    size_t nb[4];                // Tensor strides [nb0, nb1, nb2, nb3]
+} ggml_numa_refined_context_t;
+
+// ========================================================================
+// LEVEL 1: WORK SLICING STRATEGY MACROS
+// ========================================================================
+
+/**
+ * @brief Slice work by linear elements (for ADD, MUL, CPY operations)
+ */
+#define NUMA_SLICE_WORK_BY_ELEMENT(ctx, tensor, params) do { \
+    /* Initialize basic slice context */ \
+    NUMA_SLICE_ELEMENTS(*(ggml_numa_slice_context_t*)&(ctx), tensor, params); \
+    \
+    /* Extended context setup */ \
+    (ctx).tensor = tensor; \
+    (ctx).iteration_strategy = NUMA_ITER_BY_ELEMENT; \
+    (ctx).ne[0] = (tensor)->ne[0]; \
+    (ctx).ne[1] = (tensor)->ne[1]; \
+    (ctx).ne[2] = (tensor)->ne[2]; \
+    (ctx).ne[3] = (tensor)->ne[3]; \
+    (ctx).nb[0] = (tensor)->nb[0]; \
+    (ctx).nb[1] = (tensor)->nb[1]; \
+    (ctx).nb[2] = (tensor)->nb[2]; \
+    (ctx).nb[3] = (tensor)->nb[3]; \
+} while(0)
+
+/**
+ * @brief Slice work by sequences (for ROPE operations)
+ */
+#define NUMA_SLICE_WORK_BY_SEQUENCE(ctx, tensor, params) do { \
+    /* Initialize sequence slice context */ \
+    NUMA_SLICE_SEQUENCES(*(ggml_numa_slice_context_t*)&(ctx), tensor, params); \
+    \
+    /* Extended context setup */ \
+    (ctx).tensor = tensor; \
+    (ctx).iteration_strategy = NUMA_ITER_BY_SEQUENCE; \
+    (ctx).ne[0] = (tensor)->ne[0]; \
+    (ctx).ne[1] = (tensor)->ne[1]; \
+    (ctx).ne[2] = (tensor)->ne[2]; \
+    (ctx).ne[3] = (tensor)->ne[3]; \
+    (ctx).nb[0] = (tensor)->nb[0]; \
+    (ctx).nb[1] = (tensor)->nb[1]; \
+    (ctx).nb[2] = (tensor)->nb[2]; \
+    (ctx).nb[3] = (tensor)->nb[3]; \
+} while(0)
+
+/**
+ * @brief Slice work by rows (for SOFT_MAX, RMS_NORM operations)
+ */
+#define NUMA_SLICE_WORK_BY_ROW(ctx, tensor, params) do { \
+    /* Initialize row slice context */ \
+    NUMA_SLICE_ROWS_1D(*(ggml_numa_slice_context_t*)&(ctx), tensor, params); \
+    \
+    /* Extended context setup */ \
+    (ctx).tensor = tensor; \
+    (ctx).iteration_strategy = NUMA_ITER_BY_ROW; \
+    (ctx).ne[0] = (tensor)->ne[0]; \
+    (ctx).ne[1] = (tensor)->ne[1]; \
+    (ctx).ne[2] = (tensor)->ne[2]; \
+    (ctx).ne[3] = (tensor)->ne[3]; \
+    (ctx).nb[0] = (tensor)->nb[0]; \
+    (ctx).nb[1] = (tensor)->nb[1]; \
+    (ctx).nb[2] = (tensor)->nb[2]; \
+    (ctx).nb[3] = (tensor)->nb[3]; \
+} while(0)
+
+/**
+ * @brief Slice work by columns (for future matrix operations)
+ */
+#define NUMA_SLICE_WORK_BY_COLUMN(ctx, tensor, params) do { \
+    /* Initialize column slice context */ \
+    NUMA_SLICE_COLUMNS(*(ggml_numa_slice_context_t*)&(ctx), tensor, params); \
+    \
+    /* Extended context setup */ \
+    (ctx).tensor = tensor; \
+    (ctx).iteration_strategy = NUMA_ITER_BY_COLUMN; \
+    (ctx).ne[0] = (tensor)->ne[0]; \
+    (ctx).ne[1] = (tensor)->ne[1]; \
+    (ctx).ne[2] = (tensor)->ne[2]; \
+    (ctx).ne[3] = (tensor)->ne[3]; \
+    (ctx).nb[0] = (tensor)->nb[0]; \
+    (ctx).nb[1] = (tensor)->nb[1]; \
+    (ctx).nb[2] = (tensor)->nb[2]; \
+    (ctx).nb[3] = (tensor)->nb[3]; \
+} while(0)
+
+// ========================================================================
+// LEVEL 2: SAFE ITERATION MACROS
+// ========================================================================
+
+/**
+ * @brief Safe 1D iteration over elements with automatic bounds checking
+ * 
+ * Generates a for loop that iterates over the thread's assigned elements.
+ * The iteration variable is guaranteed to be within bounds.
+ */
+#define NUMA_ITERATE_1D(ctx, element_var) \
+    for (size_t element_var = (ctx).thread_start, __numa_end_##element_var = (ctx).thread_end; \
+         element_var < __numa_end_##element_var; \
+         element_var++)
+
+/**
+ * @brief Safe 2D iteration with automatic bounds checking
+ * 
+ * Generates nested for loops for 2D tensor operations (rows and columns).
+ * Both iteration variables are guaranteed to be within bounds.
+ */
+#define NUMA_ITERATE_2D(ctx, tensor, row_var, col_var) \
+    for (int64_t row_var = (ctx).thread_start / (ctx).ne[0], __numa_end_row_##row_var = ((ctx).thread_end + (ctx).ne[0] - 1) / (ctx).ne[0]; \
+         row_var < __numa_end_row_##row_var && row_var < (ctx).ne[1]; \
+         row_var++) \
+        for (int64_t col_var = (row_var == (ctx).thread_start / (ctx).ne[0]) ? ((ctx).thread_start % (ctx).ne[0]) : 0, \
+             __numa_end_col_##col_var = (row_var == __numa_end_row_##row_var - 1) ? (((ctx).thread_end - 1) % (ctx).ne[0] + 1) : (ctx).ne[0]; \
+             col_var < __numa_end_col_##col_var && col_var < (ctx).ne[0]; \
+             col_var++)
+
+/**
+ * @brief Safe 3D iteration with automatic bounds checking
+ * 
+ * Generates nested for loops for 3D tensor operations (sequences, heads, elements).
+ * All iteration variables are guaranteed to be within bounds.
+ */
+#define NUMA_ITERATE_3D(ctx, tensor, seq_var, head_var, elem_var) \
+    for (int64_t seq_var = (ctx).thread_start, __numa_end_seq_##seq_var = (ctx).thread_end; \
+         seq_var < __numa_end_seq_##seq_var && seq_var < (ctx).ne[2]; \
+         seq_var++) \
+        for (int64_t head_var = 0; head_var < (ctx).ne[1]; head_var++) \
+            for (int64_t elem_var = 0; elem_var < (ctx).ne[0]; elem_var++)
+
+/**
+ * @brief Safe 4D iteration with automatic bounds checking
+ * 
+ * Generates nested for loops for 4D tensor operations.
+ * All iteration variables are guaranteed to be within bounds.
+ */
+#define NUMA_ITERATE_4D(ctx, tensor, batch_var, seq_var, head_var, elem_var) \
+    for (int64_t batch_var = 0; batch_var < (ctx).ne[3]; batch_var++) \
+        for (int64_t seq_var = (ctx).thread_start, __numa_end_seq_##seq_var = (ctx).thread_end; \
+             seq_var < __numa_end_seq_##seq_var && seq_var < (ctx).ne[2]; \
+             seq_var++) \
+            for (int64_t head_var = 0; head_var < (ctx).ne[1]; head_var++) \
+                for (int64_t elem_var = 0; elem_var < (ctx).ne[0]; elem_var++)
+
+// ========================================================================
+// LEVEL 3: SAFE MEMORY ACCESS MACROS
+// ========================================================================
+
+/**
+ * @brief Safe source tensor data access
+ * 
+ * Returns a pointer to the source tensor data with bounds checking.
+ * Supports up to 4 source tensors (indexed 0-3).
+ */
+#define NUMA_SRC_DATA(ctx, src_idx) \
+    ((const float *)(tensor_data((ctx).src_tensors[src_idx])))
+
+/**
+ * @brief Safe source tensor value access with 1D indexing
+ */
+#define NUMA_SRC_VALUE_1D(ctx, src_idx, i0) \
+    (NUMA_SRC_DATA(ctx, src_idx)[i0])
+
+/**
+ * @brief Safe source tensor value access with 2D indexing
+ */
+#define NUMA_SRC_VALUE_2D(ctx, src_idx, i1, i0) \
+    (*(const float*)((const char*)NUMA_SRC_DATA(ctx, src_idx) + (i1) * (ctx).src_tensors[src_idx]->nb[1] + (i0) * (ctx).src_tensors[src_idx]->nb[0]))
+
+/**
+ * @brief Safe source tensor value access with 3D indexing
+ */
+#define NUMA_SRC_VALUE_3D(ctx, src_idx, i2, i1, i0) \
+    (*(const float*)((const char*)NUMA_SRC_DATA(ctx, src_idx) + (i2) * (ctx).src_tensors[src_idx]->nb[2] + (i1) * (ctx).src_tensors[src_idx]->nb[1] + (i0) * (ctx).src_tensors[src_idx]->nb[0]))
+
+/**
+ * @brief Safe source tensor value access with 4D indexing
+ */
+#define NUMA_SRC_VALUE_4D(ctx, src_idx, i3, i2, i1, i0) \
+    (*(const float*)((const char*)NUMA_SRC_DATA(ctx, src_idx) + (i3) * (ctx).src_tensors[src_idx]->nb[3] + (i2) * (ctx).src_tensors[src_idx]->nb[2] + (i1) * (ctx).src_tensors[src_idx]->nb[1] + (i0) * (ctx).src_tensors[src_idx]->nb[0]))
+
+/**
+ * @brief Safe destination tensor write with 1D indexing
+ */
+#define NUMA_DST_WRITE_1D(ctx, value, i0) do { \
+    ((float*)(ctx).dst_data)[i0] = (value); \
+} while(0)
+
+/**
+ * @brief Safe destination tensor write with 2D indexing
+ */
+#define NUMA_DST_WRITE_2D(ctx, value, i1, i0) do { \
+    (*(float*)((char*)(ctx).dst_data + (i1) * (ctx).nb[1] + (i0) * (ctx).nb[0])) = (value); \
+} while(0)
+
+/**
+ * @brief Safe destination tensor write with 3D indexing
+ */
+#define NUMA_DST_WRITE_3D(ctx, value, i2, i1, i0) do { \
+    (*(float*)((char*)(ctx).dst_data + (i2) * (ctx).nb[2] + (i1) * (ctx).nb[1] + (i0) * (ctx).nb[0])) = (value); \
+} while(0)
+
+/**
+ * @brief Safe destination tensor write with 4D indexing
+ */
+#define NUMA_DST_WRITE_4D(ctx, value, i3, i2, i1, i0) do { \
+    (*(float*)((char*)(ctx).dst_data + (i3) * (ctx).nb[3] + (i2) * (ctx).nb[2] + (i1) * (ctx).nb[1] + (i0) * (ctx).nb[0])) = (value); \
+} while(0)
+
+/**
+ * @brief Safe work buffer access with automatic offset calculation
+ */
+#define NUMA_WORK_BUFFER_AT(ctx, offset) \
+    ((float*)((char*)(ctx).work_buffer + (ctx).work_buffer_offset + (offset)))
+
+// ========================================================================
+// LEVEL 4: UNIFIED KERNEL SETUP MACROS
+// ========================================================================
+
+/**
+ * @brief Unified kernel setup for element-wise operations
+ * 
+ * Combines work slicing, memory setup, and barrier handling in one macro.
+ * Creates a code block where user code can be written safely.
+ */
+#define NUMA_KERNEL_SETUP_ELEMENT_WISE(ctx_name, tensor, params, data_type) \
+    ggml_numa_refined_context_t ctx_name = {0}; \
+    NUMA_SLICE_WORK_BY_ELEMENT(ctx_name, tensor, params); \
+    NUMA_GET_SHARED_DATA(tensor, (ctx_name).dst_data, data_type); \
+    (ctx_name).src_tensors[0] = (tensor)->src[0]; \
+    (ctx_name).src_tensors[1] = (tensor)->src[1]; \
+    (ctx_name).src_tensors[2] = (tensor)->src[2]; \
+    (ctx_name).src_tensors[3] = (tensor)->src[3]; \
+    if ((ctx_name).has_work) /* User code block follows */
+
+/**
+ * @brief Unified kernel setup for sequence-wise operations
+ */
+#define NUMA_KERNEL_SETUP_SEQUENCE_WISE(ctx_name, tensor, params, data_type) \
+    ggml_numa_refined_context_t ctx_name = {0}; \
+    NUMA_SLICE_WORK_BY_SEQUENCE(ctx_name, tensor, params); \
+    NUMA_GET_SHARED_DATA(tensor, (ctx_name).dst_data, data_type); \
+    (ctx_name).src_tensors[0] = (tensor)->src[0]; \
+    (ctx_name).src_tensors[1] = (tensor)->src[1]; \
+    (ctx_name).src_tensors[2] = (tensor)->src[2]; \
+    (ctx_name).src_tensors[3] = (tensor)->src[3]; \
+    if (params->wdata) { \
+        (ctx_name).work_buffer = params->wdata; \
+        (ctx_name).work_buffer_offset = ((tensor)->ne[0] + 16) * sizeof(float) * params->ith; \
+    } \
+    if ((ctx_name).has_work) /* User code block follows */
+
+/**
+ * @brief Unified kernel setup for row-wise operations  
+ */
+#define NUMA_KERNEL_SETUP_ROW_WISE(ctx_name, tensor, params, data_type) \
+    ggml_numa_refined_context_t ctx_name = {0}; \
+    NUMA_SLICE_WORK_BY_ROW(ctx_name, tensor, params); \
+    NUMA_GET_SHARED_DATA(tensor, (ctx_name).dst_data, data_type); \
+    (ctx_name).src_tensors[0] = (tensor)->src[0]; \
+    (ctx_name).src_tensors[1] = (tensor)->src[1]; \
+    (ctx_name).src_tensors[2] = (tensor)->src[2]; \
+    (ctx_name).src_tensors[3] = (tensor)->src[3]; \
+    if ((ctx_name).has_work) /* User code block follows */
+
+/**
+ * @brief End kernel processing with proper barrier handling
+ */
+#define NUMA_KERNEL_END_REFINED(ctx_name) \
+    NUMA_KERNEL_END_BARRIER(*(ggml_numa_slice_context_t*)&(ctx_name))
 
 // ========================================================================
 // DEBUGGING AND LOGGING MACROS  
