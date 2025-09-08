@@ -78,10 +78,12 @@ enum ggml_status ggml_numa_kernel_add_unified_execute(void * work_context,
                                                      struct ggml_compute_params * params) {
     struct ggml_tensor * tensor = (struct ggml_tensor *)work_context;
     
-    // Fast validation
-    if (!tensor || !tensor->src[0] || !tensor->src[1]) {
-        return GGML_STATUS_FAILED;
-    }
+    // Validation with NUMA_ASSERT (proper coordinator signaling)
+    NUMA_ASSERT(tensor != NULL, "ADD: Tensor cannot be null");
+    NUMA_ASSERT(tensor->op == GGML_OP_ADD, "ADD: Wrong operation type - expected GGML_OP_ADD");
+    NUMA_ASSERT(tensor->src[0] != NULL, "ADD: Source tensor 0 cannot be null");
+    NUMA_ASSERT(tensor->src[1] != NULL, "ADD: Source tensor 1 cannot be null");
+    NUMA_ASSERT(params != NULL, "ADD: Compute params cannot be null");
     
     const struct ggml_tensor * src0 = tensor->src[0];
     const struct ggml_tensor * src1 = tensor->src[1];
@@ -253,66 +255,27 @@ enum ggml_status ggml_numa_kernel_add_unified_execute(void * work_context,
 // Kernel Query Function
 // ============================================================================
 
-ggml_numa_kernel_query_result_t ggml_numa_kernel_add_query(const struct ggml_tensor * tensor) {
-    ggml_numa_kernel_query_result_t result = { .supported = false };
-    
-    // Validate this is an ADD operation
-    if (!tensor || tensor->op != GGML_OP_ADD) {
-        return result;
-    }
-    
-    // Validate tensor structure for ADD
-    if (!tensor->src[0] || !tensor->src[1]) {
-        NUMA_LOG_DEBUG("ADD query: Missing source tensors");
-        return result;
-    }
-    
-    // Check if this kernel is actually registered and supported
-    if (!ggml_numa_is_kernel_supported(GGML_OP_ADD)) {
-        NUMA_LOG_DEBUG("ADD kernel not supported - registration disabled");
-        result.supported = false;
-        return result;
-    }
-    
-    // Get our own cache entry with the registered thresholds
-    const ggml_numa_kernel_cache_entry_t * cache_entry = ggml_numa_lookup_kernel_direct(GGML_OP_ADD);
-    if (!cache_entry || !cache_entry->strategy_array.valid) {
-        NUMA_LOG_DEBUG("ADD query: No valid strategy array in cache");
-        return result;
-    }
-    
-    // Calculate total elements for strategy selection
+ggml_numa_execution_strategy_t ggml_numa_kernel_add_query(const struct ggml_tensor * tensor) {
+    // Calculate total elements for strategy selection (hot path - must be fast)
     const size_t total_elements = ggml_nelements(tensor);
+    
+    // Get cache entry with registered thresholds (O(1) lookup)
+    const ggml_numa_kernel_cache_entry_t * cache_entry = ggml_numa_lookup_kernel_direct(GGML_OP_ADD);
     
     // Use the registered thresholds for strategy selection
     ggml_numa_execution_strategy_t selected_strategy;
     NUMA_SELECT_STRATEGY_FROM_CACHE(cache_entry, total_elements, selected_strategy);
     
-    // Build successful query result
-    result.supported = true;
-    result.strategy = selected_strategy;
-    result.work_buffer_size_per_thread = 0;  // ADD doesn't need work buffers
+    // Debug logging for operation analysis (maintains integration test compatibility)
+    const char* op_name = cache_entry && cache_entry->kernel_name ? cache_entry->kernel_name : "NUMA ADD";
+    const char* strategy_name = (selected_strategy == NUMA_STRATEGY_SINGLE_THREAD) ? "(Single/Single)" :
+                               (selected_strategy == NUMA_STRATEGY_SINGLE_NODE) ? "(Single/Multi)" :
+                               "(Data Parallel)";
     
-    // Use unified execution function for all strategies
-    result.work_function = ggml_numa_kernel_add_unified_execute;
-    result.efficiency_score = 0.98f;
-    result.kernel_name = "NUMA ADD (Unified)";
+    NUMA_LOG_DEBUG("NUMA ADD %s", strategy_name);
     
-    // Apply force strategy override if environment variable is set
-    bool strategy_overridden = ggml_numa_apply_kernel_force_strategy(&result, "ADD",
-        ggml_numa_kernel_add_unified_execute,   // single-single function
-        ggml_numa_kernel_add_unified_execute,   // single-multi function  
-        ggml_numa_kernel_add_unified_execute    // data-parallel function
-    );
-    
-    // ADD operations don't need aggregation - each node writes directly to result
-    result.aggregation_policy = GGML_NUMA_AGGREGATION_NONE;
-    
-    NUMA_LOG_DEBUG("ADD query: %zu elements -> %s (efficiency: %.2f)%s", 
-                   total_elements, result.kernel_name, (double)result.efficiency_score,
-                   strategy_overridden ? " [STRATEGY OVERRIDDEN]" : "");
-    
-    return result;
+    // Return strategy only - executor gets everything else from cache
+    return selected_strategy;
 }
 
 // ============================================================================

@@ -33,7 +33,7 @@ typedef struct ggml_numa_kernel_query_result_s ggml_numa_kernel_query_result_t;
  * Query function pointer type for kernels
  * Each kernel provides a query function of this type
  */
-typedef ggml_numa_kernel_query_result_t (*ggml_numa_kernel_query_fn_t)(const struct ggml_tensor * tensor);
+typedef ggml_numa_execution_strategy_t (*ggml_numa_kernel_query_fn_t)(const struct ggml_tensor * tensor);
 
 /**
  * Work buffer size calculation function pointer type
@@ -138,6 +138,28 @@ bool ggml_numa_is_kernel_supported(enum ggml_op op_type);
 bool ggml_numa_is_kernel_noop(enum ggml_op op_type);
 
 /**
+ * Get work function for specific strategy from cache entry
+ * Ultra-fast O(1) lookup with strategy-based function selection
+ */
+ggml_numa_work_function_t ggml_numa_get_work_function_from_cache(
+    const ggml_numa_kernel_cache_entry_t * cache_entry,
+    const ggml_numa_execution_strategy_t * strategy);
+
+/**
+ * Get work buffer calculation function from cache entry
+ * Returns NULL if operation doesn't need work buffers
+ */
+ggml_numa_kernel_work_buffer_calc_fn_t ggml_numa_get_work_buffer_calc_from_cache(
+    const ggml_numa_kernel_cache_entry_t * cache_entry);
+
+/**
+ * Get kernel name from cache entry for debugging/logging
+ * Returns static string, safe to use in logging
+ */
+const char * ggml_numa_get_kernel_name_from_cache(
+    const ggml_numa_kernel_cache_entry_t * cache_entry);
+
+/**
  * Array-based strategy lookup - direct access using operation type as index
  * Returns execution strategy based on operation type and element count
  */
@@ -189,22 +211,15 @@ typedef enum ggml_status (*ggml_numa_aggregation_function_t)(
 );
 
 /**
- * Kernel execution information returned by registry queries
- * Contains all information needed for the executor to dispatch work to coordinator
+ * Simplified kernel query result - only returns strategy selection
+ * All other metadata comes from the strategy cache entry
  * 
- * This is the primary interface between the registry and executor.
- * Both cache and threshold-based queries return this structure.
+ * This structure is returned by kernel query functions in the hot path
+ * and should be kept minimal for performance.
  */
 typedef struct ggml_numa_kernel_query_result_s {
-    bool supported;                                    // Whether this operation is supported
-    ggml_numa_execution_strategy_t strategy;          // Recommended execution strategy
-    size_t work_buffer_size_per_thread;              // Required compute buffer size per thread
-    ggml_numa_work_function_t work_function;         // Function pointer for coordinator execution
-    float efficiency_score;                           // Efficiency estimate (0.0-1.0)
-    const char * kernel_name;                         // Human-readable kernel name
-    ggml_numa_aggregation_policy_t aggregation_policy; // How to handle result aggregation
-    ggml_numa_aggregation_function_t aggregation_function; // Custom aggregation function (if policy is CUSTOM)
-    void * aggregation_user_data;                     // User data passed to custom aggregation function
+    bool supported;                            ///< Whether this operation is supported
+    ggml_numa_execution_strategy_t strategy;  ///< Selected execution strategy based on complexity
 } ggml_numa_kernel_query_result_t;
 
 /**
@@ -234,7 +249,7 @@ void ggml_numa_kernels_cleanup(void);
  * @param tensor The tensor operation to query about
  * @return Query result with all execution information
  */
-ggml_numa_kernel_query_result_t ggml_numa_kernels_query(const struct ggml_tensor * tensor);
+ggml_numa_execution_strategy_t ggml_numa_kernels_query(const struct ggml_tensor * tensor);
 
 /**
  * Fast strategy lookup for a tensor operation (simplified interface)
@@ -242,7 +257,8 @@ ggml_numa_kernel_query_result_t ggml_numa_kernels_query(const struct ggml_tensor
  * @param tensor The tensor operation to query about
  * @return Execution strategy result with O(1) array lookup
  */
-ggml_numa_kernel_query_result_t ggml_numa_kernels_strategy_lookup(const struct ggml_tensor * tensor);
+// Legacy function temporarily disabled during query simplification
+// ggml_numa_kernel_query_result_t ggml_numa_kernels_strategy_lookup(const struct ggml_tensor * tensor);
 
 /**
  * Get strategy cache statistics for performance monitoring
@@ -271,15 +287,15 @@ void ggml_numa_kernels_clear_strategy_cache(void);
  * @param result Pointer to query result to potentially override
  * @param op_name Operation name for logging purposes
  * @param single_single_fn Function pointer for single-node, single-thread execution
- * @param single_multi_fn Function pointer for single-node, multi-thread execution  
- * @param data_parallel_fn Function pointer for data-parallel execution
- * @return true if strategy was overridden, false if unchanged
+ * Legacy function disabled during simplification
  */
+/*
 bool ggml_numa_apply_kernel_force_strategy(ggml_numa_kernel_query_result_t * result,
                                            const char * op_name,
                                            ggml_numa_work_function_t single_single_fn,
                                            ggml_numa_work_function_t single_multi_fn,
                                            ggml_numa_work_function_t data_parallel_fn);
+*/
 
 /**
  * NUMA_SELECT_STRATEGY_BY_THRESHOLD - Macro for optimal threshold-based strategy selection
@@ -332,16 +348,13 @@ bool ggml_numa_apply_kernel_force_strategy(ggml_numa_kernel_query_result_t * res
 #define NUMA_SELECT_STRATEGY_FROM_CACHE(cache_entry, total_elements, selected_strategy) do { \
     if (total_elements < cache_entry->strategy_array.thresholds[NUMA_STRATEGY_IDX_SINGLE_SINGLE]) { \
         /* Very small tensors: single-threaded */ \
-        selected_strategy.node_strategy = NUMA_NODE_STRATEGY_SINGLE; \
-        selected_strategy.on_node_strategy = NUMA_ON_NODE_STRATEGY_SINGLE_THREAD; \
+        selected_strategy = NUMA_STRATEGY_SINGLE_THREAD; \
     } else if (total_elements < cache_entry->strategy_array.thresholds[NUMA_STRATEGY_IDX_SINGLE_MULTI]) { \
         /* Small to medium tensors: multi-threaded on single node */ \
-        selected_strategy.node_strategy = NUMA_NODE_STRATEGY_SINGLE; \
-        selected_strategy.on_node_strategy = NUMA_ON_NODE_STRATEGY_MULTI_THREAD; \
+        selected_strategy = NUMA_STRATEGY_SINGLE_NODE; \
     } else { \
         /* Large tensors: data-parallel across NUMA nodes */ \
-        selected_strategy.node_strategy = NUMA_NODE_STRATEGY_DATA_PARALLEL; \
-        selected_strategy.on_node_strategy = NUMA_ON_NODE_STRATEGY_MULTI_THREAD; \
+        selected_strategy = NUMA_STRATEGY_DATA_PARALLEL; \
     } \
 } while(0)
 

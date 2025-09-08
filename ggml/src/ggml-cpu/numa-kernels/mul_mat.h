@@ -32,7 +32,7 @@ ggml_numa_kernel_registration_info_t ggml_numa_kernel_mul_mat_register(void);
  * Query MUL_MAT kernel for optimal execution strategy
  * Returns strategy recommendation and kernel info for given tensor
  */
-ggml_numa_kernel_query_result_t ggml_numa_kernel_mul_mat_query(const struct ggml_tensor * tensor);
+ggml_numa_execution_strategy_t ggml_numa_kernel_mul_mat_query(const struct ggml_tensor * tensor);
 
 /**
  * Calculate work buffer size for MUL_MAT operation

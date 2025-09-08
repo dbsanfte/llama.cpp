@@ -170,24 +170,19 @@ analyze_numa_debug_logs() {
     local fallback_ops_file=$(mktemp)
     local summary_file=$(mktemp)
     
-    # Extract NUMA kernel executions (successful dispatches)
-    # Look for "Query result - supported=true, kernel=NUMA ADD (Single/Multi)" patterns
-    grep "Query result.*supported=true.*kernel=" "$log_file" | \
-        sed -E 's/.*kernel=(NUMA )?([A-Z_]+).*/\2/' | \
+    # Extract NUMA kernel executions (successful dispatches) 
+    # Look for "NUMA DEBUG: NUMA ADD (Strategy)" patterns - this is the new standardized format
+    grep -E "NUMA DEBUG: NUMA [A-Z_]+ \([^)]+\)" "$log_file" | \
+        sed -E 's/.*NUMA DEBUG: NUMA ([A-Z_]+) \([^)]+\).*/\1/' | \
         sort | uniq -c | sort -nr > "$numa_ops_file"
     
-    # Extract strategy breakdown for each operation
+    # Extract strategy breakdown for each operation using the new standardized format
     local strategy_file=$(mktemp)
     
-    # Extract both query results AND actual strategy logging messages for comprehensive analysis
-    # Pattern 1: Query result messages (e.g., "kernel=NUMA MUL_MAT (Data-Parallel)")
-    grep "Query result.*supported=true.*kernel=" "$log_file" | \
-        sed -E 's/.*kernel=(.*)/\1/' > "$strategy_file"
-    
-    # Pattern 2: Direct strategy logging messages (e.g., "NUMA MUL_MAT (Data Parallel)")
-    # These are more reliable and use consistent formatting
+    # Extract strategy logging messages: "NUMA DEBUG: NUMA ADD (Data Parallel)"
+    # This provides both operation name and strategy in a consistent format
     grep -E "NUMA DEBUG: NUMA [A-Z_]+ \([^)]+\)" "$log_file" | \
-        sed -E 's/.*NUMA DEBUG: (NUMA [A-Z_]+ \([^)]+\)).*/\1/' >> "$strategy_file"
+        sed -E 's/.*NUMA DEBUG: (NUMA [A-Z_]+ \([^)]+\)).*/\1/' > "$strategy_file"
     
     # Extract fallback executions (operations that fell back to ggml-cpu)
     # Look for "No kernel found for operation GET_ROWS" patterns specifically

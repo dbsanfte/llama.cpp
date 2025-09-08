@@ -351,7 +351,7 @@ enum ggml_status ggml_numa_kernel_rope_f16_execute(void * work_context, struct g
 /**
  * Query function for ROPE kernel strategy selection
  */
-ggml_numa_kernel_query_result_t ggml_numa_kernel_rope_query(const struct ggml_tensor * tensor);
+ggml_numa_execution_strategy_t ggml_numa_kernel_rope_query(const struct ggml_tensor * tensor);
 
 /**
  * Work buffer calculation function for ROPE kernels
@@ -385,7 +385,7 @@ ggml_numa_kernel_registration_info_t ggml_numa_kernel_rope_register(void);
  * Query ROPE kernel for optimal execution strategy
  * Returns strategy recommendation and kernel info for given tensor
  */
-ggml_numa_kernel_query_result_t ggml_numa_kernel_rope_query(const struct ggml_tensor * tensor);
+ggml_numa_execution_strategy_t ggml_numa_kernel_rope_query(const struct ggml_tensor * tensor);
 
 /**
  * Calculate work buffer size for ROPE operation

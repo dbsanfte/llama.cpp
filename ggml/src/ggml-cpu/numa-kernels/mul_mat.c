@@ -107,32 +107,25 @@ ggml_numa_kernel_registration_info_t ggml_numa_kernel_mul_mat_register(void) {
     return info;
 }
 
-ggml_numa_kernel_query_result_t ggml_numa_kernel_mul_mat_query(const struct ggml_tensor * tensor) {
-    ggml_numa_kernel_query_result_t result = { .supported = false };
+ggml_numa_execution_strategy_t ggml_numa_kernel_mul_mat_query(const struct ggml_tensor * tensor) {
+    ggml_numa_execution_strategy_t strategy = NUMA_STRATEGY_SINGLE_THREAD;
     
     // Validate this is a MUL_MAT operation
     if (!tensor || tensor->op != GGML_OP_MUL_MAT) {
-        return result;
+        return strategy;
     }
     
     // Validate tensor structure for MUL_MAT
     if (!tensor->src[0] || !tensor->src[1]) {
         NUMA_LOG_DEBUG("MUL_MAT query: Missing source tensors");
-        return result;
-    }
-    
-    // Check if this kernel is actually registered and supported
-    if (!ggml_numa_is_kernel_supported(GGML_OP_MUL_MAT)) {
-        NUMA_LOG_DEBUG("MUL_MAT kernel not supported - registration disabled");
-        result.supported = false;
-        return result;
+        return strategy;
     }
     
     // Get our own cache entry with the registered thresholds
     const ggml_numa_kernel_cache_entry_t * cache_entry = ggml_numa_lookup_kernel_direct(GGML_OP_MUL_MAT);
     if (!cache_entry || !cache_entry->strategy_array.valid) {
         NUMA_LOG_DEBUG("MUL_MAT query: No valid strategy array in cache");
-        return result;
+        return strategy;
     }
 
     // Calculate total operations for strategy selection (matrix dimensions)
@@ -147,48 +140,16 @@ ggml_numa_kernel_query_result_t ggml_numa_kernel_mul_mat_query(const struct ggml
     const size_t total_ops = ne00 * ne01 * ne11;
     
     // Use the registered thresholds for strategy selection
-    ggml_numa_execution_strategy_t selected_strategy;
-    NUMA_SELECT_STRATEGY_FROM_CACHE(cache_entry, total_ops, selected_strategy);
+    NUMA_SELECT_STRATEGY_FROM_CACHE(cache_entry, total_ops, strategy);
     
-    // Build successful query result
-    result.supported = true;
-    result.strategy = selected_strategy;
-    result.work_buffer_size_per_thread = ggml_numa_kernel_mul_mat_work_buffer_calc(tensor, 1, 1);  // Calculate actual buffer size needed
-    result.aggregation_policy = GGML_NUMA_AGGREGATION_NONE;  // Direct writes, no aggregation needed
-    result.aggregation_function = NULL;
-    result.aggregation_user_data = NULL;
+    // Debug logging for operation analysis (maintains integration test compatibility)
+    const char* strategy_name = (strategy == NUMA_STRATEGY_SINGLE_THREAD) ? "(Single/Single)" :
+                               (strategy == NUMA_STRATEGY_SINGLE_NODE) ? "(Single/Multi)" :
+                               "(Data Parallel)";
     
-    // Select work function and metadata based on strategy
-    if (selected_strategy.node_strategy == NUMA_NODE_STRATEGY_SINGLE) {
-        if (selected_strategy.on_node_strategy == NUMA_ON_NODE_STRATEGY_SINGLE_THREAD) {
-            result.work_function = ggml_numa_kernel_mul_mat_execute;
-            result.efficiency_score = 0.85f;  // Lower due to no parallelism
-            result.kernel_name = "NUMA MUL_MAT (Single/Single)";
-        } else {
-            result.work_function = ggml_numa_kernel_mul_mat_execute;
-            result.efficiency_score = 0.92f;  // Good thread parallelism
-            result.kernel_name = "NUMA MUL_MAT (Single/Multi)";
-        }
-    } else {
-        // Data-parallel strategy
-        result.work_function = ggml_numa_kernel_mul_mat_execute;
-        result.efficiency_score = 0.98f;  // Excellent NUMA + thread parallelism
-        result.kernel_name = "NUMA MUL_MAT (Data-Parallel)";
-    }
+    NUMA_LOG_DEBUG("NUMA MUL_MAT %s", strategy_name);
     
-    // Apply force strategy override if environment variable is set
-    ggml_numa_apply_kernel_force_strategy(&result, "MUL_MAT", 
-                                          ggml_numa_kernel_mul_mat_execute,
-                                          ggml_numa_kernel_mul_mat_execute,
-                                          ggml_numa_kernel_mul_mat_execute);
-    
-    NUMA_LOG_DEBUG("MUL_MAT query: ops=%ld, strategy=%s/%s, efficiency=%.2f", 
-                   total_ops,
-                   selected_strategy.node_strategy == NUMA_NODE_STRATEGY_SINGLE ? "single" : "data-parallel",
-                   selected_strategy.on_node_strategy == NUMA_ON_NODE_STRATEGY_SINGLE_THREAD ? "single-thread" : "multi-thread",
-                   result.efficiency_score);
-    
-    return result;
+    return strategy;
 }
 
 size_t ggml_numa_kernel_mul_mat_work_buffer_calc(const struct ggml_tensor * tensor, int total_numa_nodes, int total_threads) {
@@ -474,7 +435,7 @@ enum ggml_status ggml_numa_kernel_mul_mat_execute(void * work_context, struct gg
             }
         }
         
-        NUMA_LOG_VERBOSE("MUL_MAT: Thread %d/%d (global %d/%d) converted src1 blocks [%ld-%ld) from F32 to vec_dot_type %d", 
+        NUMA_LOG_TRACE("MUL_MAT: Thread %d/%d (global %d/%d) converted src1 blocks [%ld-%ld) from F32 to vec_dot_type %d", 
                          ith, nth, global_ith, global_nth, 
                          (global_ith * ne10/ggml_blck_size(vec_dot_type)) / global_nth, 
                          ((global_ith + 1) * ne10/ggml_blck_size(vec_dot_type)) / global_nth, vec_dot_type);

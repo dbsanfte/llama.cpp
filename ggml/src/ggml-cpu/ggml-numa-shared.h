@@ -41,28 +41,18 @@ typedef enum ggml_status (*ggml_numa_work_function_t)(
 );
 
 /**
- * Node distribution strategies - how work is distributed across NUMA nodes
+ * NUMA execution strategies - flattened for maximum hot path performance
+ * Single enum return uses register instead of struct, significantly faster
  */
 typedef enum {
-    NUMA_NODE_STRATEGY_SINGLE,            // Execute on a single node
-    NUMA_NODE_STRATEGY_DATA_PARALLEL      // Distribute data across multiple nodes
-} ggml_numa_node_strategy_t;
+    NUMA_STRATEGY_SINGLE_THREAD   = 0,  // Single node, single thread (tiny tensors)
+    NUMA_STRATEGY_SINGLE_NODE     = 1,  // Single node, multi thread (medium tensors)
+    NUMA_STRATEGY_DATA_PARALLEL   = 2,  // Data parallel, multi thread (large tensors)
+    NUMA_STRATEGY_RESERVED        = 3   // Reserved for future extensions
+} ggml_numa_strategy_t;
 
-/**
- * On-node execution strategies - how work is executed within each NUMA node
- */
-typedef enum {
-    NUMA_ON_NODE_STRATEGY_SINGLE_THREAD,  // Single thread execution
-    NUMA_ON_NODE_STRATEGY_MULTI_THREAD    // Multi-threaded execution
-} ggml_numa_on_node_strategy_t;
-
-/**
- * Combined execution strategy - combines node distribution and on/node execution
- */
-typedef struct {
-    ggml_numa_node_strategy_t node_strategy;      // How to distribute across nodes
-    ggml_numa_on_node_strategy_t on_node_strategy; // How to execute within each node
-} ggml_numa_execution_strategy_t;
+// Legacy type alias for backward compatibility during transition
+typedef ggml_numa_strategy_t ggml_numa_execution_strategy_t;
 
 // ============================================================================
 // NUMA Strategy Cache System (O(1) Hash Table Performance)
@@ -432,33 +422,23 @@ static inline ggml_numa_execution_strategy_t numa_select_strategy_fast(
     const ggml_numa_kernel_strategy_array_t * strategy_array,
     size_t element_count) {
     
-    ggml_numa_execution_strategy_t result;
-    
     if (!strategy_array || !strategy_array->valid) {
         // Default fallback: single node, multi-thread for safety
-        result.node_strategy = NUMA_NODE_STRATEGY_SINGLE;
-        result.on_node_strategy = NUMA_ON_NODE_STRATEGY_MULTI_THREAD;
-        return result;
+        return NUMA_STRATEGY_SINGLE_NODE;
     }
     
     // O(1) threshold comparison for strategy selection with 3-level support
     if (element_count <= strategy_array->thresholds[NUMA_STRATEGY_IDX_SINGLE_SINGLE]) {
-        result.node_strategy = NUMA_NODE_STRATEGY_SINGLE;
-        result.on_node_strategy = NUMA_ON_NODE_STRATEGY_SINGLE_THREAD;
+        return NUMA_STRATEGY_SINGLE_THREAD;
     } else if (element_count <= strategy_array->thresholds[NUMA_STRATEGY_IDX_SINGLE_MULTI]) {
-        result.node_strategy = NUMA_NODE_STRATEGY_SINGLE;
-        result.on_node_strategy = NUMA_ON_NODE_STRATEGY_MULTI_THREAD;
+        return NUMA_STRATEGY_SINGLE_NODE;
     } else if (element_count <= strategy_array->thresholds[NUMA_STRATEGY_IDX_DATA_PARALLEL]) {
         // Third threshold: data-parallel with controlled size
-        result.node_strategy = NUMA_NODE_STRATEGY_DATA_PARALLEL;
-        result.on_node_strategy = NUMA_ON_NODE_STRATEGY_MULTI_THREAD;
+        return NUMA_STRATEGY_DATA_PARALLEL;
     } else {
         // Above all thresholds: use data-parallel strategy (large)
-        result.node_strategy = NUMA_NODE_STRATEGY_DATA_PARALLEL;
-        result.on_node_strategy = NUMA_ON_NODE_STRATEGY_MULTI_THREAD;
+        return NUMA_STRATEGY_DATA_PARALLEL;
     }
-    
-    return result;
 }
 
 /**
@@ -466,21 +446,22 @@ static inline ggml_numa_execution_strategy_t numa_select_strategy_fast(
  */
 static inline ggml_numa_work_function_t numa_get_work_func_fast(
     const ggml_numa_kernel_work_funcs_t * work_funcs,
-    const ggml_numa_execution_strategy_t * strategy) {
+    ggml_numa_execution_strategy_t strategy) {
     
-    if (!work_funcs || !work_funcs->valid || !strategy) {
+    if (!work_funcs || !work_funcs->valid) {
         return NULL;
     }
     
-    // O(1) function pointer selection based on strategy
-    if (strategy->node_strategy == NUMA_NODE_STRATEGY_SINGLE) {
-        if (strategy->on_node_strategy == NUMA_ON_NODE_STRATEGY_SINGLE_THREAD) {
+    // O(1) function pointer selection based on flat strategy enum
+    switch (strategy) {
+        case NUMA_STRATEGY_SINGLE_THREAD:
             return work_funcs->single_single_fn;
-        } else {
+        case NUMA_STRATEGY_SINGLE_NODE:
             return work_funcs->single_multi_fn;
-        }
-    } else {
-        return work_funcs->data_parallel_fn;
+        case NUMA_STRATEGY_DATA_PARALLEL:
+        case NUMA_STRATEGY_RESERVED:
+        default:
+            return work_funcs->data_parallel_fn;
     }
 }
 
@@ -489,21 +470,22 @@ static inline ggml_numa_work_function_t numa_get_work_func_fast(
  */
 static inline enum ggml_status (*numa_get_aggregation_func_fast(
     const ggml_numa_kernel_aggregation_funcs_t * agg_funcs,
-    const ggml_numa_execution_strategy_t * strategy))(void *, int, struct ggml_tensor *, struct ggml_cplan *) {
+    ggml_numa_execution_strategy_t strategy))(void *, int, struct ggml_tensor *, struct ggml_cplan *) {
     
-    if (!agg_funcs || !agg_funcs->valid || !strategy) {
+    if (!agg_funcs || !agg_funcs->valid) {
         return NULL;
     }
     
-    // O(1) function pointer selection based on strategy
-    if (strategy->node_strategy == NUMA_NODE_STRATEGY_SINGLE) {
-        if (strategy->on_node_strategy == NUMA_ON_NODE_STRATEGY_SINGLE_THREAD) {
+    // O(1) function pointer selection based on flat strategy enum
+    switch (strategy) {
+        case NUMA_STRATEGY_SINGLE_THREAD:
             return agg_funcs->single_single_fn;
-        } else {
+        case NUMA_STRATEGY_SINGLE_NODE:
             return agg_funcs->single_multi_fn;
-        }
-    } else {
-        return agg_funcs->data_parallel_fn;
+        case NUMA_STRATEGY_DATA_PARALLEL:
+        case NUMA_STRATEGY_RESERVED:
+        default:
+            return agg_funcs->data_parallel_fn;
     }
 }
 

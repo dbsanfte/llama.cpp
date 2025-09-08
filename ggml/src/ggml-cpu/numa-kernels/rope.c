@@ -759,10 +759,11 @@ enum ggml_status ggml_numa_kernel_rope_execute(void * work_context, struct ggml_
     struct ggml_tensor * tensor = (struct ggml_tensor *)work_context;
     
     // Validate inputs
-    NUMA_ASSERT(tensor != NULL, "Tensor cannot be null");
-    NUMA_ASSERT(tensor->src[0] != NULL, "Source tensor 0 cannot be null");
-    NUMA_ASSERT(tensor->src[1] != NULL, "Source tensor 1 (positions) cannot be null");
-    NUMA_ASSERT(params != NULL, "Compute params cannot be null");
+    NUMA_ASSERT(tensor != NULL, "ROPE: Tensor cannot be null");
+    NUMA_ASSERT(tensor->op == GGML_OP_ROPE, "ROPE: Wrong operation type - expected GGML_OP_ROPE");
+    NUMA_ASSERT(tensor->src[0] != NULL, "ROPE: Source tensor 0 cannot be null");
+    NUMA_ASSERT(tensor->src[1] != NULL, "ROPE: Source tensor 1 (positions) cannot be null");
+    NUMA_ASSERT(params != NULL, "ROPE: Compute params cannot be null");
     
     const struct ggml_tensor * src0 = tensor->src[0];
     
@@ -787,58 +788,26 @@ enum ggml_status ggml_numa_kernel_rope_execute(void * work_context, struct ggml_
 /**
  * Query function for ROPE kernel strategy selection
  */
-ggml_numa_kernel_query_result_t ggml_numa_kernel_rope_query(const struct ggml_tensor * tensor) {
-    ggml_numa_kernel_query_result_t result = {0};
-    
-    if (!tensor || !tensor->src[0]) {
-        result.supported = false;
-        return result;
-    }
-    
-    // Get cache entry for this operation
-    const ggml_numa_kernel_cache_entry_t * cache_entry = ggml_numa_lookup_kernel_direct(GGML_OP_ROPE);
-    if (!cache_entry || !cache_entry->supported) {
-        result.supported = false;
-        return result;
-    }
-    
-    // Calculate total elements for strategy selection
+ggml_numa_execution_strategy_t ggml_numa_kernel_rope_query(const struct ggml_tensor * tensor) {
+    // Calculate total elements for strategy selection (hot path - must be fast)
     size_t total_elements = ggml_nelements(tensor);
+    
+    // Get cache entry for this operation (O(1) lookup)
+    const ggml_numa_kernel_cache_entry_t * cache_entry = ggml_numa_lookup_kernel_direct(GGML_OP_ROPE);
     
     // Use shared macro for unified strategy selection
     ggml_numa_execution_strategy_t selected_strategy;
     NUMA_SELECT_STRATEGY_FROM_CACHE(cache_entry, total_elements, selected_strategy);
     
-    // Calculate work buffer size needed for ROPE cache
-    // ROPE needs cache space: (ne0 + CACHE_LINE_SIZE_F32) * sizeof(float) per thread
-    const size_t ne0 = tensor->ne[0];
-    const size_t work_buffer_size = (ne0 + CACHE_LINE_SIZE_F32) * sizeof(float);
+    // Debug logging for operation analysis (maintains integration test compatibility)
+    const char* strategy_name = (selected_strategy == NUMA_STRATEGY_SINGLE_THREAD) ? "(Single/Single)" :
+                               (selected_strategy == NUMA_STRATEGY_SINGLE_NODE) ? "(Single/Multi)" :
+                               (selected_strategy == NUMA_STRATEGY_DATA_PARALLEL) ? "(Data Parallel)" : "(Unknown)";
     
-    // Set result with proper work function selection
-    result.supported = true;
-    result.strategy = selected_strategy;
+    NUMA_LOG_DEBUG("NUMA ROPE %s", strategy_name);
     
-    // Select work function based on strategy - all strategies now supported
-    if (selected_strategy.on_node_strategy == NUMA_ON_NODE_STRATEGY_SINGLE_THREAD) {
-        result.work_function = cache_entry->work_funcs.single_single_fn;
-    } else if (selected_strategy.node_strategy == NUMA_NODE_STRATEGY_SINGLE) {
-        result.work_function = cache_entry->work_funcs.single_multi_fn;
-    } else {
-        // Data-parallel mode now properly supported with shared destination memory
-        result.work_function = cache_entry->work_funcs.data_parallel_fn;
-    }
-    
-    result.aggregation_function = NULL; // ROPE doesn't need aggregation
-    result.aggregation_policy = GGML_NUMA_AGGREGATION_NONE;
-    result.work_buffer_size_per_thread = work_buffer_size; // Proper work buffer size for ROPE
-    result.efficiency_score = 0.9f; // High efficiency for ROPE operations
-    result.kernel_name = "NUMA ROPE Kernel";
-    result.aggregation_user_data = NULL;
-    
-    NUMA_LOG_DEBUG("ROPE strategy selected: %d for %zu elements, work_buffer_size=%zu bytes", 
-                   selected_strategy, total_elements, work_buffer_size);
-    
-    return result;
+    // Return strategy only - executor gets everything else from cache
+    return selected_strategy;
 }
 
 /**

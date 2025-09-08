@@ -90,18 +90,15 @@ bool ggml_numa_apply_force_strategy_override(ggml_numa_execution_strategy_t * st
     // Apply force strategy override
     switch (force_strategy) {
         case NUMA_FORCE_STRATEGY_SINGLE_SINGLE:
-            strategy->node_strategy = NUMA_NODE_STRATEGY_SINGLE;
-            strategy->on_node_strategy = NUMA_ON_NODE_STRATEGY_SINGLE_THREAD;
+            *strategy = NUMA_STRATEGY_SINGLE_THREAD;
             break;
             
         case NUMA_FORCE_STRATEGY_SINGLE_MULTI:
-            strategy->node_strategy = NUMA_NODE_STRATEGY_SINGLE;
-            strategy->on_node_strategy = NUMA_ON_NODE_STRATEGY_MULTI_THREAD;
+            *strategy = NUMA_STRATEGY_SINGLE_NODE;
             break;
             
         case NUMA_FORCE_STRATEGY_DATA_PARALLEL:
-            strategy->node_strategy = NUMA_NODE_STRATEGY_DATA_PARALLEL;
-            strategy->on_node_strategy = NUMA_ON_NODE_STRATEGY_MULTI_THREAD;
+            *strategy = NUMA_STRATEGY_DATA_PARALLEL;
             break;
             
         default:
@@ -111,13 +108,12 @@ bool ggml_numa_apply_force_strategy_override(ggml_numa_execution_strategy_t * st
     }
     
     // Log the strategy override
-    const char * original_node_str = (original.node_strategy == NUMA_NODE_STRATEGY_SINGLE) ? "SINGLE" : "DATA_PARALLEL";
-    const char * original_thread_str = (original.on_node_strategy == NUMA_ON_NODE_STRATEGY_SINGLE_THREAD) ? "SINGLE_THREAD" : "MULTI_THREAD";
-    const char * new_node_str = (strategy->node_strategy == NUMA_NODE_STRATEGY_SINGLE) ? "SINGLE" : "DATA_PARALLEL";
-    const char * new_thread_str = (strategy->on_node_strategy == NUMA_ON_NODE_STRATEGY_SINGLE_THREAD) ? "SINGLE_THREAD" : "MULTI_THREAD";
+    const char * original_str = (original == NUMA_STRATEGY_SINGLE_THREAD) ? "SINGLE_THREAD" :
+                               (original == NUMA_STRATEGY_SINGLE_NODE) ? "SINGLE_NODE" : "DATA_PARALLEL";
+    const char * new_str = (*strategy == NUMA_STRATEGY_SINGLE_THREAD) ? "SINGLE_THREAD" :
+                          (*strategy == NUMA_STRATEGY_SINGLE_NODE) ? "SINGLE_NODE" : "DATA_PARALLEL";
     
-    NUMA_LOG_DEBUG("NUMA Force Strategy Override: %s+%s -> %s+%s", 
-                   original_node_str, original_thread_str, new_node_str, new_thread_str);
+    NUMA_LOG_DEBUG("NUMA Force Strategy Override: %s -> %s", original_str, new_str);
     
     return true;
 }

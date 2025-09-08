@@ -83,7 +83,7 @@ ggml_numa_kernel_registration_info_t ggml_numa_kernel_noop_register(void);
  * 
  * @note Returns minimal operation count (1) to represent pure overhead measurement
  */
-ggml_numa_kernel_query_result_t ggml_numa_kernel_noop_query(const struct ggml_tensor * tensor);
+ggml_numa_execution_strategy_t ggml_numa_kernel_noop_query(const struct ggml_tensor * tensor);
 
 /**
  * @brief Work buffer calculation function for NOOP operations

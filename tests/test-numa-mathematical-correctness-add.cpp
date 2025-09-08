@@ -226,17 +226,19 @@ public:
         // Initialize NUMA system 
         ggml_numa_init(GGML_NUMA_STRATEGY_MIRROR);
         
-        // Query the NUMA kernel to see if it's supported
-        ggml_numa_kernel_query_result_t query_result = ggml_numa_kernels_query(numa_result);
+        // Query the NUMA kernel to see if it's supported - NEW ARCHITECTURE
+        ggml_numa_execution_strategy_t strategy_result = ggml_numa_kernels_query(numa_result);
+        const ggml_numa_kernel_cache_entry_t * cache_entry = ggml_numa_lookup_kernel_direct(numa_result->op);
+        bool is_supported = cache_entry && cache_entry->supported;
+        const char* kernel_name = cache_entry ? ggml_numa_get_kernel_name_from_cache(cache_entry) : "Unknown";
         
-        if (!query_result.supported) {
+        if (!is_supported) {
             printf("⚠️  ADD operation not supported by NUMA kernels - skipping NUMA test\n");
             ggml_free(test_ctx);
             return false;  // Consider this a fail since kernel isn't available
         }
         
-        printf("📊 NUMA Strategy: %s (efficiency: %.2f)\n", 
-               query_result.kernel_name, query_result.efficiency_score);
+        printf("📊 NUMA Strategy: %s\n", kernel_name);
         
         // Explain execution mode for clarity
         printf("🔧 Strategy Test: Forcing execution strategy to %s\n", strategy_name);
@@ -350,15 +352,15 @@ public:
         
         std::vector<ExecutionStrategy> strategies = {
             // Strategy 1: Single-thread, single-node
-            {{NUMA_NODE_STRATEGY_SINGLE, NUMA_ON_NODE_STRATEGY_SINGLE_THREAD}, 
+            {NUMA_STRATEGY_SINGLE_THREAD, 
              "Single-Single", "Single-thread execution on single NUMA node"},
             
             // Strategy 2: Multi-thread, single-node
-            {{NUMA_NODE_STRATEGY_SINGLE, NUMA_ON_NODE_STRATEGY_MULTI_THREAD}, 
+            {NUMA_STRATEGY_SINGLE_NODE, 
              "Single-Multi", "Multi-thread execution within single NUMA node"},
             
             // Strategy 3: Multi-thread, multi-node (data-parallel)
-            {{NUMA_NODE_STRATEGY_DATA_PARALLEL, NUMA_ON_NODE_STRATEGY_MULTI_THREAD}, 
+            {NUMA_STRATEGY_DATA_PARALLEL, 
              "Data-Parallel", "Data-parallel execution across multiple NUMA nodes"}
         };
         
@@ -513,12 +515,15 @@ public:
                         const char* expected_type_name = ggml_type_name(combo.dst_type);
                         
                         if (result->type == combo.dst_type) {
-                            // Query NUMA kernel support for this type combination
-                            ggml_numa_kernel_query_result_t query = ggml_numa_kernels_query(result);
+                            // Query NUMA kernel support for this type combination - NEW ARCHITECTURE
+                            ggml_numa_execution_strategy_t strategy = ggml_numa_kernels_query(result);
+                            const ggml_numa_kernel_cache_entry_t * cache_entry = ggml_numa_lookup_kernel_direct(result->op);
+                            bool is_supported = cache_entry && cache_entry->supported;
+                            const char* kernel_name = cache_entry ? ggml_numa_get_kernel_name_from_cache(cache_entry) : "Unknown";
                             
-                            if (query.supported) {
-                                printf("✅ %s: NUMA kernel supported (efficiency: %.2f)\n", 
-                                       combo.description, query.efficiency_score);
+                            if (is_supported) {
+                                printf("✅ %s: NUMA kernel supported (%s)\n", 
+                                       combo.description, kernel_name);
                                 test_passed = true;
                             } else {
                                 // Check if reference implementation supports it
@@ -530,11 +535,15 @@ public:
                             printf("⚠️  %s: ggml_add returned %s instead of expected %s\n", 
                                    combo.description, actual_type_name, expected_type_name);
                             
-                            // Test if the actual result type combination is supported
-                            ggml_numa_kernel_query_result_t query = ggml_numa_kernels_query(result);
-                            if (query.supported) {
-                                printf("✅ %s: NUMA kernel supports actual type (efficiency: %.2f)\n", 
-                                       combo.description, query.efficiency_score);
+                            // Test if the actual result type combination is supported - NEW ARCHITECTURE
+                            ggml_numa_execution_strategy_t strategy = ggml_numa_kernels_query(result);
+                            const ggml_numa_kernel_cache_entry_t * cache_entry = ggml_numa_lookup_kernel_direct(result->op);
+                            bool is_supported = cache_entry && cache_entry->supported;
+                            const char* kernel_name = cache_entry ? ggml_numa_get_kernel_name_from_cache(cache_entry) : "Unknown";
+                            
+                            if (is_supported) {
+                                printf("✅ %s: NUMA kernel supports actual type (%s)\n", 
+                                       combo.description, kernel_name);
                                 test_passed = true;
                             } else {
                                 printf("⚠️  %s: Actual type combination not supported\n", 
@@ -647,11 +656,15 @@ public:
                 
                 struct ggml_tensor* result = ggml_add(ctx, matrix, vector);
                 if (result) {
-                    ggml_numa_kernel_query_result_t query = ggml_numa_kernels_query(result);
-                    printf("🔍 Broadcasting query result: supported=%s\n", 
-                           query.supported ? "YES" : "NO");
+                    // Query NUMA kernel support - NEW ARCHITECTURE
+                    ggml_numa_execution_strategy_t strategy = ggml_numa_kernels_query(result);
+                    const ggml_numa_kernel_cache_entry_t * cache_entry = ggml_numa_lookup_kernel_direct(result->op);
+                    bool is_supported = cache_entry && cache_entry->supported;
                     
-                    if (query.supported) {
+                    printf("🔍 Broadcasting query result: supported=%s\n", 
+                           is_supported ? "YES" : "NO");
+                    
+                    if (is_supported) {
                         printf("✅ Matrix + Vector broadcasting supported\n");
                     } else {
                         printf("❌ Matrix + Vector broadcasting not supported!\n");
@@ -888,10 +901,10 @@ public:
             ggml_numa_execution_strategy_t strategy;
             if (test_case.force_data_parallel) {
                 // Force data-parallel to test edge case handling
-                strategy = {NUMA_NODE_STRATEGY_DATA_PARALLEL, NUMA_ON_NODE_STRATEGY_MULTI_THREAD};
+                strategy = NUMA_STRATEGY_DATA_PARALLEL;
             } else {
                 // Let natural strategy selection work
-                strategy = {NUMA_NODE_STRATEGY_SINGLE, NUMA_ON_NODE_STRATEGY_SINGLE_THREAD}; // Will be overridden by query
+                strategy = NUMA_STRATEGY_SINGLE_THREAD; // Will be overridden by query
             }
             
             bool test_passed = test_single_ADD_case(
@@ -978,10 +991,7 @@ public:
                    edge_case.ne0 * edge_case.ne1 * edge_case.ne2 * edge_case.ne3);
             
             // Force data-parallel execution - this MUST work for any tensor size
-            ggml_numa_execution_strategy_t forced_data_parallel = {
-                NUMA_NODE_STRATEGY_DATA_PARALLEL, 
-                NUMA_ON_NODE_STRATEGY_MULTI_THREAD
-            };
+            ggml_numa_execution_strategy_t forced_data_parallel = NUMA_STRATEGY_DATA_PARALLEL;
             
             bool test_passed = test_single_ADD_case(
                 edge_case.ne0, edge_case.ne1, edge_case.ne2, edge_case.ne3,
@@ -1115,9 +1125,9 @@ public:
         // Execute with forced strategy if requested
         ggml_numa_execution_strategy_t strategy;
         if (force_data_parallel) {
-            strategy = {NUMA_NODE_STRATEGY_DATA_PARALLEL, NUMA_ON_NODE_STRATEGY_MULTI_THREAD};
+            strategy = NUMA_STRATEGY_DATA_PARALLEL;
         } else {
-            strategy = {NUMA_NODE_STRATEGY_SINGLE, NUMA_ON_NODE_STRATEGY_SINGLE_THREAD};
+            strategy = NUMA_STRATEGY_SINGLE_THREAD;
         }
         
         // Setup compute plan

@@ -260,7 +260,9 @@ enum ggml_status ggml_numa_kernel_mul_mat_execute(void * work_context,
         // Fallback to local tensor data for compatibility
         dst_data = (float *)tensor_data(dst);
         NUMA_LOG_VERBOSE("MUL_MAT kernel using local tensor memory");
-    }    // =============================================================================
+    }    
+    
+    // =============================================================================
     // Memory Layout & Broadcasting Setup
     // =============================================================================
     

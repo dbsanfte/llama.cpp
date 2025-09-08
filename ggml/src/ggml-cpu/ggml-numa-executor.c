@@ -507,22 +507,34 @@ enum ggml_status ggml_numa_executor_execute_tensor(struct ggml_tensor * tensor, 
     NUMA_LOG_DEBUG("DEBUG: NUMA Executor: NUMA info not available (not Linux)\n");
     #endif
     
-    // Query the kernel registry for execution information
+    // Get cache entry and query for execution strategy (hot path - must be fast)
     NUMA_PERF_START(NUMA_PERF_EXECUTOR_QUERY, op_name, "kernel_registry", -1, 0, 0);
-    ggml_numa_kernel_query_result_t query_result = ggml_numa_kernels_query(tensor);
+    const ggml_numa_kernel_cache_entry_t * cache_entry = ggml_numa_lookup_kernel_direct(tensor->op);
+    ggml_numa_execution_strategy_t strategy = ggml_numa_kernels_query(tensor);
     NUMA_PERF_END();
     
-    NUMA_LOG_DEBUG("DEBUG: NUMA Executor: Query result - supported=%s, kernel=%s\n", 
-           query_result.supported ? "true" : "false", 
-           query_result.supported ? query_result.kernel_name : "N/A");
-    
-    if (!query_result.supported) {
+    if (!cache_entry || !cache_entry->supported) {
         GGML_LOG_DEBUG("NUMA Executor: Operation %s not supported by NUMA kernels, using direct kernel dispatch\n", 
                       op_name);
         enum ggml_status result = ggml_numa_executor_direct_kernel_dispatch(tensor, cplan);
         NUMA_PERF_END();
         return result;
     }
+    
+    // Check cache entry exists (we already got it above)
+    if (!cache_entry) {
+        GGML_LOG_DEBUG("NUMA Executor: No cache entry for %s, using direct kernel dispatch\n", op_name);
+        enum ggml_status result = ggml_numa_executor_direct_kernel_dispatch(tensor, cplan);
+        NUMA_PERF_END();
+        return result;
+    }
+    
+    // Get work function and metadata from cache
+    ggml_numa_work_function_t work_function = ggml_numa_get_work_function_from_cache(cache_entry, &strategy);
+    const char * kernel_name = ggml_numa_get_kernel_name_from_cache(cache_entry);
+    
+    // Debug logging is now handled by kernel query functions with standardized format
+    // This eliminates duplicate logging and ensures consistent operation analysis parsing
     
     // Check if this is a no-op kernel that doesn't require coordinator dispatch
     if (ggml_numa_is_kernel_noop(tensor->op)) {
@@ -531,15 +543,13 @@ enum ggml_status ggml_numa_executor_execute_tensor(struct ggml_tensor * tensor, 
         return GGML_STATUS_SUCCESS;
     }
     
-    GGML_LOG_DEBUG("NUMA Executor: %s kernel selected for %s (efficiency=%.2f, strategy=%s, buffer=%zu bytes/thread)\n",
-                   query_result.kernel_name,
+    GGML_LOG_DEBUG("NUMA Executor: %s kernel selected for %s (strategy=%s)\n",
+                   kernel_name,
                    op_name,
-                   query_result.efficiency_score,
-                   (query_result.strategy.node_strategy == NUMA_NODE_STRATEGY_DATA_PARALLEL) ? "data-parallel" : "single-node",
-                   query_result.work_buffer_size_per_thread);
+                   (strategy == NUMA_STRATEGY_DATA_PARALLEL) ? "data-parallel" : "single-node");
     
     // Initialize OpenMP coordinator if needed
-    NUMA_PERF_START(NUMA_PERF_COORDINATOR_INIT, op_name, query_result.kernel_name, -1, 0, cplan->n_threads);
+    NUMA_PERF_START(NUMA_PERF_COORDINATOR_INIT, op_name, kernel_name, -1, 0, cplan->n_threads);
     if (!ggml_numa_openmp_coordinator_init()) {
         NUMA_PERF_END();
         GGML_LOG_DEBUG("NUMA Executor: Failed to initialize OpenMP coordinator, using direct kernel dispatch for %s\n", 
@@ -559,11 +569,11 @@ enum ggml_status ggml_numa_executor_execute_tensor(struct ggml_tensor * tensor, 
     int num_numa_nodes = config.total_numa_nodes;
     NUMA_LOG_DEBUG("DEBUG: NUMA Executor: num_numa_nodes=%d, strategy=%s\n", 
            num_numa_nodes,
-           (query_result.strategy.node_strategy == NUMA_NODE_STRATEGY_DATA_PARALLEL) ? "data-parallel" : "single-node");
+           (strategy == NUMA_STRATEGY_DATA_PARALLEL) ? "data-parallel" : "single-node");
            
-    if (query_result.strategy.node_strategy == NUMA_NODE_STRATEGY_DATA_PARALLEL && num_numa_nodes > 1) {
+    if (strategy == NUMA_STRATEGY_DATA_PARALLEL && num_numa_nodes > 1) {
         // Multi-node data-parallel execution using OpenMP
-        NUMA_PERF_START(NUMA_PERF_EXECUTOR_KERNEL_EXEC, op_name, query_result.kernel_name, -1, tensor_size, num_numa_nodes);
+        NUMA_PERF_START(NUMA_PERF_EXECUTOR_KERNEL_EXEC, op_name, kernel_name, -1, tensor_size, num_numa_nodes);
         NUMA_LOG_DEBUG("DEBUG: NUMA Executor: Taking DATA_PARALLEL path with %d nodes\n", num_numa_nodes);
         GGML_LOG_DEBUG("NUMA Executor: Dispatching %s for data-parallel execution across %d nodes\n", 
                        op_name, num_numa_nodes);
@@ -577,7 +587,7 @@ enum ggml_status ggml_numa_executor_execute_tensor(struct ggml_tensor * tensor, 
         
         result = ggml_numa_openmp_execute_data_parallel(
             tensor, 
-            query_result.work_function,
+            work_function,
             work_buffer_size);
             
         NUMA_LOG_DEBUG("DEBUG: NUMA Executor: Data-parallel execution result=%d\n", result);
@@ -591,10 +601,10 @@ enum ggml_status ggml_numa_executor_execute_tensor(struct ggml_tensor * tensor, 
         
     } else {
         // Single-node execution - choose target node based on NUMA strategy and data locality
-        enum ggml_numa_strategy strategy = ggml_numa_get_strategy();
+        enum ggml_numa_strategy numa_strategy = ggml_numa_get_strategy();
         int target_node = 0;  // Default to node 0
         
-        if (strategy == GGML_NUMA_STRATEGY_ISOLATE) {
+        if (numa_strategy == GGML_NUMA_STRATEGY_ISOLATE) {
             // For isolate mode, use the specified isolation node
             int isolate_node = ggml_numa_get_isolate_node();
             if (isolate_node >= 0) {
@@ -625,20 +635,20 @@ enum ggml_status ggml_numa_executor_execute_tensor(struct ggml_tensor * tensor, 
             }
         }
         
-        NUMA_PERF_START(NUMA_PERF_EXECUTOR_KERNEL_EXEC, op_name, query_result.kernel_name, target_node, tensor_size, 1);
-        NUMA_LOG_DEBUG("DEBUG: NUMA Executor: Taking SINGLE_NODE path, target_node=%d (strategy=%d)\n", target_node, strategy);
+        NUMA_PERF_START(NUMA_PERF_EXECUTOR_KERNEL_EXEC, op_name, kernel_name, target_node, tensor_size, 1);
+        NUMA_LOG_DEBUG("DEBUG: NUMA Executor: Taking SINGLE_NODE path, target_node=%d (numa_strategy=%d)\n", target_node, numa_strategy);
         GGML_LOG_DEBUG("NUMA Executor: Dispatching %s for single-node execution on node %d\n", 
                        ggml_op_name(tensor->op), target_node);
         
-        // Choose between single-thread and multi-thread execution based on on_node_strategy
-        if (query_result.strategy.on_node_strategy == NUMA_ON_NODE_STRATEGY_SINGLE_THREAD) {
+        // Choose between single-thread and multi-thread execution based on strategy
+        if (strategy == NUMA_STRATEGY_SINGLE_THREAD) {
             NUMA_LOG_DEBUG("DEBUG: NUMA Executor: Using single-thread execution\n");
             
             // Calculate work buffer size for single thread
             size_t work_buffer_size = ggml_numa_calculate_work_size(tensor, 1);
             
             result = ggml_numa_openmp_execute_single_thread(
-                tensor, query_result.work_function, target_node, work_buffer_size);
+                tensor, work_function, target_node, work_buffer_size);
         } else {
             NUMA_LOG_DEBUG("DEBUG: NUMA Executor: Using multi-thread execution\n");
             
@@ -646,7 +656,7 @@ enum ggml_status ggml_numa_executor_execute_tensor(struct ggml_tensor * tensor, 
             size_t work_buffer_size = ggml_numa_calculate_work_size(tensor, config.threads_per_node);
             
             result = ggml_numa_openmp_execute_single_node(
-                tensor, query_result.work_function, target_node, config.threads_per_node, work_buffer_size);
+                tensor, work_function, target_node, config.threads_per_node, work_buffer_size);
         }
         
         NUMA_LOG_DEBUG("DEBUG: NUMA Executor: Single-node execution result=%d\n", result);
@@ -655,7 +665,7 @@ enum ggml_status ggml_numa_executor_execute_tensor(struct ggml_tensor * tensor, 
         NUMA_LOG_TRACE("EXECUTOR_SINGLE_NODE_COMPLETE: op=%s result=%s tensor=%p elements=%ld target_node=%d threads=%d",
                        op_name, (result == GGML_STATUS_SUCCESS) ? "SUCCESS" : "FAILED", 
                        (void*)tensor, ggml_nelements(tensor), target_node,
-                       (query_result.strategy.on_node_strategy == NUMA_ON_NODE_STRATEGY_SINGLE_THREAD) ? 1 : config.threads_per_node);
+                       (strategy == NUMA_STRATEGY_SINGLE_THREAD) ? 1 : config.threads_per_node);
         
         NUMA_PERF_END();
     }
@@ -664,11 +674,11 @@ enum ggml_status ggml_numa_executor_execute_tensor(struct ggml_tensor * tensor, 
     if (result == GGML_STATUS_SUCCESS) {
         NUMA_LOG_DEBUG("DEBUG: NUMA Executor: SUCCESS - returning GGML_STATUS_SUCCESS\n");
         GGML_LOG_DEBUG("NUMA Executor: Successfully completed %s using %s\n", 
-                       op_name, query_result.kernel_name);
+                       op_name, kernel_name);
     } else {
         NUMA_LOG_DEBUG("DEBUG: NUMA Executor: FAILURE - returning status %d\n", result);
         GGML_LOG_ERROR("NUMA Executor: Failed to execute %s using %s (status=%d)\n", 
-                       op_name, query_result.kernel_name, (int)result);
+                       op_name, kernel_name, (int)result);
     }
     
     NUMA_PERF_END();
@@ -691,27 +701,30 @@ enum ggml_status ggml_numa_executor_execute_tensor_forced_strategy(
     NUMA_PERF_START(NUMA_PERF_EXECUTOR_KERNEL_EXEC, ggml_op_name(tensor->op), "forced_strategy", -1, 0, 0);
     
     const char* op_name = ggml_op_name(tensor->op);
-    NUMA_LOG_DEBUG("DEBUG: NUMA Executor (FORCED): Starting execution for %s with forced strategy (node=%s, on_node=%s)\n", 
-           op_name,
-           (forced_strategy.node_strategy == NUMA_NODE_STRATEGY_DATA_PARALLEL) ? "data-parallel" : "single",
-           (forced_strategy.on_node_strategy == NUMA_ON_NODE_STRATEGY_MULTI_THREAD) ? "multi-thread" : "single-thread");
+    const char* strategy_str = (forced_strategy == NUMA_STRATEGY_SINGLE_THREAD) ? "single-thread" :
+                              (forced_strategy == NUMA_STRATEGY_SINGLE_NODE) ? "single-node" : "data-parallel";
+    NUMA_LOG_DEBUG("DEBUG: NUMA Executor (FORCED): Starting execution for %s with forced strategy %s\n", 
+           op_name, strategy_str);
     
     // TRACE: Very explicit forced strategy execution tracking
-    NUMA_LOG_DEBUG("🔥 FORCED STRATEGY EXECUTION PATH: op=%s node_strategy=%d on_node_strategy=%d", 
-                   op_name, (int)forced_strategy.node_strategy, (int)forced_strategy.on_node_strategy);
+    NUMA_LOG_DEBUG("🔥 FORCED STRATEGY EXECUTION PATH: op=%s strategy=%d (%s)", 
+                   op_name, (int)forced_strategy, strategy_str);
     
     // Query the kernel registry for execution information (but override strategy)
     NUMA_PERF_START(NUMA_PERF_EXECUTOR_QUERY, op_name, "kernel_registry", -1, 0, 0);
-    ggml_numa_kernel_query_result_t query_result = ggml_numa_kernels_query(tensor);
-    NUMA_PERF_END();
-    
-    if (!query_result.supported) {
+    // Get cache entry for this operation
+    const ggml_numa_kernel_cache_entry_t * cache_entry = ggml_numa_lookup_kernel_direct(tensor->op);
+    if (!cache_entry || !cache_entry->supported) {
         GGML_LOG_DEBUG("NUMA Executor (FORCED): Operation %s not supported by NUMA kernels, using direct kernel dispatch\n", 
                       op_name);
         enum ggml_status result = ggml_numa_executor_direct_kernel_dispatch(tensor, cplan);
         NUMA_PERF_END();
         return result;
     }
+    
+    // Get metadata from cache
+    const char * kernel_name = ggml_numa_get_kernel_name_from_cache(cache_entry);
+    ggml_numa_work_function_t work_function = ggml_numa_get_work_function_from_cache(cache_entry, &forced_strategy);
     
     // Check if this is a no-op kernel
     if (ggml_numa_is_kernel_noop(tensor->op)) {
@@ -720,13 +733,10 @@ enum ggml_status ggml_numa_executor_execute_tensor_forced_strategy(
         return GGML_STATUS_SUCCESS;
     }
     
-    // Override the strategy with the forced one
-    query_result.strategy = forced_strategy;
-    
     GGML_LOG_DEBUG("NUMA Executor (FORCED): %s kernel selected for %s with forced strategy=%s\n",
-                   query_result.kernel_name,
+                   kernel_name,
                    op_name,
-                   (query_result.strategy.node_strategy == NUMA_NODE_STRATEGY_DATA_PARALLEL) ? "data-parallel" : "single-node");
+                   (forced_strategy == NUMA_STRATEGY_DATA_PARALLEL) ? "data-parallel" : "single-node");
     
     enum ggml_status result = GGML_STATUS_SUCCESS;
     
@@ -735,9 +745,9 @@ enum ggml_status ggml_numa_executor_execute_tensor_forced_strategy(
     
     NUMA_LOG_DEBUG("DEBUG: NUMA Executor (FORCED): num_numa_nodes=%d, strategy=%s\n", 
            num_numa_nodes,
-           (query_result.strategy.node_strategy == NUMA_NODE_STRATEGY_DATA_PARALLEL) ? "data-parallel" : "single-node");
+           (forced_strategy == NUMA_STRATEGY_DATA_PARALLEL) ? "data-parallel" : "single-node");
     
-    if (query_result.strategy.node_strategy == NUMA_NODE_STRATEGY_DATA_PARALLEL && num_numa_nodes > 1) {
+    if (forced_strategy == NUMA_STRATEGY_DATA_PARALLEL && num_numa_nodes > 1) {
         // Data-parallel execution across multiple NUMA nodes
         NUMA_LOG_DEBUG("DEBUG: NUMA Executor (FORCED): Using data-parallel execution across %d nodes\n", num_numa_nodes);
         
@@ -750,7 +760,7 @@ enum ggml_status ggml_numa_executor_execute_tensor_forced_strategy(
         size_t work_buffer_size = ggml_numa_calculate_work_size(tensor, cplan->n_threads);
         
         result = ggml_numa_openmp_execute_data_parallel(
-            tensor, query_result.work_function, work_buffer_size);
+            tensor, work_function, work_buffer_size);
             
         NUMA_LOG_DEBUG("DEBUG: NUMA Executor (FORCED): Data-parallel execution result=%d\n", result);
         NUMA_PERF_END();
@@ -761,13 +771,13 @@ enum ggml_status ggml_numa_executor_execute_tensor_forced_strategy(
         // Choose target NUMA node (simplified for forced strategy - use node 0)
         int target_node = 0;
         
-        if (query_result.strategy.on_node_strategy == NUMA_ON_NODE_STRATEGY_SINGLE_THREAD) {
+        if (forced_strategy == NUMA_STRATEGY_SINGLE_THREAD) {
             NUMA_LOG_DEBUG("DEBUG: NUMA Executor (FORCED): Using single-thread execution on node %d\n", target_node);
             
             // Calculate work buffer size for single-thread execution
             size_t work_buffer_size = ggml_numa_calculate_work_size(tensor, 1);
             
-            result = ggml_numa_openmp_execute_single_thread(tensor, query_result.work_function, target_node, work_buffer_size);
+            result = ggml_numa_openmp_execute_single_thread(tensor, work_function, target_node, work_buffer_size);
         } else {
             NUMA_LOG_DEBUG("DEBUG: NUMA Executor (FORCED): Using multi-thread execution on node %d\n", target_node);
             
@@ -775,7 +785,7 @@ enum ggml_status ggml_numa_executor_execute_tensor_forced_strategy(
             size_t work_buffer_size = ggml_numa_calculate_work_size(tensor, cplan->n_threads);
             
             result = ggml_numa_openmp_execute_single_node(
-                tensor, query_result.work_function, target_node, cplan->n_threads, work_buffer_size);
+                tensor, work_function, target_node, cplan->n_threads, work_buffer_size);
         }
         
         NUMA_LOG_DEBUG("DEBUG: NUMA Executor (FORCED): Single-node execution result=%d\n", result);

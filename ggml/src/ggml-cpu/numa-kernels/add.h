@@ -74,7 +74,7 @@ enum ggml_status ggml_numa_kernel_add_unified_execute(void * work_context, struc
  * @param tensor  The destination tensor to analyze
  * @return        Query result with selected strategy and efficiency estimate
  */
-ggml_numa_kernel_query_result_t ggml_numa_kernel_add_query(const struct ggml_tensor * tensor);
+ggml_numa_execution_strategy_t ggml_numa_kernel_add_query(const struct ggml_tensor * tensor);
 
 /**
  * Kernel registration function 

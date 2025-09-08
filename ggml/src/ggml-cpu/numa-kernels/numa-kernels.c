@@ -179,10 +179,7 @@ const ggml_numa_execution_strategy_t * ggml_numa_lookup_strategy_direct(
     enum ggml_op op_type,
     size_t element_count) {
     
-    static ggml_numa_execution_strategy_t default_strategy = {
-        .node_strategy = NUMA_NODE_STRATEGY_SINGLE,
-        .on_node_strategy = NUMA_ON_NODE_STRATEGY_MULTI_THREAD
-    };
+    static ggml_numa_execution_strategy_t default_strategy = NUMA_STRATEGY_SINGLE_NODE;
     
     // Direct array access - no hash computation!
     const ggml_numa_kernel_cache_entry_t * entry = ggml_numa_lookup_kernel_direct(op_type);
@@ -198,8 +195,73 @@ const ggml_numa_execution_strategy_t * ggml_numa_lookup_strategy_direct(
 
 /**
  * Array-based aggregation function lookup - direct access using operation type as index
- * Returns aggregation function pointer based on operation and strategy
+ * Returns aggregation function for the given strategy, or NULL if not needed
  */
+enum ggml_status (*ggml_numa_lookup_aggregation_direct(
+    enum ggml_op op, const ggml_numa_execution_strategy_t * strategy
+))(void *, int, struct ggml_tensor *, struct ggml_cplan *) {
+    // Implementation would go here based on strategy
+    // For now, most operations don't need aggregation
+    GGML_UNUSED(op);
+    GGML_UNUSED(strategy);
+    return NULL;
+}
+
+/**
+ * Get work function for specific strategy from cache entry
+ * Ultra-fast O(1) lookup with strategy-based function selection
+ */
+ggml_numa_work_function_t ggml_numa_get_work_function_from_cache(
+    const ggml_numa_kernel_cache_entry_t * cache_entry,
+    const ggml_numa_execution_strategy_t * strategy) {
+    
+    if (!cache_entry || !cache_entry->work_funcs.valid) {
+        return NULL;
+    }
+    
+    // Select appropriate work function based on strategy
+    if (*strategy == NUMA_STRATEGY_DATA_PARALLEL) {
+        return cache_entry->work_funcs.data_parallel_fn;
+    } else if (*strategy == NUMA_STRATEGY_SINGLE_THREAD) {
+        return cache_entry->work_funcs.single_single_fn;
+    } else {
+        return cache_entry->work_funcs.single_multi_fn;
+    }
+}
+
+/**
+ * Get work buffer calculation function from cache entry
+ * Returns NULL if operation doesn't need work buffers
+ */
+ggml_numa_kernel_work_buffer_calc_fn_t ggml_numa_get_work_buffer_calc_from_cache(
+    const ggml_numa_kernel_cache_entry_t * cache_entry) {
+    
+    if (!cache_entry) {
+        return NULL;
+    }
+    
+    return cache_entry->work_buffer_calc_fn;
+}
+
+/**
+ * Get kernel name from cache entry for debugging/logging
+ * Returns static string, safe to use in logging
+ */
+const char * ggml_numa_get_kernel_name_from_cache(
+    const ggml_numa_kernel_cache_entry_t * cache_entry) {
+    
+    if (!cache_entry) {
+        return "Unknown";
+    }
+    
+    return cache_entry->kernel_name;
+}
+
+/**
+ * Returns aggregation function pointer based on operation and strategy
+ * Temporarily disabled - simplified architecture doesn't need this variant
+ */
+/*
 enum ggml_status (*ggml_numa_lookup_aggregation_direct(
     enum ggml_op op_type,
     const ggml_numa_execution_strategy_t * strategy
@@ -218,6 +280,7 @@ enum ggml_status (*ggml_numa_lookup_aggregation_direct(
     // Use the same fast function selection as before
     return numa_get_aggregation_func_fast(&entry->agg_funcs, strategy);
 }
+*/
 
 /**
  * Array-based work function lookup - direct access using operation type as index
@@ -238,7 +301,7 @@ ggml_numa_work_function_t ggml_numa_lookup_work_function_direct(
     }
     
     // Use the same fast function selection as before
-    return numa_get_work_func_fast(&entry->work_funcs, strategy);
+    return numa_get_work_func_fast(&entry->work_funcs, *strategy);
 }
 
 // ============================================================================
@@ -300,9 +363,9 @@ enum ggml_status ggml_numa_kernels_init(void) {
 // ============================================================================
 
 /*
- * Modern kernel strategy lookup using direct array system
- * Ultra-fast single memory access for optimal performance
+ * Legacy function temporarily disabled during query simplification
  */
+/*
 ggml_numa_kernel_query_result_t ggml_numa_kernels_strategy_lookup(const struct ggml_tensor * tensor) {
     // Default fallback result for safety
     ggml_numa_kernel_query_result_t default_result = {
@@ -370,6 +433,7 @@ ggml_numa_kernel_query_result_t ggml_numa_kernels_strategy_lookup(const struct g
     
     return result;
 }
+*/
 
 /**
  * Cleanup function for the direct array cache system
@@ -386,19 +450,12 @@ void ggml_numa_kernels_cleanup(void) {
     NUMA_LOG_DEBUG("✅ NUMA Kernels: O(1) hash table system cleaned up");
 }
 
-ggml_numa_kernel_query_result_t ggml_numa_kernels_query(const struct ggml_tensor * tensor) {
-    ggml_numa_kernel_query_result_t result = {
-        .supported = false,
-        .strategy = {0},
-        .work_buffer_size_per_thread = 0,
-        .work_function = NULL,
-        .efficiency_score = 0.0f,
-        .kernel_name = "Unsupported"
-    };
+ggml_numa_execution_strategy_t ggml_numa_kernels_query(const struct ggml_tensor * tensor) {
+    ggml_numa_execution_strategy_t strategy = {0};
     
     if (!tensor) {
         GGML_LOG_DEBUG("NUMA Query: Tensor is NULL\n");
-        return result;
+        return strategy;
     }
     
     // Ensure kernel system is initialized
@@ -407,7 +464,7 @@ ggml_numa_kernel_query_result_t ggml_numa_kernels_query(const struct ggml_tensor
         enum ggml_status init_result = ggml_numa_kernels_init();
         if (init_result != GGML_STATUS_SUCCESS) {
             GGML_LOG_DEBUG("NUMA Query: Failed to initialize kernel system for op %s\n", ggml_op_name(tensor->op));
-            return result;
+            return strategy;
         }
     }
     
@@ -415,60 +472,11 @@ ggml_numa_kernel_query_result_t ggml_numa_kernels_query(const struct ggml_tensor
     const ggml_numa_kernel_cache_entry_t * entry = ggml_numa_lookup_kernel_direct(tensor->op);
     if (!entry || !entry->query_fn) {
         NUMA_LOG_DEBUG("NUMA Query: No kernel found for operation %s", ggml_op_name(tensor->op));
-        return result;
+        return strategy;
     }
     
     // Call the kernel's query function directly through the cached pointer!
+    // Note: Individual kernels now return only strategy, not full result structure
     NUMA_LOG_DEBUG("NUMA Query: Calling cached query function for operation %s", ggml_op_name(tensor->op));
     return entry->query_fn(tensor);
-}
-
-// ============================================================================
-// Force Strategy Helper Function
-// ============================================================================
-
-bool ggml_numa_apply_kernel_force_strategy(ggml_numa_kernel_query_result_t * result,
-                                           const char * op_name,
-                                           ggml_numa_work_function_t single_single_fn,
-                                           ggml_numa_work_function_t single_multi_fn,
-                                           ggml_numa_work_function_t data_parallel_fn) {
-    if (!result) {
-        NUMA_LOG_ERROR("Cannot apply force strategy: result pointer is NULL");
-        return false;
-    }
-    
-    // Apply force strategy override to execution strategy
-    bool strategy_overridden = ggml_numa_apply_force_strategy_override(&result->strategy);
-    
-    if (strategy_overridden) {
-        // Update work function and kernel name based on overridden strategy
-        if (result->strategy.node_strategy == NUMA_NODE_STRATEGY_SINGLE) {
-            if (result->strategy.on_node_strategy == NUMA_ON_NODE_STRATEGY_SINGLE_THREAD) {
-                if (single_single_fn) {
-                    result->work_function = single_single_fn;
-                    result->kernel_name = "NUMA (Forced Single/Single)";
-                }
-            } else {
-                if (single_multi_fn) {
-                    result->work_function = single_multi_fn;
-                    result->kernel_name = "NUMA (Forced Single/Multi)";
-                }
-            }
-        } else {
-            // Data parallel strategy
-            if (data_parallel_fn) {
-                result->work_function = data_parallel_fn;
-                result->kernel_name = "NUMA (Forced Data-Parallel)";
-            }
-        }
-        
-        // Add operation name to kernel name for clarity
-        static char kernel_name_buffer[256];
-        snprintf(kernel_name_buffer, sizeof(kernel_name_buffer), "%s %s", op_name, result->kernel_name);
-        result->kernel_name = kernel_name_buffer;
-        
-        NUMA_LOG_DEBUG("%s: Strategy overridden by NUMA_FORCE_STRATEGY", op_name);
-    }
-    
-    return strategy_overridden;
 }

@@ -132,49 +132,35 @@ ggml_numa_kernel_registration_info_t ggml_numa_kernel_noop_register(void) {
  * @note Strategy selection is based purely on element count thresholds,
  *       making it ideal for measuring overhead at different scales
  */
-ggml_numa_kernel_query_result_t ggml_numa_kernel_noop_query(const struct ggml_tensor * tensor) {
-    ggml_numa_kernel_query_result_t result = { .supported = false };
+ggml_numa_execution_strategy_t ggml_numa_kernel_noop_query(const struct ggml_tensor * tensor) {
+    ggml_numa_execution_strategy_t strategy = NUMA_STRATEGY_SINGLE_THREAD;
     
-    // Basic validation
+    // Basic validation - return default single-thread strategy for any invalid input
     if (tensor == NULL || tensor->op != GGML_OP_NUMA_NOOP) {
-        return result;
-    }
-    
-    // Check if this kernel is actually registered and supported
-    if (!ggml_numa_is_kernel_supported(GGML_OP_NUMA_NOOP)) {
-        NUMA_LOG_DEBUG("NOOP kernel not supported - registration disabled");
-        result.supported = false;
-        return result;
+        return strategy;
     }
     
     // Get cache entry for this operation
     const ggml_numa_kernel_cache_entry_t * cache_entry = ggml_numa_lookup_kernel_direct(tensor->op);
     if (cache_entry == NULL || !cache_entry->strategy_array.valid) {
         NUMA_LOG_DEBUG("NOOP query: No valid strategy array in cache");
-        return result;
+        return strategy;
     }
     
     // Calculate total elements for threshold comparison
     size_t total_elements = ggml_nelements(tensor);
     
     // Use shared macro for unified strategy selection
-    ggml_numa_execution_strategy_t selected_strategy;
-    NUMA_SELECT_STRATEGY_FROM_CACHE(cache_entry, total_elements, selected_strategy);
+    NUMA_SELECT_STRATEGY_FROM_CACHE(cache_entry, total_elements, strategy);
     
-    // Build successful query result
-    result.supported = true;
-    result.strategy = selected_strategy;
-    result.work_buffer_size_per_thread = 0;  // NOOP doesn't need work buffers
-    result.work_function = ggml_numa_kernel_noop_unified_execute;
-    result.efficiency_score = 1.0f;  // Perfect efficiency for no-op
-    result.kernel_name = "NUMA NOOP Kernel";
-    result.aggregation_policy = GGML_NUMA_AGGREGATION_NONE;  // No aggregation needed for NOOP
-    result.aggregation_function = NULL;
-    result.aggregation_user_data = NULL;
+    // Debug logging for operation analysis (maintains integration test compatibility)
+    const char* strategy_name = (strategy == NUMA_STRATEGY_SINGLE_THREAD) ? "(Single/Single)" :
+                               (strategy == NUMA_STRATEGY_SINGLE_NODE) ? "(Single/Multi)" :
+                               "(Data Parallel)";
     
-    NUMA_LOG_TRACE("NOOP query: %zu elements", total_elements);
+    NUMA_LOG_DEBUG("NUMA NOOP %s", strategy_name);
     
-    return result;
+    return strategy;
 }
 
 /**

@@ -316,18 +316,13 @@ TestResult test_rope_operation(const TestConfig& config, bool enable_numa, const
         memset(ggml_get_data(result_numa), 0, ggml_nbytes(result_numa));
         memset(ggml_get_data(result_ref), 0, ggml_nbytes(result_ref));
         
-        // Query the NUMA kernel to see if it's supported
-        ggml_numa_kernel_query_result_t query_result = ggml_numa_kernels_query(result_numa);
+        // Query the NUMA kernel for strategy
+        ggml_numa_execution_strategy_t query_result = ggml_numa_kernels_query(result_numa);
         
-        if (!query_result.supported) {
-            printf("⚠️  ROPE operation not supported by NUMA kernels - skipping NUMA test\n");
-            ggml_free(ctx_numa);
-            ggml_free(ctx_ref);
-            result.passed = true;  // Consider this a pass since kernel isn't available
-            return result;
-        }
-        
-        printf("📊 NUMA Strategy: %s\n", query_result.kernel_name);
+        printf("📊 NUMA Strategy: %s\n", 
+               (query_result == NUMA_STRATEGY_SINGLE_THREAD) ? "single-thread" :
+               (query_result == NUMA_STRATEGY_SINGLE_NODE) ? "single-node" :
+               (query_result == NUMA_STRATEGY_DATA_PARALLEL) ? "data-parallel" : "unknown");
         
         // Initialize NUMA system - always use MIRROR for strategy testing
         ggml_numa_init(GGML_NUMA_STRATEGY_MIRROR);
@@ -566,15 +561,15 @@ int main(int argc, char** argv) {
     
     std::vector<ExecutionStrategy> strategies = {
         // Strategy 1: Single-thread, single-node
-        {{NUMA_NODE_STRATEGY_SINGLE, NUMA_ON_NODE_STRATEGY_SINGLE_THREAD}, 
+        {NUMA_STRATEGY_SINGLE_THREAD, 
          "Single-Single", "Single-thread execution on single NUMA node"},
         
         // Strategy 2: Multi-thread, single-node
-        {{NUMA_NODE_STRATEGY_SINGLE, NUMA_ON_NODE_STRATEGY_MULTI_THREAD}, 
+        {NUMA_STRATEGY_SINGLE_NODE, 
          "Single-Multi", "Multi-thread execution within single NUMA node"},
         
         // Strategy 3: Multi-thread, multi-node (data-parallel)
-        {{NUMA_NODE_STRATEGY_DATA_PARALLEL, NUMA_ON_NODE_STRATEGY_MULTI_THREAD}, 
+        {NUMA_STRATEGY_DATA_PARALLEL, 
          "Data-Parallel", "Data-parallel execution across multiple NUMA nodes"}
     };
     
@@ -651,7 +646,7 @@ int main(int argc, char** argv) {
         config.ne2 = 32;
         config.ne3 = 1;
         config.n_dims = variant.n_dims;
-        config.strategy = {NUMA_NODE_STRATEGY_SINGLE, NUMA_ON_NODE_STRATEGY_MULTI_THREAD};  // Multi-thread single-node
+        config.strategy = NUMA_STRATEGY_SINGLE_NODE;  // Multi-thread single-node
         config.strategy_name = "Single-Multi";
         config.tensor_type = GGML_TYPE_F32;
         config.rope_mode = 0;  // Standard ROPE
