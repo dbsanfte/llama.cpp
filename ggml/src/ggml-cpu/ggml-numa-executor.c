@@ -367,7 +367,7 @@ enum ggml_status ggml_numa_executor_execute_graph(struct ggml_cgraph * cgraph, s
     GGML_LOG_DEBUG("NUMA Executor: Processing compute graph with %d nodes\n", cgraph->n_nodes);
     
     // Initialize kernel registry if not already done
-    if (!ggml_numa_kernels_init()) {
+    if (ggml_numa_kernels_init() != GGML_STATUS_SUCCESS) {
         GGML_LOG_ERROR("NUMA Executor: Failed to initialize kernel registry\n");
         return GGML_STATUS_FAILED;
     }
@@ -583,12 +583,19 @@ enum ggml_status ggml_numa_executor_execute_tensor(struct ggml_tensor * tensor, 
         
         // Calculate work buffer size for data-parallel execution
         int total_threads = num_numa_nodes * config.threads_per_node;
-        size_t work_buffer_size = ggml_numa_calculate_work_size(tensor, total_threads);
+        
+        // Update cplan to reflect actual coordinator thread count
+        // The coordinator makes threading decisions, not the caller
+        cplan->n_threads = total_threads;
+        
+        // Get work buffer calculation function from kernel cache entry
+        ggml_numa_kernel_work_buffer_calc_fn_t work_buffer_calc_fn = 
+            (cache_entry && cache_entry->work_buffer_calc_fn) ? cache_entry->work_buffer_calc_fn : NULL;
         
         result = ggml_numa_openmp_execute_data_parallel(
             tensor, 
             work_function,
-            work_buffer_size);
+            work_buffer_calc_fn);
             
         NUMA_LOG_DEBUG("DEBUG: NUMA Executor: Data-parallel execution result=%d\n", result);
         
@@ -644,19 +651,21 @@ enum ggml_status ggml_numa_executor_execute_tensor(struct ggml_tensor * tensor, 
         if (strategy == NUMA_STRATEGY_SINGLE_THREAD) {
             NUMA_LOG_DEBUG("DEBUG: NUMA Executor: Using single-thread execution\n");
             
-            // Calculate work buffer size for single thread
-            size_t work_buffer_size = ggml_numa_calculate_work_size(tensor, 1);
+            // Get work buffer calculation function from kernel cache entry
+            ggml_numa_kernel_work_buffer_calc_fn_t work_buffer_calc_fn = 
+                (cache_entry && cache_entry->work_buffer_calc_fn) ? cache_entry->work_buffer_calc_fn : NULL;
             
             result = ggml_numa_openmp_execute_single_thread(
-                tensor, work_function, target_node, work_buffer_size);
+                tensor, work_function, target_node, work_buffer_calc_fn);
         } else {
             NUMA_LOG_DEBUG("DEBUG: NUMA Executor: Using multi-thread execution\n");
             
-            // Calculate work buffer size for multi-thread single-node
-            size_t work_buffer_size = ggml_numa_calculate_work_size(tensor, config.threads_per_node);
+            // Get work buffer calculation function from kernel cache entry
+            ggml_numa_kernel_work_buffer_calc_fn_t work_buffer_calc_fn = 
+                (cache_entry && cache_entry->work_buffer_calc_fn) ? cache_entry->work_buffer_calc_fn : NULL;
             
             result = ggml_numa_openmp_execute_single_node(
-                tensor, work_function, target_node, config.threads_per_node, work_buffer_size);
+                tensor, work_function, target_node, work_buffer_calc_fn);
         }
         
         NUMA_LOG_DEBUG("DEBUG: NUMA Executor: Single-node execution result=%d\n", result);
@@ -705,6 +714,13 @@ enum ggml_status ggml_numa_executor_execute_tensor_forced_strategy(
                               (forced_strategy == NUMA_STRATEGY_SINGLE_NODE) ? "single-node" : "data-parallel";
     NUMA_LOG_DEBUG("DEBUG: NUMA Executor (FORCED): Starting execution for %s with forced strategy %s\n", 
            op_name, strategy_str);
+    
+    // Initialize kernel registry if not already done
+    if (ggml_numa_kernels_init() != GGML_STATUS_SUCCESS) {
+        GGML_LOG_ERROR("NUMA Executor (FORCED): Failed to initialize kernel registry\n");
+        NUMA_PERF_END();
+        return GGML_STATUS_FAILED;
+    }
     
     // TRACE: Very explicit forced strategy execution tracking
     NUMA_LOG_DEBUG("🔥 FORCED STRATEGY EXECUTION PATH: op=%s strategy=%d (%s)", 
@@ -756,11 +772,12 @@ enum ggml_status ggml_numa_executor_execute_tensor_forced_strategy(
         
         NUMA_PERF_START(NUMA_PERF_COORDINATOR_DISPATCH, op_name, "data_parallel", num_numa_nodes, 0, 0);
         
-        // Calculate work buffer size for data-parallel execution
-        size_t work_buffer_size = ggml_numa_calculate_work_size(tensor, cplan->n_threads);
+        // Get work buffer calculation function from kernel cache entry
+        ggml_numa_kernel_work_buffer_calc_fn_t work_buffer_calc_fn = 
+            (cache_entry && cache_entry->work_buffer_calc_fn) ? cache_entry->work_buffer_calc_fn : NULL;
         
         result = ggml_numa_openmp_execute_data_parallel(
-            tensor, work_function, work_buffer_size);
+            tensor, work_function, work_buffer_calc_fn);
             
         NUMA_LOG_DEBUG("DEBUG: NUMA Executor (FORCED): Data-parallel execution result=%d\n", result);
         NUMA_PERF_END();
@@ -771,21 +788,19 @@ enum ggml_status ggml_numa_executor_execute_tensor_forced_strategy(
         // Choose target NUMA node (simplified for forced strategy - use node 0)
         int target_node = 0;
         
+        // Get work buffer calculation function from kernel cache entry
+        ggml_numa_kernel_work_buffer_calc_fn_t work_buffer_calc_fn = 
+            (cache_entry && cache_entry->work_buffer_calc_fn) ? cache_entry->work_buffer_calc_fn : NULL;
+        
         if (forced_strategy == NUMA_STRATEGY_SINGLE_THREAD) {
             NUMA_LOG_DEBUG("DEBUG: NUMA Executor (FORCED): Using single-thread execution on node %d\n", target_node);
             
-            // Calculate work buffer size for single-thread execution
-            size_t work_buffer_size = ggml_numa_calculate_work_size(tensor, 1);
-            
-            result = ggml_numa_openmp_execute_single_thread(tensor, work_function, target_node, work_buffer_size);
+            result = ggml_numa_openmp_execute_single_thread(tensor, work_function, target_node, work_buffer_calc_fn);
         } else {
             NUMA_LOG_DEBUG("DEBUG: NUMA Executor (FORCED): Using multi-thread execution on node %d\n", target_node);
             
-            // Calculate work buffer size for multi-thread single-node
-            size_t work_buffer_size = ggml_numa_calculate_work_size(tensor, cplan->n_threads);
-            
             result = ggml_numa_openmp_execute_single_node(
-                tensor, work_function, target_node, cplan->n_threads, work_buffer_size);
+                tensor, work_function, target_node, work_buffer_calc_fn);
         }
         
         NUMA_LOG_DEBUG("DEBUG: NUMA Executor (FORCED): Single-node execution result=%d\n", result);
@@ -925,23 +940,18 @@ static size_t ggml_numa_calculate_work_size(struct ggml_tensor * tensor, int n_t
 }
 
 /**
- * @brief Direct kernel dispatch function for maximum performance
+ * @brief Direct Fallback kernel dispatch function for maximum performance
  * 
  * High-performance execution path that eliminates temporary graph overhead
  * by calling compute functions directly. This function provides the fastest
- * possible execution for operations that don't require NUMA coordination.
+ * possible execution for fallback operations in ggml-cpu.c
  * 
  * Performance Benefits:
  * - Zero-copy operation without graph allocation
  * - Direct function call without dispatch overhead
- * - Minimal memory footprint and cache impact
- * - Optimal for small to medium operations
  * 
  * Use Cases:
- * - Operations below NUMA coordination threshold
- * - Single-node systems where NUMA coordination is unnecessary
- * - Fallback path when NUMA coordinator unavailable
- * - Performance-critical code paths
+ * - Fallback path when no NUMA kernel exists for an op
  * 
  * @param tensor The operation tensor to execute
  * @param cplan The compute plan with threading and buffer information
@@ -957,7 +967,7 @@ enum ggml_status ggml_numa_executor_direct_kernel_dispatch(struct ggml_tensor * 
     
     NUMA_PERF_START(NUMA_PERF_EXECUTOR_FALLBACK, op_name, "direct_kernel_dispatch", -1, tensor_size, cplan->n_threads);
     
-    GGML_LOG_DEBUG("NUMA Direct Kernel Dispatch: Starting for operation %s\n", op_name);
+    GGML_LOG_DEBUG("NUMA Direct Fallback Kernel Dispatch: Starting for operation %s\n", op_name);
     
     // Set flag to disable NUMA dispatch during this call (prevents infinite recursion)
     ggml_numa_set_fallback_flag(true);
@@ -1015,7 +1025,7 @@ enum ggml_status ggml_numa_executor_direct_kernel_dispatch(struct ggml_tensor * 
         .threadpool = fallback_threadpool  // Must provide valid threadpool for barrier operations
     };
     
-    GGML_LOG_INFO("🚀 NUMA Direct Kernel Dispatch: Executing operation %s (work_size=%zu, threads=%d, threadpool=%p)\n", 
+    GGML_LOG_INFO("🚀 NUMA Direct Fallback Kernel Dispatch: Executing operation %s (work_size=%zu, threads=%d, threadpool=%p)\n", 
                    ggml_op_name(tensor->op), needed_work_size, params.nth, (void*)params.threadpool);
     
     // OPTIMIZATION: Direct kernel dispatch - call the operation's compute function directly
@@ -1033,148 +1043,12 @@ enum ggml_status ggml_numa_executor_direct_kernel_dispatch(struct ggml_tensor * 
     
     // Check result
     if (result != GGML_STATUS_SUCCESS) {
-        GGML_LOG_ERROR("NUMA Direct Kernel Dispatch: Kernel execution failed with status %d\n", result);
+        GGML_LOG_ERROR("NUMA Direct Fallback Kernel Dispatch: Kernel execution failed with status %d\n", result);
         NUMA_PERF_END();
         return GGML_STATUS_FAILED;
     }
 
-    GGML_LOG_DEBUG("NUMA Direct Kernel Dispatch: Operation %s completed successfully\n", op_name);
-    NUMA_PERF_END();
-    return GGML_STATUS_SUCCESS;
-}
-
-/**
- * @brief Legacy fallback function for compatibility
- * 
- * Provides compatibility fallback for operations not yet supported by
- * the NUMA kernel system or when NUMA coordination is unavailable.
- * This function creates a temporary graph and executes using standard
- * ggml computation pipeline.
- * 
- * Performance Characteristics:
- * - Higher overhead due to temporary graph creation
- * - Standard ggml threading model (no NUMA optimization)
- * - Broader operation compatibility
- * - Recursive fallback protection
- * 
- * Usage Notes:
- * - Should be replaced by direct kernel dispatch for better performance
- * - Kept for compatibility with legacy code paths
- * - Includes automatic work buffer management
- * - Prevents infinite recursion through fallback flags
- * 
- * @param tensor The operation tensor to execute
- * @param cplan The compute plan with threading and buffer information
- * @return GGML_STATUS_SUCCESS on success, error code on failure
- */
-enum ggml_status ggml_numa_executor_fallback_to_cpu(struct ggml_tensor * tensor, struct ggml_cplan * cplan) {
-    if (!tensor || !cplan) {
-        return GGML_STATUS_FAILED;
-    }
-    
-    const char* op_name = ggml_op_name(tensor->op);
-    size_t tensor_size = ggml_nbytes(tensor);
-    
-    NUMA_PERF_START(NUMA_PERF_EXECUTOR_FALLBACK, op_name, "cpu_fallback_legacy", -1, tensor_size, cplan->n_threads);
-    
-    GGML_LOG_DEBUG("NUMA Fallback (Legacy): Starting fallback for operation %s\n", op_name);
-    
-    // Set flag to disable NUMA dispatch during this call (prevents infinite recursion)
-    ggml_numa_set_fallback_flag(true);
-    
-    // Calculate work buffer size needed for this specific operation
-    size_t needed_work_size = ggml_numa_calculate_work_size(tensor, cplan->n_threads);
-    
-    void * work_data = NULL;
-    
-    // Check if existing work buffer is sufficient
-    if (cplan->work_data && cplan->work_size >= needed_work_size) {
-        work_data = cplan->work_data;
-        GGML_LOG_DEBUG("NUMA Fallback (Legacy): Using existing work buffer (%zu bytes >= %zu needed)\n", 
-                       cplan->work_size, needed_work_size);
-    } else if (needed_work_size > 0) {
-        // Allocate temporary work buffer for fallback operations
-        work_data = malloc(needed_work_size);
-        if (work_data) {
-            GGML_LOG_DEBUG("NUMA Fallback (Legacy): Allocated temporary work buffer (%zu bytes)\n", needed_work_size);
-        } else {
-            GGML_LOG_DEBUG("NUMA Fallback (Legacy): Failed to allocate work buffer (%zu bytes) - continuing without\n", needed_work_size);
-            // Continue without work buffer - some operations can work without it
-        }
-    } else {
-        GGML_LOG_DEBUG("NUMA Fallback (Legacy): No work buffer needed (%zu bytes)\n", needed_work_size);
-    }
-
-    // TODO: Implement threadpool fallback for OpenMP coordinator
-    struct ggml_threadpool * fallback_threadpool = NULL;
-    int fallback_thread_count = cplan->n_threads; // Default to original plan's thread count
-    
-    // Try to get the dedicated fallback threadpool from coordinator
-    fallback_threadpool = ggml_numa_openmp_get_fallback_threadpool();
-    if (fallback_threadpool) {
-        // Use the fallback threadpool's actual thread count
-        fallback_thread_count = ggml_numa_openmp_get_fallback_thread_count();
-        
-        GGML_LOG_DEBUG("🔧 Using dedicated fallback threadpool: %p (bound to NUMA node 0)\n", (void*)fallback_threadpool);
-        GGML_LOG_DEBUG("📊 Fallback Execution (Legacy): threads=%d (fallback capacity), threadpool=%p (disposable=false)\n", 
-                       fallback_thread_count, (void*)fallback_threadpool);
-    } else if (cplan->threadpool) {
-        fallback_threadpool = cplan->threadpool;
-        GGML_LOG_DEBUG("NUMA Fallback (Legacy): Using existing threadpool with %d thread(s)\n", fallback_thread_count);
-    } else {
-        GGML_LOG_ERROR("NUMA Fallback (Legacy): No threadpool available - this should not happen with OpenMP coordinator\n");
-        return GGML_STATUS_FAILED;
-    }
-    
-    // Set up compute params for fallback execution  
-    struct ggml_compute_params params = {
-        .ith = 0,
-        .nth = fallback_thread_count,
-        .wsize = needed_work_size,
-        .wdata = work_data,
-        .threadpool = fallback_threadpool  // Use dedicated fallback threadpool
-    };
-    
-    GGML_LOG_INFO("🔧 NUMA Fallback (Legacy): Executing operation %s (work_size=%zu, fallback_threads=%d, params.nth=%d, threadpool=%p)\n", 
-                   ggml_op_name(tensor->op), needed_work_size, fallback_thread_count, params.nth, (void*)fallback_threadpool);
-    
-    // LEGACY APPROACH: Use ggml_graph_compute with temporary graph (high overhead)
-    // Create a temporary single-node graph for this operation
-    struct ggml_cgraph temp_graph = {0};
-    temp_graph.nodes = &tensor;
-    temp_graph.n_nodes = 1;
-    temp_graph.size = 1;
-    
-    // Create a temporary compute plan for the fallback threadpool
-    struct ggml_cplan temp_cplan = {
-        .n_threads = fallback_thread_count,
-        .threadpool = fallback_threadpool,
-        .work_size = needed_work_size,
-        .work_data = work_data,
-        .abort_callback = NULL,
-        .abort_callback_data = NULL
-    };
-    
-    // Execute using the internal implementation that bypasses NUMA dispatcher
-    enum ggml_status result = ggml_graph_compute_impl(&temp_graph, &temp_cplan);
-    
-    // Clean up temporary work buffer if we allocated one
-    if (work_data && work_data != cplan->work_data) {
-        free(work_data);
-        GGML_LOG_DEBUG("NUMA Fallback (Legacy): Freed temporary work buffer\n");
-    }
-    
-    // Clear flag after computation
-    ggml_numa_set_fallback_flag(false);
-    
-    // Check result
-    if (result != GGML_STATUS_SUCCESS) {
-        GGML_LOG_ERROR("NUMA Fallback: Graph computation failed with status %d\n", result);
-        NUMA_PERF_END();
-        return GGML_STATUS_FAILED;
-    }
-
-    GGML_LOG_DEBUG("NUMA Fallback: Operation %s completed successfully\n", op_name);
+    GGML_LOG_DEBUG("NUMA Direct Fallback Kernel Dispatch: Operation %s completed successfully\n", op_name);
     NUMA_PERF_END();
     return GGML_STATUS_SUCCESS;
 }

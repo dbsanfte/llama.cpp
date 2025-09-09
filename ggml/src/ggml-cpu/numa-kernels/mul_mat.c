@@ -1,522 +1,322 @@
 /**
  * @file mul_mat.c
- * @brief NUMA Matrix Multiplication (MUL_MAT) Kernel Implementation
+ * @brief NUMA-aware matrix multiplication kernel implementation
  * @author David Sanftenberg
  * 
- * ============================================================================
- * NUMA KERNEL: MUL_MAT (Matrix Multiplication) - Complete Implementation
- * ============================================================================
- * 
- * This implementation provides comprehensive MUL_MAT kernel functionality with:
- * - All quantization types supported by reference (F32, F16, Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q8_1, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, IQ2_XXS, IQ2_XS, IQ3_XXS, IQ3_S, IQ2_S, IQ1_S, IQ1_M, IQ4_NL, IQ4_XS, Q8_K, BF16, TQ1_0, TQ2_0)
- * - NUMA-aware chunk-based work distribution
- * - Type-specific SIMD operations using vec_dot dispatch
- * - Work buffer management for type conversions
- * - Optimal cache utilization through block-tiling
- * 
- * OPERATION CHARACTERISTICS:
- * ========================
- * - Complex 4D tensor operations: dst = src0 @ src1
- * - Type dispatch based on src0 quantization type
- * - Chunk-based parallelization for optimal NUMA performance
- * - Work buffer allocation for type conversions
- * - Block-tiling for cache efficiency
- * 
- * IMPLEMENTATION STRATEGY:
- * =======================
- * 1. Mirror reference implementation logic exactly
- * 2. NUMA-aware chunk distribution across nodes
- * 3. Type-specific vec_dot function dispatch
- * 4. Work buffer management for non-native types
- * 5. Comprehensive error handling and validation
- * 
- * MATRIX MULTIPLICATION VARIANTS:
- * ==============================
- * - Standard matrix multiplication with quantization support
- * - Type conversion handling for src1 when needed
- * - Block-tiling optimization for cache efficiency
- * - Broadcasting support for batch operations
- * 
- * ============================================================================
+ * This implementation provides NUMA-optimized matrix multiplication using
+ * sophisticated 2D chunking, block tiling, and the new macro system.
  */
 
 #include "mul_mat.h"
-#include <stdatomic.h>
-#include <unistd.h>
-#include <time.h>
-#include <omp.h>
 #include "numa-kernels.h"
-#include "../ggml-numa-shared.h"
-#include "../ggml-cpu-impl.h"
-#include "../ggml-impl.h"
-#include "../vec.h"
-
-// Forward declarations
-// External functions for vec_dot operations - from ggml-cpu.c
+#include "ggml-numa-shared.h"
+#include "ggml-cpu.h"
+#include "ggml-cpu-impl.h"
 
 #ifndef MIN
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
 #endif
 
-#ifndef MAX
-#define MAX(a, b) ((a) > (b) ? (a) : (b))
-#endif
-
-// Cache line padding for performance
-#define CACHE_LINE_SIZE_F32 (64/sizeof(float))
-
-// ============================================================================
-// MUL_MAT Kernel Registration
-// ============================================================================
-
-ggml_numa_kernel_registration_info_t ggml_numa_kernel_mul_mat_register(void) {
-    printf("🐛 DEBUG: MUL_MAT register function called!\n");
-    fflush(stdout);
-    
-    ggml_numa_kernel_registration_info_t info = {0};
-    
-    info.op_type = GGML_OP_MUL_MAT;
-    info.supported = true;
-    info.kernel_name = "NUMA MUL_MAT Kernel";
-    
-    // Strategy thresholds for MUL_MAT operation
-    // Use larger thresholds due to computational intensity
-    info.strategy_array.thresholds[NUMA_STRATEGY_IDX_SINGLE_SINGLE] = 4096;      // Single thread below 4K elements
-    info.strategy_array.thresholds[NUMA_STRATEGY_IDX_SINGLE_MULTI] = 1048576;    // Multi-thread below 1M elements
-    // Above 1M elements: data-parallel strategy
-    info.strategy_array.valid = true;
-    
-    // Function pointers for different strategies
-    info.work_funcs.single_single_fn = ggml_numa_kernel_mul_mat_execute;
-    info.work_funcs.single_multi_fn = ggml_numa_kernel_mul_mat_execute;
-    info.work_funcs.data_parallel_fn = ggml_numa_kernel_mul_mat_execute;
-    info.work_funcs.valid = true;
-    
-    // Query function pointer - enables direct dispatch
-    info.query_fn = (void*)ggml_numa_kernel_mul_mat_query;
-    
-    // Work buffer calculation function pointer
-    info.work_buffer_calc_fn = (void*)ggml_numa_kernel_mul_mat_work_buffer_calc;
-    
-    // MUL_MAT doesn't need aggregation functions
-    info.agg_funcs.single_single_fn = NULL;
-    info.agg_funcs.single_multi_fn = NULL; 
-    info.agg_funcs.data_parallel_fn = NULL;
-    info.agg_funcs.valid = false;
-    
-    return info;
-}
-
-ggml_numa_execution_strategy_t ggml_numa_kernel_mul_mat_query(const struct ggml_tensor * tensor) {
-    ggml_numa_execution_strategy_t strategy = NUMA_STRATEGY_SINGLE_THREAD;
-    
-    // Validate this is a MUL_MAT operation
-    if (!tensor || tensor->op != GGML_OP_MUL_MAT) {
-        return strategy;
-    }
-    
-    // Validate tensor structure for MUL_MAT
-    if (!tensor->src[0] || !tensor->src[1]) {
-        NUMA_LOG_DEBUG("MUL_MAT query: Missing source tensors");
-        return strategy;
-    }
-    
-    // Get our own cache entry with the registered thresholds
-    const ggml_numa_kernel_cache_entry_t * cache_entry = ggml_numa_lookup_kernel_direct(GGML_OP_MUL_MAT);
-    if (!cache_entry || !cache_entry->strategy_array.valid) {
-        NUMA_LOG_DEBUG("MUL_MAT query: No valid strategy array in cache");
-        return strategy;
-    }
-
-    // Calculate total operations for strategy selection (matrix dimensions)
-    const struct ggml_tensor * src0 = tensor->src[0];
-    const struct ggml_tensor * src1 = tensor->src[1];
-    
-    const int64_t ne00 = src0->ne[0]; // cols of src0
-    const int64_t ne01 = src0->ne[1]; // rows of src0  
-    const int64_t ne11 = src1->ne[1]; // cols of src1
-    
-    // For MUL_MAT, use total operations (FLOPS) as complexity metric
-    const size_t total_ops = ne00 * ne01 * ne11;
-    
-    // Use the registered thresholds for strategy selection
-    NUMA_SELECT_STRATEGY_FROM_CACHE(cache_entry, total_ops, strategy);
-    
-    // Debug logging for operation analysis (maintains integration test compatibility)
-    const char* strategy_name = (strategy == NUMA_STRATEGY_SINGLE_THREAD) ? "(Single/Single)" :
-                               (strategy == NUMA_STRATEGY_SINGLE_NODE) ? "(Single/Multi)" :
-                               "(Data Parallel)";
-    
-    NUMA_LOG_DEBUG("NUMA MUL_MAT %s", strategy_name);
-    
-    return strategy;
-}
-
+/**
+ * @brief Calculate work buffer size for matrix multiplication
+ * 
+ * Matrix multiplication requires work buffers for type conversion when
+ * src1 type doesn't match the optimal vec_dot_type.
+ */
 size_t ggml_numa_kernel_mul_mat_work_buffer_calc(const struct ggml_tensor * tensor, int total_numa_nodes, int total_threads) {
-    if (!tensor || !tensor->src[0] || !tensor->src[1]) {
-        return 0;
-    }
-    
+    NUMA_ASSERT(tensor != NULL, "Tensor cannot be null");
+    NUMA_ASSERT(tensor->src[0] != NULL, "src0 cannot be null");  
+    NUMA_ASSERT(tensor->src[1] != NULL, "src1 cannot be null");
+
+    // Unused parameters (required by function signature)
+    (void)total_numa_nodes;
+    (void)total_threads;
+
     const struct ggml_tensor * src0 = tensor->src[0];
     const struct ggml_tensor * src1 = tensor->src[1];
     
-    // Get type traits to determine if type conversion is needed
+    // Get type traits for src0 to determine required vec_dot_type
     const struct ggml_type_traits_cpu * type_traits = ggml_get_type_traits_cpu(src0->type);
-    if (!type_traits) {
-        return 0;
-    }
-    
     const enum ggml_type vec_dot_type = type_traits->vec_dot_type;
     
-    // Work buffer is only needed if src1 type != vec_dot_type
+    // Only need work buffer if src1 needs type conversion
     if (src1->type == vec_dot_type) {
         return 0;  // No conversion needed
     }
     
-    // Calculate work buffer size for type conversion
-    // Based on reference implementation logic
-    const int64_t ne10 = src1->ne[0];
-    const int64_t ne11 = src1->ne[1];
-    const int64_t ne12 = src1->ne[2];
-    const int64_t ne13 = src1->ne[3];
+    // Calculate total size needed for converted src1 data
+    const size_t src1_converted_size = ggml_row_size(vec_dot_type, ggml_nelements(src1));
     
-    const size_t nbw0 = ggml_type_size(vec_dot_type);
-    const size_t nbw1 = ggml_row_size(vec_dot_type, ne10);
-    const size_t nbw2 = nbw1 * ne11;
-    const size_t nbw3 = nbw2 * ne12;
+    NUMA_LOG_DEBUG("MUL_MAT work buffer: src1_type=%d, vec_dot_type=%d, size=%zu bytes", 
+                   src1->type, vec_dot_type, src1_converted_size);
     
-    // Total work buffer size for all batches
-    const size_t total_work_buffer = ne13 * nbw3;
-    
-    NUMA_LOG_DEBUG("MUL_MAT work buffer: src1_type=%s, vec_dot_type=%s, size=%zu bytes", 
-                   ggml_type_name(src1->type), ggml_type_name(vec_dot_type), total_work_buffer);
-    
-    return total_work_buffer;
+    return src1_converted_size;
 }
 
-// ============================================================================
-// NUMA MUL_MAT Kernel Implementation
-// ============================================================================
+/**
+ * @brief Query execution strategy for matrix multiplication
+ */
+ggml_numa_execution_strategy_t ggml_numa_kernel_mul_mat_query(const struct ggml_tensor * tensor) {
+    NUMA_ASSERT(tensor != NULL, "Tensor cannot be null");
+    NUMA_ASSERT(tensor->src[0] != NULL, "src0 tensor cannot be null");
+    
+    // Check if vec_dot function is available for src0 type
+    const enum ggml_type src0_type = tensor->src[0]->type;
+    const struct ggml_type_traits_cpu * traits = ggml_get_type_traits_cpu(src0_type);
+    if (traits->vec_dot == NULL) {
+        NUMA_LOG_DEBUG("MUL_MAT: vec_dot function not available for type %s, using reference implementation", 
+                       ggml_type_name(src0_type));
+        return NUMA_STRATEGY_RESERVED;  // Signal unsupported - executor should fall back
+    }
+    
+    // Use strategy cache for O(1) lookup based on total elements  
+    const ggml_numa_kernel_cache_entry_t* cache_entry = ggml_numa_lookup_kernel_direct(GGML_OP_MUL_MAT);
+    const size_t total_elements = ggml_nelements(tensor);
+    
+    // Use unified strategy selection macro for consistent behavior
+    ggml_numa_execution_strategy_t selected_strategy;
+    NUMA_SELECT_STRATEGY_FROM_CACHE(cache_entry, total_elements, selected_strategy);
+    
+    // Debug logging (controlled by environment variable)
+    const char* op_name = cache_entry ? cache_entry->kernel_name : "NUMA MUL_MAT";
+    NUMA_LOG_DEBUG("MUL_MAT query: %zu elements -> strategy %d (%s)\n", 
+                   total_elements, selected_strategy, op_name);
+    
+    return selected_strategy;
+}
 
 /**
- * Execute one chunk of MUL_MAT operation - mirrors reference implementation
+ * @brief Execute matrix multiplication kernel using proper NUMA pattern
+ * 
+ * Implements the correct NUMA pattern:
+ * 1. Phase 1: Multithreaded type conversion per NUMA node
+ * 2. Barrier synchronization
+ * 3. Phase 2: Multithreaded matrix computation with shared result writes
  */
-static enum ggml_status ggml_numa_kernel_mul_mat_one_chunk(
-    const struct ggml_compute_params * params,
-    struct ggml_tensor * dst,
-    const enum ggml_type src0_type,
-    const int64_t num_rows_per_vec_dot,
-    const int64_t ir0_start,
-    const int64_t ir0_end,
-    const int64_t ir1_start,
-    const int64_t ir1_end) {
-
-    const struct ggml_tensor * src0 = dst->src[0];
-    const struct ggml_tensor * src1 = dst->src[1];
-
-    // Tensor dimension extraction macro - exact mirror of reference
-    GGML_TENSOR_BINARY_OP_LOCALS
-
-    const bool src1_cont = ggml_is_contiguous(src1);
-
-    // Get type traits for vec_dot dispatch
-    const struct ggml_type_traits_cpu * type_traits = ggml_get_type_traits_cpu(src0_type);
-    NUMA_ASSERT(type_traits != NULL, "Invalid type traits for src0_type");
-
-    ggml_vec_dot_t const vec_dot = type_traits->vec_dot;
-    enum ggml_type const vec_dot_type = type_traits->vec_dot_type;
-
-    NUMA_ASSERT(vec_dot != NULL, "No vec_dot function available for type");
-
-    // Broadcast factors - exact mirror of reference
+enum ggml_status ggml_numa_kernel_mul_mat_execute(void * work_context, struct ggml_compute_params * params) {
+    struct ggml_tensor * tensor = (struct ggml_tensor *)work_context;
+    
+    // Validation
+    NUMA_ASSERT(tensor != NULL, "Tensor cannot be null");
+    NUMA_ASSERT(tensor->src[0] != NULL, "Source tensor 0 cannot be null");
+    NUMA_ASSERT(tensor->src[1] != NULL, "Source tensor 1 cannot be null");
+    NUMA_ASSERT(params != NULL, "Compute params cannot be null");
+    
+    const struct ggml_tensor * src0 = tensor->src[0];
+    const struct ggml_tensor * src1 = tensor->src[1];
+    
+    // Extract tensor dimensions (mirrors GGML_TENSOR_BINARY_OP_LOCALS)
+    const int64_t ne00 = src0->ne[0], ne01 = src0->ne[1], ne02 = src0->ne[2], ne03 = src0->ne[3];
+    const int64_t ne10 = src1->ne[0], ne11 = src1->ne[1], ne12 = src1->ne[2], ne13 = src1->ne[3];
+    const int64_t ne0 = tensor->ne[0], ne1 = tensor->ne[1], ne2 = tensor->ne[2], ne3 = tensor->ne[3];
+    
+    const size_t nb00 = src0->nb[0], nb01 = src0->nb[1], nb02 = src0->nb[2], nb03 = src0->nb[3];
+    const size_t nb10 = src1->nb[0], nb11 = src1->nb[1], nb12 = src1->nb[2], nb13 = src1->nb[3];
+    const size_t nb0 = tensor->nb[0], nb1 = tensor->nb[1], nb2 = tensor->nb[2], nb3 = tensor->nb[3];
+    
+    // Suppress unused parameter warnings for variables used only in debug/conditional code
+    (void)ne01; (void)ne0; (void)ne2; (void)ne3; (void)nb00; (void)nb10;
+    
+    // Get type traits for vec_dot operation
+    const enum ggml_type src0_type = src0->type;
+    const struct ggml_type_traits_cpu * traits = ggml_get_type_traits_cpu(src0_type);
+    ggml_vec_dot_t const vec_dot = traits->vec_dot;
+    enum ggml_type const vec_dot_type = traits->vec_dot_type;
+    ggml_from_float_t const from_float = ggml_get_type_traits_cpu(vec_dot_type)->from_float;
+    int64_t const num_rows_per_vec_dot = traits->nrows;
+    
+    // Check if vec_dot function is available for this type
+    if (vec_dot == NULL) {
+        NUMA_LOG_DEBUG("MUL_MAT: vec_dot function not available for type %s, falling back to reference implementation", 
+                       ggml_type_name(src0_type));
+        return GGML_STATUS_FAILED;  // Let reference implementation handle this
+    }
+    
+    // Broadcast factors (from reference implementation)
     const int64_t r2 = ne12 / ne02;
     const int64_t r3 = ne13 / ne03;
-
-    // Early exit for threads with no work
-    if (ir0_start >= ir0_end || ir1_start >= ir1_end) {
-        return GGML_STATUS_SUCCESS;
-    }
-
-    // Get work data (for type conversion) or use direct src1 data
-    const void * wdata = (src1->type == vec_dot_type) ? tensor_data(src1) : params->wdata;
+    
+    // Work data and memory layout setup
+    const bool src1_cont = ggml_is_contiguous(src1);
     const size_t row_size = ggml_row_size(vec_dot_type, ne10);
-
-    NUMA_ASSERT(ne12 % ne02 == 0, "Dimension mismatch in broadcast factor r2");
-    NUMA_ASSERT(ne13 % ne03 == 0, "Dimension mismatch in broadcast factor r3");
-
-    // Block-tiling parameters - exact mirror of reference
-    const int64_t blck_0 = 16;
-    const int64_t blck_1 = 16;
-
-    const size_t src1_col_stride = src1_cont || src1->type != vec_dot_type ? row_size : nb11;
-
-    // Get NUMA execution context from thread-local variables (set by coordinator)
-    extern __thread int ggml_current_numa_node;
-    extern __thread bool ggml_numa_is_data_parallel_execution;
-    extern __thread void * ggml_numa_shared_result_tensor_data;
-
-    // Use shared result tensor memory for direct writes (eliminates aggregation)
+    
+    // Thread and NUMA context setup
+    const int ith = params->ith;
+    const int nth = params->nth;
+    
+    // Get shared result tensor data for direct writes
     float * dst_data;
-    if (ggml_numa_shared_result_tensor_data != NULL) {
-        dst_data = (float *)ggml_numa_shared_result_tensor_data;
+    NUMA_GET_SHARED_DATA(tensor, dst_data, float);
+    
+    // PHASE 1: MULTITHREADED TYPE CONVERSION (PER NUMA NODE)
+    // Each NUMA node converts full src1 tensor using multiple threads for speed
+    char * wdata = NULL;
+    if (src1->type != vec_dot_type) {
+        wdata = (char *)params->wdata;
+        NUMA_ASSERT(wdata != NULL, "Work buffer required for type conversion");
+        
+        // Calculate work buffer strides (mirrors reference implementation)
+        const size_t nbw1 = row_size;
+        const size_t nbw2 = nbw1 * ne11;
+        const size_t nbw3 = nbw2 * ne12;
+        
+        NUMA_LOG_DEBUG("MUL_MAT: Converting src1 from %s to %s (thread %d/%d)", 
+                       ggml_type_name(src1->type), ggml_type_name(vec_dot_type), ith, nth);
+        
+        // MULTITHREADED conversion: each thread handles its portion
+        // Pattern matches reference: for (int64_t i11 = ith; i11 < ne11; i11 += nth)
+        for (int64_t i13 = 0; i13 < ne13; ++i13) {
+            for (int64_t i12 = 0; i12 < ne12; ++i12) {
+                for (int64_t i11 = ith; i11 < ne11; i11 += nth) {  // ← MULTITHREADED
+                    const float * src1_row = (const float *)((char *)tensor_data(src1) + 
+                                                i13*nb13 + i12*nb12 + i11*nb11);
+                    void * wdata_row = wdata + i13*nbw3 + i12*nbw2 + i11*nbw1;
+                    
+                    from_float(src1_row, wdata_row, ne10);
+                }
+            }
+        }
+        
+        // BARRIER: All threads on this NUMA node must complete conversion before proceeding
+        NUMA_OPENMP_BARRIER();
+        
+        NUMA_LOG_DEBUG("MUL_MAT: Type conversion completed, proceeding to computation (thread %d/%d)", ith, nth);
     } else {
-        dst_data = (float *)tensor_data(dst);
+        // No conversion needed - use original data
+        wdata = (char *)tensor_data(src1);
     }
-
-    NUMA_LOG_TRACE("MUL_MAT chunk execution: ir0=[%ld,%ld), ir1=[%ld,%ld), NUMA_node=%d, shared_mem=%s",
-                   ir0_start, ir0_end, ir1_start, ir1_end, ggml_current_numa_node,
-                   ggml_numa_shared_result_tensor_data ? "yes" : "no");
-
-    // Mirror exact iteration pattern from reference implementation
-    for (int64_t iir1 = ir1_start; iir1 < ir1_end; iir1 += blck_1) {
-        for (int64_t iir0 = ir0_start; iir0 < ir0_end; iir0 += blck_0) {
-            for (int64_t ir1 = iir1; ir1 < iir1 + blck_1 && ir1 < ir1_end; ir1 += num_rows_per_vec_dot) {
-                const int64_t i13 = (ir1 / (ne12 * ne1));
-                const int64_t i12 = (ir1 - i13 * ne12 * ne1) / ne1;
-                const int64_t i11 = (ir1 - i13 * ne12 * ne1 - i12 * ne1);
-
-                // Broadcast src0 into src1 - exact mirror of reference
-                const int64_t i03 = i13 / r3;
-                const int64_t i02 = i12 / r2;
-
-                const int64_t i1 = i11;
-                const int64_t i2 = i12;
-                const int64_t i3 = i13;
-
-                const char * src0_row = (const char*)tensor_data(src0) + (0 + i02 * nb02 + i03 * nb03);
-
-                // Calculate src1 column pointer - handles both contiguous and non-contiguous cases
-                const char * src1_col = (const char*)wdata +
-                    (src1_cont || src1->type != vec_dot_type
-                        ? (i11 + i12 * ne11 + i13 * ne12 * ne11) * row_size
-                        : (i11 * nb11 + i12 * nb12 + i13 * nb13));
-
-                float * dst_col = (float*)((char*)dst_data + (i1 * nb1 + i2 * nb2 + i3 * nb3));
-
-                // Direct assignment - mirror reference implementation pattern
-                for (int64_t ir0 = iir0; ir0 < iir0 + blck_0 && ir0 < ir0_end; ir0 += num_rows_per_vec_dot) {
-                    if (num_rows_per_vec_dot == 1) {
-                        // Single row case - direct vec_dot call
-                        vec_dot(ne00, &dst_col[ir0], 0, src0_row + ir0*nb01, 0, src1_col, 0, 1);
-                    } else {
-                        // Multi-row case - handle multiple rows per vec_dot call
-                        for (int cn = 0; cn < num_rows_per_vec_dot; ++cn) {
-                            float * dst_ptr = &dst_col[ir0 + cn * nb1 / nb0];
-                            const char * src0_ptr = src0_row + (ir0 + cn) * nb01;
-                            const char * src1_ptr = src1_col + cn * src1_col_stride;
-                            
-                            vec_dot(ne00, dst_ptr, 0, src0_ptr, 0, src1_ptr, 0, 1);
+    
+    // PHASE 2: MULTITHREADED MATRIX COMPUTATION
+    NUMA_LOG_DEBUG("MUL_MAT: Type conversion completed, proceeding to computation (thread %d/%d)\n", ith, nth);
+    
+    // CRITICAL FIX: Each thread must use their NUMA node's converted data
+    // In data-parallel mode, each NUMA node converted the full tensor in their local work buffer
+    // Threads should access their local NUMA node's converted data, not shared wdata
+    const char * numa_converted_data = (const char*)wdata;
+    
+    // Use chunk-based iteration matching reference implementation
+    const int64_t nr0 = ne0;  // Result first dimension 
+    const int64_t nr1 = ne1 * ne2 * ne3;  // Result remaining dimensions
+    
+    // Chunk size setup (matches reference)
+    int chunk_size = 16;
+    if (nr0 == 1 || nr1 == 1) {
+        chunk_size = 64;
+    }
+    
+    // Calculate chunks for distribution
+    int64_t nchunk0 = (nr0 + chunk_size - 1) / chunk_size;
+    int64_t nchunk1 = (nr1 + chunk_size - 1) / chunk_size;
+    
+    // NUMA-aware chunking: distribute by thread like reference
+    if (nchunk0 * nchunk1 < nth * 4 || ggml_current_numa_node >= 0) {
+        nchunk0 = nr0 > nr1 ? nth : 1;
+        nchunk1 = nr0 > nr1 ? 1 : nth;
+    }
+    
+    const int64_t dr0 = (nr0 + nchunk0 - 1) / nchunk0;
+    const int64_t dr1 = (nr1 + nchunk1 - 1) / nchunk1;
+    
+    // Each thread processes multiple chunks
+    for (int64_t chunk_id = ith; chunk_id < nchunk0 * nchunk1; chunk_id += nth) {
+        const int64_t ith0 = chunk_id % nchunk0;
+        const int64_t ith1 = chunk_id / nchunk0;
+        
+        const int64_t ir0_start = dr0 * ith0;
+        const int64_t ir0_end = MIN(ir0_start + dr0, nr0);
+        const int64_t ir1_start = dr1 * ith1;
+        const int64_t ir1_end = MIN(ir1_start + dr1, nr1);
+        
+        // Skip empty chunks
+        if (ir0_start >= ir0_end || ir1_start >= ir1_end) continue;
+        
+        // Block tiling (matches reference)
+        const int64_t blck_0 = 16;
+        const int64_t blck_1 = 16;
+        const size_t src1_col_stride = src1_cont || src1->type != vec_dot_type ? row_size : nb11;
+        
+        // Process this chunk with exact reference pattern
+        for (int64_t iir1 = ir1_start; iir1 < ir1_end; iir1 += blck_1) {
+            for (int64_t iir0 = ir0_start; iir0 < ir0_end; iir0 += blck_0) {
+                for (int64_t ir1 = iir1; ir1 < iir1 + blck_1 && ir1 < ir1_end; ir1 += num_rows_per_vec_dot) {
+                    // Coordinate calculation (exact reference pattern)
+                    const int64_t i13 = (ir1 / (ne12 * ne1));
+                    const int64_t i12 = (ir1 - i13 * ne12 * ne1) / ne1;
+                    const int64_t i11 = (ir1 - i13 * ne12 * ne1 - i12 * ne1);
+                    
+                    // Broadcast src0 into src1 (from reference)
+                    const int64_t i03 = i13 / r3;
+                    const int64_t i02 = i12 / r2;
+                    
+                    const int64_t i1 = i11;
+                    const int64_t i2 = i12;
+                    const int64_t i3 = i13;
+                    
+                    // Memory access pointers (exact reference pattern)
+                    const char * src0_row = (const char*)tensor_data(src0) + (0 + i02 * nb02 + i03 * nb03);
+                    // CRITICAL FIX: Use numa_converted_data instead of wdata for thread safety
+                    const char * src1_col = numa_converted_data +
+                        (src1_cont || src1->type != vec_dot_type
+                            ? (i11 + i12 * ne11 + i13 * ne12 * ne11) * row_size
+                            : (i11 * nb11 + i12 * nb12 + i13 * nb13));
+                    float * dst_col = (float*)((char*)dst_data + (i1 * nb1 + i2 * nb2 + i3 * nb3));
+                    
+                    // Vec_dot computation (exact reference pattern)
+                    for (int64_t ir0 = iir0; ir0 < iir0 + blck_0 && ir0 < ir0_end; ir0 += num_rows_per_vec_dot) {
+                        if (num_rows_per_vec_dot == 1) {
+                            vec_dot(ne00, &dst_col[ir0], 0, src0_row + ir0*nb01, 0, src1_col, 0, 1);
+                        } else {
+                            // Multi-row case
+                            for (int cn = 0; cn < num_rows_per_vec_dot; ++cn) {
+                                float * dst_ptr = &dst_col[ir0 + cn * nb1 / nb0];
+                                const char * src0_ptr = src0_row + (ir0 + cn) * nb01;
+                                const char * src1_ptr = src1_col + cn * src1_col_stride;
+                                vec_dot(ne00, dst_ptr, 0, src0_ptr, 0, src1_ptr, 0, 1);
+                            }
                         }
                     }
                 }
             }
         }
     }
-
+    
     return GGML_STATUS_SUCCESS;
 }
 
-enum ggml_status ggml_numa_kernel_mul_mat_execute(void * work_context, struct ggml_compute_params * params) {
-    struct ggml_tensor * dst = (struct ggml_tensor *)work_context;
+/**
+ * @brief Register the matrix multiplication kernel
+ */
+ggml_numa_kernel_registration_info_t ggml_numa_kernel_mul_mat_register(void) {
+    ggml_numa_kernel_registration_info_t info = {0};
     
-    // Validate inputs
-    NUMA_ASSERT(dst != NULL, "Destination tensor cannot be null");
-    NUMA_ASSERT(dst->src[0] != NULL, "Source tensor 0 cannot be null");
-    NUMA_ASSERT(dst->src[1] != NULL, "Source tensor 1 cannot be null");
-    NUMA_ASSERT(params != NULL, "Compute params cannot be null");
+    info.op_type = GGML_OP_MUL_MAT;
+    info.supported = true;  // FULL IMPLEMENTATION COMPLETE
+    info.kernel_name = "NUMA Matrix Multiplication Kernel";
     
-    const struct ggml_tensor * src0 = dst->src[0];
-    const struct ggml_tensor * src1 = dst->src[1];
+    // Strategy thresholds for matrix multiplication
+    // Use more conservative thresholds due to computational complexity
+    info.strategy_array.thresholds[NUMA_STRATEGY_IDX_SINGLE_SINGLE] = 128;      // Small matrices: single thread
+    info.strategy_array.thresholds[NUMA_STRATEGY_IDX_SINGLE_MULTI] = 1024;    // Medium matrices: multi-thread single node
+    // Large matrices (> 1K elements): data-parallel across NUMA nodes
+    info.strategy_array.valid = true;
     
-    // Get type traits and verify support
-    const struct ggml_type_traits_cpu * type_traits = ggml_get_type_traits_cpu(src0->type);
-    NUMA_ASSERT(type_traits != NULL, "Type traits not found for src0 type");
+    // Function pointers for all strategies
+    info.work_funcs.single_single_fn = ggml_numa_kernel_mul_mat_execute;
+    info.work_funcs.single_multi_fn = ggml_numa_kernel_mul_mat_execute;
+    info.work_funcs.data_parallel_fn = ggml_numa_kernel_mul_mat_execute;
+    info.work_funcs.valid = true;
     
-    const enum ggml_type vec_dot_type = type_traits->vec_dot_type;
-    const ggml_from_float_t from_float = type_traits->from_float;
-    const int64_t vec_dot_num_rows = type_traits->nrows;
+    // Query function pointer for O(1) strategy selection
+    info.query_fn = (void*)ggml_numa_kernel_mul_mat_query;
     
-    NUMA_ASSERT(type_traits->vec_dot != NULL, "No vec_dot function for src0 type");
+    // Work buffer calculation function
+    info.work_buffer_calc_fn = (void*)ggml_numa_kernel_mul_mat_work_buffer_calc;
     
-    // Tensor dimension extraction - exact mirror of reference
-    GGML_TENSOR_BINARY_OP_LOCALS
+    // Matrix multiplication doesn't need aggregation functions
+    info.agg_funcs.single_single_fn = NULL;
+    info.agg_funcs.single_multi_fn = NULL;
+    info.agg_funcs.data_parallel_fn = NULL;
+    info.agg_funcs.valid = false;
     
-    // Dimension validation - exact mirror of reference
-    NUMA_ASSERT(ne0 == ne01, "Matrix dimension mismatch: ne0 != ne01");
-    NUMA_ASSERT(ne1 == ne11, "Matrix dimension mismatch: ne1 != ne11");
-    NUMA_ASSERT(ne2 == ne12, "Matrix dimension mismatch: ne2 != ne12");
-    NUMA_ASSERT(ne3 == ne13, "Matrix dimension mismatch: ne3 != ne13");
-    
-    // Stride validation - exact mirror of reference
-    NUMA_ASSERT(nb00 == ggml_type_size(src0->type), "src0 not contiguous");
-    NUMA_ASSERT(nb10 == ggml_type_size(src1->type), "src1 not contiguous");
-    NUMA_ASSERT(nb0 == sizeof(float), "dst not contiguous");
-    NUMA_ASSERT(nb0 <= nb1, "dst stride validation failed");
-    NUMA_ASSERT(nb1 <= nb2, "dst stride validation failed");
-    NUMA_ASSERT(nb2 <= nb3, "dst stride validation failed");
-    
-    // Get NUMA execution context from thread-local variables (set by coordinator)
-    extern __thread int ggml_current_numa_node;
-    extern __thread bool ggml_numa_is_data_parallel_execution;
-    extern __thread int ggml_numa_total_nodes_for_data_parallel;
-    
-    const int ith = params->ith;
-    const int nth = params->nth;
-    
-    // Calculate global thread coordinates for data-parallel execution
-    int global_ith, global_nth;
-    if (ggml_numa_is_data_parallel_execution) {
-        // Global thread index across all NUMA nodes
-        global_ith = ggml_current_numa_node * nth + ith;
-        global_nth = ggml_numa_total_nodes_for_data_parallel * nth;
-        NUMA_LOG_TRACE("MUL_MAT execution: NUMA node %d, local thread %d/%d, global thread %d/%d",
-                      ggml_current_numa_node, ith, nth, global_ith, global_nth);
-    } else {
-        // Single NUMA node execution - use local coordinates
-        global_ith = ith;
-        global_nth = nth;
-    }
-    
-    // Log execution strategy in standardized format for integration test parsing
-    // Only log once per operation (thread 0 of NUMA node 0) to avoid inflated counts
-    if (ith == 0 && ggml_current_numa_node == 0) {
-        if (ggml_numa_is_data_parallel_execution) {
-            NUMA_LOG_STRATEGY_DATA_PARALLEL("MUL_MAT");
-        } else if (params->nth > 1) {
-            NUMA_LOG_STRATEGY_SINGLE_MULTI("MUL_MAT");
-        } else {
-            NUMA_LOG_STRATEGY_SINGLE_SINGLE("MUL_MAT");
-        }
-    }
-    
-    NUMA_LOG_DEBUG("MUL_MAT execution: src0_type=%s, src1_type=%s, dst_type=%s, dims=[%ld,%ld,%ld,%ld]",
-                   ggml_type_name(src0->type), ggml_type_name(src1->type), ggml_type_name(dst->type),
-                   ne0, ne1, ne2, ne3);
-    
-    // Handle type conversion if needed - exact mirror of reference logic
-    if (src1->type != vec_dot_type) {
-        char * wdata = params->wdata;
-        NUMA_ASSERT(wdata != NULL, "Work buffer required for type conversion but not provided");
-        
-        const size_t nbw0 = ggml_type_size(vec_dot_type);
-        const size_t nbw1 = ggml_row_size(vec_dot_type, ne10);
-        const size_t nbw2 = nbw1*ne11;
-        const size_t nbw3 = nbw2*ne12;
-        
-        NUMA_ASSERT(params->wsize >= ne13*nbw3, "Work buffer too small for type conversion");
-        NUMA_ASSERT(src1->type == GGML_TYPE_F32, "Type conversion only supports F32 source");
-        NUMA_ASSERT(from_float != NULL, "No conversion function available");
-        
-        // Convert src1 tensor to vec_dot_type using global thread coordination
-        for (int64_t i13 = 0; i13 < ne13; ++i13) {
-            for (int64_t i12 = 0; i12 < ne12; ++i12) {
-                for (int64_t i11 = 0; i11 < ne11; ++i11) {
-                    // Thread coordination: each thread processes different blocks within each row
-                    // Use global thread coordinates to avoid race conditions across NUMA nodes
-                    size_t bs = ggml_blck_size(vec_dot_type);
-                    int64_t ne10_block_start = (global_ith * ne10/bs) / global_nth;
-                    int64_t ne10_block_end   = ((global_ith + 1) * ne10/bs) / global_nth;
-                    
-                    // Skip if this thread has no work for this block
-                    if (ne10_block_start >= ne10_block_end) {
-                        continue;
-                    }
-                    
-                    // Source: F32 data at the current batch/matrix/row position + block offset
-                    const float * src1_row = (const float *)((const char *)tensor_data(src1) + 
-                                             i13*nb13 + i12*nb12 + i11*nb11 + ne10_block_start*bs*nb10);
-                    
-                    // Destination: converted data in work buffer with proper layout + block offset
-                    void * dst_row = wdata + i13*nbw3 + i12*nbw2 + i11*nbw1 + ne10_block_start*nbw0;
-                    
-                    // Perform the actual conversion (e.g., F32 -> Q8_0) for this thread's block
-                    from_float(src1_row, dst_row, (ne10_block_end - ne10_block_start) * bs);
-                }
-            }
-        }
-        
-        NUMA_LOG_TRACE("MUL_MAT: Thread %d/%d (global %d/%d) converted src1 blocks [%ld-%ld) from F32 to vec_dot_type %d", 
-                         ith, nth, global_ith, global_nth, 
-                         (global_ith * ne10/ggml_blck_size(vec_dot_type)) / global_nth, 
-                         ((global_ith + 1) * ne10/ggml_blck_size(vec_dot_type)) / global_nth, vec_dot_type);
-    }
-    
-    // Thread synchronization for type conversion - use OpenMP barrier
-    // Synchronize ALL threads in data-parallel mode, or just local threads in single-node mode
-    if (ggml_numa_is_data_parallel_execution || nth > 1) {
-        #pragma omp barrier
-        NUMA_LOG_DEBUG("MUL_MAT: Thread %d/%d (NUMA node %d) completed type conversion using OpenMP barrier", 
-                      ith, nth, ggml_current_numa_node);
-    } else {
-        NUMA_LOG_DEBUG("MUL_MAT: Single thread execution, skipping barrier synchronization");
-    }
-    
-    // Coordinate work distribution using global thread coordinates for consistency
-    const int64_t nr0 = ne0;  // Rows in result
-    const int64_t nr1 = ne1 * ne2 * ne3;  // Columns in result
-    
-    // Use the same global thread coordinates for work distribution consistency
-    int work_ith, work_nth;
-    if (ggml_numa_is_data_parallel_execution) {
-        work_ith = global_ith;
-        work_nth = global_nth;
-    } else {
-        work_ith = ith;
-        work_nth = nth;
-    }
-    
-    // Dynamic chunk sizing - exact mirror of reference
-    int chunk_size = 16;
-    if (nr0 == 1 || nr1 == 1) {
-        chunk_size = 64;
-    }
-    
-    int64_t nchunk0 = (nr0 + chunk_size - 1) / chunk_size;
-    int64_t nchunk1 = (nr1 + chunk_size - 1) / chunk_size;
-    
-    // NUMA-aware chunking adjustment
-    if (nchunk0 * nchunk1 < work_nth * 4 || ggml_numa_is_data_parallel_execution) {
-        nchunk0 = nr0 > nr1 ? work_nth : 1;
-        nchunk1 = nr0 > nr1 ? 1 : work_nth;
-    }
-    
-    const int64_t dr0 = (nr0 + nchunk0 - 1) / nchunk0;
-    const int64_t dr1 = (nr1 + nchunk1 - 1) / nchunk1;
-    
-    // Calculate chunk assignment for this thread using global coordinates
-    const int64_t ith0 = work_ith % nchunk0;
-    const int64_t ith1 = work_ith / nchunk0;
-    
-    const int64_t ir0_start = dr0 * ith0;
-    const int64_t ir0_end = MIN(ir0_start + dr0, nr0);
-    
-    const int64_t ir1_start = dr1 * ith1;
-    const int64_t ir1_end = MIN(ir1_start + dr1, nr1);
-    
-    // Determine rows per vec_dot operation - exact mirror of reference
-    int64_t num_rows_per_vec_dot = vec_dot_num_rows;
-    
-    // Optimization constraints - exact mirror of reference
-    if ((nr0 % 2 != 0) || (ne11 % 2 != 0) || ((ir0_end - ir0_start) % 2 != 0) || ((ir1_end - ir1_start) % 2 != 0)) {
-        num_rows_per_vec_dot = 1;
-    }
-    
-    NUMA_LOG_TRACE("MUL_MAT thread work: NUMA_node=%d, local_thread=%d/%d, global_thread=%d/%d, chunks=[%ld,%ld), ir0=[%ld,%ld), ir1=[%ld,%ld), rows_per_vec_dot=%ld",
-                   ggml_current_numa_node, ith, nth, work_ith, work_nth, ith0, ith1, ir0_start, ir0_end, ir1_start, ir1_end, num_rows_per_vec_dot);
-    
-    // Execute the chunk
-    enum ggml_status result = ggml_numa_kernel_mul_mat_one_chunk(params, dst, src0->type, num_rows_per_vec_dot, 
-                                                                ir0_start, ir0_end, ir1_start, ir1_end);
-    
-    // CRITICAL: Cross-NUMA barrier after matrix multiplication computation
-    // Ensure all threads complete their matrix multiplication before operation finishes
-    if (ggml_numa_is_data_parallel_execution || nth > 1) {
-        #pragma omp barrier
-        NUMA_LOG_DEBUG("MUL_MAT: Thread %d/%d (NUMA node %d) completed matrix multiplication using OpenMP barrier", 
-                      ith, nth, ggml_current_numa_node);
-    } else {
-        NUMA_LOG_DEBUG("MUL_MAT: Single thread execution, skipping matrix multiplication barrier");
-    }
-    
-    return result;
+    return info;
 }

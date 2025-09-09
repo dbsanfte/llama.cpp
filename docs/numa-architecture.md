@@ -67,8 +67,6 @@ The NUMA OpenMP coordinator implements a **three-strategy execution model** usin
 
 ### **Thread-Local Context Variables**
 
-### **Thread-Local Context Variables**
-
 The OpenMP coordinator sets up thread-local variables that kernels use for adaptive data slicing with modern shared macros:
 
 ```c
@@ -79,7 +77,7 @@ extern __thread int ggml_current_numa_node;                    // Current NUMA n
 extern __thread bool ggml_numa_is_data_parallel_execution;     // True if multi-node execution
 extern __thread int ggml_numa_total_nodes_for_data_parallel;   // Total nodes participating
 
-// Shared memory optimization
+// Cross-numa shared memory pointer for final results (lives on Numa 0)
 extern __thread void * ggml_numa_shared_result_tensor_data;    // Direct result memory access
 ```
 

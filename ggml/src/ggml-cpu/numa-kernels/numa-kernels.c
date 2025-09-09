@@ -319,7 +319,7 @@ enum ggml_status ggml_numa_kernels_init(void) {
     NUMA_REGISTER_KERNEL(rope);
 
     // Register MUL_MAT kernel
-    // NUMA_REGISTER_KERNEL(mul_mat);  // Temporarily disabled - debugging cross-NUMA race conditions
+    NUMA_REGISTER_KERNEL(mul_mat);
     
     // Register the binary op kernels:
     NUMA_REGISTER_KERNEL(add); 

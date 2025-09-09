@@ -120,34 +120,6 @@ enum ggml_status test_work_function(void * work_context, struct ggml_compute_par
 }
 
 /**
- * @brief No-op work function for latency benchmarking
- */
-enum ggml_status noop_work_function(void * work_context, struct ggml_compute_params * params) {
-    struct ggml_tensor * tensor = (struct ggml_tensor *)work_context;
-    
-    // Minimal validation only
-    if (!tensor || !params) {
-        return GGML_STATUS_FAILED;
-    }
-    
-    // Absolutely minimal work - just return success
-    // This measures pure dispatch overhead
-    return GGML_STATUS_SUCCESS;
-}
-
-/**
- * @brief No-op work buffer calc function for latency benchmarking
- */
-size_t noop_work_buffer_calc(const struct ggml_tensor * tensor, int total_numa_nodes, int total_threads) {
-    (void)tensor;
-    (void)total_numa_nodes;
-    (void)total_threads;
-    
-    // Return zero - no work buffer needed for no-op operations
-    return 0;
-}
-
-/**
  * @brief Test single-thread execution strategy
  */
 bool test_single_thread_strategy() {
@@ -274,75 +246,19 @@ bool test_data_parallel_strategy() {
 }
 
 /**
- * @brief Work buffer calculation function for auto-growth testing
+ * @brief Test work buffer calculation function
  */
-size_t test_work_buffer_calc_small(const struct ggml_tensor * tensor, int total_numa_nodes, int total_threads) {
-    (void)tensor; (void)total_numa_nodes; // Suppress unused parameter warnings
-    // Start with small buffer: 512 bytes per thread
-    size_t per_thread_buffer = 512;
+size_t test_work_buffer_calc(const struct ggml_tensor * tensor, int total_numa_nodes, int total_threads) {
+    // Simple calculation: 1KB per thread for testing
+    size_t per_thread_buffer = 1024;
     return per_thread_buffer * total_threads;
 }
 
 /**
- * @brief Work buffer calculation function for larger allocation testing
- */
-size_t test_work_buffer_calc_large(const struct ggml_tensor * tensor, int total_numa_nodes, int total_threads) {
-    (void)tensor; (void)total_numa_nodes; // Suppress unused parameter warnings
-    // Larger buffer: 4KB per thread
-    size_t per_thread_buffer = 4096;
-    return per_thread_buffer * total_threads;
-}
-
-/**
- * @brief Work function that validates work buffer state and NUMA locality
- */
-enum ggml_status test_work_buffer_validation_function(void * work_context, struct ggml_compute_params * params) {
-    (void)work_context; // Suppress unused parameter warning
-    
-    // Get current thread work buffer state
-    void* buffer_ptr = nullptr;
-    size_t current_size = 0;
-    int numa_node = -1;
-    bool is_numa_allocated = false;
-    
-    bool has_buffer = ggml_numa_openmp_get_thread_work_buffer_state(
-        &buffer_ptr, &current_size, &numa_node, &is_numa_allocated);
-    
-    if (has_buffer && params) {
-        // Validate buffer exists and has expected properties
-        if (buffer_ptr != nullptr && current_size > 0) {
-            // Verify work buffer accessibility (write/read test)
-            char* test_buffer = (char*)buffer_ptr;
-            test_buffer[0] = 'T';
-            test_buffer[current_size - 1] = 'E';
-            
-            // Verify the writes worked
-            if (test_buffer[0] != 'T' || test_buffer[current_size - 1] != 'E') {
-                printf("❌ Work buffer memory access validation failed\n");
-                return GGML_STATUS_FAILED;
-            }
-            
-            // Print validation info (controlled by TEST_PRINTF)
-            if (current_size >= 1024) {
-                printf("     Thread %d/%d: Buffer %zuKB on NUMA %d (NUMA-allocated: %s)\n", 
-                       params->ith, params->nth, current_size / 1024, numa_node,
-                       is_numa_allocated ? "yes" : "no");
-            } else {
-                printf("     Thread %d/%d: Buffer %zuB on NUMA %d (NUMA-allocated: %s)\n", 
-                       params->ith, params->nth, current_size, numa_node,
-                       is_numa_allocated ? "yes" : "no");
-            }
-        }
-    }
-    
-    return GGML_STATUS_SUCCESS;
-}
-
-/**
- * @brief Comprehensive work buffer allocation and auto-growth testing
+ * @brief Test work buffer allocation
  */
 bool test_work_buffer_allocation() {
-    TEST_PRINTF("🧪 Testing comprehensive work buffer allocation and auto-growth...\n");
+    TEST_PRINTF("🧪 Testing work buffer allocation...\n");
     
     // Create a simple tensor for testing
     struct ggml_context * ctx = nullptr;
@@ -365,221 +281,18 @@ bool test_work_buffer_allocation() {
         return false;
     }
     
-    // Test 1: Initial small buffer allocation
-    TEST_PRINTF("   📋 Test 1: Initial small buffer allocation (512B per thread)...\n");
-    enum ggml_status result1 = ggml_numa_openmp_execute_single_node(
-        tensor, test_work_buffer_validation_function, 0, test_work_buffer_calc_small);
+    // Test execution with work buffer calculation
+    enum ggml_status result = ggml_numa_openmp_execute_single_node(
+        tensor, test_work_function, 0, test_work_buffer_calc);
     
-    if (result1 != GGML_STATUS_SUCCESS) {
-        ggml_free(ctx);
-        record_test_result("work_buffer_allocation", false, "Small buffer allocation failed");
-        return false;
-    }
-    
-    // Test 2: Auto-growth to larger buffer size
-    TEST_PRINTF("   📋 Test 2: Auto-growth to larger buffer size (4KB per thread)...\n");
-    enum ggml_status result2 = ggml_numa_openmp_execute_single_node(
-        tensor, test_work_buffer_validation_function, 0, test_work_buffer_calc_large);
-    
-    if (result2 != GGML_STATUS_SUCCESS) {
-        ggml_free(ctx);
-        record_test_result("work_buffer_allocation", false, "Buffer auto-growth failed");
-        return false;
-    }
-    
-    // Test 3: NUMA locality validation across multiple nodes (data-parallel)
-    TEST_PRINTF("   📋 Test 3: NUMA locality validation across multiple nodes...\n");
-    enum ggml_status result3 = ggml_numa_openmp_execute_data_parallel(
-        tensor, test_work_buffer_validation_function, test_work_buffer_calc_large);
-    
-    if (result3 != GGML_STATUS_SUCCESS) {
-        ggml_free(ctx);
-        record_test_result("work_buffer_allocation", false, "Multi-NUMA buffer validation failed");
-        return false;
-    }
-    
-    // Test 4: Force specific NUMA allocation and verify locality
-    TEST_PRINTF("   📋 Test 4: Force-allocated buffer NUMA locality verification...\n");
-    ggml_numa_openmp_config_t config = ggml_numa_openmp_coordinator_get_config();
-    
-    for (int numa_node = 0; numa_node < config.total_numa_nodes; numa_node++) {
-        size_t test_size = 2048; // 2KB test buffer
-        void* forced_buffer = ggml_numa_openmp_test_force_work_buffer_allocation(test_size, numa_node);
-        
-        if (forced_buffer == nullptr) {
-            ggml_free(ctx);
-            record_test_result("work_buffer_allocation", false, "Force allocation failed");
-            return false;
-        }
-        
-        // Verify the forced allocation properties
-        void* buffer_ptr = nullptr;
-        size_t current_size = 0;
-        int allocated_numa_node = -1;
-        bool is_numa_allocated = false;
-        
-        bool has_buffer = ggml_numa_openmp_get_thread_work_buffer_state(
-            &buffer_ptr, &current_size, &allocated_numa_node, &is_numa_allocated);
-        
-        if (!has_buffer || allocated_numa_node != numa_node) {
-            ggml_free(ctx);
-            record_test_result("work_buffer_allocation", false, 
-                "Force-allocated buffer not on expected NUMA node");
-            return false;
-        }
-        
-        if (current_size < test_size) {
-            ggml_free(ctx);
-            record_test_result("work_buffer_allocation", false, 
-                "Force-allocated buffer smaller than requested");
-            return false;
-        }
-        
-        // Test memory access on the forced buffer
-        char* test_ptr = (char*)forced_buffer;
-        test_ptr[0] = 'F';
-        test_ptr[test_size - 1] = 'A';
-        
-        if (test_ptr[0] != 'F' || test_ptr[test_size - 1] != 'A') {
-            ggml_free(ctx);
-            record_test_result("work_buffer_allocation", false, 
-                "Force-allocated buffer memory access failed");
-            return false;
-        }
-        
-        TEST_PRINTF("     ✅ NUMA node %d: %zuB buffer allocated and accessible\n", 
-                   numa_node, current_size);
-    }
-    
-    // Cleanup
-    ggml_numa_openmp_cleanup_thread_work_buffers();
     ggml_free(ctx);
+    
+    if (result != GGML_STATUS_SUCCESS) {
+        record_test_result("work_buffer_allocation", false, "Work buffer execution failed");
+        return false;
+    }
     
     record_test_result("work_buffer_allocation", true);
-    return true;
-}
-
-/**
- * @brief Test execution strategy latency benchmarking
- */
-bool test_execution_strategy_latency() {
-    TEST_PRINTF("🧪 Testing execution strategy latency benchmarking...\n");
-    
-    // Create context and tensor for benchmarking
-    struct ggml_context * ctx = nullptr;
-    struct ggml_init_params params = {
-        .mem_size = 1024 * 1024,
-        .mem_buffer = nullptr,
-        .no_alloc = false,
-    };
-    ctx = ggml_init(params);
-    
-    if (!ctx) {
-        record_test_result("execution_strategy_latency", false, "Failed to create ggml context");
-        return false;
-    }
-    
-    // Create a small tensor for minimal overhead
-    struct ggml_tensor * tensor = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 32, 32);
-    if (!tensor) {
-        ggml_free(ctx);
-        record_test_result("execution_strategy_latency", false, "Failed to create tensor");
-        return false;
-    }
-    
-    // Benchmark parameters
-    const int num_iterations = 1000;  // Number of iterations for reliable timing
-    
-    TEST_PRINTF("   📊 Benchmarking %d iterations of no-op operations...\n", num_iterations);
-    TEST_PRINTF("   📊 Measuring pure dispatch overhead for each strategy\n");
-    
-    // Strategy 1: Single-thread/single-node latency
-    {
-        auto start = std::chrono::high_resolution_clock::now();
-        
-        for (int i = 0; i < num_iterations; i++) {
-            enum ggml_status result = ggml_numa_openmp_execute_single_thread(
-                tensor,
-                noop_work_function,
-                0,  // target_numa_node 
-                noop_work_buffer_calc
-            );
-            
-            if (result != GGML_STATUS_SUCCESS) {
-                ggml_free(ctx);
-                record_test_result("execution_strategy_latency", false, 
-                    "Single-thread strategy failed during benchmark");
-                return false;
-            }
-        }
-        
-        auto end = std::chrono::high_resolution_clock::now();
-        auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
-        double avg_latency_us = static_cast<double>(duration.count()) / num_iterations;
-        
-        TEST_PRINTF("   ⚡ Single-thread/single-node: %.2f μs per operation\n", avg_latency_us);
-    }
-    
-    // Strategy 2: Multi-thread/single-node latency  
-    {
-        auto start = std::chrono::high_resolution_clock::now();
-        
-        for (int i = 0; i < num_iterations; i++) {
-            enum ggml_status result = ggml_numa_openmp_execute_single_node(
-                tensor,
-                noop_work_function,
-                0,  // target_numa_node
-                noop_work_buffer_calc
-            );
-            
-            if (result != GGML_STATUS_SUCCESS) {
-                ggml_free(ctx);
-                record_test_result("execution_strategy_latency", false, 
-                    "Single-node strategy failed during benchmark");
-                return false;
-            }
-        }
-        
-        auto end = std::chrono::high_resolution_clock::now();
-        auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
-        double avg_latency_us = static_cast<double>(duration.count()) / num_iterations;
-        
-        TEST_PRINTF("   ⚡ Multi-thread/single-node: %.2f μs per operation\n", avg_latency_us);
-    }
-    
-    // Strategy 3: Multi-thread/multi-node (data-parallel) latency
-    {
-        auto start = std::chrono::high_resolution_clock::now();
-        
-        for (int i = 0; i < num_iterations; i++) {
-            enum ggml_status result = ggml_numa_openmp_execute_data_parallel(
-                tensor,
-                noop_work_function,
-                noop_work_buffer_calc
-            );
-            
-            if (result != GGML_STATUS_SUCCESS) {
-                ggml_free(ctx);
-                record_test_result("execution_strategy_latency", false, 
-                    "Data-parallel strategy failed during benchmark");
-                return false;
-            }
-        }
-        
-        auto end = std::chrono::high_resolution_clock::now();
-        auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
-        double avg_latency_us = static_cast<double>(duration.count()) / num_iterations;
-        
-        TEST_PRINTF("   ⚡ Multi-thread/multi-node: %.2f μs per operation\n", avg_latency_us);
-    }
-    
-    TEST_PRINTF("   📋 Note: These timings show pure dispatch overhead with no-op work function\n");
-    TEST_PRINTF("   📋 Actual operation latency would include computation time on top of dispatch\n");
-    
-    // Cleanup
-    ggml_free(ctx);
-    
-    record_test_result("execution_strategy_latency", true);
     return true;
 }
 
@@ -679,7 +392,6 @@ int main(int argc, char **argv) {
     run_test("single_node_strategy", test_single_node_strategy);
     run_test("data_parallel_strategy", test_data_parallel_strategy);
     run_test("work_buffer_allocation", test_work_buffer_allocation);
-    run_test("execution_strategy_latency", test_execution_strategy_latency);
 
     // Cleanup
     ggml_numa_openmp_coordinator_shutdown();

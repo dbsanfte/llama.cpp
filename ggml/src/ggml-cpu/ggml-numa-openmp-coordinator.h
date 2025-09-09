@@ -19,6 +19,9 @@ extern "C" {
 #include <stdbool.h>
 #include <pthread.h>
 
+// Include for work buffer calculation function type
+#include "numa-kernels/numa-kernels.h"
+
 // Constants
 #define NUMA_MAX_NODES 16  // Maximum NUMA nodes supported
 
@@ -182,7 +185,7 @@ enum ggml_status ggml_numa_openmp_execute_single_thread(
     struct ggml_tensor * tensor,
     ggml_numa_openmp_work_fn_t work_fn,
     int target_numa_node,
-    size_t work_buffer_size
+    ggml_numa_kernel_work_buffer_calc_fn_t work_buffer_calc_fn
 );
 
 /**
@@ -201,8 +204,7 @@ enum ggml_status ggml_numa_openmp_execute_single_node(
     struct ggml_tensor * tensor,
     ggml_numa_openmp_work_fn_t work_fn,
     int target_numa_node,
-    int n_threads,
-    size_t work_buffer_size
+    ggml_numa_kernel_work_buffer_calc_fn_t work_buffer_calc_fn
 );
 
 /**
@@ -218,7 +220,7 @@ enum ggml_status ggml_numa_openmp_execute_single_node(
 enum ggml_status ggml_numa_openmp_execute_data_parallel(
     struct ggml_tensor * tensor,
     ggml_numa_openmp_work_fn_t work_fn,
-    size_t work_buffer_size
+    ggml_numa_kernel_work_buffer_calc_fn_t work_buffer_calc_fn
 );
 
 /**

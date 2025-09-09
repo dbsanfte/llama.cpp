@@ -410,7 +410,7 @@ bool ggml_numa_apply_kernel_force_strategy(ggml_numa_kernel_query_result_t * res
 
 /**
  * NUMA slicing context structure
- * Contains all calculated slice boundaries for element-wise and sequence-wise operations
+ * Contains all calculated slice boundaries for element-wise, sequence-wise, and matrix operations
  */
 typedef struct {
     // NUMA-level slicing (across nodes)
@@ -429,6 +429,14 @@ typedef struct {
     int total_threads;           // Total threads on this NUMA node
     bool has_work;               // Whether this thread has work to do
     bool is_data_parallel;       // Whether data-parallel execution is active
+    
+    // Matrix multiplication specific fields (for 2D chunking)
+    int64_t nchunk0;             // Number of chunks in dimension 0
+    int64_t nchunk1;             // Number of chunks in dimension 1
+    int64_t nr0;                 // Total elements in dimension 0
+    int64_t nr1;                 // Total elements in dimension 1
+    int64_t dr0;                 // Elements per chunk in dimension 0
+    int64_t dr1;                 // Elements per chunk in dimension 1
 } ggml_numa_slice_context_t;
 
 /**
@@ -1583,6 +1591,220 @@ typedef struct {
  */
 #define NUMA_KERNEL_END_REFINED(ctx_name) \
     NUMA_KERNEL_END_BARRIER(*(ggml_numa_slice_context_t*)&(ctx_name))
+
+// ========================================================================
+// MATRIX MULTIPLICATION SPECIFIC MACROS
+// ========================================================================
+
+/**
+ * @brief 2D chunk-based work distribution for matrix multiplication
+ * 
+ * Implements the sophisticated 2D chunking strategy used by mul_mat reference.
+ * Distributes work across both output rows (nr0) and output columns (nr1)
+ * using configurable chunk sizes with NUMA-aware distribution.
+ * 
+ * @param ctx NUMA execution context (will be populated)
+ * @param tensor Target tensor (for dimensions)
+ * @param chunk_size Base chunk size (typically 16 for cache optimization)
+ * @param params Compute parameters
+ * @param adaptive_chunking Whether to use adaptive chunking for NUMA systems
+ */
+#define NUMA_SLICE_2D_CHUNKS(ctx, tensor, chunk_size, params, adaptive_chunking) do { \
+    /* Initialize basic context */ \
+    (ctx).thread_id = (params)->ith; \
+    (ctx).total_threads = (params)->nth; \
+    \
+    /* Get NUMA execution context from thread-local variables */ \
+    extern __thread int ggml_current_numa_node; \
+    extern __thread bool ggml_numa_is_data_parallel_execution; \
+    extern __thread int ggml_numa_total_nodes_for_data_parallel; \
+    \
+    (ctx).numa_node = ggml_current_numa_node; \
+    (ctx).is_data_parallel = ggml_numa_is_data_parallel_execution; \
+    \
+    /* Calculate matrix dimensions following mul_mat reference pattern */ \
+    const int64_t nr0 = (tensor)->ne[0];  /* First dimension of result */ \
+    const int64_t nr1 = (tensor)->ne[1] * (tensor)->ne[2] * (tensor)->ne[3];  /* Rest of dimensions */ \
+    \
+    /* Calculate chunk counts */ \
+    int64_t nchunk0 = (nr0 + (chunk_size) - 1) / (chunk_size); \
+    int64_t nchunk1 = (nr1 + (chunk_size) - 1) / (chunk_size); \
+    \
+    /* Adaptive chunking for NUMA systems (matches reference logic) */ \
+    if ((adaptive_chunking) && (nchunk0 * nchunk1 < (ctx).total_threads * 4 || (ctx).is_data_parallel)) { \
+        nchunk0 = nr0 > nr1 ? (ctx).total_threads : 1; \
+        nchunk1 = nr0 > nr1 ? 1 : (ctx).total_threads; \
+    } \
+    \
+    const int64_t total_chunks = nchunk0 * nchunk1; \
+    const int64_t dr0 = (nr0 + nchunk0 - 1) / nchunk0; \
+    const int64_t dr1 = (nr1 + nchunk1 - 1) / nchunk1; \
+    \
+    /* NUMA-aware chunk distribution */ \
+    if ((ctx).is_data_parallel) { \
+        size_t chunks_per_node = total_chunks / ggml_numa_total_nodes_for_data_parallel; \
+        (ctx).numa_start = (ctx).numa_node * chunks_per_node; \
+        (ctx).numa_end = ((ctx).numa_node == ggml_numa_total_nodes_for_data_parallel - 1) ? \
+                         total_chunks : (ctx).numa_start + chunks_per_node; \
+    } else { \
+        (ctx).numa_start = 0; \
+        (ctx).numa_end = total_chunks; \
+    } \
+    \
+    /* Thread-level chunk assignment within NUMA node */ \
+    size_t numa_chunks = (ctx).numa_end - (ctx).numa_start; \
+    size_t chunks_per_thread = (numa_chunks + (ctx).total_threads - 1) / (ctx).total_threads; \
+    size_t thread_start_local = (ctx).thread_id * chunks_per_thread; \
+    size_t thread_end_local = (thread_start_local + chunks_per_thread > numa_chunks) ? \
+                              numa_chunks : thread_start_local + chunks_per_thread; \
+    \
+    /* Convert to global chunk indices */ \
+    (ctx).thread_start = (ctx).numa_start + thread_start_local; \
+    (ctx).thread_end = (ctx).numa_start + thread_end_local; \
+    (ctx).thread_elements = (ctx).thread_end - (ctx).thread_start; \
+    \
+    /* Store chunk configuration for iteration macro */ \
+    (ctx).nchunk0 = nchunk0; \
+    (ctx).nchunk1 = nchunk1; \
+    (ctx).nr0 = nr0; \
+    (ctx).nr1 = nr1; \
+    (ctx).dr0 = dr0; \
+    (ctx).dr1 = dr1; \
+    \
+    /* Check if thread has work */ \
+    (ctx).has_work = ((ctx).thread_elements > 0); \
+} while(0)
+
+/**
+ * @brief Block-tiled iteration over 2D chunks with automatic bounds checking
+ * 
+ * Iterates over chunks assigned to this thread, providing block-tiled access
+ * within each chunk. Mirrors the reference mul_mat nested loop structure.
+ * 
+ * @param ctx NUMA context (must be set up with NUMA_SLICE_2D_CHUNKS)
+ * @param ir0_var Variable name for outer dimension iteration
+ * @param ir1_var Variable name for inner dimension iteration  
+ * @param iir0_var Variable name for block-level outer iteration
+ * @param iir1_var Variable name for block-level inner iteration
+ * @param block_size Block size for tiling (typically 16)
+ */
+#define NUMA_ITERATE_2D_CHUNKS_TILED(ctx, ir0_var, ir1_var, iir0_var, iir1_var, block_size) \
+    for (size_t __chunk_idx = (ctx).thread_start; __chunk_idx < (ctx).thread_end; __chunk_idx++) { \
+        /* Calculate 2D chunk coordinates */ \
+        const int64_t __ith0 = __chunk_idx % (ctx).nchunk0; \
+        const int64_t __ith1 = __chunk_idx / (ctx).nchunk0; \
+        \
+        /* Calculate chunk boundaries */ \
+        const int64_t __ir0_start = (ctx).dr0 * __ith0; \
+        const int64_t __ir0_end = ((__ir0_start + (ctx).dr0) > (ctx).nr0) ? (ctx).nr0 : (__ir0_start + (ctx).dr0); \
+        const int64_t __ir1_start = (ctx).dr1 * __ith1; \
+        const int64_t __ir1_end = ((__ir1_start + (ctx).dr1) > (ctx).nr1) ? (ctx).nr1 : (__ir1_start + (ctx).dr1); \
+        \
+        /* Block-tiled iteration within chunk (mirrors reference pattern) */ \
+        for (int64_t iir1_var = __ir1_start; iir1_var < __ir1_end; iir1_var += (block_size)) { \
+            for (int64_t iir0_var = __ir0_start; iir0_var < __ir0_end; iir0_var += (block_size)) { \
+                for (int64_t ir1_var = iir1_var; ir1_var < (iir1_var + (block_size)) && ir1_var < __ir1_end; ir1_var++) { \
+                    for (int64_t ir0_var = iir0_var; ir0_var < (iir0_var + (block_size)) && ir0_var < __ir0_end; ir0_var++)
+
+/**
+ * @brief End macro for NUMA_ITERATE_2D_CHUNKS_TILED
+ */
+#define NUMA_ITERATE_2D_CHUNKS_TILED_END() \
+                } \
+            } \
+        } \
+    }
+
+/**
+ * @brief Matrix multiplication broadcasting coordinate calculation
+ * 
+ * Handles the complex coordinate calculation for matrix multiplication
+ * including broadcasting factors r2, r3 used in the reference implementation.
+ * 
+ * @param ir1 Current output dimension 1 index
+ * @param ne1,ne2,ne12,ne13 Tensor dimensions
+ * @param i11,i12,i13 Output coordinate variables for src1
+ * @param i02,i03 Output coordinate variables for src0 (broadcasted)
+ * @param r2,r3 Broadcasting factors
+ */
+#define NUMA_MATMUL_BROADCAST_COORDS(ir1, ne1, ne2, ne12, ne13, i11, i12, i13, i02, i03, r2, r3) do { \
+    (i13) = (ir1) / ((ne12) * (ne1)); \
+    (i12) = ((ir1) - (i13) * (ne12) * (ne1)) / (ne1); \
+    (i11) = ((ir1) - (i13) * (ne12) * (ne1) - (i12) * (ne1)); \
+    \
+    /* Calculate broadcasting coordinates for src0 */ \
+    (i03) = (i13) / (r3); \
+    (i02) = (i12) / (r2); \
+} while(0)
+
+/**
+ * @brief Calculate memory pointers for matrix multiplication access patterns
+ * 
+ * Computes the specific memory access patterns used by mul_mat:
+ * - src0_row: Row-wise access with broadcasting
+ * - src1_col: Column-wise access (contiguous or strided)
+ * - dst_col: Output column pointer
+ * 
+ * @param src0_data,src1_data,dst_data Base tensor data pointers
+ * @param ir0,i11,i12,i13,i02,i03 Coordinate indices
+ * @param nb01,nb02,nb03,nb11,nb12,nb13,nb1,nb2,nb3 Tensor strides
+ * @param row_size Row size for src1 data
+ * @param src1_cont Whether src1 is contiguous
+ * @param src1_col_stride Stride for src1 columns
+ * @param src0_row_ptr,src1_col_ptr,dst_col_ptr Output pointer variables
+ */
+#define NUMA_MATMUL_ACCESS_POINTERS(src0_data, src1_data, dst_data, wdata, src1_type, vec_dot_type, \
+                                   ir0, i11, i12, i13, i02, i03, \
+                                   nb01, nb02, nb03, nb11, nb12, nb13, nb1, nb2, nb3, \
+                                   ne11, ne12, row_size, src1_cont, src1_col_stride, \
+                                   src0_row_ptr, src1_col_ptr, dst_col_ptr) do { \
+    /* src0 row pointer with broadcasting */ \
+    (src0_row_ptr) = (const char*)(src0_data) + (0 + (i02) * (nb02) + (i03) * (nb03)); \
+    \
+    /* src1 column pointer (contiguous or strided) */ \
+    const void * __wdata = ((src1_type) == (vec_dot_type)) ? (src1_data) : (wdata); \
+    (src1_col_ptr) = (const char*)__wdata + \
+        ((src1_cont) || (src1_type) != (vec_dot_type) \
+            ? ((i11) + (i12) * (ne11) + (i13) * (ne12) * (ne11)) * (row_size) \
+            : ((i11) * (nb11) + (i12) * (nb12) + (i13) * (nb13))); \
+    \
+    /* dst column pointer */ \
+    (dst_col_ptr) = (float*)((char*)(dst_data) + ((i11) * (nb1) + (i12) * (nb2) + (i13) * (nb3))); \
+} while(0)
+
+/**
+ * @brief Comprehensive setup macro for matrix multiplication kernels
+ * 
+ * Provides complete setup for mul_mat operations including 2D chunk distribution,
+ * shared memory access, and proper barrier handling for edge cases.
+ * 
+ * @param ctx NUMA execution context (will be populated)
+ * @param tensor Target tensor
+ * @param params Compute parameters
+ * @param dst_ptr Destination data pointer variable
+ * @param data_type Data type (typically float)
+ * @param chunk_size Chunk size for 2D distribution
+ */
+#define NUMA_KERNEL_MATMUL_SETUP(ctx, tensor, params, dst_ptr, data_type, chunk_size) do { \
+    NUMA_SLICE_2D_CHUNKS(ctx, tensor, chunk_size, params, true); \
+    NUMA_GET_SHARED_DATA(tensor, dst_ptr, data_type); \
+    \
+    /* Handle threads with no work - must participate in all barriers */ \
+    if (!(ctx).has_work) { \
+        if ((ctx).is_data_parallel || (ctx).total_threads > 1) { \
+            /* Check if type conversion barrier is needed */ \
+            const struct ggml_tensor * __src1 = (tensor)->src[1]; \
+            if (__src1) { \
+                const struct ggml_type_traits_cpu * __traits = ggml_get_type_traits_cpu((tensor)->src[0]->type); \
+                if (__src1->type != __traits->vec_dot_type) { \
+                    NUMA_OPENMP_BARRIER(); /* Type conversion barrier */ \
+                } \
+            } \
+            NUMA_OPENMP_BARRIER(); /* Computation completion barrier */ \
+        } \
+        return GGML_STATUS_SUCCESS; \
+    } \
+} while(0)
 
 // ========================================================================
 // DEBUGGING AND LOGGING MACROS  

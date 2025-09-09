@@ -47,6 +47,8 @@
 #include <algorithm>
 #include <stdexcept>
 #include <regex>
+#include <thread>
+#include <algorithm>
 
 // GGML includes
 #include "ggml.h"
@@ -127,7 +129,7 @@ const std::vector<enum ggml_type> SUPPORTED_QUANT_TYPES = {
     GGML_TYPE_IQ1_M,   // Intelligent quantization 1-bit M
     GGML_TYPE_IQ4_NL,  // Intelligent quantization 4-bit NL
     GGML_TYPE_IQ4_XS,  // Intelligent quantization 4-bit XS
-    GGML_TYPE_Q8_K,    // K-quantization 8-bit
+    // GGML_TYPE_Q8_K,    // K-quantization 8-bit - not supported as src0 type (no vec_dot function, used as vec_dot_type)
     GGML_TYPE_BF16,    // Brain float16
     GGML_TYPE_TQ1_0,   // Ternary quantization 1-bit
     GGML_TYPE_TQ2_0    // Ternary quantization 2-bit
@@ -142,15 +144,17 @@ TestConfig get_test_config(TestSizeClass size_class, int num_threads, enum ggml_
     
     switch (size_class) {
         case TINY:
-            // Small matrix: src0=[64,32,1,1] @ src1=[64,16,1,1] = dst=[32,16,1,1]
-            config.src0_ne0 = 64; config.src0_ne1 = 32; config.src0_ne2 = 1; config.src0_ne3 = 1;
-            config.src1_ne0 = 64; config.src1_ne1 = 16; config.src1_ne2 = 1; config.src1_ne3 = 1;
+            // Small matrix: src0=[256,32,1,1] @ src1=[256,16,1,1] = dst=[32,16,1,1]
+            // Note: First dimension must be multiple of 256 for K-quantization (QK_K = 256)
+            config.src0_ne0 = 256; config.src0_ne1 = 32; config.src0_ne2 = 1; config.src0_ne3 = 1;
+            config.src1_ne0 = 256; config.src1_ne1 = 16; config.src1_ne2 = 1; config.src1_ne3 = 1;
             config.test_name = "TINY";
             break;
         case SMALL:
-            // Medium matrix: src0=[128,64,1,1] @ src1=[128,32,1,1] = dst=[64,32,1,1]
-            config.src0_ne0 = 128; config.src0_ne1 = 64; config.src0_ne2 = 1; config.src0_ne3 = 1;
-            config.src1_ne0 = 128; config.src1_ne1 = 32; config.src1_ne2 = 1; config.src1_ne3 = 1;
+            // Medium matrix: src0=[256,64,1,1] @ src1=[256,32,1,1] = dst=[64,32,1,1]
+            // Note: First dimension must be multiple of 256 for K-quantization (QK_K = 256)
+            config.src0_ne0 = 256; config.src0_ne1 = 64; config.src0_ne2 = 1; config.src0_ne3 = 1;
+            config.src1_ne0 = 256; config.src1_ne1 = 32; config.src1_ne2 = 1; config.src1_ne3 = 1;
             config.test_name = "SMALL";
             break;
         case MEDIUM:
@@ -249,7 +253,7 @@ struct ggml_tensor* create_mul_mat_operation(struct ggml_context* ctx, const Tes
 }
 
 // Test MUL_MAT operation correctness
-bool test_mul_mat_correctness(const TestConfig& config, const std::string& test_description) {
+bool test_mul_mat_correctness(const TestConfig& config, const std::string& test_description, ggml_numa_execution_strategy_t strategy) {
     const size_t ctx_size = 256 * 1024 * 1024;  // 256MB context
     
     try {
@@ -293,18 +297,48 @@ bool test_mul_mat_correctness(const TestConfig& config, const std::string& test_
         struct ggml_tensor* result_ref = create_mul_mat_operation(ctx_ref, config, src0_ref, src1_ref);
         struct ggml_tensor* result_numa = create_mul_mat_operation(ctx_numa, config, src0_numa, src1_numa);
         
-        // Create computation graphs
-        struct ggml_cgraph* gf_ref = ggml_new_graph(ctx_ref);
-        struct ggml_cgraph* gf_numa = ggml_new_graph(ctx_numa);
+        // Execute both reference and NUMA computations
         
-        ggml_build_forward_expand(gf_ref, result_ref);
-        ggml_build_forward_expand(gf_numa, result_numa);
+        // 1. REFERENCE: Use direct ggml computation (bypassing NUMA entirely)
+        ggml_numa_set_fallback_flag(true);  // Force fallback to reference implementation
         
-        // Execute reference computation (standard CPU)
-        ggml_graph_compute_with_ctx(ctx_ref, gf_ref, config.num_threads);
+        struct ggml_cgraph* ref_graph = ggml_new_graph(ctx_ref);
+        ggml_build_forward_expand(ref_graph, result_ref);
         
-        // Execute NUMA computation
-        ggml_graph_compute_with_ctx(ctx_numa, gf_numa, config.num_threads);
+        struct ggml_cplan ref_plan = ggml_graph_plan(ref_graph, 1, nullptr);  // Single thread
+        if (ref_plan.work_size > 0) {
+            ref_plan.work_data = (uint8_t*)malloc(ref_plan.work_size);
+        }
+        
+        printf("   Executing TRUE reference implementation (bypassing NUMA)...\n");
+        ggml_graph_compute(ref_graph, &ref_plan);
+        
+        ggml_numa_set_fallback_flag(false);  // Re-enable NUMA dispatch
+        
+        if (ref_plan.work_data) {
+            free(ref_plan.work_data);
+        }
+        
+        // 2. NUMA: Use NUMA executor with forced strategy
+        ggml_numa_set_fallback_flag(false);  // Ensure NUMA dispatch is enabled
+        
+        // Create minimal computation plan for NUMA execution
+        struct ggml_cplan cplan = ggml_graph_plan(ggml_new_graph(ctx_numa), 1, nullptr);
+        cplan.work_size = 0;
+        cplan.work_data = nullptr;
+        cplan.n_threads = 1;  // Will be updated by coordinator
+        cplan.threadpool = nullptr;
+        cplan.abort_callback = nullptr;
+        cplan.abort_callback_data = nullptr;
+        
+        enum ggml_status dispatch_result = ggml_numa_executor_execute_tensor_forced_strategy(result_numa, &cplan, strategy);
+        
+        if (dispatch_result != GGML_STATUS_SUCCESS) {
+            printf("❌ NUMA execution failed with status %d\n", (int)dispatch_result);
+            ggml_free(ctx_ref);
+            ggml_free(ctx_numa);
+            return false;
+        }
         
         // Compare results
         const float* ref_data = (const float*)ggml_get_data(result_ref);
@@ -345,7 +379,7 @@ TestResult run_mul_mat_test(TestSizeClass size_class, int num_threads, enum ggml
            config.src0_ne1, config.src1_ne1, config.src0_ne2, config.src0_ne3,  // result dimensions
            num_threads);
     
-    bool passed = test_mul_mat_correctness(config, test_name);
+    bool passed = test_mul_mat_correctness(config, test_name, NUMA_STRATEGY_DATA_PARALLEL);  // Default to data parallel for old tests
     
     if (passed) {
         printf("   ✅ PASSED\n");
@@ -392,7 +426,25 @@ TestResult run_mul_mat_test_with_strategy(TestSizeClass size_class, enum ggml_ty
     // Set up NUMA strategy - OpenMP coordinator handles threading automatically
     ggml_numa_init(strategy);
     
-    bool passed = test_mul_mat_correctness(config, test_name);
+    // Map test strategy to execution strategy
+    ggml_numa_execution_strategy_t execution_strategy;
+    switch (strategy) {
+        case GGML_NUMA_STRATEGY_MIRROR:
+            if (thread_constraint == 1) {
+                execution_strategy = NUMA_STRATEGY_SINGLE_THREAD;  // Single/Single
+            } else {
+                execution_strategy = NUMA_STRATEGY_DATA_PARALLEL;  // Data-Parallel
+            }
+            break;
+        case GGML_NUMA_STRATEGY_ISOLATE:
+            execution_strategy = NUMA_STRATEGY_SINGLE_NODE;  // Single/Multi
+            break;
+        default:
+            execution_strategy = NUMA_STRATEGY_DATA_PARALLEL;
+            break;
+    }
+    
+    bool passed = test_mul_mat_correctness(config, test_name, execution_strategy);
     
     if (passed) {
         printf("   ✅ PASSED\n");
@@ -413,10 +465,18 @@ int main(int argc, char* argv[]) {
     printf("=======================================================\n\n");
     
     // Parse command line arguments for test filtering
-    if (argc >= 2) {
-        g_test_filter = argv[1];
-        g_filter_enabled = true;
-        printf("🔍 Test filter enabled: '%s'\n\n", g_test_filter.c_str());
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--filter") == 0 && i + 1 < argc) {
+            g_test_filter = argv[i + 1];
+            g_filter_enabled = true;
+            printf("🔍 Test filter enabled: '%s'\n\n", g_test_filter.c_str());
+            i++; // Skip the filter pattern argument
+        } else if (i == 1) {
+            // For backward compatibility: first argument without --filter flag
+            g_test_filter = argv[1];
+            g_filter_enabled = true;
+            printf("🔍 Test filter enabled: '%s'\n\n", g_test_filter.c_str());
+        }
     }
     
     std::vector<TestResult> results;
@@ -485,8 +545,8 @@ int main(int argc, char* argv[]) {
         GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_Q4_0, GGML_TYPE_Q4_1, 
         GGML_TYPE_Q5_0, GGML_TYPE_Q5_1, GGML_TYPE_Q8_0,  // Q8_1 removed - not supported as src0
         GGML_TYPE_Q2_K, GGML_TYPE_Q3_K, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K,
-        GGML_TYPE_IQ4_NL, GGML_TYPE_IQ4_XS, GGML_TYPE_Q8_K, GGML_TYPE_BF16,
-        GGML_TYPE_TQ1_0, GGML_TYPE_TQ2_0
+        GGML_TYPE_IQ4_NL, GGML_TYPE_IQ4_XS, // GGML_TYPE_Q8_K - removed, not supported as src0 (no vec_dot function)
+        GGML_TYPE_BF16, GGML_TYPE_TQ1_0, GGML_TYPE_TQ2_0
     };
     
     for (auto qtype : testable_types) {

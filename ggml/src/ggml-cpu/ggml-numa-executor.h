@@ -86,6 +86,19 @@ enum ggml_status ggml_numa_executor_compute_graph(
     struct ggml_cplan * cplan);
 
 /**
+ * @brief Execute compute graph using NUMA-aware executor
+ * 
+ * Alternative entry point for compute graph execution with NUMA optimization.
+ * Provides similar functionality to ggml_numa_executor_compute_graph() but
+ * with different internal optimization paths.
+ * 
+ * @param cgraph The compute graph to execute
+ * @param cplan The compute plan
+ * @return GGML_STATUS_SUCCESS on success, error code on failure
+ */
+enum ggml_status ggml_numa_executor_execute_graph(struct ggml_cgraph * cgraph, struct ggml_cplan * cplan);
+
+/**
  * @brief Execute a single tensor operation using optimal NUMA strategy
  * 
  * Core execution function that analyzes a single tensor operation and
@@ -123,34 +136,21 @@ enum ggml_status ggml_numa_executor_execute_tensor_forced_strategy(
     ggml_numa_execution_strategy_t forced_strategy);
 
 /**
- * @brief Execute compute graph using NUMA-aware executor
+ * @brief Direct Fallback kernel dispatch function for maximum performance
  * 
- * Alternative entry point for compute graph execution with NUMA optimization.
- * Provides similar functionality to ggml_numa_executor_compute_graph() but
- * with different internal optimization paths.
+ * High-performance execution path that eliminates temporary graph overhead
+ * by calling compute functions directly. This function provides the fastest
+ * possible execution for fallback operations in ggml-cpu.c
  * 
- * @param cgraph The compute graph to execute
- * @param cplan The compute plan
- * @return GGML_STATUS_SUCCESS on success, error code on failure
- */
-enum ggml_status ggml_numa_executor_execute_graph(struct ggml_cgraph * cgraph, struct ggml_cplan * cplan);
-
-/**
- * @brief Direct kernel dispatch for maximum performance (OPTIMIZED VERSION)
+ * Performance Benefits:
+ * - Zero-copy operation without graph allocation
+ * - Direct function call without dispatch overhead
  * 
- * High-performance execution path that calls compute functions directly
- * without temporary graph creation overhead. This eliminates performance
- * bottlenecks in the fallback system by providing:
- * - Zero-copy direct kernel invocation
- * - Minimal function call overhead
- * - Optimized resource management
- * - Cache-friendly execution patterns
+ * Use Cases:
+ * - Fallback path when no NUMA kernel exists for an op
  * 
- * Calls compute functions directly without temporary graph creation overhead
- * This eliminates the performance bottlenecks in the fallback system
- * 
- * @param tensor The operation tensor
- * @param cplan The compute plan
+ * @param tensor The operation tensor to execute
+ * @param cplan The compute plan with threading and buffer information
  * @return GGML_STATUS_SUCCESS on success, error code on failure
  */
 enum ggml_status ggml_numa_executor_direct_kernel_dispatch(struct ggml_tensor * tensor, struct ggml_cplan * cplan);
@@ -167,27 +167,6 @@ enum ggml_status ggml_numa_executor_direct_kernel_dispatch(struct ggml_tensor * 
  * @return GGML_STATUS_SUCCESS on success, error code on failure
  */
 enum ggml_status ggml_numa_executor_call_direct_kernel(struct ggml_tensor * tensor, struct ggml_compute_params * params);
-
-/**
- * @brief Fallback to standard CPU implementation (LEGACY VERSION)
- * 
- * Provides compatibility fallback for operations not yet supported by
- * the NUMA kernel system. This calls ggml-cpu.c functions via temporary
- * graph creation, which has higher overhead but ensures compatibility.
- * 
- * Used when:
- * - Operation not registered in NUMA kernel registry
- * - NUMA system initialization failed
- * - Explicit fallback requested for debugging
- * 
- * This calls ggml-cpu.c functions via temporary graph (high overhead)
- * Should be replaced by direct kernel dispatch for better performance
- * 
- * @param tensor The operation tensor
- * @param cplan The compute plan
- * @return GGML_STATUS_SUCCESS on success, error code on failure
- */
-enum ggml_status ggml_numa_executor_fallback_to_cpu(struct ggml_tensor * tensor, struct ggml_cplan * cplan);
 
 #ifdef __cplusplus
 }
