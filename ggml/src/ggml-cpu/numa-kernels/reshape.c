@@ -49,33 +49,11 @@
  */
 enum ggml_status ggml_numa_kernel_reshape_execute(void * work_context, 
                                                    struct ggml_compute_params * params) {
-    // Validate parameters for consistency with other NUMA kernels
-    NUMA_ASSERT(work_context != NULL, "Work context cannot be null");
-    NUMA_ASSERT(params != NULL, "Compute params cannot be null");
+    // RESHAPE is a metadata-only operation - no computation required
+    // The reshape is handled by the ggml tensor system
     
-    struct ggml_tensor * tensor = (struct ggml_tensor *)work_context;
-    NUMA_ASSERT(tensor != NULL, "Tensor cannot be null");
-    NUMA_ASSERT(tensor->op == GGML_OP_RESHAPE, "Expected RESHAPE operation");
-    
-    // Get NUMA execution context for logging
-    extern __thread int ggml_current_numa_node;
-    extern __thread bool ggml_numa_is_data_parallel_execution;
-    
-    NUMA_LOG_TRACE("NUMA RESHAPE kernel executing on node %d (data_parallel=%s) - tensor: %s",
-                   ggml_current_numa_node, 
-                   ggml_numa_is_data_parallel_execution ? "true" : "false",
-                   tensor->name ? tensor->name : "unnamed");
-    
-    NUMA_LOG_VERBOSE("RESHAPE Node %d: No-op execution for tensor [%ld,%ld,%ld,%ld] -> [%ld,%ld,%ld,%ld]",
-                     ggml_current_numa_node,
-                     tensor->src[0] ? tensor->src[0]->ne[0] : 0,
-                     tensor->src[0] ? tensor->src[0]->ne[1] : 0, 
-                     tensor->src[0] ? tensor->src[0]->ne[2] : 0,
-                     tensor->src[0] ? tensor->src[0]->ne[3] : 0,
-                     tensor->ne[0], tensor->ne[1], tensor->ne[2], tensor->ne[3]);
-    
-    // RESHAPE: Return immediately with success
-    // No computation required - metadata operation only
+    // This function should never be called.
+    NUMA_ASSERT(false, "RESHAPE kernel execute function should not be called - metadata-only operation");
     return GGML_STATUS_SUCCESS;
 }
 
@@ -125,6 +103,7 @@ ggml_numa_kernel_registration_info_t ggml_numa_kernel_reshape_register(void) {
     info.op_type = GGML_OP_RESHAPE;
     info.supported = true;
     info.kernel_name = "NUMA RESHAPE Kernel";
+    info.is_noop = true; // This kernel doesn't do any calculations
     
     // Strategy thresholds - always use single-thread for metadata operations
     info.strategy_array.thresholds[NUMA_STRATEGY_IDX_SINGLE_SINGLE] = SIZE_MAX;  // Always single-thread

@@ -61,6 +61,10 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
         ggml-cpu/numa-kernels/transpose.h
         ggml-cpu/numa-kernels/view.c
         ggml-cpu/numa-kernels/view.h
+        ggml-cpu/numa-kernels/permute.c
+        ggml-cpu/numa-kernels/permute.h
+        ggml-cpu/numa-kernels/rms_norm.c
+        ggml-cpu/numa-kernels/rms_norm.h
         ggml-work-item.c
         ggml-cpu/repack.cpp
         ggml-cpu/repack.h

@@ -646,6 +646,25 @@ typedef struct {
 } while(0)
 
 /**
+ * 3D nested loop kernel template with barrier handling for operations like RMS_NORM
+ * This macro provides setup for operations with 3D nested loops where only the middle
+ * dimension (ne[1] = i01) is distributed across threads, while outer dimensions
+ * (ne[2] = i02, ne[3] = i03) are processed in full by each thread
+ */
+#define NUMA_KERNEL_3D_NESTED_SETUP(ctx, tensor, params, dst_ptr, data_type) do { \
+    NUMA_SLICE_ROWS_1D(ctx, tensor, params); \
+    NUMA_GET_SHARED_DATA(tensor, dst_ptr, data_type); \
+    \
+    /* Handle threads with no work - must participate in barrier */ \
+    if (!(ctx).has_work) { \
+        if ((ctx).is_data_parallel || (ctx).total_threads > 1) { \
+            NUMA_OPENMP_BARRIER(); \
+        } \
+        return GGML_STATUS_SUCCESS; \
+    } \
+} while(0)
+
+/**
  * End-of-kernel barrier for kernels that completed work
  * All kernels should call this at the end to ensure synchronization
  */
