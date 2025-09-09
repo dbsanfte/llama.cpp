@@ -1826,6 +1826,502 @@ typedef struct {
 } while(0)
 
 // ========================================================================
+// COMPOSABLE KERNEL BUILDING BLOCKS SYSTEM
+// ========================================================================
+
+/**
+ * COMPOSABLE NUMA KERNEL MACROS
+ * 
+ * This system provides atomic building blocks that can be combined like Lego pieces
+ * to construct NUMA kernels. Based on combinator patterns from functional programming,
+ * these macros separate concerns and promote code reuse.
+ * 
+ * DESIGN PRINCIPLES:
+ * - Each macro does ONE thing well
+ * - Macros compose naturally without conflicts
+ * - Clear naming indicates purpose and usage
+ * - All error handling and edge cases built-in
+ * - Consistent parameter ordering across all macros
+ * 
+ * USAGE PATTERN:
+ * 1. Setup kernel context and validate inputs
+ * 2. Choose data access strategy (memory layout)
+ * 3. Select iteration pattern (loop structure)
+ * 4. Define computation operations
+ * 5. Handle synchronization requirements
+ */
+
+// ========================================================================
+// ATOMIC BUILDING BLOCKS - Level 1 Primitives
+// ========================================================================
+
+/**
+ * @group Context Setup Building Blocks
+ * Initialize execution context and validate kernel inputs
+ */
+
+/**
+ * @brief Initialize NUMA execution context with thread and node information
+ * @param ctx Variable name for ggml_numa_slice_context_t (will be declared)
+ * @param tensor Target tensor being processed
+ * @param params Compute parameters from OpenMP coordinator
+ * 
+ * WHAT IT DOES:
+ * - Declares and initializes slice context variable
+ * - Extracts thread ID, thread count, NUMA node information
+ * - Sets up data-parallel execution flags
+ * - Prepares context for subsequent building blocks
+ * 
+ * USAGE:
+ *   NUMA_INIT_CONTEXT(ctx, tensor, params);
+ *   // ctx is now ready for slicing operations
+ */
+#define NUMA_INIT_CONTEXT(ctx, tensor, params) \
+    ggml_numa_slice_context_t ctx; \
+    do { \
+        (ctx).thread_id = (params)->ith; \
+        (ctx).total_threads = (params)->nth; \
+        \
+        extern __thread int ggml_current_numa_node; \
+        extern __thread bool ggml_numa_is_data_parallel_execution; \
+        extern __thread int ggml_numa_total_nodes_for_data_parallel; \
+        \
+        (ctx).numa_node = ggml_current_numa_node; \
+        (ctx).is_data_parallel = ggml_numa_is_data_parallel_execution; \
+    } while(0)
+
+/**
+ * @brief Validate kernel inputs with automatic error handling
+ * @param tensor Target tensor (checked for NULL)
+ * @param params Compute parameters (checked for NULL)
+ * @param ... Additional validation expressions (optional)
+ * 
+ * WHAT IT DOES:
+ * - Validates essential inputs are not NULL
+ * - Checks tensor structure integrity
+ * - Executes custom validation expressions
+ * - Returns early with error status if validation fails
+ * 
+ * USAGE:
+ *   NUMA_VALIDATE_INPUTS(tensor, params, 
+ *                        tensor->ne[0] > 0,
+ *                        tensor->src[0] != NULL);
+ */
+#define NUMA_VALIDATE_INPUTS(tensor, params, ...) do { \
+    NUMA_ASSERT((tensor) != NULL, "Tensor cannot be null"); \
+    NUMA_ASSERT((params) != NULL, "Compute params cannot be null"); \
+    NUMA_ASSERT(tensor_data(tensor) != NULL, "Tensor data cannot be null"); \
+    __VA_ARGS__ \
+} while(0)
+
+/**
+ * @group Memory Access Building Blocks  
+ * Handle tensor memory access with NUMA-awareness
+ */
+
+/**
+ * @brief Get typed pointer to tensor data with NUMA optimization
+ * @param ptr_var Variable name for output pointer (will be declared)
+ * @param tensor Source tensor
+ * @param data_type Data type for pointer (e.g., float, ggml_fp16_t)
+ * 
+ * WHAT IT DOES:
+ * - Declares typed pointer variable
+ * - Handles NUMA memory mirroring if available
+ * - Falls back to standard tensor data access
+ * - Optimizes for shared memory scenarios
+ * 
+ * USAGE:
+ *   NUMA_GET_TYPED_POINTER(src_data, tensor->src[0], float);
+ *   NUMA_GET_TYPED_POINTER(dst_data, tensor, ggml_fp16_t);
+ */
+#define NUMA_GET_TYPED_POINTER(ptr_var, tensor, data_type) \
+    data_type * ptr_var; \
+    do { \
+        extern __thread void * ggml_numa_shared_result_tensor_data; \
+        if (ggml_numa_shared_result_tensor_data && (tensor) && \
+            tensor_data(tensor) == ggml_numa_shared_result_tensor_data) { \
+            ptr_var = (data_type *)ggml_numa_shared_result_tensor_data; \
+        } else { \
+            ptr_var = (data_type *)tensor_data(tensor); \
+        } \
+    } while(0)
+
+/**
+ * @brief Access source tensor with validation
+ * @param ptr_var Variable name for output pointer (will be declared)
+ * @param tensor Target tensor (uses tensor->src[src_index])
+ * @param src_index Source tensor index (0, 1, etc.)
+ * @param data_type Data type for pointer
+ * 
+ * WHAT IT DOES:
+ * - Validates source tensor exists
+ * - Gets typed pointer to source data
+ * - Handles const-correctness
+ * 
+ * USAGE:
+ *   NUMA_GET_SOURCE_POINTER(src0_data, tensor, 0, float);
+ *   NUMA_GET_SOURCE_POINTER(src1_data, tensor, 1, float);
+ */
+#define NUMA_GET_SOURCE_POINTER(ptr_var, tensor, src_index, data_type) \
+    const data_type * ptr_var; \
+    do { \
+        NUMA_ASSERT((tensor)->src[src_index] != NULL, "Source tensor " #src_index " cannot be null"); \
+        ptr_var = (const data_type *)tensor_data((tensor)->src[src_index]); \
+    } while(0)
+
+/**
+ * @group Data Slicing Building Blocks
+ * Distribute work across threads and NUMA nodes
+ */
+
+/**
+ * @brief Slice data contiguously across all dimensions  
+ * @param ctx NUMA execution context (must be initialized)
+ * @param tensor Target tensor
+ * 
+ * WHAT IT DOES:
+ * - Calculates total elements (ne[0] * ne[1] * ne[2] * ne[3])
+ * - Distributes elements linearly across NUMA nodes and threads
+ * - Sets thread_start, thread_end, thread_elements in context
+ * - Handles remainder elements correctly
+ * 
+ * WHEN TO USE:
+ * - Element-wise operations (ADD, MUL, etc.)
+ * - Operations that treat tensor as flat array
+ * - When memory access pattern doesn't matter
+ * 
+ * USAGE:
+ *   NUMA_SLICE_CONTIGUOUS(ctx, tensor);
+ *   // Process elements from ctx.thread_start to ctx.thread_end
+ */
+#define NUMA_SLICE_CONTIGUOUS(ctx, tensor) do { \
+    size_t total_elements = ggml_nelements(tensor); \
+    \
+    /* NUMA-level slicing */ \
+    if ((ctx).is_data_parallel) { \
+        extern __thread int ggml_numa_total_nodes_for_data_parallel; \
+        size_t elements_per_node = total_elements / ggml_numa_total_nodes_for_data_parallel; \
+        (ctx).numa_start = (ctx).numa_node * elements_per_node; \
+        (ctx).numa_end = ((ctx).numa_node == ggml_numa_total_nodes_for_data_parallel - 1) ? \
+                         total_elements : (ctx).numa_start + elements_per_node; \
+    } else { \
+        (ctx).numa_start = 0; \
+        (ctx).numa_end = total_elements; \
+    } \
+    \
+    /* Thread-level slicing within NUMA node */ \
+    size_t numa_elements = (ctx).numa_end - (ctx).numa_start; \
+    size_t elements_per_thread = (numa_elements + (ctx).total_threads - 1) / (ctx).total_threads; \
+    size_t thread_start_local = (ctx).thread_id * elements_per_thread; \
+    size_t thread_end_local = (thread_start_local + elements_per_thread > numa_elements) ? \
+                              numa_elements : thread_start_local + elements_per_thread; \
+    \
+    /* Convert to global indices */ \
+    (ctx).thread_start = (ctx).numa_start + thread_start_local; \
+    (ctx).thread_end = (ctx).numa_start + thread_end_local; \
+    (ctx).thread_elements = (ctx).thread_end - (ctx).thread_start; \
+    (ctx).has_work = ((ctx).thread_elements > 0); \
+} while(0)
+
+/**
+ * @brief Slice tensor rows (ne[1] dimension only)
+ * @param ctx NUMA execution context (must be initialized)  
+ * @param tensor Target tensor
+ * 
+ * WHAT IT DOES:
+ * - Distributes rows (ne[1] dimension) across threads
+ * - Leaves other dimensions (ne[0], ne[2], ne[3]) unsliced
+ * - Each thread processes full rows but subset of row indices
+ * 
+ * WHEN TO USE:
+ * - Row-wise operations where each row is independent
+ * - Operations that need to process complete rows
+ * - When outer dimensions (ne[2], ne[3]) should be fully processed per thread
+ * 
+ * USAGE:
+ *   NUMA_SLICE_ROWS_ATOMIC(ctx, tensor);
+ *   // Process rows ctx.thread_start to ctx.thread_end
+ *   for (i02) for (i01 = ctx.thread_start; i01 < ctx.thread_end; i01++)
+ */
+#define NUMA_SLICE_ROWS_ATOMIC(ctx, tensor) do { \
+    size_t total_rows = (tensor)->ne[1]; \
+    \
+    /* NUMA-level slicing */ \
+    if ((ctx).is_data_parallel) { \
+        extern __thread int ggml_numa_total_nodes_for_data_parallel; \
+        size_t rows_per_node = total_rows / ggml_numa_total_nodes_for_data_parallel; \
+        (ctx).numa_start = (ctx).numa_node * rows_per_node; \
+        (ctx).numa_end = ((ctx).numa_node == ggml_numa_total_nodes_for_data_parallel - 1) ? \
+                         total_rows : (ctx).numa_start + rows_per_node; \
+    } else { \
+        (ctx).numa_start = 0; \
+        (ctx).numa_end = total_rows; \
+    } \
+    \
+    /* Thread-level slicing within NUMA node */ \
+    size_t numa_rows = (ctx).numa_end - (ctx).numa_start; \
+    size_t rows_per_thread = (numa_rows + (ctx).total_threads - 1) / (ctx).total_threads; \
+    size_t thread_start_local = (ctx).thread_id * rows_per_thread; \
+    size_t thread_end_local = (thread_start_local + rows_per_thread > numa_rows) ? \
+                              numa_rows : thread_start_local + rows_per_thread; \
+    \
+    /* Convert to global row indices */ \
+    (ctx).thread_start = (ctx).numa_start + thread_start_local; \
+    (ctx).thread_end = (ctx).numa_start + thread_end_local; \
+    (ctx).thread_elements = (ctx).thread_end - (ctx).thread_start; \
+    (ctx).has_work = ((ctx).thread_elements > 0); \
+} while(0)
+
+/**
+ * @group Early Exit Building Blocks
+ * Handle threads with no work assignment
+ */
+
+/**
+ * @brief Handle threads that have no work with automatic barrier participation
+ * @param ctx NUMA execution context
+ * @param return_value Value to return (typically GGML_STATUS_SUCCESS)
+ * 
+ * WHAT IT DOES:
+ * - Checks if thread has work assigned (ctx.has_work)
+ * - If no work: participates in barrier and returns early
+ * - If has work: continues execution
+ * - Ensures all threads participate in synchronization
+ * 
+ * WHEN TO USE:
+ * - After any slicing operation
+ * - Before starting actual computation
+ * - To ensure proper thread synchronization
+ * 
+ * USAGE:
+ *   NUMA_EARLY_EXIT_IF_NO_WORK(ctx, GGML_STATUS_SUCCESS);
+ *   // Only threads with work continue past this point
+ */
+#define NUMA_EARLY_EXIT_IF_NO_WORK(ctx, return_value) do { \
+    if (!(ctx).has_work) { \
+        if ((ctx).is_data_parallel || (ctx).total_threads > 1) { \
+            NUMA_OPENMP_BARRIER(); \
+        } \
+        return return_value; \
+    } \
+} while(0)
+
+/**
+ * @group Synchronization Building Blocks
+ * Handle thread and NUMA node synchronization
+ */
+
+/**
+ * @brief Automatic barrier - only when needed
+ * @param ctx NUMA execution context
+ * 
+ * WHAT IT DOES:
+ * - Inserts OpenMP barrier only when multiple threads/nodes are active
+ * - Optimizes single-thread case (no barrier overhead)
+ * - Ensures all threads reach synchronization point
+ * 
+ * WHEN TO USE:
+ * - End of kernel execution
+ * - Before/after shared data modifications
+ * - When all threads must complete before continuing
+ * 
+ * USAGE:
+ *   NUMA_BARRIER_AUTO(ctx);
+ */
+#define NUMA_BARRIER_AUTO(ctx) do { \
+    if ((ctx).is_data_parallel || (ctx).total_threads > 1) { \
+        NUMA_OPENMP_BARRIER(); \
+    } \
+} while(0)
+
+/**
+ * @brief Always insert barrier regardless of thread count
+ * 
+ * WHAT IT DOES:
+ * - Unconditionally inserts OpenMP barrier
+ * - Use sparingly - has overhead in single-thread case
+ * 
+ * WHEN TO USE:
+ * - Debugging race conditions
+ * - Critical synchronization points
+ * - When barrier is always required regardless of configuration
+ */
+#define NUMA_BARRIER_ALWAYS() do { \
+    NUMA_OPENMP_BARRIER(); \
+} while(0)
+
+/**
+ * @brief Never insert barrier (no-op)
+ * 
+ * WHAT IT DOES:
+ * - No synchronization (compile-time no-op)
+ * - Use for lockfree algorithms or single-threaded operations
+ * 
+ * WHEN TO USE:
+ * - View operations (metadata-only)
+ * - Lockfree algorithms
+ * - When synchronization is handled elsewhere
+ */
+#define NUMA_BARRIER_NEVER() do { \
+    /* No barrier */ \
+} while(0)
+
+// ========================================================================
+// COMPOSED KERNEL TEMPLATES - Level 2 Building Blocks  
+// ========================================================================
+
+/**
+ * KERNEL COMPOSITION TEMPLATES
+ * 
+ * These macros combine atomic building blocks into common kernel patterns.
+ * They provide ready-made templates for the most frequent NUMA kernel types.
+ * Think of these as "kernel recipes" that handle the infrastructure while
+ * you focus on the mathematical computation.
+ */
+
+/**
+ * @brief Complete element-wise kernel template
+ * @param ctx Context variable name (will be declared and initialized)
+ * @param tensor Target tensor
+ * @param params Compute parameters
+ * @param dst_ptr Destination pointer variable name (will be declared)
+ * @param data_type Data type (typically float)
+ * 
+ * WHAT IT PROVIDES:
+ * - Complete setup and validation
+ * - Contiguous data slicing
+ * - Early exit for threads without work
+ * - Typed destination pointer
+ * - Ready for element-wise computation
+ * 
+ * WHAT YOU NEED TO ADD:
+ * - The actual computation logic
+ * - Source data access if needed
+ * - Final barrier call
+ * 
+ * USAGE EXAMPLE:
+ *   NUMA_ELEMENTWISE_KERNEL_SETUP(ctx, tensor, params, dst_data, float);
+ *   const float* src_data = ...;
+ *   // Compute on elements from ctx.thread_start to ctx.thread_end
+ *   ggml_vec_add_f32(ctx.thread_elements, dst_data + ctx.thread_start, ...);
+ *   NUMA_BARRIER_AUTO(ctx);
+ */
+#define NUMA_ELEMENTWISE_KERNEL_SETUP(ctx, tensor, params, dst_ptr, data_type) \
+    NUMA_INIT_CONTEXT(ctx, tensor, params); \
+    NUMA_VALIDATE_INPUTS(tensor, params); \
+    NUMA_SLICE_CONTIGUOUS(ctx, tensor); \
+    NUMA_EARLY_EXIT_IF_NO_WORK(ctx, GGML_STATUS_SUCCESS); \
+    NUMA_GET_TYPED_POINTER(dst_ptr, tensor, data_type)
+
+/**
+ * @brief Complete row-wise kernel template  
+ * @param ctx Context variable name (will be declared and initialized)
+ * @param tensor Target tensor
+ * @param params Compute parameters
+ * @param dst_ptr Destination pointer variable name (will be declared)
+ * @param data_type Data type (typically float)
+ * 
+ * WHAT IT PROVIDES:
+ * - Complete setup and validation
+ * - Row-wise data slicing (ne[1] dimension)
+ * - Early exit for threads without work
+ * - Typed destination pointer
+ * - Ready for nested loop processing
+ * 
+ * WHAT YOU NEED TO ADD:
+ * - Nested loop structure (typically 3D: i03, i02, i01)
+ * - Row-level computation logic
+ * - Final barrier call
+ * 
+ * USAGE EXAMPLE:
+ *   NUMA_ROWWISE_KERNEL_SETUP(ctx, tensor, params, dst_data, float);
+ *   // Process rows from ctx.thread_start to ctx.thread_end
+ *   for (int64_t i03 = 0; i03 < ne03; i03++) {
+ *       for (int64_t i02 = 0; i02 < ne02; i02++) {
+ *           for (size_t i01 = ctx.thread_start; i01 < ctx.thread_end; i01++) {
+ *               // Process row i01
+ *           }
+ *       }
+ *   }
+ *   NUMA_BARRIER_AUTO(ctx);
+ */
+#define NUMA_ROWWISE_KERNEL_SETUP(ctx, tensor, params, dst_ptr, data_type) \
+    NUMA_INIT_CONTEXT(ctx, tensor, params); \
+    NUMA_VALIDATE_INPUTS(tensor, params); \
+    NUMA_SLICE_ROWS_ATOMIC(ctx, tensor); \
+    NUMA_EARLY_EXIT_IF_NO_WORK(ctx, GGML_STATUS_SUCCESS); \
+    NUMA_GET_TYPED_POINTER(dst_ptr, tensor, data_type)
+
+/**
+ * @brief Minimal kernel template for custom operations
+ * @param ctx Context variable name (will be declared and initialized)  
+ * @param tensor Target tensor
+ * @param params Compute parameters
+ * 
+ * WHAT IT PROVIDES:
+ * - Basic context initialization
+ * - Input validation only
+ * - No slicing (you choose your own)
+ * - No early exit (you handle edge cases)
+ * 
+ * WHAT YOU NEED TO ADD:
+ * - Your own slicing strategy
+ * - Work distribution logic  
+ * - Computation implementation
+ * - Synchronization handling
+ * 
+ * WHEN TO USE:
+ * - Complex operations that don't fit standard patterns
+ * - Operations requiring custom slicing
+ * - Experimental kernel development
+ * 
+ * USAGE EXAMPLE:
+ *   NUMA_CUSTOM_KERNEL_SETUP(ctx, tensor, params);
+ *   // Your custom slicing logic here
+ *   NUMA_SLICE_CONTIGUOUS(ctx, tensor);  // or custom slicing
+ *   NUMA_EARLY_EXIT_IF_NO_WORK(ctx, GGML_STATUS_SUCCESS);
+ *   // Your computation logic here
+ *   NUMA_BARRIER_AUTO(ctx);
+ */
+#define NUMA_CUSTOM_KERNEL_SETUP(ctx, tensor, params) \
+    NUMA_INIT_CONTEXT(ctx, tensor, params); \
+    NUMA_VALIDATE_INPUTS(tensor, params)
+
+/**
+ * @brief Complete kernel template with custom computation block
+ * @param tensor Target tensor
+ * @param params Compute parameters
+ * @param computation_block Code block containing the actual computation
+ * 
+ * WHAT IT PROVIDES:
+ * - Complete element-wise setup
+ * - Automatic computation execution
+ * - Proper synchronization
+ * - Error handling
+ * 
+ * LIMITATIONS:
+ * - Fixed to element-wise processing
+ * - Single computation block only
+ * - Less flexible than component approach
+ * 
+ * USAGE EXAMPLE:
+ *   NUMA_COMPLETE_ELEMENTWISE_KERNEL(tensor, params, {
+ *       const float* src = (const float*)tensor_data(tensor->src[0]);
+ *       ggml_vec_scale_f32(ctx.thread_elements, 
+ *                         dst_data + ctx.thread_start,
+ *                         src + ctx.thread_start);
+ *   });
+ */
+#define NUMA_COMPLETE_ELEMENTWISE_KERNEL(tensor, params, computation_block) do { \
+    ggml_numa_slice_context_t ctx; \
+    float* dst_data; \
+    NUMA_ELEMENTWISE_KERNEL_SETUP(ctx, tensor, params, dst_data, float); \
+    computation_block \
+    NUMA_BARRIER_AUTO(ctx); \
+} while(0)
+
+// ========================================================================
 // DEBUGGING AND LOGGING MACROS  
 // ========================================================================
 

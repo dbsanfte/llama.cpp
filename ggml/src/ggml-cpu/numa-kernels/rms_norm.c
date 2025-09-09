@@ -56,10 +56,11 @@ enum ggml_status ggml_numa_kernel_rms_norm_execute(void * work_context, struct g
     memcpy(&eps, dst->op_params, sizeof(float));
     NUMA_ASSERT(eps >= 0.0f, "Epsilon must be non-negative");
     
-    // Set up NUMA context using shared macro for 3D nested processing
-    ggml_numa_slice_context_t slice_ctx;
-    float * dst_data;
-    NUMA_KERNEL_3D_NESTED_SETUP(slice_ctx, dst, params, dst_data, float);
+    // === COMPOSABLE KERNEL SETUP USING NEW BUILDING BLOCKS ===
+    NUMA_ROWWISE_KERNEL_SETUP(ctx, dst, params, dst_data, float);
+    
+    // Get source data using building block
+    NUMA_GET_SOURCE_POINTER(src_data, dst, 0, float);
     
     // Extract tensor dimensions
     const int64_t ne00 = dst->ne[0];  // Elements per row
@@ -67,24 +68,23 @@ enum ggml_status ggml_numa_kernel_rms_norm_execute(void * work_context, struct g
     const int64_t ne02 = dst->ne[2];  // Outer dimension (full processing per thread)
     const int64_t ne03 = dst->ne[3];  // Outermost dimension (full processing per thread)
     
-    // Calculate strides
-    const size_t nb01 = src0->nb[1];
-    const size_t nb02 = src0->nb[2];
-    const size_t nb03 = src0->nb[3];
+    // Calculate strides from source tensor (obtained via building block)
+    const size_t nb01 = dst->src[0]->nb[1];
+    const size_t nb02 = dst->src[0]->nb[2];
+    const size_t nb03 = dst->src[0]->nb[3];
     const size_t nb1 = dst->nb[1];
     const size_t nb2 = dst->nb[2];
     const size_t nb3 = dst->nb[3];
     
-    // Suppress unused variable warning (RMS_NORM doesn't use shared memory)
-    (void)dst_data;
+    // Note: dst_data from NUMA_ROWWISE_KERNEL_SETUP is ready to use
     
     // 3D nested loop processing: outer loops (i03, i02) process all elements,
     // inner loop (i01) is distributed across threads using NUMA slice context
     for (int64_t i03 = 0; i03 < ne03; i03++) {
         for (int64_t i02 = 0; i02 < ne02; i02++) {
-            for (size_t i01 = slice_ctx.thread_start; i01 < slice_ctx.thread_end; i01++) {
-                // Calculate row pointers
-                const float * x = (const float *)((const char *)tensor_data(src0) + i01*nb01 + i02*nb02 + i03*nb03);
+            for (size_t i01 = ctx.thread_start; i01 < ctx.thread_end; i01++) {
+                // Calculate row pointers using tensor_data for NUMA-aware access
+                const float * x = (const float *)((const char *)tensor_data(dst->src[0]) + i01*nb01 + i02*nb02 + i03*nb03);
                 float * y = (float *)((char *)tensor_data(dst) + i01*nb1 + i02*nb2 + i03*nb3);
                 
                 // First pass: compute sum of squares for this row
@@ -108,11 +108,11 @@ enum ggml_status ggml_numa_kernel_rms_norm_execute(void * work_context, struct g
     }
     
     // End barrier for consistent thread synchronization
-    NUMA_KERNEL_END_BARRIER(slice_ctx);
+    NUMA_BARRIER_AUTO(ctx);
     
     NUMA_LOG_TRACE("RMS_NORM processed rows %zu-%zu with thread %d/%d on NUMA node %d", 
-                   slice_ctx.thread_start, slice_ctx.thread_end,
-                   slice_ctx.thread_id, slice_ctx.total_threads, slice_ctx.numa_node);
+                   ctx.thread_start, ctx.thread_end,
+                   ctx.thread_id, ctx.total_threads, ctx.numa_node);
     
     return GGML_STATUS_SUCCESS;
 }

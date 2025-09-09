@@ -499,29 +499,54 @@ enum ggml_status ggml_numa_kernel_rope_f32_execute(void * work_context,
                                                     struct ggml_compute_params * params) {
     struct ggml_tensor * dst = (struct ggml_tensor *)work_context;
     
-    // TRACE: Log function entry for every thread
-    NUMA_LOG_TRACE("ROPE_F32_ENTRY: thread=%d/%d numa_node=%d tensor=%p",
-                   params->ith, params->nth, ggml_current_numa_node, (void*)dst);
+    // Use basic composable macro system for setup
+    NUMA_INIT_CONTEXT(ctx, dst, params);
+    NUMA_VALIDATE_INPUTS(dst, params);
     
-    // Validate inputs
-    NUMA_ASSERT(dst != NULL, "Destination tensor cannot be null");
-    NUMA_ASSERT(dst->src[0] != NULL, "Source tensor 0 cannot be null");
+    // Additional ROPE-specific validation
     NUMA_ASSERT(dst->src[1] != NULL, "Source tensor 1 (positions) cannot be null");
-    NUMA_ASSERT(params != NULL, "Compute params cannot be null");
     
-    // Extract ROPE parameters manually (inline for now until helpers are implemented)
+    // ROPE-specific row-based slicing (sequence-aware)
+    // ROPE processes sequences (ne[2]) with rows (ne[1]) within each sequence
+    const int64_t ne1 = dst->ne[1];
+    const int64_t ne2 = dst->ne[2]; 
+    const int64_t ne3 = dst->ne[3];
+    const int64_t total_rows = ne1 * ne2 * ne3;
+    
+    // Calculate row range for this thread using ROPE's original logic
+    const int64_t dr = (total_rows + ctx.total_threads - 1) / ctx.total_threads;
+    const int64_t ir0 = dr * ctx.thread_id;
+    const int64_t ir1 = MIN(ir0 + dr, total_rows);
+    
+    // Early exit if no work
+    if (ir0 >= ir1) {
+        NUMA_BARRIER_AUTO(ctx);
+        return GGML_STATUS_SUCCESS;
+    }
+    
+    // TRACE: Log function entry for every thread
+    NUMA_LOG_TRACE("ROPE_F32_ENTRY: thread=%d/%d numa_node=%d tensor=%p work=[%ld,%ld)",
+                   ctx.thread_id, ctx.total_threads, ctx.numa_node, (void*)dst, 
+                   ir0, ir1);
+    
+    // Extract ROPE parameters using efficient helper functions (avoids memcpy overhead)
     numa_rope_params_t rope_params;
-    rope_params.n_dims     = ((int32_t *) dst->op_params)[1];
-    rope_params.mode       = ((int32_t *) dst->op_params)[2];
-    rope_params.n_ctx_orig = ((int32_t *) dst->op_params)[4];
+    rope_params.n_dims     = ggml_get_op_params_i32(dst, 1);
+    rope_params.mode       = ggml_get_op_params_i32(dst, 2);
+    rope_params.n_ctx_orig = ggml_get_op_params_i32(dst, 4);
     
-    memcpy(&rope_params.freq_base,   (int32_t *) dst->op_params +  5, sizeof(float));
-    memcpy(&rope_params.freq_scale,  (int32_t *) dst->op_params +  6, sizeof(float));
-    memcpy(&rope_params.ext_factor,  (int32_t *) dst->op_params +  7, sizeof(float));
-    memcpy(&rope_params.attn_factor, (int32_t *) dst->op_params +  8, sizeof(float));
-    memcpy(&rope_params.beta_fast,   (int32_t *) dst->op_params +  9, sizeof(float));
-    memcpy(&rope_params.beta_slow,   (int32_t *) dst->op_params + 10, sizeof(float));
-    memcpy(&rope_params.sections,    (int32_t *) dst->op_params + 11, sizeof(int)*4);
+    rope_params.freq_base   = ggml_get_op_params_f32(dst, 5);
+    rope_params.freq_scale  = ggml_get_op_params_f32(dst, 6);
+    rope_params.ext_factor  = ggml_get_op_params_f32(dst, 7);
+    rope_params.attn_factor = ggml_get_op_params_f32(dst, 8);
+    rope_params.beta_fast   = ggml_get_op_params_f32(dst, 9);
+    rope_params.beta_slow   = ggml_get_op_params_f32(dst, 10);
+    
+    // Extract sections array (4 integers) efficiently  
+    rope_params.sections[0] = ggml_get_op_params_i32(dst, 11);
+    rope_params.sections[1] = ggml_get_op_params_i32(dst, 12);
+    rope_params.sections[2] = ggml_get_op_params_i32(dst, 13);
+    rope_params.sections[3] = ggml_get_op_params_i32(dst, 14);
     
     // Set tensor dimensions and strides
     rope_params.ne0 = dst->ne[0];
@@ -544,55 +569,10 @@ enum ggml_status ggml_numa_kernel_rope_f32_execute(void * work_context,
     rope_params.is_mrope = rope_params.mode & GGML_ROPE_TYPE_MROPE;
     rope_params.is_vision = rope_params.mode == GGML_ROPE_TYPE_VISION;
     
-    // Calculate work distribution manually (inline for now until helpers are implemented)
+    // Convert slice context to work info structure
     numa_rope_thread_work_t work_info;
-    
-    // Calculate total rows to process (ne1 * ne2 * ne3)
-    const size_t total_rows = rope_params.ne1 * rope_params.ne2 * rope_params.ne3;
-    
-    // Get NUMA execution context from thread-local variables
-    extern __thread int ggml_current_numa_node;
-    extern __thread bool ggml_numa_is_data_parallel_execution;
-    extern __thread int ggml_numa_total_nodes_for_data_parallel;
-    
-    // Step 1: NUMA-level slicing (across nodes)
-    size_t numa_start, numa_end;
-    if (ggml_numa_is_data_parallel_execution) {
-        size_t rows_per_node = total_rows / ggml_numa_total_nodes_for_data_parallel;
-        numa_start = ggml_current_numa_node * rows_per_node;
-        numa_end = (ggml_current_numa_node == ggml_numa_total_nodes_for_data_parallel - 1) ?
-                   total_rows : numa_start + rows_per_node;
-    } else {
-        numa_start = 0;
-        numa_end = total_rows;
-    }
-    size_t numa_elements = numa_end - numa_start;
-    
-    // Step 2: Thread-level slicing (within NUMA node)
-    size_t rows_per_thread = (numa_elements + params->nth - 1) / params->nth;
-    size_t thread_start_local = params->ith * rows_per_thread;
-    size_t thread_end_local;
-    
-    // Bounds checking for thread-level slicing
-    if (thread_start_local >= numa_elements) {
-        thread_start_local = numa_elements;
-        thread_end_local = numa_elements;
-    } else {
-        thread_end_local = thread_start_local + rows_per_thread;
-        if (thread_end_local > numa_elements) {
-            thread_end_local = numa_elements;
-        }
-    }
-    
-    // Convert to global row indices
-    work_info.ir0 = (int)(numa_start + thread_start_local);
-    work_info.ir1 = (int)(numa_start + thread_end_local);
-    
-    // Early exit if this thread has no work
-    if (work_info.ir0 >= work_info.ir1) {
-        NUMA_LOG_TRACE("ROPE_THREAD_NO_WORK: Thread %d has no rows to process", params->ith);
-        return GGML_STATUS_SUCCESS;
-    }
+    work_info.ir0 = (int)ir0;
+    work_info.ir1 = (int)ir1;
     
     // Get work buffer for cache - each thread gets its own cache space
     float * cache = (float *) params->wdata + (rope_params.ne0 + CACHE_LINE_SIZE_F32) * params->ith;
@@ -614,8 +594,13 @@ enum ggml_status ggml_numa_kernel_rope_f32_execute(void * work_context,
     const void * src0_base = tensor_data(dst->src[0]);
     
     // Call unified internal implementation for F32 type
-    return rope_unified_compute_internal(&rope_params, &work_info, src0_base, dst_base, 
-                                       pos, freq_factors, cache, params, false);
+    enum ggml_status result = rope_unified_compute_internal(&rope_params, &work_info, src0_base, dst_base, 
+                                                           pos, freq_factors, cache, params, false);
+    
+    // CRITICAL: All threads must participate in barrier regardless of work status
+    NUMA_BARRIER_AUTO(ctx);
+    
+    return result;
 }
 
 // ============================================================================
@@ -629,29 +614,54 @@ enum ggml_status ggml_numa_kernel_rope_f16_execute(void * work_context,
                                                     struct ggml_compute_params * params) {
     struct ggml_tensor * dst = (struct ggml_tensor *)work_context;
     
-    // TRACE: Log function entry for every thread
-    NUMA_LOG_TRACE("ROPE_F16_ENTRY: thread=%d/%d numa_node=%d tensor=%p",
-                   params->ith, params->nth, ggml_current_numa_node, (void*)dst);
+    // Use basic composable macro system for setup
+    NUMA_INIT_CONTEXT(ctx, dst, params);
+    NUMA_VALIDATE_INPUTS(dst, params);
     
-    // Validate inputs
-    NUMA_ASSERT(dst != NULL, "Destination tensor cannot be null");
-    NUMA_ASSERT(dst->src[0] != NULL, "Source tensor 0 cannot be null");
+    // Additional ROPE-specific validation
     NUMA_ASSERT(dst->src[1] != NULL, "Source tensor 1 (positions) cannot be null");
-    NUMA_ASSERT(params != NULL, "Compute params cannot be null");
     
-    // Extract ROPE parameters manually (inline for now until helpers are implemented)
+    // ROPE-specific row-based slicing (sequence-aware)
+    // ROPE processes sequences (ne[2]) with rows (ne[1]) within each sequence
+    const int64_t ne1 = dst->ne[1];
+    const int64_t ne2 = dst->ne[2]; 
+    const int64_t ne3 = dst->ne[3];
+    const int64_t total_rows = ne1 * ne2 * ne3;
+    
+    // Calculate row range for this thread using ROPE's original logic
+    const int64_t dr = (total_rows + ctx.total_threads - 1) / ctx.total_threads;
+    const int64_t ir0 = dr * ctx.thread_id;
+    const int64_t ir1 = MIN(ir0 + dr, total_rows);
+    
+    // Early exit if no work
+    if (ir0 >= ir1) {
+        NUMA_BARRIER_AUTO(ctx);
+        return GGML_STATUS_SUCCESS;
+    }
+    
+    // TRACE: Log function entry for every thread
+    NUMA_LOG_TRACE("ROPE_F16_ENTRY: thread=%d/%d numa_node=%d tensor=%p work=[%ld,%ld)",
+                   ctx.thread_id, ctx.total_threads, ctx.numa_node, (void*)dst,
+                   ir0, ir1);
+    
+    // Extract ROPE parameters using efficient helper functions (avoids memcpy overhead)
     numa_rope_params_t rope_params;
-    rope_params.n_dims     = ((int32_t *) dst->op_params)[1];
-    rope_params.mode       = ((int32_t *) dst->op_params)[2];
-    rope_params.n_ctx_orig = ((int32_t *) dst->op_params)[4];
+    rope_params.n_dims     = ggml_get_op_params_i32(dst, 1);
+    rope_params.mode       = ggml_get_op_params_i32(dst, 2);
+    rope_params.n_ctx_orig = ggml_get_op_params_i32(dst, 4);
     
-    memcpy(&rope_params.freq_base,   (int32_t *) dst->op_params +  5, sizeof(float));
-    memcpy(&rope_params.freq_scale,  (int32_t *) dst->op_params +  6, sizeof(float));
-    memcpy(&rope_params.ext_factor,  (int32_t *) dst->op_params +  7, sizeof(float));
-    memcpy(&rope_params.attn_factor, (int32_t *) dst->op_params +  8, sizeof(float));
-    memcpy(&rope_params.beta_fast,   (int32_t *) dst->op_params +  9, sizeof(float));
-    memcpy(&rope_params.beta_slow,   (int32_t *) dst->op_params + 10, sizeof(float));
-    memcpy(&rope_params.sections,    (int32_t *) dst->op_params + 11, sizeof(int)*4);
+    rope_params.freq_base   = ggml_get_op_params_f32(dst, 5);
+    rope_params.freq_scale  = ggml_get_op_params_f32(dst, 6);
+    rope_params.ext_factor  = ggml_get_op_params_f32(dst, 7);
+    rope_params.attn_factor = ggml_get_op_params_f32(dst, 8);
+    rope_params.beta_fast   = ggml_get_op_params_f32(dst, 9);
+    rope_params.beta_slow   = ggml_get_op_params_f32(dst, 10);
+    
+    // Extract sections array (4 integers) efficiently  
+    rope_params.sections[0] = ggml_get_op_params_i32(dst, 11);
+    rope_params.sections[1] = ggml_get_op_params_i32(dst, 12);
+    rope_params.sections[2] = ggml_get_op_params_i32(dst, 13);
+    rope_params.sections[3] = ggml_get_op_params_i32(dst, 14);
     
     // Set tensor dimensions and strides
     rope_params.ne0 = dst->ne[0];
@@ -674,55 +684,10 @@ enum ggml_status ggml_numa_kernel_rope_f16_execute(void * work_context,
     rope_params.is_mrope = rope_params.mode & GGML_ROPE_TYPE_MROPE;
     rope_params.is_vision = rope_params.mode == GGML_ROPE_TYPE_VISION;
     
-    // Calculate work distribution manually (inline for now until helpers are implemented)
+    // Convert slice context to legacy work info structure
     numa_rope_thread_work_t work_info;
-    
-    // Calculate total rows to process (ne1 * ne2 * ne3)
-    const size_t total_rows = rope_params.ne1 * rope_params.ne2 * rope_params.ne3;
-    
-    // Get NUMA execution context from thread-local variables
-    extern __thread int ggml_current_numa_node;
-    extern __thread bool ggml_numa_is_data_parallel_execution;
-    extern __thread int ggml_numa_total_nodes_for_data_parallel;
-    
-    // Step 1: NUMA-level slicing (across nodes)
-    size_t numa_start, numa_end;
-    if (ggml_numa_is_data_parallel_execution) {
-        size_t rows_per_node = total_rows / ggml_numa_total_nodes_for_data_parallel;
-        numa_start = ggml_current_numa_node * rows_per_node;
-        numa_end = (ggml_current_numa_node == ggml_numa_total_nodes_for_data_parallel - 1) ?
-                   total_rows : numa_start + rows_per_node;
-    } else {
-        numa_start = 0;
-        numa_end = total_rows;
-    }
-    size_t numa_elements = numa_end - numa_start;
-    
-    // Step 2: Thread-level slicing (within NUMA node)
-    size_t rows_per_thread = (numa_elements + params->nth - 1) / params->nth;
-    size_t thread_start_local = params->ith * rows_per_thread;
-    size_t thread_end_local;
-    
-    // Bounds checking for thread-level slicing
-    if (thread_start_local >= numa_elements) {
-        thread_start_local = numa_elements;
-        thread_end_local = numa_elements;
-    } else {
-        thread_end_local = thread_start_local + rows_per_thread;
-        if (thread_end_local > numa_elements) {
-            thread_end_local = numa_elements;
-        }
-    }
-    
-    // Convert to global row indices
-    work_info.ir0 = (int)(numa_start + thread_start_local);
-    work_info.ir1 = (int)(numa_start + thread_end_local);
-    
-    // Early exit if this thread has no work
-    if (work_info.ir0 >= work_info.ir1) {
-        NUMA_LOG_TRACE("ROPE_THREAD_NO_WORK: Thread %d has no rows to process", params->ith);
-        return GGML_STATUS_SUCCESS;
-    }
+    work_info.ir0 = (int)ir0;
+    work_info.ir1 = (int)ir1;
     
     // Get work buffer for cache - each thread gets its own cache space
     float * cache = (float *) params->wdata + (rope_params.ne0 + CACHE_LINE_SIZE_F32) * params->ith;
@@ -744,8 +709,13 @@ enum ggml_status ggml_numa_kernel_rope_f16_execute(void * work_context,
     const void * src0_base = tensor_data(dst->src[0]);
     
     // Call unified internal implementation for F16 type
-    return rope_unified_compute_internal(&rope_params, &work_info, src0_base, dst_base, 
-                                       pos, freq_factors, cache, params, true);
+    enum ggml_status result = rope_unified_compute_internal(&rope_params, &work_info, src0_base, dst_base, 
+                                                           pos, freq_factors, cache, params, true);
+    
+    // CRITICAL: All threads must participate in barrier regardless of work status
+    NUMA_BARRIER_AUTO(ctx);
+    
+    return result;
 }
 
 // ============================================================================

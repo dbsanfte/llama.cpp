@@ -36,21 +36,4 @@ else()
         add_subdirectory(cvector-generator)
         add_subdirectory(export-lora)
     endif()
-    
-    # GGML tensor visualization tools for debugging
-    add_executable(visualize-tensor-basic visualize-tensor-basic.cpp)
-    target_link_libraries(visualize-tensor-basic PRIVATE ggml ${CMAKE_THREAD_LIBS_INIT})
-    target_compile_features(visualize-tensor-basic PRIVATE cxx_std_11)
-    
-    add_executable(visualize-tensor-quantization visualize-tensor-quantization.cpp)
-    target_link_libraries(visualize-tensor-quantization PRIVATE ggml ggml-cpu ${CMAKE_THREAD_LIBS_INIT})
-    target_compile_features(visualize-tensor-quantization PRIVATE cxx_std_11)
-    
-    add_executable(visualize-tensor-add-types visualize-tensor-add-types.cpp)
-    target_link_libraries(visualize-tensor-add-types PRIVATE ggml ggml-cpu ${CMAKE_THREAD_LIBS_INIT})
-    target_compile_features(visualize-tensor-add-types PRIVATE cxx_std_11)
-    
-    add_executable(visualize-tensor-broadcasting visualize-tensor-broadcasting.cpp)
-    target_link_libraries(visualize-tensor-broadcasting PRIVATE ggml ${CMAKE_THREAD_LIBS_INIT})
-    target_compile_features(visualize-tensor-broadcasting PRIVATE cxx_std_11)
 endif()
