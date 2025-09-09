@@ -20,6 +20,9 @@
 #include "mul_mat.h"
 #include "rope.h"
 #include "noop.h"
+#include "reshape.h"
+#include "transpose.h"
+#include "view.h"
 #include "../ggml-impl.h"
 #include "../ggml-vec-numa.h"
 
@@ -326,6 +329,11 @@ enum ggml_status ggml_numa_kernels_init(void) {
     NUMA_REGISTER_KERNEL(mul);
     NUMA_REGISTER_KERNEL(div);
     NUMA_REGISTER_KERNEL(sub);
+    
+    // Register view operations (metadata-only, no-op kernels):
+    NUMA_REGISTER_KERNEL(reshape);
+    NUMA_REGISTER_KERNEL(transpose);
+    NUMA_REGISTER_KERNEL(view);
     
     // Register NOOP kernel for performance testing
     NUMA_REGISTER_KERNEL(noop);

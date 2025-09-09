@@ -120,6 +120,7 @@ enum ggml_status ggml_numa_kernel_mul_mat_execute(void * work_context, struct gg
     // Get type traits for vec_dot operation
     const enum ggml_type src0_type = src0->type;
     const struct ggml_type_traits_cpu * traits = ggml_get_type_traits_cpu(src0_type);
+
     ggml_vec_dot_t const vec_dot = traits->vec_dot;
     enum ggml_type const vec_dot_type = traits->vec_dot_type;
     ggml_from_float_t const from_float = ggml_get_type_traits_cpu(vec_dot_type)->from_float;

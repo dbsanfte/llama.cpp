@@ -55,6 +55,12 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
         ggml-cpu/numa-kernels/rope.h
         ggml-cpu/numa-kernels/noop.c
         ggml-cpu/numa-kernels/noop.h
+        ggml-cpu/numa-kernels/reshape.c
+        ggml-cpu/numa-kernels/reshape.h
+        ggml-cpu/numa-kernels/transpose.c
+        ggml-cpu/numa-kernels/transpose.h
+        ggml-cpu/numa-kernels/view.c
+        ggml-cpu/numa-kernels/view.h
         ggml-work-item.c
         ggml-cpu/repack.cpp
         ggml-cpu/repack.h
