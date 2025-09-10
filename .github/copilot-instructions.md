@@ -305,6 +305,59 @@ enum ggml_status ggml_numa_kernel_soft_max_execute(void * work_context, struct g
 }
 ```
 
+**3D Threaded Operation (Multithreaded Type Conversion Pattern):**
+```c
+enum ggml_status ggml_numa_kernel_mul_mat_type_conversion(void * work_context, struct ggml_compute_params * params) {
+    struct ggml_tensor * src1 = (struct ggml_tensor *)work_context;
+    
+    // Extract thread parameters for direct use in macro
+    const int ith = params->ith;
+    const int nth = params->nth;
+    
+    // Work buffer setup and type conversion function
+    char * wdata = (char *)params->wdata;
+    ggml_from_float_t const from_float = ggml_get_type_traits_cpu(target_type)->from_float;
+    
+    // 3D threaded loop pattern - distributes innermost dimension across threads
+    NUMA_3D_THREADED_LOOP(src1, ith, nth, {
+        const float * src1_row = (const float *)((char *)tensor_data(src1) + 
+                                    i13*nb13 + i12*nb12 + i11*nb11);
+        void * wdata_row = wdata + i13*nbw3 + i12*nbw2 + i11*nbw1;
+        
+        from_float(src1_row, wdata_row, ne10);
+    });
+    
+    return GGML_STATUS_SUCCESS;
+}
+```
+
+**Matrix Chunked Operation (Block-Tiled Processing Pattern):**
+```c
+enum ggml_status ggml_numa_kernel_mul_mat_computation(void * work_context, struct ggml_compute_params * params) {
+    struct ggml_tensor * tensor = (struct ggml_tensor *)work_context;
+    
+    // Chunk parameters (from thread work distribution)
+    const int64_t ir0_start = chunk_ir0_start, ir0_end = chunk_ir0_end;
+    const int64_t ir1_start = chunk_ir1_start, ir1_end = chunk_ir1_end;
+    const int64_t blck_0 = 16, blck_1 = 16;
+    const int64_t num_rows_per_vec_dot = vec_dot_traits->nrows;
+    
+    // Matrix chunked loop pattern - processes blocks with vector dot optimization
+    NUMA_MATRIX_CHUNKED_LOOP(ir0_start, ir0_end, ir1_start, ir1_end, 
+                             blck_0, blck_1, num_rows_per_vec_dot, {
+        // Calculate matrix coordinates from loop indices
+        const int64_t i13 = (ir1 / (ne12 * ne1));
+        const int64_t i12 = (ir1 - i13 * ne12 * ne1) / ne1;
+        const int64_t i11 = (ir1 - i13 * ne12 * ne1 - i12 * ne1);
+        
+        // Matrix computation with proper memory access patterns
+        vec_dot_operation(src0_data, src1_data, dst_data, i11, i12, i13, iir0, ir1);
+    });
+    
+    return GGML_STATUS_SUCCESS;
+}
+```
+
 **🏆 Composable Macro Benefits:**
 - **Lego-like Flexibility**: Mix and match atomic building blocks for any kernel complexity
 - **Proven Patterns**: Composed templates handle 80% of common cases with one-line setup

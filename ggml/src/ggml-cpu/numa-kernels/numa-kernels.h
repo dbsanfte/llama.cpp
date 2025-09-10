@@ -946,6 +946,71 @@ typedef struct {
     } \
 } while(0)
 
+/**
+ * @brief 3D threaded tensor iteration loop for multithreaded operations
+ * @param tensor Tensor to iterate over (uses tensor->ne[3], tensor->ne[2], tensor->ne[1])
+ * @param ith Thread index (0-based)
+ * @param nth Total number of threads
+ * @param loop_body Code block to execute for each (i13, i12, i11) iteration
+ * 
+ * This macro provides the common 3D nested loop pattern with thread distribution
+ * used in operations like MUL_MAT type conversion where:
+ * - i13, i12 are outer dimensions (processed completely by each thread)
+ * - i11 is the innermost dimension distributed across threads using ith/nth pattern
+ * 
+ * USAGE EXAMPLE:
+ *   NUMA_3D_THREADED_LOOP(src1, ith, nth, {
+ *       // Process element at coordinates (i13, i12, i11)
+ *       // i13, i12, i11 variables are available in the loop body
+ *       const float * src_element = get_element_pointer(src_data, i11, i12, i13);
+ *       void * dst_element = get_element_pointer(dst_data, i11, i12, i13);
+ *       convert_element(src_element, dst_element);
+ *   });
+ */
+#define NUMA_3D_THREADED_LOOP(tensor, ith, nth, loop_body) do { \
+    const int64_t _numa_3d_ne13 = (tensor)->ne[3]; \
+    const int64_t _numa_3d_ne12 = (tensor)->ne[2]; \
+    const int64_t _numa_3d_ne11 = (tensor)->ne[1]; \
+    for (int64_t i13 = 0; i13 < _numa_3d_ne13; ++i13) { \
+        for (int64_t i12 = 0; i12 < _numa_3d_ne12; ++i12) { \
+            for (int64_t i11 = (ith); i11 < _numa_3d_ne11; i11 += (nth)) { \
+                loop_body \
+            } \
+        } \
+    } \
+} while(0)
+
+/**
+ * @brief Matrix chunked iteration loop for block-tiled matrix operations
+ * @param ir0_start,ir0_end Range for first dimension
+ * @param ir1_start,ir1_end Range for second dimension  
+ * @param blck_0,blck_1 Block sizes for tiling
+ * @param num_rows_per_vec_dot Number of rows processed per vector dot operation
+ * @param loop_body Code block to execute for each (iir1, iir0, ir1) iteration
+ * 
+ * This macro provides the complex chunked processing pattern used in matrix
+ * operations with block tiling and vector dot optimization where:
+ * - iir1, iir0 iterate over blocks of size blck_1, blck_0
+ * - ir1 iterates within each block with num_rows_per_vec_dot stride
+ * 
+ * USAGE EXAMPLE:
+ *   NUMA_MATRIX_CHUNKED_LOOP(ir0_start, ir0_end, ir1_start, ir1_end, 
+ *                            blck_0, blck_1, num_rows_per_vec_dot, {
+ *       // Process matrix chunk at coordinates (iir1, iir0, ir1)
+ *       // iir1, iir0, ir1 variables are available in the loop body
+ *       process_matrix_chunk(iir1, iir0, ir1);
+ *   });
+ */
+#define NUMA_MATRIX_CHUNKED_LOOP(ir0_start, ir0_end, ir1_start, ir1_end, blck_0, blck_1, num_rows_per_vec_dot, loop_body) do { \
+    for (int64_t iir1 = (ir1_start); iir1 < (ir1_end); iir1 += (blck_1)) { \
+        for (int64_t iir0 = (ir0_start); iir0 < (ir0_end); iir0 += (blck_0)) { \
+            for (int64_t ir1 = iir1; ir1 < iir1 + (blck_1) && ir1 < (ir1_end); ir1 += (num_rows_per_vec_dot)) { \
+                loop_body \
+            } \
+        } \
+    } \
+} while(0)
+
 // ========================================================================
 // NUMA WORK DISTRIBUTION MACROS
 // ========================================================================

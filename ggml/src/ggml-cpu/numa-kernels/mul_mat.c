@@ -164,19 +164,15 @@ enum ggml_status ggml_numa_kernel_mul_mat_execute(void * work_context, struct gg
         NUMA_LOG_DEBUG("MUL_MAT: Converting src1 from %s to %s (thread %d/%d)", 
                        ggml_type_name(src1->type), ggml_type_name(vec_dot_type), ith, nth);
         
-        // MULTITHREADED conversion: each thread handles its portion
-        // Pattern matches reference: for (int64_t i11 = ith; i11 < ne11; i11 += nth)
-        for (int64_t i13 = 0; i13 < ne13; ++i13) {
-            for (int64_t i12 = 0; i12 < ne12; ++i12) {
-                for (int64_t i11 = ith; i11 < ne11; i11 += nth) {  // ← MULTITHREADED
-                    const float * src1_row = (const float *)((char *)tensor_data(src1) + 
-                                                i13*nb13 + i12*nb12 + i11*nb11);
-                    void * wdata_row = wdata + i13*nbw3 + i12*nbw2 + i11*nbw1;
-                    
-                    from_float(src1_row, wdata_row, ne10);
-                }
-            }
-        }
+        // MULTITHREADED conversion using the 3D threaded loop macro
+        // Pattern: each thread handles its portion of the innermost dimension (i11)
+        NUMA_3D_THREADED_LOOP(src1, ith, nth, {
+            const float * src1_row = (const float *)((char *)tensor_data(src1) + 
+                                        i13*nb13 + i12*nb12 + i11*nb11);
+            void * wdata_row = wdata + i13*nbw3 + i12*nbw2 + i11*nbw1;
+            
+            from_float(src1_row, wdata_row, ne10);
+        });
         
         // BARRIER: All threads on this NUMA node must complete conversion before proceeding
         NUMA_OPENMP_BARRIER();
@@ -236,49 +232,46 @@ enum ggml_status ggml_numa_kernel_mul_mat_execute(void * work_context, struct gg
         const int64_t blck_1 = 16;
         const size_t src1_col_stride = src1_cont || src1->type != vec_dot_type ? row_size : nb11;
         
-        // Process this chunk with exact reference pattern
-        for (int64_t iir1 = ir1_start; iir1 < ir1_end; iir1 += blck_1) {
-            for (int64_t iir0 = ir0_start; iir0 < ir0_end; iir0 += blck_0) {
-                for (int64_t ir1 = iir1; ir1 < iir1 + blck_1 && ir1 < ir1_end; ir1 += num_rows_per_vec_dot) {
-                    // Coordinate calculation (exact reference pattern)
-                    const int64_t i13 = (ir1 / (ne12 * ne1));
-                    const int64_t i12 = (ir1 - i13 * ne12 * ne1) / ne1;
-                    const int64_t i11 = (ir1 - i13 * ne12 * ne1 - i12 * ne1);
-                    
-                    // Broadcast src0 into src1 (from reference)
-                    const int64_t i03 = i13 / r3;
-                    const int64_t i02 = i12 / r2;
-                    
-                    const int64_t i1 = i11;
-                    const int64_t i2 = i12;
-                    const int64_t i3 = i13;
-                    
-                    // Memory access pointers (exact reference pattern)
-                    const char * src0_row = (const char*)tensor_data(src0) + (0 + i02 * nb02 + i03 * nb03);
-                    // CRITICAL FIX: Use numa_converted_data instead of wdata for thread safety
-                    const char * src1_col = numa_converted_data +
-                        (src1_cont || src1->type != vec_dot_type
-                            ? (i11 + i12 * ne11 + i13 * ne12 * ne11) * row_size
-                            : (i11 * nb11 + i12 * nb12 + i13 * nb13));
-                    float * dst_col = (float*)((char*)dst_data + (i1 * nb1 + i2 * nb2 + i3 * nb3));
-                    
-                    // Vec_dot computation (exact reference pattern)
-                    for (int64_t ir0 = iir0; ir0 < iir0 + blck_0 && ir0 < ir0_end; ir0 += num_rows_per_vec_dot) {
-                        if (num_rows_per_vec_dot == 1) {
-                            vec_dot(ne00, &dst_col[ir0], 0, src0_row + ir0*nb01, 0, src1_col, 0, 1);
-                        } else {
-                            // Multi-row case
-                            for (int cn = 0; cn < num_rows_per_vec_dot; ++cn) {
-                                float * dst_ptr = &dst_col[ir0 + cn * nb1 / nb0];
-                                const char * src0_ptr = src0_row + (ir0 + cn) * nb01;
-                                const char * src1_ptr = src1_col + cn * src1_col_stride;
-                                vec_dot(ne00, dst_ptr, 0, src0_ptr, 0, src1_ptr, 0, 1);
-                            }
-                        }
+        // Process this chunk with matrix chunked loop macro
+        NUMA_MATRIX_CHUNKED_LOOP(ir0_start, ir0_end, ir1_start, ir1_end, 
+                                 blck_0, blck_1, num_rows_per_vec_dot, {
+            // Coordinate calculation (exact reference pattern)
+            const int64_t i13 = (ir1 / (ne12 * ne1));
+            const int64_t i12 = (ir1 - i13 * ne12 * ne1) / ne1;
+            const int64_t i11 = (ir1 - i13 * ne12 * ne1 - i12 * ne1);
+            
+            // Broadcast src0 into src1 (from reference)
+            const int64_t i03 = i13 / r3;
+            const int64_t i02 = i12 / r2;
+            
+            const int64_t i1 = i11;
+            const int64_t i2 = i12;
+            const int64_t i3 = i13;
+            
+            // Memory access pointers (exact reference pattern)
+            const char * src0_row = (const char*)tensor_data(src0) + (0 + i02 * nb02 + i03 * nb03);
+            // CRITICAL FIX: Use numa_converted_data instead of wdata for thread safety
+            const char * src1_col = numa_converted_data +
+                (src1_cont || src1->type != vec_dot_type
+                    ? (i11 + i12 * ne11 + i13 * ne12 * ne11) * row_size
+                    : (i11 * nb11 + i12 * nb12 + i13 * nb13));
+            float * dst_col = (float*)((char*)dst_data + (i1 * nb1 + i2 * nb2 + i3 * nb3));
+            
+            // Vec_dot computation (exact reference pattern)
+            for (int64_t ir0 = iir0; ir0 < iir0 + blck_0 && ir0 < ir0_end; ir0 += num_rows_per_vec_dot) {
+                if (num_rows_per_vec_dot == 1) {
+                    vec_dot(ne00, &dst_col[ir0], 0, src0_row + ir0*nb01, 0, src1_col, 0, 1);
+                } else {
+                    // Multi-row case
+                    for (int cn = 0; cn < num_rows_per_vec_dot; ++cn) {
+                        float * dst_ptr = &dst_col[ir0 + cn * nb1 / nb0];
+                        const char * src0_ptr = src0_row + (ir0 + cn) * nb01;
+                        const char * src1_ptr = src1_col + cn * src1_col_stride;
+                        vec_dot(ne00, dst_ptr, 0, src0_ptr, 0, src1_ptr, 0, 1);
                     }
                 }
             }
-        }
+        });
     }
     
     return GGML_STATUS_SUCCESS;
