@@ -914,6 +914,38 @@ typedef struct {
     } \
 } while(0)
 
+/**
+ * @brief 4D rowwise tensor iteration loop for NUMA thread distribution
+ * @param tensor Tensor to iterate over
+ * @param ctx NUMA thread context with thread_start and thread_end ranges
+ * @param loop_body Code block to execute for each (i03, i02, i01) iteration
+ * 
+ * This macro provides the common 4D nested loop pattern used in operations like
+ * SOFT_MAX and RMS_NORM where:
+ * - i03, i02 are outer dimensions (processed completely by each thread)
+ * - i01 is the row dimension distributed across threads using ctx.thread_start to ctx.thread_end
+ * 
+ * USAGE EXAMPLE:
+ *   NUMA_4D_ROWWISE_LOOP(tensor, ctx, {
+ *       // Process row i01 with coordinates (i03, i02, i01)
+ *       // i03, i02, i01 variables are available in the loop body
+ *       const float * src_row = get_row_pointer(src_data, i01, i02, i03);
+ *       float * dst_row = get_row_pointer(dst_data, i01, i02, i03);
+ *       process_row(src_row, dst_row, ne00);
+ *   });
+ */
+#define NUMA_4D_ROWWISE_LOOP(tensor, ctx, loop_body) do { \
+    const int64_t ne02 = (tensor)->ne[2]; \
+    const int64_t ne03 = (tensor)->ne[3]; \
+    for (int64_t i03 = 0; i03 < ne03; i03++) { \
+        for (int64_t i02 = 0; i02 < ne02; i02++) { \
+            for (size_t i01 = (ctx).thread_start; i01 < (ctx).thread_end; i01++) { \
+                loop_body \
+            } \
+        } \
+    } \
+} while(0)
+
 // ========================================================================
 // NUMA WORK DISTRIBUTION MACROS
 // ========================================================================

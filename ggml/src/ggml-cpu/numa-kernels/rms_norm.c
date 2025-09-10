@@ -64,9 +64,6 @@ enum ggml_status ggml_numa_kernel_rms_norm_execute(void * work_context, struct g
     
     // Extract tensor dimensions
     const int64_t ne00 = dst->ne[0];  // Elements per row
-    const int64_t ne01 = dst->ne[1];  // Number of rows (distributed across threads)
-    const int64_t ne02 = dst->ne[2];  // Outer dimension (full processing per thread)
-    const int64_t ne03 = dst->ne[3];  // Outermost dimension (full processing per thread)
     
     // Calculate strides from source tensor (obtained via building block)
     const size_t nb01 = dst->src[0]->nb[1];
@@ -78,34 +75,30 @@ enum ggml_status ggml_numa_kernel_rms_norm_execute(void * work_context, struct g
     
     // Note: dst_data from NUMA_ROWWISE_KERNEL_SETUP is ready to use
     
-    // 3D nested loop processing: outer loops (i03, i02) process all elements,
+    // 4D nested loop processing using NUMA rowwise pattern: outer loops (i03, i02) process all elements,
     // inner loop (i01) is distributed across threads using NUMA slice context
-    for (int64_t i03 = 0; i03 < ne03; i03++) {
-        for (int64_t i02 = 0; i02 < ne02; i02++) {
-            for (size_t i01 = ctx.thread_start; i01 < ctx.thread_end; i01++) {
-                // Calculate row pointers using tensor_data for NUMA-aware access
-                const float * x = (const float *)((const char *)tensor_data(dst->src[0]) + i01*nb01 + i02*nb02 + i03*nb03);
-                float * y = (float *)((char *)tensor_data(dst) + i01*nb1 + i02*nb2 + i03*nb3);
-                
-                // First pass: compute sum of squares for this row
-                ggml_float sum = 0.0;
-                for (int64_t i00 = 0; i00 < ne00; i00++) {
-                    sum += (ggml_float)(x[i00] * x[i00]);
-                }
-                
-                // Compute mean and normalization scale
-                const float mean = sum / ne00;
-                const float scale = 1.0f / sqrtf(mean + eps);
-                
-                // Verify scale is valid (catches NaN/inf issues early)
-                NUMA_ASSERT(scale > 0.0f && isfinite(scale), "Invalid normalization scale computed");
-                
-                // Second pass: copy input and apply scaling with SIMD optimization
-                memcpy(y, x, ne00 * sizeof(float));
-                ggml_vec_scale_f32(ne00, y, scale);
-            }
+    NUMA_4D_ROWWISE_LOOP(dst, ctx, {
+        // Calculate row pointers using tensor_data for NUMA-aware access
+        const float * x = (const float *)((const char *)tensor_data(dst->src[0]) + i01*nb01 + i02*nb02 + i03*nb03);
+        float * y = (float *)((char *)tensor_data(dst) + i01*nb1 + i02*nb2 + i03*nb3);
+        
+        // First pass: compute sum of squares for this row
+        ggml_float sum = 0.0;
+        for (int64_t i00 = 0; i00 < ne00; i00++) {
+            sum += (ggml_float)(x[i00] * x[i00]);
         }
-    }
+        
+        // Compute mean and normalization scale
+        const float mean = sum / ne00;
+        const float scale = 1.0f / sqrtf(mean + eps);
+        
+        // Verify scale is valid (catches NaN/inf issues early)
+        NUMA_ASSERT(scale > 0.0f && isfinite(scale), "Invalid normalization scale computed");
+        
+        // Second pass: copy input and apply scaling with SIMD optimization
+        memcpy(y, x, ne00 * sizeof(float));
+        ggml_vec_scale_f32(ne00, y, scale);
+    });
     
     // End barrier for consistent thread synchronization
     NUMA_BARRIER_AUTO(ctx);

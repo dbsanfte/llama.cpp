@@ -58,6 +58,7 @@ NUMA_TESTS=(
     "test-numa-mathematical-correctness-add"
     "test-numa-mathematical-correctness-rope"
     "test-numa-mathematical-correctness-rms_norm"
+    "test-numa-mathematical-correctness-soft_max"
     "test-ggml-openmp-coordinator"
 )
 

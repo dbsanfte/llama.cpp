@@ -277,6 +277,34 @@ enum ggml_status ggml_numa_kernel_rope_f32_execute(void * work_context, struct g
 }
 ```
 
+**4D Rowwise Operation (Full Composable Approach with 4D Loop Pattern):**
+```c
+enum ggml_status ggml_numa_kernel_soft_max_execute(void * work_context, struct ggml_compute_params * params) {
+    struct ggml_tensor * tensor = (struct ggml_tensor *)work_context;
+    
+    // Standard setup using composable macros
+    ggml_numa_thread_context_t ctx;
+    float * dst_data;
+    NUMA_ROWWISE_KERNEL_SETUP(ctx, tensor, params, dst_data, float);
+    
+    const float * src_data;
+    NUMA_GET_SOURCE_POINTER(src_data, tensor->src[0], float);
+    
+    // 4D rowwise loop pattern - processes outer dimensions completely,
+    // distributes inner dimension (ne[1]) across threads using ctx.thread_start/thread_end
+    NUMA_4D_ROWWISE_LOOP(tensor, ctx, {
+        const int64_t row_offset = i03 * tensor->ne[2] * tensor->ne[1] * tensor->ne[0] +
+                                   i02 * tensor->ne[1] * tensor->ne[0] +
+                                   i01 * tensor->ne[0];
+        
+        // Softmax computation on the row from row_offset to row_offset + ne[0]
+        ggml_vec_soft_max_f32(tensor->ne[0], dst_data + row_offset, src_data + row_offset);
+    });
+    
+    return GGML_STATUS_SUCCESS;
+}
+```
+
 **🏆 Composable Macro Benefits:**
 - **Lego-like Flexibility**: Mix and match atomic building blocks for any kernel complexity
 - **Proven Patterns**: Composed templates handle 80% of common cases with one-line setup

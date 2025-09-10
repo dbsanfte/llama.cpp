@@ -19,6 +19,7 @@
 #include "sub.h"
 #include "mul_mat.h"
 #include "rope.h"
+#include "soft_max.h"
 #include "noop.h"
 #include "reshape.h"
 #include "transpose.h"
@@ -334,6 +335,7 @@ enum ggml_status ggml_numa_kernels_init(void) {
     
     // Register reduction kernels:
     NUMA_REGISTER_KERNEL(rms_norm);
+    NUMA_REGISTER_KERNEL(soft_max);
     
     // Register view operations (metadata-only, no-op kernels):
     NUMA_REGISTER_KERNEL(reshape);
