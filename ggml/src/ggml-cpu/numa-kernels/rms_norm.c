@@ -110,99 +110,17 @@ enum ggml_status ggml_numa_kernel_rms_norm_execute(void * work_context, struct g
     return GGML_STATUS_SUCCESS;
 }
 
-/**
- * @brief Query optimal execution strategy for RMS_NORM operation
- * 
- * RMS_NORM benefits from different strategies based on tensor size:
- * - Small tensors: Single-thread to avoid threading overhead
- * - Medium tensors: Multi-thread single-node for cache locality
- * - Large tensors: Data-parallel for maximum throughput
- * 
- * @param tensor Target tensor for RMS normalization
- * @return Optimal execution strategy based on tensor size
- */
-ggml_numa_execution_strategy_t ggml_numa_kernel_rms_norm_query(const struct ggml_tensor * tensor) {
-    // Calculate total elements for strategy selection (hot path - must be fast)
-    const size_t total_elements = ggml_nelements(tensor);
-    
-    // Get cache entry for RMS_NORM operation using direct lookup
-    const ggml_numa_kernel_cache_entry_t * cache_entry = ggml_numa_lookup_kernel_direct(GGML_OP_RMS_NORM);
-    
-    if (!cache_entry || !cache_entry->supported) {
-        return NUMA_STRATEGY_SINGLE_THREAD;  // Fallback to single thread strategy
-    }
-    
-    // Use unified strategy selection macro for consistent behavior
-    ggml_numa_execution_strategy_t selected_strategy;
-    NUMA_SELECT_STRATEGY_FROM_CACHE(cache_entry, total_elements, selected_strategy);
-    
-    // Debug logging (controlled by environment variable)
-    const char* op_name = cache_entry && cache_entry->kernel_name[0] ? cache_entry->kernel_name : "NUMA RMS_NORM";
-    NUMA_LOG_DEBUG("RMS_NORM query: %zu elements -> strategy %d (%s)\n", 
-                   total_elements, selected_strategy, op_name);
-    
-    return selected_strategy;
-}
+// ============================================================================ 
+// Complete kernel implementation using shared macros
+// ============================================================================
 
-/**
- * @brief Calculate work buffer size for RMS_NORM operation
- * 
- * RMS_NORM requires no additional work buffers since it processes
- * data in-place with direct memory access patterns.
- * 
- * @param tensor Target tensor (unused - no work buffer needed)
- * @param total_numa_nodes Total NUMA nodes (unused)
- * @param total_threads Total threads (unused)
- * @return 0 (no work buffer required)
- */
-size_t ggml_numa_kernel_rms_norm_work_buffer_calc(const struct ggml_tensor * tensor, int total_numa_nodes, int total_threads) {
-    NUMA_ASSERT(tensor != NULL, "Tensor cannot be null");
-    NUMA_ASSERT(total_numa_nodes > 0, "Total NUMA nodes must be positive");
-    NUMA_ASSERT(total_threads > 0, "Total threads must be positive");
-    
-    // RMS_NORM processes data in-place, no additional work buffers needed
-    return 0;
-}
+NUMA_KERNEL_REGISTER_METADATA(
+    rms_norm,                               // kernel name
+    GGML_OP_RMS_NORM,                      // operation type
+    "NUMA RMS_NORM Kernel (Row-wise Reduction)",  // kernel description
+    2048,                                   // single_single threshold (smaller for reductions)
+    131072,                                 // single_multi threshold (128K elements)  
+    ggml_numa_kernel_rms_norm_execute      // execution function
+)
 
-/**
- * @brief Register RMS_NORM kernel with NUMA system
- * 
- * Configures registration info for the RMS_NORM operation with
- * reduction-specific thresholds and row-wise processing strategy.
- * 
- * @return Fully populated registration info structure
- */
-ggml_numa_kernel_registration_info_t ggml_numa_kernel_rms_norm_register(void) {
-    ggml_numa_kernel_registration_info_t info = {0};
-    
-    info.op_type = GGML_OP_RMS_NORM;
-    info.supported = true;
-    info.kernel_name = "NUMA RMS_NORM Kernel (Row-wise Reduction)";
-    
-    // Strategy thresholds for reduction operation
-    // Use smaller thresholds than element-wise ops due to reduction overhead
-    info.strategy_array.thresholds[NUMA_STRATEGY_IDX_SINGLE_SINGLE] = 2048;      // Single thread below 2K elements
-    info.strategy_array.thresholds[NUMA_STRATEGY_IDX_SINGLE_MULTI] = 131072;     // Multi-thread below 128K elements
-    // Above 128K elements: data-parallel strategy
-    info.strategy_array.valid = true;
-    
-    // Function pointers for different strategies
-    info.work_funcs.single_single_fn = ggml_numa_kernel_rms_norm_execute;
-    info.work_funcs.single_multi_fn = ggml_numa_kernel_rms_norm_execute;
-    info.work_funcs.data_parallel_fn = ggml_numa_kernel_rms_norm_execute;
-    info.work_funcs.valid = true;
-    
-    // Query function pointer for direct dispatch
-    info.query_fn = (void*)ggml_numa_kernel_rms_norm_query;
-    
-    // Work buffer calculation function pointer
-    info.work_buffer_calc_fn = (void*)ggml_numa_kernel_rms_norm_work_buffer_calc;
-    
-    // No aggregation functions needed (row-wise processing, no cross-NUMA reduction)
-    info.agg_funcs.single_single_fn = NULL;
-    info.agg_funcs.single_multi_fn = NULL; 
-    info.agg_funcs.data_parallel_fn = NULL;
-    info.agg_funcs.valid = false;
-    
-    return info;
-}
+

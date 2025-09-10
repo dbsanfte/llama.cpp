@@ -66,72 +66,15 @@ enum ggml_status ggml_numa_kernel_sub_unified_execute(void * work_context, struc
     return GGML_STATUS_SUCCESS;
 }
 
-// ============================================================================
-// Kernel Query Function - IDENTICAL TO ADD
-// ============================================================================
-
-ggml_numa_execution_strategy_t ggml_numa_kernel_sub_query(const struct ggml_tensor * tensor) {
-    // Calculate total elements for threshold comparison
-    size_t total_elements = ggml_nelements(tensor);
-    
-    // Get cache entry for this operation  
-    const ggml_numa_kernel_cache_entry_t * cache_entry = ggml_numa_lookup_kernel_direct(GGML_OP_SUB);
-    
-    if (!cache_entry || !cache_entry->supported) {
-        return NUMA_STRATEGY_SINGLE_THREAD;  // Fallback to single thread strategy
-    }
-    
-    // Use shared macro for unified strategy selection 
-    ggml_numa_execution_strategy_t selected_strategy;
-    NUMA_SELECT_STRATEGY_FROM_CACHE(cache_entry, total_elements, selected_strategy);
-    
-    // Debug logging (controlled by environment variable)
-    const char* op_name = cache_entry && cache_entry->kernel_name ? cache_entry->kernel_name : "NUMA SUB";
-    NUMA_LOG_DEBUG("SUB Query: total_elements=%zu, selected_strategy=%d (%s)\n", 
-                   total_elements, selected_strategy, op_name);
-    
-    return selected_strategy;
-}
-
-// ============================================================================
-// Work Buffer Calculation - IDENTICAL TO ADD  
+// ============================================================================ 
+// Complete kernel implementation using shared macros
 // ============================================================================
 
-size_t ggml_numa_kernel_sub_work_buffer_calc(const struct ggml_tensor * tensor, int total_numa_nodes, int total_threads) {
-    (void)tensor;        // SUB doesn't need work buffers
-    (void)total_numa_nodes;
-    (void)total_threads;
-    return 0;
-}
-
-// ============================================================================
-// Kernel Registration - IDENTICAL TO ADD
-// ============================================================================
-
-ggml_numa_kernel_registration_info_t ggml_numa_kernel_sub_register(void) {
-    ggml_numa_kernel_registration_info_t info = {0};
-    
-    info.op_type = GGML_OP_SUB;           // ONLY LINE CHANGED: ADD → SUB
-    info.supported = true;
-    info.kernel_name = "NUMA SUB Kernel"; // ONLY LINE CHANGED: ADD → SUB
-    
-    // Strategy thresholds for operation - IDENTICAL TO ADD
-    info.strategy_array.thresholds[NUMA_STRATEGY_IDX_SINGLE_SINGLE] = 1024;      
-    info.strategy_array.thresholds[NUMA_STRATEGY_IDX_SINGLE_MULTI] = 262144;     
-    info.strategy_array.valid = true;
-    
-    // Unified function handles all strategies - IDENTICAL TO ADD
-    info.work_funcs.single_single_fn = ggml_numa_kernel_sub_unified_execute;
-    info.work_funcs.single_multi_fn = ggml_numa_kernel_sub_unified_execute;
-    info.work_funcs.data_parallel_fn = ggml_numa_kernel_sub_unified_execute;
-    info.work_funcs.valid = true;
-    
-    // Query and work buffer function pointers - IDENTICAL TO ADD
-    info.query_fn = (void*)ggml_numa_kernel_sub_query;
-    info.work_buffer_calc_fn = (void*)ggml_numa_kernel_sub_work_buffer_calc;
-    
-    // Element-wise operations don't need aggregation - IDENTICAL TO ADD
-    info.agg_funcs.valid = false;
-    
-    return info;
-}
+NUMA_KERNEL_REGISTER_METADATA(
+    sub,                                    // kernel name
+    GGML_OP_SUB,                           // operation type
+    "NUMA SUB Kernel",                     // kernel description
+    1024,                                  // single_single threshold
+    262144,                                // single_multi threshold
+    ggml_numa_kernel_sub_unified_execute   // execution function
+)

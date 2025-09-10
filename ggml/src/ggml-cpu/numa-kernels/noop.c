@@ -71,53 +71,16 @@ enum ggml_status ggml_numa_kernel_noop_unified_execute(void * work_context, stru
 }
 
 /**
- * @brief Kernel registration function for NUMA NOOP operations
+ * @brief Complete no-op implementation for NOOP kernel
  * 
- * This function provides registration information for the NOOP kernel.
- * 
- * @return Registration information structure with function pointers and thresholds
- * 
- * @note The NOOP kernel does not require aggregation functions as it performs
- *       no meaningful computation that needs to be combined across threads
+ * NOOP is a testing/performance kernel that should never execute actual computation.
+ * This registration marks it as a no-op kernel, so the coordinator will skip execution.
  */
-ggml_numa_kernel_registration_info_t ggml_numa_kernel_noop_register(void) {
-    ggml_numa_kernel_registration_info_t info = {0};
-    
-    info.op_type = GGML_OP_NUMA_NOOP;
-    info.supported = true;
-    info.kernel_name = "NUMA NOOP Kernel";
-    
-    // Strategy thresholds optimized for performance testing
-    // These thresholds ensure all execution strategies are exercised
-    info.strategy_array.thresholds[NUMA_STRATEGY_IDX_SINGLE_SINGLE] = 0;        // Single thread
-    info.strategy_array.thresholds[NUMA_STRATEGY_IDX_SINGLE_MULTI] = 0;       // Multi-thread
-    // Above: Data-parallel strategy
-    info.strategy_array.valid = true;
-    
-    // Function pointers for all strategies - unified execution function
-    info.work_funcs.single_single_fn = ggml_numa_kernel_noop_unified_execute;
-    info.work_funcs.single_multi_fn = ggml_numa_kernel_noop_unified_execute;
-    info.work_funcs.data_parallel_fn = ggml_numa_kernel_noop_unified_execute;
-    info.work_funcs.valid = true;
-    
-    // Query function pointer - enables direct dispatch
-    info.query_fn = (void*)ggml_numa_kernel_noop_query;
-    
-    // Work buffer calculation function pointer - NOOP requires no work buffers
-    info.work_buffer_calc_fn = (void*)ggml_numa_kernel_noop_work_buffer_calc;
-    
-    // NOOP operations don't need aggregation functions
-    info.agg_funcs.single_single_fn = NULL;
-    info.agg_funcs.single_multi_fn = NULL;
-    info.agg_funcs.data_parallel_fn = NULL;
-    info.agg_funcs.valid = false;
-    
-    NUMA_LOG_DEBUG("Registered NOOP kernel with thresholds: single=%zu, multi=%zu", 
-                   info.strategy_array.thresholds[NUMA_STRATEGY_IDX_SINGLE_SINGLE],
-                   info.strategy_array.thresholds[NUMA_STRATEGY_IDX_SINGLE_MULTI]);
-    
-    return info;
-}
+NUMA_KERNEL_REGISTER_METADATA_NOOP(
+    noop,                                  // kernel name
+    GGML_OP_NUMA_NOOP,                    // operation type  
+    "NUMA NOOP Kernel"                    // kernel description
+)
 
 /**
  * @brief Query function for NUMA NOOP kernel strategy selection
@@ -132,58 +95,4 @@ ggml_numa_kernel_registration_info_t ggml_numa_kernel_noop_register(void) {
  * @note Strategy selection is based purely on element count thresholds,
  *       making it ideal for measuring overhead at different scales
  */
-ggml_numa_execution_strategy_t ggml_numa_kernel_noop_query(const struct ggml_tensor * tensor) {
-    ggml_numa_execution_strategy_t strategy = NUMA_STRATEGY_SINGLE_THREAD;
-    
-    // Basic validation - return default single-thread strategy for any invalid input
-    if (tensor == NULL || tensor->op != GGML_OP_NUMA_NOOP) {
-        return strategy;
-    }
-    
-    // Get cache entry for this operation
-    const ggml_numa_kernel_cache_entry_t * cache_entry = ggml_numa_lookup_kernel_direct(tensor->op);
-    if (cache_entry == NULL || !cache_entry->strategy_array.valid) {
-        NUMA_LOG_DEBUG("NOOP query: No valid strategy array in cache");
-        return strategy;
-    }
-    
-    // Calculate total elements for threshold comparison
-    size_t total_elements = ggml_nelements(tensor);
-    
-    // Use shared macro for unified strategy selection
-    NUMA_SELECT_STRATEGY_FROM_CACHE(cache_entry, total_elements, strategy);
-    
-    // Debug logging for operation analysis (maintains integration test compatibility)
-    const char* strategy_name = (strategy == NUMA_STRATEGY_SINGLE_THREAD) ? "(Single/Single)" :
-                               (strategy == NUMA_STRATEGY_SINGLE_NODE) ? "(Single/Multi)" :
-                               "(Data Parallel)";
-    
-    NUMA_LOG_DEBUG("NUMA NOOP %s", strategy_name);
-    
-    return strategy;
-}
 
-/**
- * @brief Work buffer calculation function for NOOP operations
- * 
- * NOOP operations require no work buffers as they perform no meaningful
- * computation. This function returns zero to indicate no additional
- * memory allocation is needed.
- * 
- * @param tensor The tensor being processed (unused for NOOP)
- * @param total_numa_nodes Total number of NUMA nodes (unused for NOOP)
- * @param total_threads Total number of threads (unused for NOOP)
- * @return Zero indicating no work buffer memory required
- * 
- * @note This function maintains the standard kernel interface while
- *       indicating that NOOP operations have no memory overhead
- */
-size_t ggml_numa_kernel_noop_work_buffer_calc(const struct ggml_tensor * tensor, int total_numa_nodes, int total_threads) {
-    // Suppress unused parameter warnings
-    (void)tensor;
-    (void)total_numa_nodes;
-    (void)total_threads;
-    
-    // NOOP operations require no work buffers
-    return 0;
-}

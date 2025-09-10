@@ -302,33 +302,52 @@ typedef enum {
 
 ### Registration Process
 
-Kernels register themselves at startup by providing threshold arrays and function pointers:
+Kernels register themselves using streamlined macros that eliminate all boilerplate code. The modern system provides three registration approaches:
 
+**Standard Operations (99% of cases):**
 ```c
-// Kernel provides registration info
-ggml_numa_kernel_registration_info_t info = {
-    .op_type = GGML_OP_ADD,
-    .strategy_array = {
-        .thresholds = {1024, 262144},  // 1K and 256K element thresholds
-        .valid = true
-    },
-    .work_funcs = {
-        .single_single_fn = ggml_numa_kernel_add_low_overhead_execute,
-        .single_multi_fn = ggml_numa_kernel_add_low_overhead_execute,
-        .data_parallel_fn = ggml_numa_kernel_add_no_aggregation_execute,
-        .valid = true
-    },
-    .agg_funcs = {
-        .valid = false  // ADD doesn't need aggregation
-    },
-    .kernel_name = "NUMA ADD Kernel",
-    .supported = true
-};
-
-// Registry stores this information in hash table
-ggml_numa_register_kernel_strategy(info.op_type, &info.strategy_array, 
-                                   &info.work_funcs, &info.agg_funcs);
+// Single macro replaces ~80 lines of manual registration code
+NUMA_KERNEL_REGISTER_METADATA(
+    add,                                   // op_name
+    GGML_OP_ADD,                          // ggml_op_type  
+    "NUMA ADD Kernel",                    // kernel_display_name
+    1024,                                 // threshold_single_single (below 1K: single thread)
+    262144,                               // threshold_single_multi (below 256K: multi-thread single node)
+    ggml_numa_kernel_add_execute          // execute_function
+)
+// Automatically generates: query function, work buffer function, registration function
 ```
+
+**Reduction Operations (need aggregation):**
+```c
+// For operations requiring result aggregation (RMS_NORM, SOFT_MAX)
+NUMA_KERNEL_REGISTER_METADATA_WITH_AGG(
+    rms_norm,                             // op_name
+    GGML_OP_RMS_NORM,                     // ggml_op_type
+    "NUMA RMS_NORM Kernel",               // kernel_display_name  
+    1024,                                 // threshold_single_single
+    65536,                                // threshold_single_multi
+    ggml_numa_kernel_rms_norm_execute     // execute_function
+)
+```
+
+**View Operations (metadata-only, no execution):**
+```c
+// For operations that should never execute (RESHAPE, VIEW, TRANSPOSE, PERMUTE)
+NUMA_KERNEL_REGISTER_METADATA_NOOP(
+    reshape,                              // op_name
+    GGML_OP_RESHAPE,                      // ggml_op_type
+    "NUMA RESHAPE No-Op Kernel"           // kernel_display_name
+)
+// Sets is_noop=true, coordinator skips execution
+```
+
+**Benefits of New System:**
+- **99% Code Reduction**: Single macro line replaces ~80 lines of boilerplate
+- **Zero Manual Function Writing**: Query, work buffer, and registration functions auto-generated
+- **No Header Maintenance**: Function declarations automatically created
+- **Type Safety**: Compile-time validation of all parameters
+- **Consistent Behavior**: All kernels use identical registration logic
 
 ---
 
@@ -913,39 +932,26 @@ enum ggml_status ggml_numa_kernel_operation_execute(void * work_context, struct 
 
 **Registry Integration:**
 ```c
-// Registration function using modern pattern
-ggml_numa_kernel_registration_info_t ggml_numa_kernel_operation_register(void) {
-    ggml_numa_kernel_registration_info_t info = {0};
-    
-    info.op_type = GGML_OP_OPERATION;
-    info.supported = true;
-    info.kernel_name = "NUMA Operation Kernel";
-    
-    // Strategy thresholds
-    info.strategy_array.thresholds[NUMA_STRATEGY_IDX_SINGLE_SINGLE] = 1024;
-    info.strategy_array.thresholds[NUMA_STRATEGY_IDX_SINGLE_MULTI] = 262144;
-    info.strategy_array.valid = true;
-    
-    // Unified function handles all strategies through shared macros
-    info.work_funcs.single_single_fn = ggml_numa_kernel_operation_execute;
-    info.work_funcs.single_multi_fn = ggml_numa_kernel_operation_execute;
-    info.work_funcs.data_parallel_fn = ggml_numa_kernel_operation_execute;
-    info.work_funcs.valid = true;
-    
-    // Function pointers for direct dispatch
-    info.query_fn = (void*)ggml_numa_kernel_operation_query;
-    info.work_buffer_calc_fn = (void*)ggml_numa_kernel_operation_work_buffer_calc;
-    
-    // Most operations don't need aggregation
-    info.agg_funcs.valid = false;
-    
-    return info;
-}
+// Modern macro-based registration (replaces all manual boilerplate)
+// Single line in kernel source file:
+NUMA_KERNEL_REGISTER_METADATA(
+    operation,                            // op_name  
+    GGML_OP_OPERATION,                   // ggml_op_type
+    "NUMA Operation Kernel",             // kernel_display_name
+    1024,                                // threshold_single_single
+    262144,                              // threshold_single_multi  
+    ggml_numa_kernel_operation_execute   // execute_function
+)
+
+// The macro automatically generates these functions:
+// - ggml_numa_kernel_operation_query()
+// - ggml_numa_kernel_operation_work_buffer_calc() 
+// - ggml_numa_kernel_operation_register()
 
 // Enable in numa-kernels.c using NUMA_REGISTER_KERNEL macro
 void ggml_numa_kernels_init(void) {
     // ...other kernels...
-    NUMA_REGISTER_KERNEL(operation);  // Automatic registration with direct dispatch
+    NUMA_REGISTER_KERNEL(operation);  // Automatic registration with O(1) dispatch
 }
 ```
 
@@ -1019,39 +1025,45 @@ enum ggml_status ggml_numa_kernel_your_operation_execute(void * work_context, st
 
 #### 2. Register with Registry
 
-Add kernel registration in `numa-kernels.c`:
+Use the streamlined macro system that eliminates all boilerplate:
 
 ```c
-// Add to kernel registration function
-void ggml_numa_register_your_operation_kernels(void) {
-    ggml_numa_kernel_registration_info_t info = {
-        .op_type = GGML_OP_YOUR_OPERATION,
-        .strategy_array = {
-            .thresholds = {1024, 262144},  // 1K and 256K element thresholds
-            .valid = true
-        },
-        .work_funcs = {
-            .single_single_fn = ggml_numa_kernel_your_operation_execute,
-            .single_multi_fn = ggml_numa_kernel_your_operation_execute,
-            .data_parallel_fn = ggml_numa_kernel_your_operation_execute,
-            .valid = true
-        },
-        .agg_funcs = {
-            .valid = false  // Most operations don't need aggregation
-        },
-        .kernel_name = "NUMA Your Operation Kernel",
-        .supported = true
-    };
-    
-    ggml_numa_register_kernel_strategy(info.op_type, &info.strategy_array, 
-                                       &info.work_funcs, &info.agg_funcs);
-}
+// Single macro in your kernel source file (e.g., numa-kernels/your_operation.c)
+// Choose appropriate macro based on operation type:
 
-// Call registration function in ggml_numa_kernels_init()
+// APPROACH 1: Standard Operations (99% of cases)
+NUMA_KERNEL_REGISTER_METADATA(
+    your_operation,                          // op_name
+    GGML_OP_YOUR_OPERATION,                 // ggml_op_type
+    "NUMA Your Operation Kernel",           // kernel_display_name
+    1024,                                   // threshold_single_single
+    262144,                                 // threshold_single_multi
+    ggml_numa_kernel_your_operation_execute // execute_function
+)
+
+// APPROACH 2: Reduction Operations (need aggregation)
+// NUMA_KERNEL_REGISTER_METADATA_WITH_AGG(
+//     your_operation, GGML_OP_YOUR_OPERATION, "NUMA Your Operation Kernel",
+//     1024, 65536, ggml_numa_kernel_your_operation_execute
+// )
+
+// APPROACH 3: View Operations (metadata-only, no execution)
+// NUMA_KERNEL_REGISTER_METADATA_NOOP(
+//     your_operation, GGML_OP_YOUR_OPERATION, "NUMA Your Operation No-Op Kernel"
+// )
+
+// Enable in numa-kernels.c
 void ggml_numa_kernels_init(void) {
     // ... existing registrations ...
-    ggml_numa_register_your_operation_kernels();
+    NUMA_REGISTER_KERNEL(your_operation);  // Single line registration
 }
+```
+
+**What the Macro Automatically Generates:**
+- **Query Function**: `ggml_numa_kernel_your_operation_query()` with threshold-based strategy selection
+- **Work Buffer Function**: `ggml_numa_kernel_your_operation_work_buffer_calc()` (returns 0 for standard ops)
+- **Registration Function**: `ggml_numa_kernel_your_operation_register()` with complete metadata
+- **Header Declarations**: All function prototypes automatically generated
 ```
 
 #### 3. Add Mathematical Correctness Tests

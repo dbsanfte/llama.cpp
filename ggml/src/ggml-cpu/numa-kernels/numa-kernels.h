@@ -405,6 +405,322 @@ bool ggml_numa_apply_kernel_force_strategy(ggml_numa_kernel_query_result_t * res
 } while(0)
 
 // =============================================================================
+// SHARED KERNEL FUNCTION MACROS - Eliminate Code Duplication
+// =============================================================================
+
+/**
+ * NUMA_KERNEL_QUERY_FUNCTION - Macro to generate standard query functions
+ * 
+ * This macro eliminates the repetitive boilerplate code in query functions.
+ * All query functions follow the same pattern: calculate total elements,
+ * lookup cache entry, use strategy selection macro, and debug logging.
+ * 
+ * @param op_name - Operation name (e.g., ADD, MUL, ROPE)
+ * @param ggml_op_type - The GGML operation type constant (e.g., GGML_OP_ADD)
+ * @param debug_name - Human-readable name for debug logging
+ * 
+ * Usage example:
+ *   NUMA_KERNEL_QUERY_FUNCTION(add, GGML_OP_ADD, "ADD");
+ *   NUMA_KERNEL_QUERY_FUNCTION(mul, GGML_OP_MUL, "MUL");
+ * 
+ * Generates:
+ *   ggml_numa_execution_strategy_t ggml_numa_kernel_add_query(const struct ggml_tensor * tensor)
+ */
+#define NUMA_KERNEL_QUERY_FUNCTION(op_name, threshold_single_single, threshold_single_multi) \
+ggml_numa_execution_strategy_t ggml_numa_kernel_##op_name##_query(const struct ggml_tensor * tensor) { \
+    /* Calculate total elements for strategy selection (hot path - must be fast) */ \
+    const size_t total_elements = ggml_nelements(tensor); \
+    \
+    /* Direct threshold-based strategy selection for maximum performance */ \
+    if (total_elements < threshold_single_single) { \
+        return NUMA_STRATEGY_SINGLE_THREAD; \
+    } else if (total_elements < threshold_single_multi) { \
+        return NUMA_STRATEGY_SINGLE_NODE; \
+    } else { \
+        return NUMA_STRATEGY_DATA_PARALLEL; \
+    } \
+}
+
+/**
+ * @brief Macro to generate standard work buffer function that returns 0
+ *
+ * Most operations don't need work buffers, so this macro creates a function
+ * that simply returns 0. For operations that need custom work buffers,
+ * implement the function manually.
+ *
+ * @param op_name Operation name (e.g., add, mul, etc.)
+ * 
+ * Usage examples:
+ *   NUMA_KERNEL_WORK_BUFFER_FUNCTION(add);  // Returns 0 - no work buffer needed
+ *   NUMA_KERNEL_WORK_BUFFER_FUNCTION(mul);  // Returns 0 - no work buffer needed
+ * 
+ * Generates:
+ *   size_t ggml_numa_kernel_add_work_buffer_calc(const struct ggml_tensor * tensor, int total_numa_nodes, int total_threads)
+ */
+#define NUMA_KERNEL_WORK_BUFFER_FUNCTION(op_name) \
+size_t ggml_numa_kernel_##op_name##_work_buffer_calc(const struct ggml_tensor * tensor, int total_numa_nodes, int total_threads) { \
+    /* Standard parameter validation */ \
+    (void)tensor; \
+    (void)total_numa_nodes; \
+    (void)total_threads; \
+    \
+    /* Most operations don't need work buffers */ \
+    return 0; \
+}
+
+/**
+ * NUMA_KERNEL_REGISTRATION_FUNCTION - Macro to generate standard registration functions
+ * 
+ * This macro eliminates the highly repetitive registration function boilerplate.
+ * Most kernels follow identical patterns with different operation types and thresholds.
+ * 
+ * @param op_name - Operation name (e.g., add, mul, rope)
+ * @param ggml_op_type - The GGML operation type constant (e.g., GGML_OP_ADD)
+ * @param kernel_display_name - Human-readable kernel name for debugging
+ * @param threshold_single_single - Threshold for single-thread strategy
+ * @param threshold_single_multi - Threshold for single-node multi-thread strategy
+ * @param execute_function - The execution function name (e.g., ggml_numa_kernel_add_execute)
+ * @param needs_aggregation - true if operation needs aggregation functions, false otherwise
+ * 
+ * Usage examples:
+ *   NUMA_KERNEL_REGISTRATION_FUNCTION(add, GGML_OP_ADD, "NUMA ADD Kernel", 1024, 262144, ggml_numa_kernel_add_unified_execute, false);
+ *   NUMA_KERNEL_REGISTRATION_FUNCTION(rope, GGML_OP_ROPE, "NUMA ROPE Kernel", 128, 1024, ggml_numa_kernel_rope_execute, false);
+ * 
+ * Generates:
+ *   ggml_numa_kernel_registration_info_t ggml_numa_kernel_add_register(void)
+ */
+#define NUMA_KERNEL_REGISTRATION_FUNCTION(op_name, ggml_op_type, kernel_display_name, threshold_single_single, threshold_single_multi, execute_function, needs_aggregation) \
+ggml_numa_kernel_registration_info_t ggml_numa_kernel_##op_name##_register(void) { \
+    ggml_numa_kernel_registration_info_t info = {0}; \
+    \
+    info.op_type = ggml_op_type; \
+    info.supported = true; \
+    info.kernel_name = kernel_display_name; \
+    \
+    /* Strategy thresholds for operation */ \
+    info.strategy_array.thresholds[NUMA_STRATEGY_IDX_SINGLE_SINGLE] = threshold_single_single; \
+    info.strategy_array.thresholds[NUMA_STRATEGY_IDX_SINGLE_MULTI] = threshold_single_multi; \
+    /* Above threshold_single_multi elements: data-parallel strategy */ \
+    info.strategy_array.valid = true; \
+    \
+    /* Function pointers for different strategies */ \
+    info.work_funcs.single_single_fn = execute_function; \
+    info.work_funcs.single_multi_fn = execute_function; \
+    info.work_funcs.data_parallel_fn = execute_function; \
+    info.work_funcs.valid = true; \
+    \
+    /* Query function pointer - enables direct dispatch without switch statements */ \
+    info.query_fn = (void*)ggml_numa_kernel_##op_name##_query; \
+    \
+    /* Work buffer calculation function pointer */ \
+    info.work_buffer_calc_fn = (void*)ggml_numa_kernel_##op_name##_work_buffer_calc; \
+    \
+    /* Aggregation functions - most operations don't need them */ \
+    if (needs_aggregation) { \
+        info.agg_funcs.single_single_fn = (void*)ggml_numa_kernel_##op_name##_aggregate; \
+        info.agg_funcs.single_multi_fn = (void*)ggml_numa_kernel_##op_name##_aggregate; \
+        info.agg_funcs.data_parallel_fn = (void*)ggml_numa_kernel_##op_name##_aggregate; \
+        info.agg_funcs.valid = true; \
+    } else { \
+        info.agg_funcs.single_single_fn = NULL; \
+        info.agg_funcs.single_multi_fn = NULL; \
+        info.agg_funcs.data_parallel_fn = NULL; \
+        info.agg_funcs.valid = false; \
+    } \
+    \
+    return info; \
+}
+
+/**
+ * @brief Macro to generate kernel registration function WITHOUT aggregation
+ *
+ * For operations that don't need reduction/aggregation (most element-wise operations)
+ *
+ * @param op_name Operation name (e.g., add, mul, div, sub)
+ * @param ggml_op_type GGML operation type (e.g., GGML_OP_ADD)
+ * @param kernel_display_name Display name for logging
+ * @param threshold_single_single Threshold for single-thread strategy
+ * @param threshold_single_multi Threshold for multi-thread strategy  
+ * @param execute_function Function pointer to the execution function
+ */
+#define NUMA_KERNEL_REGISTRATION_FUNCTION_NO_AGG(op_name, ggml_op_type, kernel_display_name, threshold_single_single, threshold_single_multi, execute_function) \
+ggml_numa_kernel_registration_info_t ggml_numa_kernel_##op_name##_register(void) { \
+    ggml_numa_kernel_registration_info_t info = {0}; \
+    \
+    info.op_type = ggml_op_type; \
+    info.supported = true; \
+    info.kernel_name = kernel_display_name; \
+    \
+    /* Strategy thresholds for operation */ \
+    info.strategy_array.thresholds[NUMA_STRATEGY_IDX_SINGLE_SINGLE] = threshold_single_single; \
+    info.strategy_array.thresholds[NUMA_STRATEGY_IDX_SINGLE_MULTI] = threshold_single_multi; \
+    /* Above threshold_single_multi elements: data-parallel strategy */ \
+    info.strategy_array.valid = true; \
+    \
+    /* Function pointers for different strategies */ \
+    info.work_funcs.single_single_fn = execute_function; \
+    info.work_funcs.single_multi_fn = execute_function; \
+    info.work_funcs.data_parallel_fn = execute_function; \
+    info.work_funcs.valid = true; \
+    \
+    /* Query function pointer - enables direct dispatch without switch statements */ \
+    info.query_fn = (void*)ggml_numa_kernel_##op_name##_query; \
+    \
+    /* Work buffer calculation function pointer */ \
+    info.work_buffer_calc_fn = (void*)ggml_numa_kernel_##op_name##_work_buffer_calc; \
+    \
+    /* No aggregation functions needed */ \
+    info.agg_funcs.single_single_fn = NULL; \
+    info.agg_funcs.single_multi_fn = NULL; \
+    info.agg_funcs.data_parallel_fn = NULL; \
+    info.agg_funcs.valid = false; \
+    \
+    return info; \
+}
+
+/**
+ * @brief Macro to generate no-op kernel registration function
+ *
+ * For operations that should never be executed by the NUMA system (view operations, testing kernels).
+ * These kernels are registered but marked as no-op, so the coordinator will skip execution.
+ *
+ * @param op_name Operation name (e.g., reshape, view, transpose, noop)
+ * @param ggml_op_type GGML operation type (e.g., GGML_OP_RESHAPE)
+ * @param kernel_display_name Display name for logging
+ */
+#define NUMA_KERNEL_REGISTRATION_FUNCTION_NOOP(op_name, ggml_op_type, kernel_display_name) \
+ggml_numa_kernel_registration_info_t ggml_numa_kernel_##op_name##_register(void) { \
+    ggml_numa_kernel_registration_info_t info = {0}; \
+    \
+    info.op_type = ggml_op_type; \
+    info.supported = true; \
+    info.is_noop = true;  /* Mark as no-op - coordinator will skip execution */ \
+    info.kernel_name = kernel_display_name; \
+    \
+    /* No meaningful thresholds for no-op kernels - use SIZE_MAX to indicate never execute */ \
+    info.strategy_array.thresholds[NUMA_STRATEGY_IDX_SINGLE_SINGLE] = SIZE_MAX; \
+    info.strategy_array.thresholds[NUMA_STRATEGY_IDX_SINGLE_MULTI] = SIZE_MAX; \
+    info.strategy_array.valid = true; \
+    \
+    /* No execution functions needed for no-op kernels */ \
+    info.work_funcs.single_single_fn = NULL; \
+    info.work_funcs.single_multi_fn = NULL; \
+    info.work_funcs.data_parallel_fn = NULL; \
+    info.work_funcs.valid = false; \
+    \
+    /* Query function pointer - still needed for registration */ \
+    info.query_fn = (void*)ggml_numa_kernel_##op_name##_query; \
+    \
+    /* No work buffer needed for no-op kernels */ \
+    info.work_buffer_calc_fn = NULL; \
+    \
+    /* No aggregation functions needed */ \
+    info.agg_funcs.single_single_fn = NULL; \
+    info.agg_funcs.single_multi_fn = NULL; \
+    info.agg_funcs.data_parallel_fn = NULL; \
+    info.agg_funcs.valid = false; \
+    \
+    return info; \
+}
+
+/**
+ * @brief Macro to generate kernel registration function WITH aggregation
+ *
+ * For operations that need reduction/aggregation (like normalization operations)
+ *
+ * @param op_name Operation name (e.g., rms_norm, soft_max)
+ * @param ggml_op_type GGML operation type (e.g., GGML_OP_RMS_NORM)
+ * @param kernel_display_name Display name for logging
+ * @param threshold_single_single Threshold for single-thread strategy
+ * @param threshold_single_multi Threshold for multi-thread strategy  
+ * @param execute_function Function pointer to the execution function
+ */
+#define NUMA_KERNEL_REGISTRATION_FUNCTION_WITH_AGG(op_name, ggml_op_type, kernel_display_name, threshold_single_single, threshold_single_multi, execute_function) \
+ggml_numa_kernel_registration_info_t ggml_numa_kernel_##op_name##_register(void) { \
+    ggml_numa_kernel_registration_info_t info = {0}; \
+    \
+    info.op_type = ggml_op_type; \
+    info.supported = true; \
+    info.kernel_name = kernel_display_name; \
+    \
+    /* Strategy thresholds for operation */ \
+    info.strategy_array.thresholds[NUMA_STRATEGY_IDX_SINGLE_SINGLE] = threshold_single_single; \
+    info.strategy_array.thresholds[NUMA_STRATEGY_IDX_SINGLE_MULTI] = threshold_single_multi; \
+    /* Above threshold_single_multi elements: data-parallel strategy */ \
+    info.strategy_array.valid = true; \
+    \
+    /* Function pointers for different strategies */ \
+    info.work_funcs.single_single_fn = execute_function; \
+    info.work_funcs.single_multi_fn = execute_function; \
+    info.work_funcs.data_parallel_fn = execute_function; \
+    info.work_funcs.valid = true; \
+    \
+    /* Query function pointer - enables direct dispatch without switch statements */ \
+    info.query_fn = (void*)ggml_numa_kernel_##op_name##_query; \
+    \
+    /* Work buffer calculation function pointer */ \
+    info.work_buffer_calc_fn = (void*)ggml_numa_kernel_##op_name##_work_buffer_calc; \
+    \
+    /* Aggregation functions for reduction operations */ \
+    info.agg_funcs.single_single_fn = (void*)ggml_numa_kernel_##op_name##_aggregate; \
+    info.agg_funcs.single_multi_fn = (void*)ggml_numa_kernel_##op_name##_aggregate; \
+    info.agg_funcs.data_parallel_fn = (void*)ggml_numa_kernel_##op_name##_aggregate; \
+    info.agg_funcs.valid = true; \
+    \
+    return info; \
+}
+
+/**
+ * @brief Complete macro for operations that DON'T need aggregation functions
+ *
+ * This creates all three functions (query, work_buffer_calc, register) for a kernel
+ * that doesn't require aggregation. This is the most common case.
+ *
+ * @param op_name Operation name (e.g., add, mul, div, sub)
+ * @param ggml_op_type GGML operation type (e.g., GGML_OP_ADD)
+ * @param kernel_display_name Display name for logging (e.g., "ADD", "MUL")
+ * @param threshold_single_single Threshold for single-thread/single-node strategy
+ * @param threshold_single_multi Threshold for multi-thread/single-node strategy
+ * @param execute_function Function pointer to the execution function
+ */
+#define NUMA_KERNEL_REGISTER_METADATA(op_name, ggml_op_type, kernel_display_name, threshold_single_single, threshold_single_multi, execute_function) \
+    NUMA_KERNEL_QUERY_FUNCTION(op_name, threshold_single_single, threshold_single_multi) \
+    NUMA_KERNEL_WORK_BUFFER_FUNCTION(op_name) \
+    NUMA_KERNEL_REGISTRATION_FUNCTION_NO_AGG(op_name, ggml_op_type, kernel_display_name, threshold_single_single, threshold_single_multi, execute_function)
+
+/**
+ * @brief Complete macro for operations that need aggregation functions
+ *
+ * This creates all three functions (query, work_buffer_calc, register) for a kernel
+ * that requires aggregation functions for reduction operations.
+ *
+ * @param op_name Operation name (e.g., rms_norm, soft_max)
+ * @param ggml_op_type GGML operation type (e.g., GGML_OP_RMS_NORM)
+ * @param kernel_display_name Display name for logging (e.g., "RMS_NORM")
+ * @param threshold_single_single Threshold for single-thread/single-node strategy
+ * @param threshold_single_multi Threshold for multi-thread/single-node strategy
+ * @param execute_function Function pointer to the execution function
+ */
+#define NUMA_KERNEL_REGISTER_METADATA_WITH_AGG(op_name, ggml_op_type, kernel_display_name, threshold_single_single, threshold_single_multi, execute_function) \
+    NUMA_KERNEL_QUERY_FUNCTION(op_name, threshold_single_single, threshold_single_multi) \
+    NUMA_KERNEL_WORK_BUFFER_FUNCTION(op_name) \
+    NUMA_KERNEL_REGISTRATION_FUNCTION_WITH_AGG(op_name, ggml_op_type, kernel_display_name, threshold_single_single, threshold_single_multi, execute_function)
+
+/**
+ * @brief Complete macro for no-op operations (view operations, testing kernels)
+ *
+ * This creates query and registration functions for kernels that should never be executed
+ * by the NUMA system. The coordinator will skip execution for kernels marked as no-op.
+ *
+ * @param op_name Operation name (e.g., reshape, view, transpose, noop)
+ * @param ggml_op_type GGML operation type (e.g., GGML_OP_RESHAPE)
+ * @param kernel_display_name Display name for logging (e.g., "RESHAPE", "VIEW")
+ */
+#define NUMA_KERNEL_REGISTER_METADATA_NOOP(op_name, ggml_op_type, kernel_display_name) \
+    NUMA_KERNEL_QUERY_FUNCTION(op_name, SIZE_MAX, SIZE_MAX) \
+    NUMA_KERNEL_REGISTRATION_FUNCTION_NOOP(op_name, ggml_op_type, kernel_display_name)
+
+// =============================================================================
 // NUMA SLICING UTILITIES - Reusable Data Partitioning Macros
 // =============================================================================
 

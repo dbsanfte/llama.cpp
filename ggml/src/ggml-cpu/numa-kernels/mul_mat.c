@@ -54,7 +54,7 @@ size_t ggml_numa_kernel_mul_mat_work_buffer_calc(const struct ggml_tensor * tens
 }
 
 /**
- * @brief Query execution strategy for matrix multiplication
+ * @brief Query execution strategy for matrix multiplication using shared macros
  */
 ggml_numa_execution_strategy_t ggml_numa_kernel_mul_mat_query(const struct ggml_tensor * tensor) {
     NUMA_ASSERT(tensor != NULL, "Tensor cannot be null");
@@ -69,20 +69,51 @@ ggml_numa_execution_strategy_t ggml_numa_kernel_mul_mat_query(const struct ggml_
         return NUMA_STRATEGY_RESERVED;  // Signal unsupported - executor should fall back
     }
     
-    // Use strategy cache for O(1) lookup based on total elements  
-    const ggml_numa_kernel_cache_entry_t* cache_entry = ggml_numa_lookup_kernel_direct(GGML_OP_MUL_MAT);
+    // Use direct thresholds for consistent behavior
     const size_t total_elements = ggml_nelements(tensor);
     
-    // Use unified strategy selection macro for consistent behavior
-    ggml_numa_execution_strategy_t selected_strategy;
-    NUMA_SELECT_STRATEGY_FROM_CACHE(cache_entry, total_elements, selected_strategy);
+    if (total_elements < 128) {
+        return NUMA_STRATEGY_SINGLE_THREAD;
+    } else if (total_elements < 1024) {
+        return NUMA_STRATEGY_SINGLE_NODE;
+    } else {
+        return NUMA_STRATEGY_DATA_PARALLEL;
+    }
+}
+
+
+
+/**
+ * @brief Register the matrix multiplication kernel with custom work buffer logic
+ */
+ggml_numa_kernel_registration_info_t ggml_numa_kernel_mul_mat_register(void) {
+    ggml_numa_kernel_registration_info_t info = {0};
     
-    // Debug logging (controlled by environment variable)
-    const char* op_name = cache_entry ? cache_entry->kernel_name : "NUMA MUL_MAT";
-    NUMA_LOG_DEBUG("MUL_MAT query: %zu elements -> strategy %d (%s)\n", 
-                   total_elements, selected_strategy, op_name);
+    info.op_type = GGML_OP_MUL_MAT;
+    info.supported = true;
+    info.kernel_name = "NUMA Matrix Multiplication Kernel";
     
-    return selected_strategy;
+    // Strategy thresholds for matrix multiplication
+    info.strategy_array.thresholds[NUMA_STRATEGY_IDX_SINGLE_SINGLE] = 128;
+    info.strategy_array.thresholds[NUMA_STRATEGY_IDX_SINGLE_MULTI] = 1024;
+    info.strategy_array.valid = true;
+    
+    // Function pointers for all strategies
+    info.work_funcs.single_single_fn = ggml_numa_kernel_mul_mat_execute;
+    info.work_funcs.single_multi_fn = ggml_numa_kernel_mul_mat_execute;
+    info.work_funcs.data_parallel_fn = ggml_numa_kernel_mul_mat_execute;
+    info.work_funcs.valid = true;
+    
+    // Query function pointer for O(1) strategy selection
+    info.query_fn = (void*)ggml_numa_kernel_mul_mat_query;
+    
+    // Custom work buffer calculation function for type conversion
+    info.work_buffer_calc_fn = (void*)ggml_numa_kernel_mul_mat_work_buffer_calc;
+    
+    // Matrix multiplication doesn't need aggregation functions
+    info.agg_funcs.valid = false;
+    
+    return info;
 }
 
 /**
@@ -277,40 +308,4 @@ enum ggml_status ggml_numa_kernel_mul_mat_execute(void * work_context, struct gg
     return GGML_STATUS_SUCCESS;
 }
 
-/**
- * @brief Register the matrix multiplication kernel
- */
-ggml_numa_kernel_registration_info_t ggml_numa_kernel_mul_mat_register(void) {
-    ggml_numa_kernel_registration_info_t info = {0};
-    
-    info.op_type = GGML_OP_MUL_MAT;
-    info.supported = true;  // FULL IMPLEMENTATION COMPLETE
-    info.kernel_name = "NUMA Matrix Multiplication Kernel";
-    
-    // Strategy thresholds for matrix multiplication
-    // Use more conservative thresholds due to computational complexity
-    info.strategy_array.thresholds[NUMA_STRATEGY_IDX_SINGLE_SINGLE] = 128;      // Small matrices: single thread
-    info.strategy_array.thresholds[NUMA_STRATEGY_IDX_SINGLE_MULTI] = 1024;    // Medium matrices: multi-thread single node
-    // Large matrices (> 1K elements): data-parallel across NUMA nodes
-    info.strategy_array.valid = true;
-    
-    // Function pointers for all strategies
-    info.work_funcs.single_single_fn = ggml_numa_kernel_mul_mat_execute;
-    info.work_funcs.single_multi_fn = ggml_numa_kernel_mul_mat_execute;
-    info.work_funcs.data_parallel_fn = ggml_numa_kernel_mul_mat_execute;
-    info.work_funcs.valid = true;
-    
-    // Query function pointer for O(1) strategy selection
-    info.query_fn = (void*)ggml_numa_kernel_mul_mat_query;
-    
-    // Work buffer calculation function
-    info.work_buffer_calc_fn = (void*)ggml_numa_kernel_mul_mat_work_buffer_calc;
-    
-    // Matrix multiplication doesn't need aggregation functions
-    info.agg_funcs.single_single_fn = NULL;
-    info.agg_funcs.single_multi_fn = NULL;
-    info.agg_funcs.data_parallel_fn = NULL;
-    info.agg_funcs.valid = false;
-    
-    return info;
-}
+

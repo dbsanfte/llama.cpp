@@ -755,38 +755,10 @@ enum ggml_status ggml_numa_kernel_rope_execute(void * work_context, struct ggml_
 // ROPE Kernel Registration Functions
 // ============================================================================
 
-/**
- * Query function for ROPE kernel strategy selection
- */
-ggml_numa_execution_strategy_t ggml_numa_kernel_rope_query(const struct ggml_tensor * tensor) {
-    // Calculate total elements for strategy selection (hot path - must be fast)
-    size_t total_elements = ggml_nelements(tensor);
-    
-    // Get cache entry for this operation (O(1) lookup)
-    const ggml_numa_kernel_cache_entry_t * cache_entry = ggml_numa_lookup_kernel_direct(GGML_OP_ROPE);
-    
-    // Use shared macro for unified strategy selection
-    ggml_numa_execution_strategy_t selected_strategy;
-    NUMA_SELECT_STRATEGY_FROM_CACHE(cache_entry, total_elements, selected_strategy);
-    
-    // Debug logging for operation analysis (maintains integration test compatibility)
-    const char* strategy_name = (selected_strategy == NUMA_STRATEGY_SINGLE_THREAD) ? "(Single/Single)" :
-                               (selected_strategy == NUMA_STRATEGY_SINGLE_NODE) ? "(Single/Multi)" :
-                               (selected_strategy == NUMA_STRATEGY_DATA_PARALLEL) ? "(Data Parallel)" : "(Unknown)";
-    
-    NUMA_LOG_DEBUG("NUMA ROPE %s", strategy_name);
-    
-    // Return strategy only - executor gets everything else from cache
-    return selected_strategy;
-}
+// Generate standard query function using shared macro
+NUMA_KERNEL_QUERY_FUNCTION(rope, 128, 1024)
 
-/**
- * Calculate work buffer size for ROPE operation
- * @param tensor - The tensor being processed
- * @param total_numa_nodes - Total NUMA nodes participating 
- * @param total_threads - Total threads participating across all nodes
- * @return Per-thread work buffer size in bytes
- */
+// Custom work buffer calculation (too complex for simple expression macro)
 size_t ggml_numa_kernel_rope_work_buffer_calc(const struct ggml_tensor * tensor, int total_numa_nodes, int total_threads) {
     if (!tensor) {
         return 0;
@@ -809,41 +781,12 @@ size_t ggml_numa_kernel_rope_work_buffer_calc(const struct ggml_tensor * tensor,
     return total_work_buffer_size;
 }
 
-/**
- * Register ROPE kernel with NUMA strategy array and work functions
- */
-ggml_numa_kernel_registration_info_t ggml_numa_kernel_rope_register(void) {
-    ggml_numa_kernel_registration_info_t info = {0};
-    
-    info.op_type = GGML_OP_ROPE;
-    info.supported = true;
-    info.kernel_name = "NUMA ROPE Kernel";
-    
-    // Strategy thresholds for ROPE operations
-    // ROPE is now compatible with data-parallel execution after coordinator fix
-    // Each NUMA node processes non-overlapping sequences with shared destination memory
-    info.strategy_array.thresholds[NUMA_STRATEGY_IDX_SINGLE_SINGLE] = 128;     // Single thread below 1K elements
-    info.strategy_array.thresholds[NUMA_STRATEGY_IDX_SINGLE_MULTI] = 1024;     // Multi-thread below 16K elements
-    // Above 16K elements: data-parallel strategy with proper shared destination
-    info.strategy_array.valid = true;
-    
-    // All strategies supported with proper coordinator setup
-    info.work_funcs.single_single_fn = ggml_numa_kernel_rope_execute;
-    info.work_funcs.single_multi_fn = ggml_numa_kernel_rope_execute;
-    info.work_funcs.data_parallel_fn = ggml_numa_kernel_rope_execute;  // Re-enabled after coordinator fix
-    info.work_funcs.valid = true;
-    
-    // Query function pointer for direct dispatch
-    info.query_fn = (void*)ggml_numa_kernel_rope_query;
-    
-    // Work buffer calculation function
-    info.work_buffer_calc_fn = (void*)ggml_numa_kernel_rope_work_buffer_calc;
-    
-    // ROPE doesn't need aggregation functions
-    info.agg_funcs.single_single_fn = NULL;
-    info.agg_funcs.single_multi_fn = NULL;
-    info.agg_funcs.data_parallel_fn = NULL;
-    info.agg_funcs.valid = false;
-    
-    return info;
-}
+// Generate standard registration function using shared macro
+NUMA_KERNEL_REGISTRATION_FUNCTION_NO_AGG(
+    rope,                                  // op_name
+    GGML_OP_ROPE,                         // ggml_op_type
+    "NUMA ROPE Kernel",                   // kernel_display_name
+    128,                                  // threshold_single_single (Single thread below 128 elements)  
+    1024,                                 // threshold_single_multi (Multi-thread below 1K elements)
+    ggml_numa_kernel_rope_execute         // execute_function (ROPE doesn't need aggregation)
+)

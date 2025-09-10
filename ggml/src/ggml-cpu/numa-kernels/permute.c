@@ -1,122 +1,58 @@
 /**
  * @file permute.c
- * @brief NUMA kernel for PERMUTE operation (metadata-only tensor dimension permutation)
+ * @brief NUMA kernel for PERMUTE operation implementation
+ * 
+ * This file implements a NUMA-aware PERMUTE kernel for tensor axis reordering 
+ * operations. PERMUTE is a view operation that reorders tensor dimensions
+ * according to a specified axis permutation without performing actual data movement.
  * 
  * @author David Sanftenberg
- * @date 2025-09-09
- * 
- * This kernel implements the GGML_OP_PERMUTE operation for NUMA-aware execution.
- * PERMUTE is a metadata-only operation that reorders tensor dimensions according
- * to a specified permutation. Like the reference implementation, this kernel
- * performs no actual data movement - the permutation is handled at the tensor
- * metadata level by the ggml tensor system.
- * 
- * Key characteristics:
- * - Zero computational overhead (no-op execution)
- * - Metadata-only transformation
- * - Always uses single-thread/single-node strategy
- * - Compatible with all tensor data types
+ * @date 2025
  */
 
 #include "permute.h"
-#include "ggml-numa-shared.h"
-#include <stddef.h>
+#include "../ggml-numa-shared.h"
+#include "numa-kernels.h"
+#include "../ggml-cpu-impl.h"
 
 /**
- * @brief Execute PERMUTE operation (no-op implementation)
+ * @brief NUMA PERMUTE kernel execution function
  * 
- * PERMUTE is a metadata-only operation that reorders tensor dimensions.
- * The actual permutation is handled by the ggml tensor system at the
- * metadata level, so this kernel performs no computation.
+ * This function provides a no-operation implementation for PERMUTE kernels.
+ * PERMUTE is a view operation that only modifies tensor metadata and requires
+ * no actual computation during execution.
  * 
- * @param work_context Pointer to the destination tensor (cast from ggml_tensor*)
- * @param params Compute parameters (unused for no-op)
- * @return GGML_STATUS_SUCCESS always (no-op operations cannot fail)
+ * @param work_context Pointer to the tensor being processed (cast from ggml_tensor*)
+ * @param params Compute parameters containing thread information and work data
+ * @return GGML_STATUS_SUCCESS on completion
  */
 enum ggml_status ggml_numa_kernel_permute_execute(void * work_context, struct ggml_compute_params * params) {
     // PERMUTE is a metadata-only operation - no computation required
-    // The dimension permutation is handled by the ggml tensor system
+    // The permutation is handled by the ggml tensor system during graph construction
     
-    // This function should never be called.
-    NUMA_ASSERT(false, "PERMUTE kernel execute function should not be called - metadata-only operation");
+    // Basic validation for consistency with other NUMA kernels
+    NUMA_ASSERT(work_context != NULL, "Work context cannot be null");
+    NUMA_ASSERT(params != NULL, "Compute params cannot be null");
+    
+    struct ggml_tensor * tensor = (struct ggml_tensor *)work_context;
+    NUMA_ASSERT(tensor != NULL, "Tensor cannot be null");
+    NUMA_ASSERT(tensor->op == GGML_OP_PERMUTE, "Invalid operation type for PERMUTE kernel");
+    
+    // Log execution for debugging (minimal overhead)
+    NUMA_LOG_TRACE("PERMUTE no-op kernel executing on thread %d/%d", params->ith, params->nth);
+    
+    // No computation needed - return success immediately
     return GGML_STATUS_SUCCESS;
 }
 
 /**
- * @brief Query optimal execution strategy for PERMUTE operation
+ * @brief Complete no-op implementation for PERMUTE kernel
  * 
- * PERMUTE is always executed using single-thread/single-node strategy
- * since it's a metadata-only operation with zero computational cost.
- * 
- * @param tensor Target tensor for permutation (used for validation)
- * @return NUMA_STRATEGY_SINGLE_THREAD always
+ * PERMUTE is a metadata-only operation that should never be executed by the NUMA system.
+ * This registration marks it as a no-op kernel, so the coordinator will skip execution.
  */
-ggml_numa_execution_strategy_t ggml_numa_kernel_permute_query(const struct ggml_tensor * tensor) {
-    NUMA_ASSERT(tensor != NULL, "Tensor cannot be null");
-    
-    // Metadata-only operations always use single-thread strategy for minimal overhead
-    return NUMA_STRATEGY_SINGLE_THREAD;
-}
-
-/**
- * @brief Calculate work buffer size for PERMUTE operation
- * 
- * PERMUTE requires no work buffers since it's a metadata-only operation.
- * 
- * @param tensor Target tensor (unused for no-op)
- * @param total_numa_nodes Total NUMA nodes (unused for no-op)
- * @param total_threads Total threads (unused for no-op)
- * @return 0 (no work buffer needed)
- */
-size_t ggml_numa_kernel_permute_work_buffer_calc(const struct ggml_tensor * tensor, int total_numa_nodes, int total_threads) {
-    NUMA_ASSERT(tensor != NULL, "Tensor cannot be null");
-    NUMA_ASSERT(total_numa_nodes > 0, "Total NUMA nodes must be positive");
-    NUMA_ASSERT(total_threads > 0, "Total threads must be positive");
-    
-    // Metadata-only operations require no work buffers
-    return 0;
-}
-
-/**
- * @brief Register PERMUTE kernel with NUMA system
- * 
- * Configures registration info for the PERMUTE operation with metadata-only
- * characteristics and single-thread execution strategy.
- * 
- * @return Fully populated registration info structure
- */
-ggml_numa_kernel_registration_info_t ggml_numa_kernel_permute_register(void) {
-    ggml_numa_kernel_registration_info_t info = {0};
-    
-    info.op_type = GGML_OP_PERMUTE;
-    info.supported = true;
-    info.kernel_name = "NUMA PERMUTE Kernel (Metadata-Only)";
-    info.is_noop = true; // This kernel doesn't do any calculations
-    
-    // Strategy thresholds for metadata-only operation
-    // Use SIZE_MAX to ensure single-thread strategy for all tensor sizes
-    info.strategy_array.thresholds[NUMA_STRATEGY_IDX_SINGLE_SINGLE] = SIZE_MAX;
-    info.strategy_array.thresholds[NUMA_STRATEGY_IDX_SINGLE_MULTI] = SIZE_MAX;
-    // All sizes use single-thread strategy (metadata-only)
-    info.strategy_array.valid = true;
-    
-    // Function pointers - all strategies use same no-op implementation
-    info.work_funcs.single_single_fn = ggml_numa_kernel_permute_execute;
-    info.work_funcs.single_multi_fn = ggml_numa_kernel_permute_execute;
-    info.work_funcs.data_parallel_fn = ggml_numa_kernel_permute_execute;
-    info.work_funcs.valid = true;
-    
-    // Query function pointer for direct dispatch
-    info.query_fn = (void*)ggml_numa_kernel_permute_query;
-    
-    // Work buffer calculation function pointer
-    info.work_buffer_calc_fn = (void*)ggml_numa_kernel_permute_work_buffer_calc;
-    
-    // No aggregation functions needed for metadata-only operations
-    info.agg_funcs.single_single_fn = NULL;
-    info.agg_funcs.single_multi_fn = NULL; 
-    info.agg_funcs.data_parallel_fn = NULL;
-    info.agg_funcs.valid = false;
-    
-    return info;
-}
+NUMA_KERNEL_REGISTER_METADATA_NOOP(
+    permute,                               // kernel name
+    GGML_OP_PERMUTE,                       // operation type  
+    "NUMA PERMUTE No-Op Kernel"            // kernel description
+)

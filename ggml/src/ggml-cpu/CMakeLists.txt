@@ -67,6 +67,8 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
         ggml-cpu/numa-kernels/rms_norm.h
         ggml-cpu/numa-kernels/soft_max.c
         ggml-cpu/numa-kernels/soft_max.h
+        ggml-cpu/numa-kernels/glu.c
+        ggml-cpu/numa-kernels/glu.h
         ggml-work-item.c
         ggml-cpu/repack.cpp
         ggml-cpu/repack.h

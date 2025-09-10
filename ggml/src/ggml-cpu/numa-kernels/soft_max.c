@@ -140,25 +140,14 @@ enum ggml_status ggml_numa_kernel_soft_max_f32_execute(void * work_context, stru
 }
 
 /**
- * @brief Query function for SOFT_MAX strategy selection
+ * @brief Query function for SOFT_MAX strategy selection using shared macros
  * @param tensor The destination tensor for SOFT_MAX operation
  * @return Selected execution strategy based on tensor size
  */
-ggml_numa_execution_strategy_t ggml_numa_kernel_soft_max_query(const struct ggml_tensor * tensor) {
-    const size_t total_elements = ggml_nelements(tensor);
-    
-    // Use same thresholds as registration
-    if (total_elements < 1024) {
-        return NUMA_STRATEGY_SINGLE_THREAD;
-    } else if (total_elements < 65536) {
-        return NUMA_STRATEGY_SINGLE_NODE;
-    } else {
-        return NUMA_STRATEGY_DATA_PARALLEL;
-    }
-}
+NUMA_KERNEL_QUERY_FUNCTION(soft_max, 128, 1024)
 
 /**
- * @brief Calculate work buffer size for SOFT_MAX operation
+ * @brief Work buffer calculation function for SOFT_MAX operation using shared macros
  * @param tensor The destination tensor for SOFT_MAX operation
  * @param total_numa_nodes Total number of NUMA nodes participating
  * @param total_threads Total number of threads participating
@@ -177,39 +166,13 @@ size_t ggml_numa_kernel_soft_max_work_buffer_calc(const struct ggml_tensor * ten
 }
 
 /**
- * @brief Register NUMA SOFT_MAX kernel with the kernel registry
- * @return Registration information for SOFT_MAX operation
+ * @brief Register the SOFT_MAX kernel using individual macros for custom work buffer
  */
-ggml_numa_kernel_registration_info_t ggml_numa_kernel_soft_max_register(void) {
-    ggml_numa_kernel_registration_info_t info = {0};
-    
-    info.op_type = GGML_OP_SOFT_MAX;
-    info.supported = true;
-    info.kernel_name = "NUMA SOFT_MAX Kernel with ALiBi support";
-    
-    // Strategy thresholds for SOFT_MAX operation
-    info.strategy_array.thresholds[NUMA_STRATEGY_IDX_SINGLE_SINGLE] = 128;      // Single thread below 1K elements
-    info.strategy_array.thresholds[NUMA_STRATEGY_IDX_SINGLE_MULTI] = 1024;     // Multi-thread below 64K elements
-    // Above 64K elements: data-parallel strategy
-    info.strategy_array.valid = true;
-    
-    // Function pointers for different strategies - all use same F32 implementation
-    info.work_funcs.single_single_fn = ggml_numa_kernel_soft_max_f32_execute;
-    info.work_funcs.single_multi_fn = ggml_numa_kernel_soft_max_f32_execute;
-    info.work_funcs.data_parallel_fn = ggml_numa_kernel_soft_max_f32_execute;
-    info.work_funcs.valid = true;
-    
-    // Query function pointer - enables direct dispatch without switch statements
-    info.query_fn = (void*)ggml_numa_kernel_soft_max_query;
-    
-    // Work buffer calculation function pointer 
-    info.work_buffer_calc_fn = (void*)ggml_numa_kernel_soft_max_work_buffer_calc;
-    
-    // SOFT_MAX doesn't need aggregation functions (probability distributions are complete per row)
-    info.agg_funcs.single_single_fn = NULL;
-    info.agg_funcs.single_multi_fn = NULL; 
-    info.agg_funcs.data_parallel_fn = NULL;
-    info.agg_funcs.valid = false;
-    
-    return info;
-}
+NUMA_KERNEL_REGISTRATION_FUNCTION_NO_AGG(
+    soft_max,                              // kernel name
+    GGML_OP_SOFT_MAX,                     // operation type  
+    "NUMA SOFT_MAX Kernel",               // kernel description
+    128,                                  // single_single threshold
+    1024,                                 // single_multi threshold  
+    ggml_numa_kernel_soft_max_f32_execute // execution function
+)

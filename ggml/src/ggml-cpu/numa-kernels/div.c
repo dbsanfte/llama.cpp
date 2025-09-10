@@ -65,92 +65,17 @@ enum ggml_status ggml_numa_kernel_div_execute(void * work_context, struct ggml_c
     return GGML_STATUS_SUCCESS;
 }
 
-/**
- * @brief Query function for DIV kernel - determines optimal execution strategy
- * 
- * Uses cache-based threshold lookup with shared macro for consistent strategy selection.
- * Strategy selection logic is identical to ADD kernel - only operation differs.
- * 
- * @param tensor Input tensor for strategy analysis
- * @return Execution strategy recommendation
- */
-ggml_numa_execution_strategy_t ggml_numa_kernel_div_query(const struct ggml_tensor * tensor) {
-    // Calculate total elements for strategy selection (hot path - must be fast)
-    const size_t total_elements = ggml_nelements(tensor);
-    
-    // Get cache entry for DIV operation using direct lookup
-    const ggml_numa_kernel_cache_entry_t * cache_entry = ggml_numa_lookup_kernel_direct(GGML_OP_DIV);
-    
-    if (!cache_entry || !cache_entry->supported) {
-        return NUMA_STRATEGY_SINGLE_THREAD;  // Fallback to single thread strategy
-    }
-    
-    // Use unified strategy selection macro for consistent behavior
-    ggml_numa_execution_strategy_t selected_strategy;
-    NUMA_SELECT_STRATEGY_FROM_CACHE(cache_entry, total_elements, selected_strategy);
-    
-    // Debug logging (controlled by environment variable)
-    const char* op_name = cache_entry && cache_entry->kernel_name ? cache_entry->kernel_name : "NUMA DIV";
-    NUMA_LOG_DEBUG("DIV query: %zu elements -> strategy %d (%s)\n", 
-                   total_elements, selected_strategy, op_name);
-    
-    return selected_strategy;
-}
+// ============================================================================ 
+// Complete kernel implementation using shared macros
+// ============================================================================
 
-/**
- * @brief Calculate work buffer requirements for DIV kernel
- * 
- * Element-wise DIV operation processes data in-place with minimal intermediate storage.
- * No additional work buffer space required beyond input/output tensors.
- * 
- * @param tensor Input tensor for analysis
- * @param total_numa_nodes Number of NUMA nodes participating
- * @param total_threads Total thread count across all nodes
- * @return Work buffer size in bytes (0 for DIV)
- */
-size_t ggml_numa_kernel_div_work_buffer_calc(const struct ggml_tensor * tensor, int total_numa_nodes, int total_threads) {
-    // DIV operation is purely element-wise with no intermediate storage
-    // No additional work buffer space required
-    (void)tensor;
-    (void)total_numa_nodes;
-    (void)total_threads;
-    
-    return 0;
-}
+NUMA_KERNEL_REGISTER_METADATA(
+    div,                                    // kernel name
+    GGML_OP_DIV,                           // operation type
+    "NUMA DIV Kernel",                     // kernel description
+    1024,                                  // single_single threshold
+    262144,                                // single_multi threshold
+    ggml_numa_kernel_div_execute           // execution function
+)
 
-/**
- * @brief Register DIV kernel with NUMA system using shared infrastructure
- * 
- * Registration info is nearly identical to ADD kernel with same thresholds and patterns.
- * Demonstrates how shared macro framework enables trivial kernel addition.
- * 
- * @return Kernel registration information for NUMA system
- */
-ggml_numa_kernel_registration_info_t ggml_numa_kernel_div_register(void) {
-    ggml_numa_kernel_registration_info_t info = {0};
-    
-    info.op_type = GGML_OP_DIV;
-    info.supported = true;
-    info.kernel_name = "NUMA DIV Kernel";
-    
-    // Strategy thresholds identical to ADD kernel
-    info.strategy_array.thresholds[NUMA_STRATEGY_IDX_SINGLE_SINGLE] = 1024;      // Single thread below 1K elements
-    info.strategy_array.thresholds[NUMA_STRATEGY_IDX_SINGLE_MULTI] = 262144;     // Multi-thread below 256K elements
-    // Above 256K elements: data-parallel strategy
-    info.strategy_array.valid = true;
-    
-    // Unified function handles all strategies (identical to ADD)
-    info.work_funcs.single_single_fn = ggml_numa_kernel_div_execute;
-    info.work_funcs.single_multi_fn = ggml_numa_kernel_div_execute;
-    info.work_funcs.data_parallel_fn = ggml_numa_kernel_div_execute;
-    info.work_funcs.valid = true;
-    
-    // Query and work buffer function pointers (same pattern as ADD)
-    info.query_fn = (void*)ggml_numa_kernel_div_query;
-    info.work_buffer_calc_fn = (void*)ggml_numa_kernel_div_work_buffer_calc;
-    
-    // Element-wise operations don't need aggregation (same as ADD)
-    info.agg_funcs.valid = false;
-    
-    return info;
-}
+
