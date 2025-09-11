@@ -84,6 +84,7 @@ models/*
 models-mnt
 !models/.editorconfig
 !models/ggml-vocab-*.gguf*
+!models/templates
 
 # Zig
 zig-out/
@@ -151,3 +152,4 @@ poetry.toml
 Testing/Temporary/CTestCostData.txt
 
 core
+.ccache/

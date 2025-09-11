@@ -138,8 +138,9 @@ class GGUFWriter:
                 size = prod(shape)
 
                 if "_exps." in name:
-                    expert_params += (size // shape[-3])
-                    expert_sum += shape[-3]
+                    expert_count = shape[-2 if ".bias" in name else -3]
+                    expert_params += (size // expert_count)
+                    expert_sum += expert_count
                     n_expert_tensors += 1
                 else:
                     shared_params += size
@@ -675,6 +676,9 @@ class GGUFWriter:
     def add_decoder_start_token_id(self, id: int) -> None:
         self.add_uint32(Keys.LLM.DECODER_START_TOKEN_ID.format(arch=self.arch), id)
 
+    def add_decoder_block_count(self, value: int) -> None:
+        self.add_uint32(Keys.LLM.DECODER_BLOCK_COUNT.format(arch=self.arch), value)
+
     def add_embedding_length_per_layer_input(self, value: int) -> None:
         self.add_uint32(Keys.LLM.EMBD_LENGTH_PER_LAYER_INP.format(arch=self.arch), value)
 
@@ -752,6 +756,9 @@ class GGUFWriter:
 
     def add_moe_every_n_layers(self, value: int) -> None:
         self.add_uint32(Keys.LLM.MOE_EVERY_N_LAYERS.format(arch=self.arch), value)
+
+    def add_nextn_predict_layers(self, count: int) -> None:
+        self.add_uint32(Keys.LLM.NEXTN_PREDICT_LAYERS.format(arch=self.arch), count)
 
     def add_swin_norm(self, value: bool) -> None:
         self.add_bool(Keys.LLM.SWIN_NORM.format(arch=self.arch), value)
@@ -1046,6 +1053,11 @@ class GGUFWriter:
 
     def add_audio_stack_factor(self, value: int) -> None:
         self.add_uint32(Keys.ClipAudio.Projector.STACK_FACTOR, value)
+
+    # diffusion models
+
+    def add_diffusion_shift_logits(self, value: bool) -> None:
+        self.add_bool(Keys.Diffusion.SHIFT_LOGITS, value)
 
     def _pack(self, fmt: str, value: Any, skip_pack_prefix: bool = False) -> bytes:
         pack_prefix = ''
