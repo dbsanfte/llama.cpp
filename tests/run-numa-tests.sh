@@ -56,6 +56,7 @@ BIN_DIR="$BUILD_DIR/bin"
 # Test binaries to run (in order of complexity)
 NUMA_TESTS=(
     "test-numa-mathematical-correctness-add"
+    "test-numa-mathematical-correctness-cpy"
     "test-numa-mathematical-correctness-rope"
     "test-numa-mathematical-correctness-rms_norm"
     "test-numa-mathematical-correctness-soft_max"

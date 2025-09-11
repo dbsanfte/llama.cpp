@@ -27,6 +27,7 @@
 #include "view.h"
 #include "permute.h"
 #include "rms_norm.h"
+#include "cpy.h"
 #include "../ggml-impl.h"
 #include "../ggml-vec-numa.h"
 
@@ -333,6 +334,9 @@ enum ggml_status ggml_numa_kernels_init(void) {
     NUMA_REGISTER_KERNEL(mul);
     NUMA_REGISTER_KERNEL(div);
     NUMA_REGISTER_KERNEL(sub);
+    
+    // Register data movement kernels:
+    NUMA_REGISTER_KERNEL(cpy);
     
     // Register reduction kernels:
     NUMA_REGISTER_KERNEL(rms_norm);

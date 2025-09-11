@@ -1327,6 +1327,67 @@ typedef struct {
     } \
 } while(0)
 
+/**
+ * @brief 4D quantized rowwise loop for type conversion operations
+ * @param ctx NUMA execution context with thread slicing
+ * @param tensor Destination tensor
+ * @param src_tensor Source tensor
+ * @param qk Quantization block size (elements per block)
+ * @param loop_body Code block to execute for each quantized block within assigned rows
+ * 
+ * This macro provides row-based quantized processing compatible with NUMA_4D_ROWWISE_LOOP
+ * threading model. It distributes ne01 rows across threads, then processes quantized blocks
+ * within each row sequentially. This ensures thread-safe access and correct coordinate
+ * calculation for quantized dequantization operations.
+ * 
+ * LOOP VARIABLES:
+ * - i03, i02: Outer dimensions (complete iteration by each thread)
+ * - i01: Row dimension (distributed across threads using ctx.thread_start/thread_end)
+ * - block_idx: Block index within the current row (0 to blocks_per_row-1)
+ * - src_block_offset: Byte offset to source quantized block
+ * - dst_row_offset: Element offset to destination row start
+ * - dst_block_offset: Element offset to destination block within row
+ * 
+ * USAGE EXAMPLE:
+ *   NUMA_4D_QUANTIZED_ROWWISE_LOOP(ctx, tensor, src_tensor, qk, {
+ *       // Process quantized block at (i03, i02, i01, block_idx)
+ *       // Variables available: i03, i02, i01, block_idx, src_block_offset, dst_row_offset, dst_block_offset
+ *       dequantize_function(src_data + src_block_offset, dst_data + dst_block_offset, qk);
+ *   });
+ */
+#define NUMA_4D_QUANTIZED_ROWWISE_LOOP(ctx, tensor, src_tensor, qk, loop_body) do { \
+    const int64_t _qrw_ne0 = (tensor)->ne[0]; \
+    const int64_t _qrw_ne1 = (tensor)->ne[1]; \
+    const int64_t _qrw_ne2 = (tensor)->ne[2]; \
+    const int64_t _qrw_ne3 = (tensor)->ne[3]; \
+    const int64_t _qrw_nb1 = (src_tensor)->nb[1]; \
+    const int64_t _qrw_nb2 = (src_tensor)->nb[2]; \
+    const int64_t _qrw_nb3 = (src_tensor)->nb[3]; \
+    const int64_t _qrw_blocks_per_row = (_qrw_ne0 + (qk) - 1) / (qk); \
+    \
+    /* Outer dimensions: each thread processes all */ \
+    for (int64_t i03 = 0; i03 < _qrw_ne3; i03++) { \
+        for (int64_t i02 = 0; i02 < _qrw_ne2; i02++) { \
+            /* Row dimension: distributed across threads (compatible with NUMA_4D_ROWWISE_LOOP) */ \
+            for (int64_t i01 = (ctx).thread_start; i01 < (ctx).thread_end; i01++) { \
+                /* Block dimension: sequential within each row */ \
+                for (int64_t block_idx = 0; block_idx < _qrw_blocks_per_row; block_idx++) { \
+                    /* Calculate offsets for quantized access */ \
+                    const size_t src_block_offset = i03 * _qrw_nb3 + i02 * _qrw_nb2 + i01 * _qrw_nb1 + \
+                                                     block_idx * ggml_type_size((src_tensor)->type); \
+                    const size_t dst_row_offset = i03 * _qrw_ne2 * _qrw_ne1 * _qrw_ne0 + \
+                                                   i02 * _qrw_ne1 * _qrw_ne0 + \
+                                                   i01 * _qrw_ne0; \
+                    const size_t dst_block_offset = dst_row_offset + block_idx * (qk); \
+                    \
+                    /* Execute user code with available variables */ \
+                    loop_body \
+                } \
+            } \
+        } \
+    } \
+} while(0)
+
 // ========================================================================
 // NUMA WORK DISTRIBUTION MACROS
 // ========================================================================
@@ -1708,6 +1769,229 @@ typedef struct {
             const data_type __result = NUMA_BROADCAST_SRC0_VALUE() / NUMA_BROADCAST_SRC1_VALUE(); \
             NUMA_BROADCAST_DST_WRITE(__result); \
         NUMA_ITERATE_BINARY_BROADCAST_END() \
+    } \
+} while(0)
+
+// ========================================================================
+// CPY KERNEL COORDINATE CONVERSION MACROS
+// ========================================================================
+
+/**
+ * @brief Convert linear index to 4D tensor coordinates (CPY-optimized version)
+ * @param idx Linear index to convert
+ * @param ne0,ne1,ne2 Tensor dimensions (ne3 calculated implicitly)
+ * @param i0,i1,i2,i3 Output variables for 4D coordinates
+ * 
+ * This macro eliminates the repetitive 4-line coordinate calculation that appears
+ * 8+ times in the CPY kernel for both source and destination tensors.
+ * Optimized for CPY operations where ne3 is often 1 or can be calculated.
+ * 
+ * USAGE EXAMPLE:
+ *   int64_t i00_src, i01_src, i02_src, i03_src;
+ *   NUMA_CPY_LINEAR_TO_4D_COORDS(idx, ne00, ne01, ne02, i00_src, i01_src, i02_src, i03_src);
+ */
+#define NUMA_CPY_LINEAR_TO_4D_COORDS(idx, ne0, ne1, ne2, i0, i1, i2, i3) do { \
+    const int64_t _ne01_ne02 = (ne1) * (ne2); \
+    const int64_t _ne00_ne01_ne02 = (ne0) * _ne01_ne02; \
+    i3 = (idx) / _ne00_ne01_ne02; \
+    const int64_t _remainder_3 = (idx) - (i3) * _ne00_ne01_ne02; \
+    i2 = _remainder_3 / ((ne0) * (ne1)); \
+    const int64_t _remainder_2 = _remainder_3 - (i2) * ((ne0) * (ne1)); \
+    i1 = _remainder_2 / (ne0); \
+    i0 = _remainder_2 - (i1) * (ne0); \
+} while(0)
+
+/**
+ * @brief Calculate typed pointer from 4D coordinates and tensor strides
+ * @param base_data Base tensor data pointer
+ * @param tensor Tensor structure containing stride information (nb[])
+ * @param i0,i1,i2,i3 4D coordinates
+ * @param element_type Type to cast the result to
+ * @param result_ptr Output pointer variable
+ * 
+ * This macro eliminates the repetitive pointer arithmetic that appears 8+ times
+ * in the CPY kernel for both source and destination pointer calculations.
+ * 
+ * USAGE EXAMPLE:
+ *   const float * src_ptr;
+ *   NUMA_4D_COORDS_TO_PTR(tensor_data(src0), src0, i00_src, i01_src, i02_src, i03_src, float, src_ptr);
+ */
+#define NUMA_4D_COORDS_TO_PTR(base_data, tensor, i0, i1, i2, i3, element_type, result_ptr) do { \
+    result_ptr = (const element_type *)((const char *)(base_data) + \
+        (i0) * (tensor)->nb[0] + (i1) * (tensor)->nb[1] + \
+        (i2) * (tensor)->nb[2] + (i3) * (tensor)->nb[3]); \
+} while(0)
+
+/**
+ * @brief Set up element range for CPY type conversion operations
+ * @param ctx NUMA thread context
+ * @param same_shape Whether source and destination have same shape
+ * @param ne00 Number of elements per row (ne[0] of source tensor)
+ * @param start_var Output variable for start index
+ * @param end_var Output variable for end index
+ * 
+ * This macro handles the row-to-element index conversion logic that appears 4+ times
+ * in the CPY kernel for different type conversion operations.
+ * 
+ * USAGE EXAMPLE:
+ *   int64_t start_idx, end_idx;
+ *   NUMA_CPY_ELEMENT_RANGE_SETUP(ctx, same_shape, ne00, start_idx, end_idx);
+ */
+#define NUMA_CPY_ELEMENT_RANGE_SETUP(ctx, same_shape, ne00, start_var, end_var) do { \
+    if (same_shape) { \
+        /* Same shape: convert row indices to element indices */ \
+        start_var = (ctx).thread_start * (ne00); \
+        end_var = (ctx).thread_end * (ne00); \
+    } else { \
+        /* Reshape: use element indices directly */ \
+        start_var = (ctx).thread_start; \
+        end_var = (ctx).thread_end; \
+    } \
+} while(0)
+
+/**
+ * @brief Early exit pattern for CPY operations when thread has no work
+ * @param start_idx Start index for this thread
+ * @param end_idx End index for this thread  
+ * @param ctx NUMA thread context
+ * @param operation_name String name for logging (e.g., "F16->F32", "same-type")
+ * 
+ * This macro handles the early exit pattern that appears 4+ times in the CPY kernel
+ * with consistent logging and barrier participation for threads with no work.
+ * 
+ * USAGE EXAMPLE:
+ *   NUMA_CPY_EARLY_EXIT_IF_NO_WORK(start_idx, end_idx, ctx, "F16->F32");
+ */
+#define NUMA_CPY_EARLY_EXIT_IF_NO_WORK(start_idx, end_idx, ctx, operation_name) do { \
+    if ((start_idx) >= (end_idx)) { \
+        NUMA_LOG_TRACE("CPY %s: Thread %d has no work (start_idx=%ld >= end_idx=%ld)", \
+                       operation_name, (ctx).thread_id, (long)(start_idx), (long)(end_idx)); \
+        NUMA_BARRIER_AUTO(ctx); \
+        return GGML_STATUS_SUCCESS; \
+    } \
+} while(0)
+
+/**
+ * @brief Set up thread slicing strategy for CPY operations (same-shape vs reshape)
+ * @param ctx NUMA thread context to configure
+ * @param dst Destination tensor
+ * @param src0 Source tensor
+ * @param same_shape Whether tensors have same shape
+ * 
+ * This macro handles the same-shape vs reshape slicing decision that appears 2+ times
+ * in the CPY kernel, choosing between row-wise and element-wise distribution.
+ * 
+ * USAGE EXAMPLE:
+ *   NUMA_CPY_THREAD_SLICING_SETUP(ctx, dst, src0, same_shape);
+ */
+#define NUMA_CPY_THREAD_SLICING_SETUP(ctx, dst, src0, same_shape) do { \
+    if (same_shape) { \
+        /* Same shape: use row-wise distribution for better cache locality */ \
+        NUMA_SLICE_ROWS_ATOMIC(ctx, dst); \
+    } else { \
+        /* Reshape: use element-wise distribution for mathematical correctness */ \
+        const int64_t _total_elements = ggml_nelements(src0); \
+        const int64_t _elements_per_thread = (_total_elements + (ctx).total_threads - 1) / (ctx).total_threads; \
+        (ctx).thread_start = (ctx).thread_id * _elements_per_thread; \
+        (ctx).thread_end = ((ctx).thread_start + _elements_per_thread < _total_elements) ? \
+                           (ctx).thread_start + _elements_per_thread : _total_elements; \
+        (ctx).thread_elements = (ctx).thread_end - (ctx).thread_start; \
+        (ctx).has_work = ((ctx).thread_elements > 0); \
+    } \
+} while(0)
+
+/**
+ * @brief Complete element-wise loop for CPY type conversion operations
+ * @param ctx NUMA thread context
+ * @param src0 Source tensor
+ * @param dst Destination tensor  
+ * @param start_idx Start element index
+ * @param end_idx End element index
+ * @param src_type Source data type (e.g., ggml_fp16_t)
+ * @param dst_type Destination data type (e.g., float)
+ * @param conversion_expr Expression to convert src_value to dst_value (e.g., GGML_FP16_TO_FP32(src_value))
+ * 
+ * This macro provides the complete element-wise conversion loop that appears in multiple
+ * type conversion branches of the CPY kernel, handling coordinate conversion and memory access.
+ * 
+ * USAGE EXAMPLE:
+ *   NUMA_CPY_TYPE_CONVERSION_LOOP(ctx, src0, dst, start_idx, end_idx, 
+ *                                ggml_fp16_t, float, GGML_FP16_TO_FP32(*src_ptr));
+ */
+#define NUMA_CPY_TYPE_CONVERSION_LOOP(ctx, src0, dst, start_idx, end_idx, src_type, dst_type, conversion_expr) do { \
+    /* Pre-calculate tensor dimensions and strides */ \
+    const int64_t _ne00 = (src0)->ne[0], _ne01 = (src0)->ne[1], _ne02 = (src0)->ne[2]; \
+    const size_t _nb00 = (src0)->nb[0], _nb01 = (src0)->nb[1], _nb02 = (src0)->nb[2], _nb03 = (src0)->nb[3]; \
+    const size_t _nb0 = (dst)->nb[0], _nb1 = (dst)->nb[1], _nb2 = (dst)->nb[2], _nb3 = (dst)->nb[3]; \
+    const int64_t _ne0_dst = (dst)->ne[0], _ne1_dst = (dst)->ne[1], _ne2_dst = (dst)->ne[2]; \
+    \
+    for (int64_t idx = (start_idx); idx < (end_idx); idx++) { \
+        /* Convert linear index to 4D coordinates for both tensors */ \
+        int64_t i00_src, i01_src, i02_src, i03_src; \
+        int64_t i00_dst, i01_dst, i02_dst, i03_dst; \
+        NUMA_CPY_LINEAR_TO_4D_COORDS(idx, _ne00, _ne01, _ne02, i00_src, i01_src, i02_src, i03_src); \
+        NUMA_CPY_LINEAR_TO_4D_COORDS(idx, _ne0_dst, _ne1_dst, _ne2_dst, i00_dst, i01_dst, i02_dst, i03_dst); \
+        \
+        /* Calculate pointers using 4D coordinates */ \
+        const src_type * src_ptr; \
+        dst_type * dst_ptr; \
+        NUMA_4D_COORDS_TO_PTR(tensor_data(src0), src0, i00_src, i01_src, i02_src, i03_src, src_type, src_ptr); \
+        NUMA_4D_COORDS_TO_PTR(tensor_data(dst), dst, i00_dst, i01_dst, i02_dst, i03_dst, dst_type, dst_ptr); \
+        \
+        /* Perform type conversion */ \
+        *dst_ptr = conversion_expr; \
+        \
+        /* Optional debug logging for first few elements */ \
+        if (idx < (start_idx) + 4) { \
+            NUMA_LOG_TRACE("CPY CONVERT: Thread %d idx=%ld src_coords=(%ld,%ld,%ld,%ld) dst_coords=(%ld,%ld,%ld,%ld) src_ptr=%p dst_ptr=%p", \
+                           (ctx).thread_id, idx, i00_src, i01_src, i02_src, i03_src, i00_dst, i01_dst, i02_dst, i03_dst, \
+                           (void*)src_ptr, (void*)dst_ptr); \
+        } \
+    } \
+} while(0)
+
+/**
+ * @brief Complete element-wise loop for CPY same-type copy operations
+ * @param ctx NUMA thread context
+ * @param src0 Source tensor
+ * @param dst Destination tensor  
+ * @param start_idx Start element index
+ * @param end_idx End element index
+ * @param type_size Size in bytes of each element
+ * 
+ * This macro provides the complete element-wise copy loop for same-type operations
+ * using the shared coordinate conversion logic.
+ * 
+ * USAGE EXAMPLE:
+ *   NUMA_CPY_SAME_TYPE_LOOP(ctx, src0, dst, start_idx, end_idx, sizeof(float));
+ */
+#define NUMA_CPY_SAME_TYPE_LOOP(ctx, src0, dst, start_idx, end_idx, type_size) do { \
+    /* Pre-calculate tensor dimensions and strides */ \
+    const int64_t _ne00 = (src0)->ne[0], _ne01 = (src0)->ne[1], _ne02 = (src0)->ne[2]; \
+    const size_t _nb00 = (src0)->nb[0], _nb01 = (src0)->nb[1], _nb02 = (src0)->nb[2], _nb03 = (src0)->nb[3]; \
+    const size_t _nb0 = (dst)->nb[0], _nb1 = (dst)->nb[1], _nb2 = (dst)->nb[2], _nb3 = (dst)->nb[3]; \
+    const int64_t _ne0_dst = (dst)->ne[0], _ne1_dst = (dst)->ne[1], _ne2_dst = (dst)->ne[2]; \
+    \
+    for (int64_t idx = (start_idx); idx < (end_idx); idx++) { \
+        /* Convert linear index to 4D coordinates for both tensors */ \
+        int64_t i00_src, i01_src, i02_src, i03_src; \
+        int64_t i00_dst, i01_dst, i02_dst, i03_dst; \
+        NUMA_CPY_LINEAR_TO_4D_COORDS(idx, _ne00, _ne01, _ne02, i00_src, i01_src, i02_src, i03_src); \
+        NUMA_CPY_LINEAR_TO_4D_COORDS(idx, _ne0_dst, _ne1_dst, _ne2_dst, i00_dst, i01_dst, i02_dst, i03_dst); \
+        \
+        /* Calculate pointers using 4D coordinates */ \
+        const char * src_ptr = (const char *)tensor_data(src0) + i00_src*_nb00 + i01_src*_nb01 + i02_src*_nb02 + i03_src*_nb03; \
+        char * dst_ptr = (char *)tensor_data(dst) + i00_dst*_nb0 + i01_dst*_nb1 + i02_dst*_nb2 + i03_dst*_nb3; \
+        \
+        /* Copy element data */ \
+        memcpy(dst_ptr, src_ptr, (type_size)); \
+        \
+        /* Optional debug logging for first few elements */ \
+        if (idx < (start_idx) + 4) { \
+            NUMA_LOG_TRACE("CPY SAME_TYPE: Thread %d idx=%ld src_coords=(%ld,%ld,%ld,%ld) dst_coords=(%ld,%ld,%ld,%ld) src_ptr=%p dst_ptr=%p", \
+                           (ctx).thread_id, idx, i00_src, i01_src, i02_src, i03_src, i00_dst, i01_dst, i02_dst, i03_dst, \
+                           (void*)src_ptr, (void*)dst_ptr); \
+        } \
     } \
 } while(0)
 
@@ -2700,6 +2984,45 @@ typedef struct {
 #define NUMA_CUSTOM_KERNEL_SETUP(ctx, tensor, params) \
     NUMA_INIT_CONTEXT(ctx, tensor, params); \
     NUMA_VALIDATE_INPUTS(tensor, params)
+
+/**
+ * @brief Blockwise kernel template for quantized dequantization operations
+ * @param ctx Context variable name (will be declared and initialized)  
+ * @param tensor Destination tensor (F32 output)
+ * @param src_tensor Source tensor (quantized input)
+ * @param params Compute parameters
+ * @param dst_ptr Destination data pointer variable name
+ * @param data_type Destination data type (typically float)
+ * 
+ * WHAT IT PROVIDES:
+ * - Complete quantized-aware setup with standard NUMA framework integration
+ * - Row-wise thread distribution using NUMA_SLICE_ROWS_ATOMIC
+ * - Typed destination pointer extraction
+ * - Input validation and early exit handling
+ * - Ready for manual NUMA_4D_QUANTIZED_ROWWISE_LOOP usage
+ * 
+ * WHAT YOU NEED TO ADD:
+ * - NUMA_4D_QUANTIZED_ROWWISE_LOOP for block-aware processing
+ * - Source data extraction and dequantization calls
+ * - NUMA_BARRIER_AUTO() at the end
+ * 
+ * USAGE EXAMPLE:
+ *   NUMA_BLOCKWISE_KERNEL_SETUP(ctx, dst_tensor, src_tensor, params, dst_data, float);
+ *   const char * src_data = (const char *)tensor_data(src_tensor);
+ *   const ggml_to_float_t dequantize_row_q = type_traits->to_float;
+ *   const size_t qk = type_traits->blck_size;
+ *   
+ *   NUMA_4D_QUANTIZED_ROWWISE_LOOP(ctx, dst_tensor, src_tensor, qk, {
+ *       dequantize_row_q(src_data + src_block_offset, dst_data + dst_block_offset, qk);
+ *   });
+ *   NUMA_BARRIER_AUTO();
+ */
+#define NUMA_BLOCKWISE_KERNEL_SETUP(ctx, tensor, src_tensor, params, dst_ptr, data_type) \
+    NUMA_INIT_CONTEXT(ctx, tensor, params); \
+    NUMA_VALIDATE_INPUTS(tensor, params); \
+    NUMA_SLICE_ROWS_ATOMIC(ctx, tensor); \
+    NUMA_EARLY_EXIT_IF_NO_WORK(ctx, GGML_STATUS_SUCCESS); \
+    NUMA_GET_TYPED_POINTER(dst_ptr, tensor, data_type)
 
 /**
  * @brief Complete kernel template with custom computation block

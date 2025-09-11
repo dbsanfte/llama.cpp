@@ -198,9 +198,6 @@ NUMA_GET_SOURCE_POINTER(src_data, tensor->src[0], float);
 
 // 5. Synchronization - Essential for correctness
 NUMA_BARRIER_AUTO();
-
-// 6. Early exit handling - Performance optimization
-NUMA_EARLY_EXIT_IF_NO_WORK(ctx);
 ```
 
 **🏗️ Composed Templates (Recommended for Common Patterns):**
@@ -536,10 +533,11 @@ cp tests/test-numa-mathematical-correctness-template.cpp tests/test-numa-mathema
 
 **Required tests:**
 - Multi-dimensional: TINY → GIGANTIC_16GB tensor sizes (now includes GB-scale support)
-- Multi-threading: 1, 2, 4, 6, 8, 15, 16, 31, 32, 64, 128 threads
+- Multi-strategy (use Executor methods to force the strategy): Single-thread/Single-node, Multi-thread/Single-Node, and Multi-thread/Multi-Node (data parallel)
 - Hardware-specific Data Parallel: Data parallel tests with all numas available on the machine using max thread counts per numa node
 - Mathematical equivalence: Exact comparison with reference
 - Add to CMake and verify with `cmake --build build --target test-numa-mathematical-correctness-YOUR_OPERATION`
+- Optionally, use `--filter <regex>` to filter on and run specific tests, and `--summary-only` to just get a final test run summary.
 
 ## 🏗️ Current Architecture Status
 
