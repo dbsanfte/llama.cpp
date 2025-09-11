@@ -778,14 +778,14 @@ static void ggml_compute_forward_dup_f32(
                 }
             } else if (dst->type == GGML_TYPE_I32) {
                 size_t id = 0;
-                int32_t * dst_ptr = (int32_t *) dst->data;
+                int32_t * dst_ptr = (int32_t *) tensor_data(dst);
 
                 for (int i03 = 0; i03 < ne03; i03++) {
                     for (int i02 = 0; i02 < ne02; i02++) {
                         id += ne00 * ir0;
                         for (int i01 = ir0; i01 < ir1; i01++) {
                             for (int i00 = 0; i00 < ne00; i00++) {
-                                const float * src0_ptr = (float *) ((char *) src0->data + i00*nb00 + i01*nb01 + i02*nb02 + i03*nb03);
+                                const float * src0_ptr = (float *) ((char *) tensor_data(src0) + i00*nb00 + i01*nb01 + i02*nb02 + i03*nb03);
 
                                 dst_ptr[id] = *src0_ptr;
                                 id++;
@@ -983,8 +983,8 @@ static void ggml_compute_forward_dup_f32(
                 }
                 for (int64_t i01 = ir0; i01 < ir1; i01++) {
                     for (int64_t i00 = 0; i00 < ne00; i00++) {
-                        const char * src0_ptr = ((char *) src0->data + i00*nb00 + i01*nb01 + i02*nb02 + i03*nb03);
-                              char * dst_ptr  = ((char *)  dst->data + i10*nb0  + i11*nb1  + i12*nb2  + i13*nb3);
+                        const char * src0_ptr = ((char *) tensor_data(src0) + i00*nb00 + i01*nb01 + i02*nb02 + i03*nb03);
+                              char * dst_ptr  = ((char *)  tensor_data(dst) + i10*nb0  + i11*nb1  + i12*nb2  + i13*nb3);
 
                         *(int32_t *) dst_ptr = *(const float *) src0_ptr;
 
@@ -1069,8 +1069,8 @@ static void ggml_compute_forward_dup_i32(
                 }
                 for (int64_t i01 = ir0; i01 < ir1; i01++) {
                     for (int64_t i00 = 0; i00 < ne00; i00++) {
-                        const char * src0_ptr = ((char *) src0->data + i00*nb00 + i01*nb01 + i02*nb02 + i03*nb03);
-                              char * dst_ptr  = ((char *)  dst->data + i10*nb0  + i11*nb1  + i12*nb2  + i13*nb3);
+                        const char * src0_ptr = ((char *) tensor_data(src0) + i00*nb00 + i01*nb01 + i02*nb02 + i03*nb03);
+                              char * dst_ptr  = ((char *)  tensor_data(dst) + i10*nb0  + i11*nb1  + i12*nb2  + i13*nb3);
 
                         *(float *) dst_ptr = *(const int32_t *) src0_ptr;
 
@@ -1121,96 +1121,10 @@ static void ggml_compute_forward_dup_i32(
                 }
                 for (int64_t i01 = ir0; i01 < ir1; i01++) {
                     for (int64_t i00 = 0; i00 < ne00; i00++) {
-                        const char * src0_ptr = ((char *) src0->data + i00*nb00 + i01*nb01 + i02*nb02 + i03*nb03);
-                              char * dst_ptr  = ((char *)  dst->data + i10*nb0  + i11*nb1  + i12*nb2  + i13*nb3);
+                        const char * src0_ptr = ((char *) tensor_data(src0) + i00*nb00 + i01*nb01 + i02*nb02 + i03*nb03);
+                              char * dst_ptr  = ((char *)  tensor_data(dst) + i10*nb0  + i11*nb1  + i12*nb2  + i13*nb3);
 
                         *(int32_t *) dst_ptr = *(const float *) src0_ptr;
-
-                        if (++i10 == ne0) {
-                            i10 = 0;
-                            if (++i11 == ne1) {
-                                i11 = 0;
-                                if (++i12 == ne2) {
-                                    i12 = 0;
-                                    if (++i13 == ne3) {
-                                        i13 = 0;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                i10 += ne00 * (ne01 - ir1);
-                while (i10 >= ne0) {
-                    i10 -= ne0;
-                    if (++i11 == ne1) {
-                        i11 = 0;
-                        if (++i12 == ne2) {
-                            i12 = 0;
-                            if (++i13 == ne3) {
-                                i13 = 0;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    } else {
-        GGML_ABORT("fatal error"); // TODO: implement
-    }
-}
-
-static void ggml_compute_forward_dup_i32(
-        const ggml_compute_params * params,
-        ggml_tensor * dst) {
-
-    const ggml_tensor * src0 = dst->src[0];
-
-    GGML_ASSERT(ggml_nelements(dst) == ggml_nelements(src0));
-
-    GGML_TENSOR_UNARY_OP_LOCALS
-
-    const int ith = params->ith; // thread index
-    const int nth = params->nth; // number of threads
-
-    // parallelize by rows
-    const int nr = ne01;
-    // number of rows per thread
-    const int dr = (nr + nth - 1) / nth;
-    // row range for this thread
-    const int ir0 = dr * ith;
-    const int ir1 = MIN(ir0 + dr, nr);
-
-    // dst counters
-
-    int64_t i10 = 0;
-    int64_t i11 = 0;
-    int64_t i12 = 0;
-    int64_t i13 = 0;
-
-    // TODO: not optimal, but works
-    if (dst->type == GGML_TYPE_F32) {
-        for (int64_t i03 = 0; i03 < ne03; i03++) {
-            for (int64_t i02 = 0; i02 < ne02; i02++) {
-                i10 += ne00 * ir0;
-                while (i10 >= ne0) {
-                    i10 -= ne0;
-                    if (++i11 == ne1) {
-                        i11 = 0;
-                        if (++i12 == ne2) {
-                            i12 = 0;
-                            if (++i13 == ne3) {
-                                i13 = 0;
-                            }
-                        }
-                    }
-                }
-                for (int64_t i01 = ir0; i01 < ir1; i01++) {
-                    for (int64_t i00 = 0; i00 < ne00; i00++) {
-                        const char * src0_ptr = ((char *) src0->data + i00*nb00 + i01*nb01 + i02*nb02 + i03*nb03);
-                              char * dst_ptr  = ((char *)  dst->data + i10*nb0  + i11*nb1  + i12*nb2  + i13*nb3);
-
-                        *(float *) dst_ptr = *(const int32_t *) src0_ptr;
 
                         if (++i10 == ne0) {
                             i10 = 0;
@@ -1651,14 +1565,14 @@ static void ggml_compute_forward_add_id_f32(
         const int i1 = (ir - i3*ne2*ne1 - i2*ne1);
 
         // src1 indices
-        const int i11 = *(int32_t *) ((char *) src2->data + i1*nb20 + i2*nb21);
+        const int i11 = *(int32_t *) ((char *) tensor_data(src2) + i1*nb20 + i2*nb21);
 
         GGML_ASSERT(i11 >= 0 && i11 < ne11);
 
         ggml_vec_add_f32(ne0,
-                (float *) ((char *) dst->data  + i3*nb3  + i2*nb2  + i1*nb1 ),
-                (float *) ((char *) src0->data + i3*nb03 + i2*nb02 + i1*nb01),
-                (float *) ((char *) src1->data + i11*nb11));
+                (float *) ((char *) tensor_data(dst)  + i3*nb3  + i2*nb2  + i1*nb1 ),
+                (float *) ((char *) tensor_data(src0) + i3*nb03 + i2*nb02 + i1*nb01),
+                (float *) ((char *) tensor_data(src1) + i11*nb11));
     }
 }
 
@@ -3995,8 +3909,8 @@ static void ggml_compute_forward_swiglu_oai_f32(
 
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
-    char * src0_d = (char *) src0->data;
-    char * src1_d = (char *) (src1 ? src1->data : src0->data);
+    char * src0_d = (char *) tensor_data(src0);
+    char * src1_d = (char *) (src1 ? tensor_data(src1) : tensor_data(src0));
     const size_t src0_o = src0->nb[1];
     const size_t src1_o = src1 ? src1->nb[1] : src0->nb[1];
 
@@ -4031,7 +3945,7 @@ static void ggml_compute_forward_swiglu_oai_f32(
     for (int i1 = ir0; i1 < ir1; i1++) {
         float * src0_p = (float *) (src0_d + i1*src0_o);
         float * src1_p = (float *) (src1_d + i1*src1_o);
-        float * dst_p  = (float *) ((char *) dst->data + i1*(dst->nb[1]));
+        float * dst_p  = (float *) ((char *) tensor_data(dst) + i1*(dst->nb[1]));
 
         if (!src1) {
             src0_p += swapped ? nc : 0;
@@ -4074,16 +3988,16 @@ static void ggml_compute_forward_swiglu_oai(
     }
 }
 
-// ggml_compute_forward_swiglu_oai
+// ggml_compute_forward_geglu_erf
 
-static void ggml_compute_forward_swiglu_oai_f32(
+static void ggml_compute_forward_geglu_erf_f32(
         const ggml_compute_params * params,
         ggml_tensor * dst) {
 
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
-    char * src0_d = (char *) src0->data;
-    char * src1_d = (char *) (src1 ? src1->data : src0->data);
+    char * src0_d = (char *) tensor_data(src0);
+    char * src1_d = (char *) (src1 ? tensor_data(src1) : tensor_data(src0));
     const size_t src0_o = src0->nb[1];
     const size_t src1_o = src1 ? src1->nb[1] : src0->nb[1];
 
@@ -4118,18 +4032,18 @@ static void ggml_compute_forward_swiglu_oai_f32(
     for (int i1 = ir0; i1 < ir1; i1++) {
         float * src0_p = (float *) (src0_d + i1*src0_o);
         float * src1_p = (float *) (src1_d + i1*src1_o);
-        float * dst_p  = (float *) ((char *) dst->data + i1*(dst->nb[1]));
+        float * dst_p  = (float *) ((char *) tensor_data(dst) + i1*(dst->nb[1]));
 
         if (!src1) {
             src0_p += swapped ? nc : 0;
             src1_p += swapped ? 0 : nc;
         }
 
-        ggml_vec_geglu_erf_f32(nc, (float *) ((char *) dst->data + i1*(dst->nb[1])), src0_p, src1_p);
+        ggml_vec_geglu_erf_f32(nc, (float *) ((char *) tensor_data(dst) + i1*(dst->nb[1])), src0_p, src1_p);
 
 #ifndef NDEBUG
         for (int k = 0; k < nc; k++) {
-            const float x = ((float *) ((char *) dst->data + i1*( dst->nb[1])))[k];
+            const float x = ((float *) ((char *) tensor_data(dst) + i1*( dst->nb[1])))[k];
             GGML_UNUSED(x);
             assert(!isnan(x));
             assert(!isinf(x));
@@ -6025,7 +5939,7 @@ static void ggml_compute_forward_soft_max_f32(
     const bool use_f16 = (src1 && src1->type == GGML_TYPE_F16);
 
     // sinks
-    const float * sk = src2 ? (float *)((char *) src2->data) : nullptr;
+    const float * sk = src2 ? (float *)((char *) tensor_data(src2)) : nullptr;
 
     for (int64_t i03 = 0; i03 < ne03; i03++) {
         for (int64_t i02 = 0; i02 < ne02; i02++) {
@@ -7384,7 +7298,7 @@ static void ggml_compute_forward_im2col_3d_f16(
 
     // im2col: [N*IC, ID, IH, IW] => [N*OD, OH, OW, IC * KD * KH * KW]
     {
-        ggml_fp16_t * const wdata = (ggml_fp16_t *) dst->data;
+        ggml_fp16_t * const wdata = (ggml_fp16_t *) tensor_data(dst);
 
         for (int64_t in = 0; in < N; in++) {
             for (int64_t iod = 0; iod < OD; iod++) {
@@ -7394,7 +7308,7 @@ static void ggml_compute_forward_im2col_3d_f16(
 
                             // micro kernel
                             ggml_fp16_t * dst_data = wdata + (in*OD*OH_OW + iod*OH_OW + ioh*OW + iow)*IC_KD_KH_KW; // [IC, KD, KH, KW]
-                            const float * const src_data = (const float *) ((const char *)src1->data + (in*IC + iic)*nb13); // [ID, IH, IW]
+                            const float * const src_data = (const float *) ((const char *)tensor_data(src1) + (in*IC + iic)*nb13); // [ID, IH, IW]
 
                             for (int64_t ikd = 0; ikd < KD; ikd++) {
                                 for (int64_t ikh = 0; ikh < KH; ikh++) {
@@ -7475,7 +7389,7 @@ static void ggml_compute_forward_im2col_3d_f32(
 
     // im2col: [N*IC, ID, IH, IW] => [N*OD, OH, OW, IC * KD * KH * KW]
     {
-        float * const wdata = (float *) dst->data;
+        float * const wdata = (float *) tensor_data(dst);
 
         for (int64_t in = 0; in < N; in++) {
             for (int64_t iod = 0; iod < OD; iod++) {
@@ -7485,7 +7399,7 @@ static void ggml_compute_forward_im2col_3d_f32(
 
                             // micro kernel
                             float * dst_data = wdata + (in*OD*OH_OW + iod*OH_OW + ioh*OW + iow)*IC_KD_KH_KW; // [IC, KD, KH, KW]
-                            const float * const src_data = (const float *) ((const char *)src1->data + (in*IC + iic)*nb13); // [ID, IH, IW]
+                            const float * const src_data = (const float *) ((const char *)tensor_data(src1) + (in*IC + iic)*nb13); // [ID, IH, IW]
 
                             for (int64_t ikd = 0; ikd < KD; ikd++) {
                                 for (int64_t ikh = 0; ikh < KH; ikh++) {
@@ -7748,9 +7662,9 @@ static void ggml_compute_forward_conv_3d_impl(const ggml_compute_params * params
     const int64_t dst_h = dst->ne[1];
     const int64_t dst_d = dst->ne[2];
 
-    const float * src_data = (float *) src->data;
-    void  * knl_data       = kernel->data;
-    float * dst_data       = (float *) dst->data;
+    const float * src_data = (float *) tensor_data(src);
+    void  * knl_data       = tensor_data(kernel);
+    float * dst_data       = (float *) tensor_data(dst);
 
     const int64_t knl_n_per_channel = knl_w * knl_h * knl_d;
     const int64_t knl_n_total       = knl_n_per_channel * c;
@@ -8540,7 +8454,7 @@ static void ggml_compute_forward_pad_f32(
                          && (i2 >= lp2 && i2 < ne2 - rp2) \
                          && (i3 >= lp3 && i3 < ne3 - rp3)) {
                         const int64_t src_idx = (i3 - lp3)*nb03 + (i2 - lp2)*nb02 + (i1 - lp1)*nb01 + (i0 - lp0)*nb00;
-                        const float * src_ptr = (const float *)((char *) src0->data + src_idx);
+                        const float * src_ptr = (const float *)((char *) tensor_data(src0) + src_idx);
                         dst_ptr[dst_idx] = *src_ptr;
                     } else {
                         dst_ptr[dst_idx] = 0;
@@ -9030,7 +8944,7 @@ static void ggml_compute_forward_flash_attn_ext_f16(
 
         // sinks
         if (sinks) {
-            const float s = ((float *)((char *) sinks->data))[h];
+            const float s = ((float *)((char *) tensor_data(sinks)))[h];
 
             float ms = 1.0f;
             float vs = 1.0f;
@@ -11081,8 +10995,8 @@ static void ggml_compute_forward_opt_step_sgd_f32(const ggml_compute_params * pa
 
         const size_t offset = i03 * nb03 + i02 * nb02 + i01 * nb01;
 
-        float *       w = (float *) ((char *) src0->data + offset);                   // weight
-        const float * g = (const float *) ((const char *) src0_grad->data + offset);  // grad
+        float *       w = (float *) ((char *) tensor_data(src0) + offset);                   // weight
+        const float * g = (const float *) ((const char *) tensor_data(src0_grad) + offset);  // grad
 
         for (int i00 = 0; i00 < ne00; ++i00) {
             w[i00] = w[i00] * keep - alpha * g[i00];

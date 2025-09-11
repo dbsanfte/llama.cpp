@@ -1264,7 +1264,7 @@ static int repack_q2_K_to_q2_K_8_bl(struct ggml_tensor * t, int interleave_block
     GGML_ASSERT(interleave_block == 8);
     constexpr int nrows_interleaved = 8;
 
-    block_q2_Kx8 * dst = (block_q2_Kx8*)t->data;
+    block_q2_Kx8 * dst = (block_q2_Kx8*)tensor_data(t);
     const block_q2_K * src = (const block_q2_K*) data;
     block_q2_K dst_tmp[8];
     int nrow = ggml_nrows(t);
@@ -1361,7 +1361,7 @@ static int repack_iq4_nl_to_iq4_nl_4_bl(struct ggml_tensor * t, int interleave_b
     GGML_ASSERT(interleave_block == 4);
 
     const block_iq4_nl   * src = (const block_iq4_nl   *)data;
-          block_iq4_nlx4 * dst = (      block_iq4_nlx4 *)t->data;
+          block_iq4_nlx4 * dst = (      block_iq4_nlx4 *)tensor_data(t);
 
     block_iq4_nl dst_tmp[4];
 
@@ -1418,7 +1418,7 @@ static int repack_iq4_nl_to_iq4_nl_8_bl(struct ggml_tensor * t, int interleave_b
     GGML_ASSERT(interleave_block == 8);
 
     const block_iq4_nl   * src = (const block_iq4_nl   *)data;
-          block_iq4_nlx8 * dst = (      block_iq4_nlx8 *)t->data;
+          block_iq4_nlx8 * dst = (      block_iq4_nlx8 *)tensor_data(t);
 
     block_iq4_nl dst_tmp[8];
 

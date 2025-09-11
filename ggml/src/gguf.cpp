@@ -1345,8 +1345,8 @@ struct gguf_writer_file final : public gguf_writer_base {
         if (info.t.buffer) {
             ggml_backend_tensor_get(&info.t, buf.data(), 0, nbytes);
         } else {
-            GGML_ASSERT(info.t.data);
-            memcpy(buf.data(), info.t.data, nbytes);
+            GGML_ASSERT(tensor_data(&info.t));
+            memcpy(buf.data(), tensor_data(&info.t), nbytes);
         }
         write(buf);
 

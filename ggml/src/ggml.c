@@ -1352,7 +1352,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "NUMA_FALLBACK_NOOP",
 };
 
-static_assert(GGML_OP_COUNT == 90, "GGML_OP_COUNT != 90");
+static_assert(GGML_OP_COUNT == 92, "GGML_OP_COUNT != 92");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1459,7 +1459,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "numa_fallback_noop()",
 };
 
-static_assert(GGML_OP_COUNT == 90, "GGML_OP_COUNT != 90");
+static_assert(GGML_OP_COUNT == 92, "GGML_OP_COUNT != 92");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 

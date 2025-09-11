@@ -295,7 +295,7 @@ void llm_graph_input_attn_no_cache::set_input(const llama_ubatch * ubatch) {
     GGML_ASSERT(kq_mask);
     GGML_ASSERT(ggml_backend_buffer_is_host(kq_mask->buffer));
 
-    float * data = (float *) kq_mask->data;
+    float * data = (float *) tensor_data(kq_mask);
 
     // [TAG_NO_CACHE_ISWA]
     GGML_ASSERT(hparams.swa_type == LLAMA_SWA_TYPE_NONE && "TODO: implement");

@@ -251,7 +251,7 @@ enum ggml_status ggml_numa_executor_call_direct_kernel(struct ggml_tensor * tens
             ggml_compute_forward_leaky_relu(params, tensor);
             break;
         case GGML_OP_FLASH_ATTN_EXT:
-            ggml_compute_forward_flash_attn_ext(params, tensor->src[0], tensor->src[1], tensor->src[2], tensor->src[3], tensor);
+            ggml_compute_forward_flash_attn_ext(params, tensor);
             break;
         case GGML_OP_FLASH_ATTN_BACK:
             ggml_compute_forward_flash_attn_back(params, false, tensor);

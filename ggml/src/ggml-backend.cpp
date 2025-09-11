@@ -1510,7 +1510,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
                         ggml_backend_tensor_set_async(split_backend,
                             input_cpy,
-                            (const uint8_t *)input->data + expert_offset, expert_offset,
+                            (const uint8_t *)tensor_data(input) + expert_offset, expert_offset,
                             // copy a bit extra at the to ensure there are no NaNs in the padding of the last expert
                             // this is necessary for MMQ in the CUDA backend
                             expert_size_copy + padding_end);
