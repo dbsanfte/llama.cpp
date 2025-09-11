@@ -386,7 +386,7 @@ enum ggml_status ggml_numa_kernel_cpy_execute(void * work_context, struct ggml_c
     
     struct ggml_tensor * src0 = dst->src[0];
     NUMA_ASSERT(src0 != NULL, "Source tensor cannot be null");
-    NUMA_ASSERT(dst->op == GGML_OP_CPY, "Expected CPY operation");
+    NUMA_ASSERT(dst->op == GGML_OP_CPY || dst->op == GGML_OP_CONT, "Expected CPY or CONT operation");
     NUMA_ASSERT(ggml_nelements(dst) == ggml_nelements(src0), "Element count must match");
     
     // Additional validation

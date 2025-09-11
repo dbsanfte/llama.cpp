@@ -404,6 +404,64 @@ bool ggml_numa_apply_kernel_force_strategy(ggml_numa_kernel_query_result_t * res
     } \
 } while(0)
 
+/**
+ * NUMA_REGISTER_SYMLINK_KERNEL - Macro to register one operation as a symlink to another
+ * 
+ * This macro allows one operation to use another operation's kernel implementation.
+ * Perfect for cases like CONT → CPY where operations have identical underlying logic.
+ * 
+ * @param symlink_kname - The operation to create a symlink for (e.g., cont)
+ * @param target_kname - The target operation to symlink to (e.g., cpy)
+ * @param symlink_op_type - The GGML operation type constant for the symlink (e.g., GGML_OP_CONT)
+ * 
+ * Usage example:
+ *   NUMA_REGISTER_SYMLINK_KERNEL(cont, cpy, GGML_OP_CONT);
+ * 
+ * This will register GGML_OP_CONT to use the CPY kernel's functions.
+ * The target kernel must already be registered.
+ */
+#define NUMA_REGISTER_SYMLINK_KERNEL(symlink_kname, target_kname, symlink_op_type) do { \
+    /* Get the target kernel's registration info */ \
+    ggml_numa_kernel_registration_info_t target_info = ggml_numa_kernel_##target_kname##_register(); \
+    ggml_numa_kernel_query_fn_t target_query_fn = ggml_numa_kernel_##target_kname##_query; \
+    ggml_numa_kernel_work_buffer_calc_fn_t target_work_buffer_fn = NULL; \
+    /* Check if target kernel provides work buffer calculation function */ \
+    if (target_info.work_buffer_calc_fn != NULL) { \
+        target_work_buffer_fn = target_info.work_buffer_calc_fn; \
+    } \
+    /* Create symlink registration info using target's functions but symlink's operation type */ \
+    ggml_numa_kernel_registration_info_t symlink_info = {0}; /* Initialize to zero */ \
+    symlink_info.op_type = symlink_op_type; /* Use the provided operation type */ \
+    symlink_info.strategy_array = target_info.strategy_array; \
+    symlink_info.work_funcs = target_info.work_funcs; \
+    symlink_info.agg_funcs = target_info.agg_funcs; \
+    symlink_info.work_buffer_calc_fn = target_info.work_buffer_calc_fn; \
+    symlink_info.supported = target_info.supported; \
+    symlink_info.is_noop = target_info.is_noop; \
+    snprintf(symlink_info.kernel_name, sizeof(symlink_info.kernel_name), "NUMA %s → %s Symlink", \
+             #symlink_kname, #target_kname); \
+    /* Register the symlink using target's functions */ \
+    enum ggml_status symlink_result = ggml_numa_register_kernel_strategy( \
+        symlink_info.op_type, &target_info.strategy_array, \
+        &target_info.work_funcs, &target_info.agg_funcs, target_query_fn, target_work_buffer_fn, \
+        target_info.supported, target_info.is_noop); \
+    if (symlink_result != GGML_STATUS_SUCCESS) { \
+        NUMA_LOG_ERROR("Failed to register " #symlink_kname " → " #target_kname " symlink"); \
+        return symlink_result; \
+    } \
+    if (target_info.supported) { \
+        NUMA_LOG_DEBUG("🔗 Symlinked %s → %s (thresholds: %zu/%zu%s%s)", \
+                      #symlink_kname, #target_kname, \
+                      target_info.strategy_array.thresholds[NUMA_STRATEGY_IDX_SINGLE_SINGLE], \
+                      target_info.strategy_array.thresholds[NUMA_STRATEGY_IDX_SINGLE_MULTI], \
+                      target_info.is_noop ? ", no-op" : "", \
+                      target_work_buffer_fn ? ", work-buffer" : ""); \
+    } else { \
+        NUMA_LOG_DEBUG("🚫 Disabled symlink %s → %s (target marked as unsupported)", \
+                      #symlink_kname, #target_kname); \
+    } \
+} while(0)
+
 // =============================================================================
 // SHARED KERNEL FUNCTION MACROS - Eliminate Code Duplication
 // =============================================================================

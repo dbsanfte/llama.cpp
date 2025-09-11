@@ -28,6 +28,7 @@
 #include "permute.h"
 #include "rms_norm.h"
 #include "cpy.h"
+#include "cont.h"
 #include "get_rows.h"
 #include "../ggml-impl.h"
 #include "../ggml-vec-numa.h"
@@ -338,6 +339,7 @@ enum ggml_status ggml_numa_kernels_init(void) {
     
     // Register data movement kernels:
     NUMA_REGISTER_KERNEL(cpy);
+    NUMA_REGISTER_KERNEL(cont);  // CONT as thin wrapper around CPY
     NUMA_REGISTER_KERNEL(get_rows);
     
     // Register reduction kernels:
