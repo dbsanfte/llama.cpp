@@ -86,19 +86,6 @@ enum ggml_status ggml_numa_executor_compute_graph(
     struct ggml_cplan * cplan);
 
 /**
- * @brief Execute compute graph using NUMA-aware executor
- * 
- * Alternative entry point for compute graph execution with NUMA optimization.
- * Provides similar functionality to ggml_numa_executor_compute_graph() but
- * with different internal optimization paths.
- * 
- * @param cgraph The compute graph to execute
- * @param cplan The compute plan
- * @return GGML_STATUS_SUCCESS on success, error code on failure
- */
-enum ggml_status ggml_numa_executor_execute_graph(struct ggml_cgraph * cgraph, struct ggml_cplan * cplan);
-
-/**
  * @brief Execute a single tensor operation using optimal NUMA strategy
  * 
  * Core execution function that analyzes a single tensor operation and

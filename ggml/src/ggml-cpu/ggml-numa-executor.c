@@ -57,7 +57,7 @@ enum ggml_status ggml_numa_executor_call_direct_kernel(struct ggml_tensor * tens
         return GGML_STATUS_FAILED;
     }
     
-    GGML_LOG_DEBUG("Direct Kernel: Dispatching operation %s directly\n", ggml_op_name(tensor->op));
+    NUMA_LOG_DEBUG("Direct Kernel: Dispatching operation %s directly\n", ggml_op_name(tensor->op));
     
     // Direct kernel dispatch based on operation type - no temporary graph overhead
     switch (tensor->op) {
@@ -341,52 +341,6 @@ struct mmid_row_mapping {
 // Core Executor Implementation  
 // ============================================================================
 
-/**
- * @brief Compute graph execution with NUMA-aware optimization
- * 
- * Processes a complete compute graph by analyzing each node and dispatching
- * to appropriate NUMA kernels or fallback mechanisms. This function provides
- * the main execution loop for NUMA-optimized computation.
- * 
- * Execution Flow:
- * 1. Validates input parameters and initializes kernel registry
- * 2. Iterates through all graph nodes in dependency order
- * 3. For each node, selects optimal execution strategy
- * 4. Delegates to NUMA kernels or fallback as appropriate
- * 5. Collects performance statistics and handles errors
- * 
- * @param cgraph The compute graph to execute
- * @param cplan The compute plan with threading and buffer information
- * @return GGML_STATUS_SUCCESS on success, error code on failure
- */
-enum ggml_status ggml_numa_executor_execute_graph(struct ggml_cgraph * cgraph, struct ggml_cplan * cplan) {
-    if (!cgraph || !cplan) {
-        return GGML_STATUS_FAILED;
-    }
-    
-    GGML_LOG_DEBUG("NUMA Executor: Processing compute graph with %d nodes\n", cgraph->n_nodes);
-    
-    // Initialize kernel registry if not already done
-    if (ggml_numa_kernels_init() != GGML_STATUS_SUCCESS) {
-        GGML_LOG_ERROR("NUMA Executor: Failed to initialize kernel registry\n");
-        return GGML_STATUS_FAILED;
-    }
-    
-    // Process each node in the graph
-    for (int i = 0; i < cgraph->n_nodes; i++) {
-        struct ggml_tensor * node = cgraph->nodes[i];
-        
-        enum ggml_status result = ggml_numa_executor_execute_tensor(node, cplan);
-        if (result != GGML_STATUS_SUCCESS) {
-            GGML_LOG_ERROR("NUMA Executor: Failed to execute node %d (%s)\n", i, ggml_op_name(node->op));
-            return result;
-        }
-    }
-    
-    GGML_LOG_DEBUG("NUMA Executor: Successfully completed graph execution\n");
-    return GGML_STATUS_SUCCESS;
-}
-
 // ============================================================================
 // Public API Implementation
 // ============================================================================
@@ -507,6 +461,13 @@ enum ggml_status ggml_numa_executor_execute_tensor(struct ggml_tensor * tensor, 
     NUMA_LOG_DEBUG("DEBUG: NUMA Executor: NUMA info not available (not Linux)\n");
     #endif
     
+    // Initialize kernel registry if not already done (critical for first operation)
+    if (ggml_numa_kernels_init() != GGML_STATUS_SUCCESS) {
+        GGML_LOG_ERROR("NUMA Executor: Failed to initialize kernel registry\n");
+        NUMA_PERF_END();
+        return GGML_STATUS_FAILED;
+    }
+    
     // Get cache entry and query for execution strategy (hot path - must be fast)
     NUMA_PERF_START(NUMA_PERF_EXECUTOR_QUERY, op_name, "kernel_registry", -1, 0, 0);
     const ggml_numa_kernel_cache_entry_t * cache_entry = ggml_numa_lookup_kernel_direct(tensor->op);
@@ -514,6 +475,10 @@ enum ggml_status ggml_numa_executor_execute_tensor(struct ggml_tensor * tensor, 
     NUMA_PERF_END();
     
     if (!cache_entry || !cache_entry->supported) {
+        NUMA_LOG_DEBUG("NUMA Executor: Operation %s fallback analysis: cache_entry=%p, supported=%s\n", 
+                      op_name, 
+                      (void*)cache_entry,
+                      cache_entry ? (cache_entry->supported ? "true" : "false") : "N/A");
         GGML_LOG_DEBUG("NUMA Executor: Operation %s not supported by NUMA kernels, using direct kernel dispatch\n", 
                       op_name);
         enum ggml_status result = ggml_numa_executor_direct_kernel_dispatch(tensor, cplan);
@@ -552,6 +517,8 @@ enum ggml_status ggml_numa_executor_execute_tensor(struct ggml_tensor * tensor, 
     NUMA_PERF_START(NUMA_PERF_COORDINATOR_INIT, op_name, kernel_name, -1, 0, cplan->n_threads);
     if (!ggml_numa_openmp_coordinator_init()) {
         NUMA_PERF_END();
+        NUMA_LOG_DEBUG("NUMA Executor: OpenMP coordinator init failed for %s, using direct kernel dispatch\n", 
+                       op_name);
         GGML_LOG_DEBUG("NUMA Executor: Failed to initialize OpenMP coordinator, using direct kernel dispatch for %s\n", 
                        op_name);
         enum ggml_status result = ggml_numa_executor_direct_kernel_dispatch(tensor, cplan);

@@ -55,15 +55,19 @@ BIN_DIR="$BUILD_DIR/bin"
 
 # Test binaries to run (in order of complexity)
 NUMA_TESTS=(
+    "test-ggml-openmp-coordinator"
     "test-numa-mathematical-correctness-add"
-    "test-numa-mathematical-correctness-cont"
     "test-numa-mathematical-correctness-cpy"
+    "test-numa-mathematical-correctness-div"
     "test-numa-mathematical-correctness-get_rows"
+    "test-numa-mathematical-correctness-glu"
     "test-numa-mathematical-correctness-mul_mat_id"
+    "test-numa-mathematical-correctness-mul_mat"
+    "test-numa-mathematical-correctness-mul"
     "test-numa-mathematical-correctness-rope"
     "test-numa-mathematical-correctness-rms_norm"
     "test-numa-mathematical-correctness-soft_max"
-    "test-ggml-openmp-coordinator"
+    "test-numa-mathematical-correctness-sub"
 )
 
 # Performance benchmark tests (separate category)

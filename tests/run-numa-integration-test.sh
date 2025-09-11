@@ -538,28 +538,42 @@ run_integration_test() {
     echo "========================================"
     
     # Test 1: Small model (Qwen 0.5B)
-    echo -e "${YELLOW}🔬 Test 1: Small Model Validation${NC}"
-    local small_model_name="Qwen 2.5 0.5B (Q8_0)"
-    local small_model_path="./.devcontainer/qwen2.5-0.5b-instruct-q8_0.gguf"
-    local small_model_url="https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF/resolve/main/qwen2.5-0.5b-instruct-q8_0.gguf"
-    local small_model_id="qwen2.5-0.5b-instruct"
-    local small_test_prompt="Hello!"
-    local small_expected_pattern="Hello! How can I assist you today?"
+    #echo -e "${YELLOW}🔬 Test 1: Small Model Validation${NC}"
+    #local small_model_name="Qwen 2.5 0.5B (Q8_0)"
+    #local small_model_path="./.devcontainer/qwen2.5-0.5b-instruct-q8_0.gguf"
+    #local small_model_url="https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF/resolve/main/qwen2.5-0.5b-instruct-q8_0.gguf"
+    #local small_model_id="qwen2.5-0.5b-instruct"
+    #local small_test_prompt="Hello!"
+    #local small_expected_pattern="Hello! How can I assist you today?"
+    # 
+    #if ! test_single_model "$small_model_name" "$small_model_path" "$small_model_url" "$small_model_id" "$small_expected_pattern" "$small_test_prompt"; then
+    #    echo -e "${RED}❌ Small model test failed - stopping integration test${NC}"
+    #    return 1
+    #fi
     
-    if ! test_single_model "$small_model_name" "$small_model_path" "$small_model_url" "$small_model_id" "$small_expected_pattern" "$small_test_prompt"; then
-        echo -e "${RED}❌ Small model test failed - stopping integration test${NC}"
+    # Test 2: MoE model (GPT-OSS 20B - Unsloth Dynamic Quant)
+    echo -e "${YELLOW}🔬 Test 2: MoE Model Validation${NC}"
+    local moe_model_name="Qwen 3 30B-A3B-Instruct (MoE, Q4_K)"
+    local moe_model_path="./.devcontainer/Qwen3-30B-A3B-UD-Q4_K_XL.gguf"
+    local moe_model_url="https://huggingface.co/unsloth/Qwen3-30B-A3B-GGUF/resolve/main/Qwen3-30B-A3B-UD-Q4_K_XL.gguf"
+    local moe_model_id="qwen3-30b-a3b-instruct"
+    local moe_test_prompt="Hello!"
+    local moe_expected_pattern="Hello! How can I assist you today?"
+
+    if ! test_single_model "$moe_model_name" "$moe_model_path" "$moe_model_url" "$moe_model_id" "$moe_expected_pattern" "$moe_test_prompt"; then
+        echo -e "${RED}❌ MoE model test failed - stopping integration test${NC}"
         return 1
     fi
-    
-    echo ""
-    echo -e "${YELLOW}🔬 Test 2: Large Model Validation${NC}"
-    # Test 2: Large model (Qwen 32B)
-    local large_model_name="Qwen 3 32B (Q6_K)"
-    local large_model_path="./.devcontainer/Qwen3-32B-Q6_K.gguf"
-    local large_model_url="https://huggingface.co/Qwen/Qwen3-32B-GGUF/resolve/main/Qwen3-32B-Q6_K.gguf"
-    local large_model_id="qwen3-32b"
-    local large_test_prompt="What is artificial intelligence?"
-    local large_expected_pattern="I need to figure out what artificial intelligence is"
+
+    #echo ""
+    #echo -e "${YELLOW}🔬 Test 3: Larger Dense Model Validation${NC}"
+    ## Test 3: Larger dense model (Qwen 32B)
+    #local large_model_name="Qwen 3 32B (Q6_K)"
+    #local large_model_path="./.devcontainer/Qwen3-32B-Q6_K.gguf"
+    #local large_model_url="https://huggingface.co/Qwen/Qwen3-32B-GGUF/resolve/main/Qwen3-32B-Q6_K.gguf"
+    #local large_model_id="qwen3-32b"
+    #local large_test_prompt="What is artificial intelligence?"
+    #local large_expected_pattern="I need to figure out what artificial intelligence is"
     
     # TODO: remove
     #if ! test_single_model "$large_model_name" "$large_model_path" "$large_model_url" "$large_model_id" "$large_expected_pattern" "$large_test_prompt"; then

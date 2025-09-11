@@ -53,8 +53,9 @@ enum ggml_status ggml_numa_kernel_get_rows_execute(void * work_context, struct g
         
         // Bounds check on source row index - FAIL on invalid indices
         if (src_row_idx < 0 || src_row_idx >= src0_num_rows) {
-            NUMA_LOG_DEBUG("GET_ROWS: Index out of bounds: %lld (max: %lld)\n", 
+            NUMA_LOG_ERROR("GET_ROWS: Index out of bounds: %lld (max: %lld)\n", 
                           (long long)src_row_idx, (long long)src0_num_rows);
+            NUMA_ASSERT(false, "GET_ROWS: Index out of bounds");
             return GGML_STATUS_FAILED;
         }
         
@@ -94,7 +95,8 @@ enum ggml_status ggml_numa_kernel_get_rows_execute(void * work_context, struct g
                 if (type_traits && type_traits->to_float) {
                     type_traits->to_float(src_row, dst_row, nc);
                 } else {
-                    NUMA_LOG_DEBUG("GET_ROWS: Unsupported source type: %d\n", src0->type);
+                    NUMA_LOG_ERROR("GET_ROWS: Unsupported source type: %d\n", src0->type);
+                    NUMA_ASSERT(false, "GET_ROWS: Unsupported source type");
                     return GGML_STATUS_FAILED;
                 }
                 break;
