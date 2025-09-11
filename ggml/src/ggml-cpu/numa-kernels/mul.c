@@ -76,7 +76,7 @@ NUMA_KERNEL_REGISTER_METADATA(
     mul,                                   // op_name
     GGML_OP_MUL,                          // ggml_op_type  
     "NUMA MUL Kernel",                    // kernel_display_name
-    1024,                                 // threshold_single_single (Single thread below 1K elements)
-    262144,                               // threshold_single_multi (Multi-thread below 256K elements)
+    512,                                 // threshold_single_single (Single thread below 1K elements)
+    2048,                               // threshold_single_multi (Multi-thread below 256K elements)
     ggml_numa_kernel_mul_execute          // execute_function (MUL operations don't need work buffers or aggregation)
 )

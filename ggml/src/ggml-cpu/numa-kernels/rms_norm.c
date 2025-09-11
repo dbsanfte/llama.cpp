@@ -118,8 +118,8 @@ NUMA_KERNEL_REGISTER_METADATA(
     rms_norm,                               // kernel name
     GGML_OP_RMS_NORM,                      // operation type
     "NUMA RMS_NORM Kernel (Row-wise Reduction)",  // kernel description
-    2048,                                   // single_single threshold (smaller for reductions)
-    131072,                                 // single_multi threshold (128K elements)  
+    512,                                   // single_single threshold (smaller for reductions)
+    2048,                                 // single_multi threshold (128K elements)  
     ggml_numa_kernel_rms_norm_execute      // execution function
 )
 

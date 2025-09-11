@@ -45,6 +45,8 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
         ggml-cpu/numa-kernels/add.h
         ggml-cpu/numa-kernels/cpy.c
         ggml-cpu/numa-kernels/cpy.h
+        ggml-cpu/numa-kernels/get_rows.c
+        ggml-cpu/numa-kernels/get_rows.h
         ggml-cpu/numa-kernels/mul.c
         ggml-cpu/numa-kernels/mul.h
         ggml-cpu/numa-kernels/div.c

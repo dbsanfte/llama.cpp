@@ -251,6 +251,12 @@ llama_build_and_test(test-numa-mathematical-correctness-cpy.cpp)
 target_link_libraries(${LLAMA_TEST_NAME} PRIVATE ggml ggml-cpu common OpenMP::OpenMP_C OpenMP::OpenMP_CXX)
 target_include_directories(${LLAMA_TEST_NAME} PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src/ggml-cpu ${CMAKE_SOURCE_DIR}/ggml/src ${CMAKE_SOURCE_DIR}/ggml/include)
 
+# test-numa-mathematical-correctness-get_rows
+set(LLAMA_TEST_NAME test-numa-mathematical-correctness-get_rows)
+llama_build_and_test(test-numa-mathematical-correctness-get_rows.cpp)
+target_link_libraries(${LLAMA_TEST_NAME} PRIVATE ggml ggml-cpu common OpenMP::OpenMP_C OpenMP::OpenMP_CXX)
+target_include_directories(${LLAMA_TEST_NAME} PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src/ggml-cpu ${CMAKE_SOURCE_DIR}/ggml/src ${CMAKE_SOURCE_DIR}/ggml/include)
+
 # test-numa-mathematical-correctness-mul_mat
 set(LLAMA_TEST_NAME test-numa-mathematical-correctness-mul_mat)
 llama_build_and_test(test-numa-mathematical-correctness-mul_mat.cpp)

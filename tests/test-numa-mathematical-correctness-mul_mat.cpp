@@ -61,6 +61,10 @@
 // Global test filter
 std::string g_test_filter = "";
 bool g_filter_enabled = false;
+bool g_summary_only = false;
+
+// Conditional printf macro for summary-only mode
+#define TEST_PRINTF(...) do { if (!g_summary_only) printf(__VA_ARGS__); } while(0)
 
 /**
  * Check if a test name matches the current filter
@@ -186,22 +190,22 @@ bool compare_float_arrays(const float* a, const float* b, size_t count, const ch
         // Use relaxed tolerance for quantized operations
         if (diff > tolerance && rel_error > tolerance) {
             if (mismatches < max_reported_mismatches) {
-                printf("   ❌ Mismatch at index %zu: NUMA=%.8f vs Reference=%.8f (diff=%.8f, rel_err=%.6f%%)\n",
+                TEST_PRINTF("   ❌ Mismatch at index %zu: NUMA=%.8f vs Reference=%.8f (diff=%.8f, rel_err=%.6f%%)\n",
                        i, a[i], b[i], diff, rel_error * 100.0f);
             } else if (mismatches == max_reported_mismatches) {
-                printf("   ... (suppressing further mismatch reports)\n");
+                TEST_PRINTF("   ... (suppressing further mismatch reports)\n");
             }
             mismatches++;
         }
     }
     
     if (mismatches > 0) {
-        printf("   ❌ %s: %zu/%zu elements mismatched (%.2f%% failure rate)\n",
+        TEST_PRINTF("   ❌ %s: %zu/%zu elements mismatched (%.2f%% failure rate)\n",
                operation_name, mismatches, count, (float)mismatches / count * 100.0f);
         return false;
     }
     
-    printf("   ✅ %s: All %zu elements match (%.2e tolerance)\n", operation_name, count, tolerance);
+    TEST_PRINTF("   ✅ %s: All %zu elements match (%.2e tolerance)\n", operation_name, count, tolerance);
     return true;
 }
 
@@ -372,7 +376,7 @@ TestResult run_mul_mat_test(TestSizeClass size_class, int num_threads, enum ggml
         return {test_name, true, "Skipped (filter)"};
     }
     
-    printf("🧮 Testing %s: [%dx%dx%dx%d] @ [%dx%dx%dx%d] = [%dx%dx%dx%d] with %d threads\n",
+    TEST_PRINTF("🧮 Testing %s: [%dx%dx%dx%d] @ [%dx%dx%dx%d] = [%dx%dx%dx%d] with %d threads\n",
            test_name.c_str(),
            config.src0_ne0, config.src0_ne1, config.src0_ne2, config.src0_ne3,
            config.src1_ne0, config.src1_ne1, config.src1_ne2, config.src1_ne3,
@@ -382,11 +386,11 @@ TestResult run_mul_mat_test(TestSizeClass size_class, int num_threads, enum ggml
     bool passed = test_mul_mat_correctness(config, test_name, NUMA_STRATEGY_DATA_PARALLEL);  // Default to data parallel for old tests
     
     if (passed) {
-        printf("   ✅ PASSED\n");
+        TEST_PRINTF("   ✅ PASSED\n");
         return {test_name, true, ""};
     } else {
         std::string failure_reason = "Mathematical mismatch between NUMA and reference implementations";
-        printf("   ❌ FAILED: %s\n", failure_reason.c_str());
+        TEST_PRINTF("   ❌ FAILED: %s\n", failure_reason.c_str());
         return {test_name, false, failure_reason};
     }
 }
@@ -416,7 +420,7 @@ TestResult run_mul_mat_test_with_strategy(TestSizeClass size_class, enum ggml_ty
         return {test_name, true, "Skipped (filter)"};
     }
     
-    printf("🧮 Testing %s: [%dx%dx%dx%d] @ [%dx%dx%dx%d] = [%dx%dx%dx%d] strategy=%s\n",
+    TEST_PRINTF("🧮 Testing %s: [%dx%dx%dx%d] @ [%dx%dx%dx%d] = [%dx%dx%dx%d] strategy=%s\n",
            test_name.c_str(),
            config.src0_ne0, config.src0_ne1, config.src0_ne2, config.src0_ne3,
            config.src1_ne0, config.src1_ne1, config.src1_ne2, config.src1_ne3,
@@ -447,11 +451,11 @@ TestResult run_mul_mat_test_with_strategy(TestSizeClass size_class, enum ggml_ty
     bool passed = test_mul_mat_correctness(config, test_name, execution_strategy);
     
     if (passed) {
-        printf("   ✅ PASSED\n");
+        TEST_PRINTF("   ✅ PASSED\n");
         return {test_name, true, ""};
     } else {
         std::string failure_reason = "Mathematical mismatch between NUMA and reference implementations";
-        printf("   ❌ FAILED: %s\n", failure_reason.c_str());
+        TEST_PRINTF("   ❌ FAILED: %s\n", failure_reason.c_str());
         return {test_name, false, failure_reason};
     }
 }
@@ -464,18 +468,34 @@ int main(int argc, char* argv[]) {
     printf("🚀 NUMA Mathematical Correctness Test: MUL_MAT Operation\n");
     printf("=======================================================\n\n");
     
-    // Parse command line arguments for test filtering
+    // Parse command line arguments for test filtering and summary mode
     for (int i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "--filter") == 0 && i + 1 < argc) {
+        if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
+            printf("Usage: %s [OPTIONS]\n\n", argv[0]);
+            printf("Options:\n");
+            printf("  --filter PATTERN    Run only tests matching the given regex pattern\n");
+            printf("  --summary-only      Only print the summary table, not full test output\n");
+            printf("  --help, -h          Show this help message\n\n");
+            printf("Examples:\n");
+            printf("  %s --filter \"TINY.*f32\"     # Run only TINY f32 tests\n", argv[0]);
+            printf("  %s --summary-only           # Run all tests with minimal output\n", argv[0]);
+            return 0;
+        } else if (strcmp(argv[i], "--summary-only") == 0) {
+            g_summary_only = true;
+        } else if (strcmp(argv[i], "--filter") == 0 && i + 1 < argc) {
             g_test_filter = argv[i + 1];
             g_filter_enabled = true;
-            printf("🔍 Test filter enabled: '%s'\n\n", g_test_filter.c_str());
+            TEST_PRINTF("🔍 Test filter enabled: '%s'\n\n", g_test_filter.c_str());
             i++; // Skip the filter pattern argument
-        } else if (i == 1) {
+        } else if (i == 1 && strncmp(argv[i], "--", 2) != 0) {
             // For backward compatibility: first argument without --filter flag
             g_test_filter = argv[1];
             g_filter_enabled = true;
-            printf("🔍 Test filter enabled: '%s'\n\n", g_test_filter.c_str());
+            TEST_PRINTF("🔍 Test filter enabled: '%s'\n\n", g_test_filter.c_str());
+        } else {
+            printf("❌ Error: Unknown argument '%s'\n", argv[i]);
+            printf("Use --help for usage information.\n");
+            return 1;
         }
     }
     
@@ -509,11 +529,11 @@ int main(int argc, char* argv[]) {
     for (int stage_idx = 0; stage_idx < (int)stages.size(); stage_idx++) {
         const auto& stage = stages[stage_idx];
         
-        printf("📋 STAGE %d: %s\n", stage_idx + 1, stage.name);
-        printf("   Purpose: %s\n\n", stage.description);
+        TEST_PRINTF("📋 STAGE %d: %s\n", stage_idx + 1, stage.name);
+        TEST_PRINTF("   Purpose: %s\n\n", stage.description);
         
         for (auto size_class : size_classes) {
-            printf("🎯 Testing %s tensors: %s\n", 
+            TEST_PRINTF("🎯 Testing %s tensors: %s\n", 
                    get_test_config(size_class, 0).test_name, stage.name);
             
             // Test key quantization types for each stage
@@ -537,8 +557,8 @@ int main(int argc, char* argv[]) {
     }
     
     // Test Stage 4: Comprehensive Quantization Coverage (use ISOLATE strategy for deterministic testing)
-    printf("\n📋 STAGE 4: Comprehensive Quantization Tests\n");
-    printf("   Purpose: Validate all supported quantization types\n\n");
+    TEST_PRINTF("\n📋 STAGE 4: Comprehensive Quantization Tests\n");
+    TEST_PRINTF("   Purpose: Validate all supported quantization types\n\n");
     
     // Test subset of quantization types that have from_float functions
     std::vector<enum ggml_type> testable_types = {

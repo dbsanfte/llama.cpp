@@ -157,7 +157,7 @@ NUMA_KERNEL_REGISTER_METADATA(
     glu,                                    // kernel name
     GGML_OP_GLU,                           // operation type
     "NUMA GLU Kernel",                     // kernel description
-    128,                                   // single_single threshold
-    1024,                                  // single_multi threshold
+    1024,                                   // single_single threshold
+    2048,                                  // single_multi threshold
     ggml_numa_kernel_glu_execute           // execution function
 )
