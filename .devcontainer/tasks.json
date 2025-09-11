@@ -8,7 +8,10 @@
             "args": [
                 "-B", "build",
                 "-DCMAKE_BUILD_TYPE=Debug",
-                "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON"
+                "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON",
+                "-DGGML_NUMA_MIRROR=ON",
+                "-DGGML_OPENMP=ON",
+                "-DCMAKE_C_FLAGS:STRING=-march=native"
             ],
             "group": "build",
             "presentation": {
@@ -28,7 +31,7 @@
             "command": "bash",
             "args": [
                 "-c",
-                "cmake -B build -DCMAKE_BUILD_TYPE=Debug -DCMAKE_EXPORT_COMPILE_COMMANDS=ON -DGGML_NUMA_MIRROR=ON -DGGML_AVX512=ON -DGGML_AVX512_VNNI=ON -DGGML_AVX512_VBMI=ON -DGGML_AVX512_BF16=ON && cmake --build build --parallel"
+                "cmake -B build -DCMAKE_BUILD_TYPE=Debug -DCMAKE_EXPORT_COMPILE_COMMANDS=ON -DGGML_NUMA_MIRROR=ON -DCMAKE_C_FLAGS:STRING=-march=native && cmake --build build --parallel"
             ],
             "group": {
                 "kind": "build",
@@ -83,40 +86,6 @@
                 "$gcc"
             ],
             "detail": "Build release version with NUMA support"
-        },
-        {
-            "label": "test-cpu-topology",
-            "type": "shell",
-            "command": "./build/bin/llama-server",
-            "args": [
-                "--cpu-topology"
-            ],
-            "group": "test",
-            "presentation": {
-                "echo": true,
-                "reveal": "always",
-                "focus": false,
-                "panel": "shared"
-            },
-            "dependsOn": "cmake-build",
-            "detail": "Test consolidated CPU/GPU/NUMA topology and threading plan"
-        },
-        {
-            "label": "check-numa",
-            "type": "shell",
-            "command": "bash",
-            "args": [
-                "-c",
-                "echo '=== NUMA Hardware ===' && numactl --hardware && echo -e '\\n=== CPU Info ===' && lscpu && echo -e '\\n=== Topology ===' && hwloc-info"
-            ],
-            "group": "test",
-            "presentation": {
-                "echo": true,
-                "reveal": "always",
-                "focus": false,
-                "panel": "shared"
-            },
-            "detail": "Check NUMA and CPU topology information"
         }
     ]
 }

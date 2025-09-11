@@ -18,6 +18,7 @@
 #include "div.h"
 #include "sub.h"
 #include "mul_mat.h"
+#include "mul_mat_id.h"
 #include "rope.h"
 #include "soft_max.h"
 #include "glu.h"
@@ -330,6 +331,9 @@ enum ggml_status ggml_numa_kernels_init(void) {
 
     // Register MUL_MAT kernel
     NUMA_REGISTER_KERNEL(mul_mat);
+    
+    // Register MUL_MAT_ID kernel (Expert-based matrix multiplication)
+    NUMA_REGISTER_KERNEL(mul_mat_id);
     
     // Register the binary op kernels:
     NUMA_REGISTER_KERNEL(add); 

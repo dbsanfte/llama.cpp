@@ -57,6 +57,8 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
         ggml-cpu/numa-kernels/sub.h
         ggml-cpu/numa-kernels/mul_mat.c
         ggml-cpu/numa-kernels/mul_mat.h
+        ggml-cpu/numa-kernels/mul_mat_id.c
+        ggml-cpu/numa-kernels/mul_mat_id.h
         ggml-cpu/numa-kernels/rope.c
         ggml-cpu/numa-kernels/rope.h
         ggml-cpu/numa-kernels/noop.c
