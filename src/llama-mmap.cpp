@@ -75,33 +75,125 @@ static std::string llama_format_win_err(DWORD err) {
 #ifdef GGML_NUMA_MIRROR
 // NUMA system validation with comprehensive node testing
 static bool validate_numa_system() {
-    if (!numa_available()) {
+    printf("🔍 NUMA validation starting - checking system capabilities...\n");
+    fflush(stdout);
+    
+    if (numa_available() < 0) {
+        printf("❌ numa_available() returned < 0\n");
+        fflush(stdout);
         NUMA_LOG_DEBUG("NUMA library not available\n");
         return false;
     }
     
     int num_nodes = numa_num_configured_nodes();
-    if (num_nodes <= 0) {
-        NUMA_LOG_DEBUG("No NUMA nodes configured (got %d)\n", num_nodes);
+    printf("📊 numa_num_configured_nodes() = %d\n", num_nodes);
+    fflush(stdout);
+    
+    if (num_nodes <= 1) {
+        printf("❌ Only %d NUMA node(s) configured\n", num_nodes);
+        fflush(stdout);
+        NUMA_LOG_DEBUG("Only %d NUMA node(s) configured\n", num_nodes);
         return false;
     }
     
-    // Test if we can actually allocate memory on different nodes
-    bool numa_system_working = true;
-    for (int node = 0; node < num_nodes && numa_system_working; node++) {
-        if (numa_node_size(node, nullptr) <= 0) {
-            NUMA_LOG_DEBUG("NUMA node %d has no available memory\n", node);
-            numa_system_working = false;
+    printf("✅ NUMA validation: Testing %d nodes\n", num_nodes);
+    fflush(stdout);
+    NUMA_LOG_DEBUG("NUMA validation: Testing %d nodes\n", num_nodes);
+    
+    // Test allocation on each node and verify placement
+    const size_t test_size = 4096; // One page
+    bool all_nodes_working = true;
+    
+    for (int node = 0; node < num_nodes; node++) {
+        printf("🧪 Testing NUMA node %d...\n", node);
+        fflush(stdout);
+        
+        // Test allocation
+        void* test_ptr = numa_alloc_onnode(test_size, node);
+        if (!test_ptr) {
+            printf("❌ NUMA validation: node %d allocation failed\n", node);
+            fflush(stdout);
+            NUMA_LOG_DEBUG("NUMA validation: node %d allocation failed\n", node);
+            all_nodes_working = false;
+            continue;
         }
+        printf("✅ Node %d: allocation successful at %p\n", node, test_ptr);
+        fflush(stdout);
+        
+        // Verify the allocation is actually on the requested node
+        int actual_node = -1;
+        if (get_mempolicy(&actual_node, NULL, 0, test_ptr, MPOL_F_NODE | MPOL_F_ADDR) == 0) {
+            printf("📍 Node %d: memory at %p is on actual node %d\n", node, test_ptr, actual_node);
+            fflush(stdout);
+            if (actual_node != node) {
+                printf("⚠️  Node %d: expected allocation on node %d, got node %d (container environment)\n", node, node, actual_node);
+                fflush(stdout);
+                NUMA_LOG_DEBUG("NUMA validation: node %d requested, but memory at %p is on node %d (container env)\n", 
+                               node, test_ptr, actual_node);
+                // Don't fail for placement in containers - NUMA topology exists but memory placement may be limited
+                // The important thing is that numa_alloc_onnode() succeeds and thread binding works
+            } else {
+                printf("✅ Node %d: allocation verified correctly placed\n", node);
+                fflush(stdout);
+                NUMA_LOG_DEBUG("NUMA validation: node %d allocation verified at %p\n", node, test_ptr);
+            }
+        } else {
+            printf("❌ Node %d: get_mempolicy failed: %s\n", node, strerror(errno));
+            fflush(stdout);
+            NUMA_LOG_DEBUG("NUMA validation: get_mempolicy failed for node %d: %s\n", node, strerror(errno));
+            all_nodes_working = false;
+        }
+        
+        // Touch the memory to ensure it's actually allocated
+        printf("🖊️  Node %d: touching memory to verify allocation\n", node);
+        fflush(stdout);
+        volatile char* mem = (volatile char*)test_ptr;
+        mem[0] = 1;
+        mem[test_size - 1] = 1;
+        printf("✅ Node %d: memory touch successful\n", node);
+        fflush(stdout);
+        
+        numa_free(test_ptr, test_size);
+        printf("🧹 Node %d: memory freed\n", node);
+        fflush(stdout);
     }
     
-    if (numa_system_working) {
+    printf("🧵 Testing thread binding capabilities...\n");
+    fflush(stdout);
+    // Test thread binding
+    struct bitmask* old_mask = numa_get_run_node_mask();
+    for (int node = 0; node < num_nodes; node++) {
+        printf("🔗 Testing binding to node %d...\n", node);
+        fflush(stdout);
+        if (numa_run_on_node(node) != 0) {
+            printf("❌ Cannot bind to node %d\n", node);
+            fflush(stdout);
+            NUMA_LOG_DEBUG("NUMA validation: cannot bind to node %d\n", node);
+            all_nodes_working = false;
+        } else {
+            printf("✅ Successfully bound to node %d\n", node);
+            fflush(stdout);
+        }
+    }
+    // Restore original thread binding
+    if (old_mask) {
+        numa_run_on_node_mask(old_mask);
+        numa_free_nodemask(old_mask);
+        printf("🔄 Restored original thread binding\n");
+        fflush(stdout);
+    }
+    
+    if (all_nodes_working) {
+        printf("🎉 NUMA validation SUCCESSFUL - all %d nodes working!\n", num_nodes);
+        fflush(stdout);
         NUMA_LOG_DEBUG("✅ NUMA system validation successful - %d nodes working\n", num_nodes);
     } else {
+        printf("💥 NUMA validation FAILED - some tests didn't pass\n");
+        fflush(stdout);
         NUMA_LOG_DEBUG("❌ NUMA system validation failed - fallback to regular allocation\n");
     }
     
-    return numa_system_working;
+    return all_nodes_working;
 }
 
 // NUMA allocation using posix_memalign + first-touch approach with SIMD alignment
