@@ -718,9 +718,9 @@ extern "C" {
                     return tensor->__data[i];
                 }
             }
-            // All NUMA slots are NULL - this suggests a backend allocation issue
-            // Return NULL and let the caller handle it
-            return NULL;
+            // All NUMA slots are NULL - fall back to __data[0] (main data pointer)
+            // In NUMA mirroring mode, __data[0] is equivalent to the regular data pointer
+            return tensor->__data[0];
         }
         
         // Mirroring enabled - use NUMA-aware access
@@ -748,8 +748,9 @@ extern "C" {
                     return tensor->__data[i];
                 }
             }
-            // All NUMA slots are NULL - return NULL
-            return NULL;
+            // All NUMA slots are NULL - fall back to __data[0] (main data pointer)
+            // In NUMA mirroring mode, __data[0] is equivalent to the regular data pointer
+            return tensor->__data[0];
         }
         
         return tensor->__data[n];

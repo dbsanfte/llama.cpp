@@ -3211,30 +3211,26 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
     
     // NUMA intercept: Check if NUMA system should handle this graph computation
     bool should_dispatch = ggml_numa_should_dispatch();
-    bool coord_init = ggml_numa_openmp_coordinator_init();
-    bool not_in_fallback = !ggml_numa_is_fallback_active();
     
-    GGML_LOG_DEBUG("NUMA Dispatch Decision: should_dispatch=%d, coord_init=%d, not_in_fallback=%d\n", 
-                   should_dispatch, coord_init, not_in_fallback);
-    
-    if (should_dispatch && coord_init && not_in_fallback) {
-        GGML_LOG_INFO("🎯 NUMA Path: Processing computation graph with %d nodes through NUMA executor\n", cgraph->n_nodes);
-        test_track_numa_execution(0); // Track NUMA path was taken
-        return ggml_numa_executor_compute_graph(cgraph, cplan);
-    } else {
-        GGML_LOG_INFO("🔄 Fallback Path: Processing computation graph with %d nodes, %d threads, threadpool=%p\n", 
-                      cgraph->n_nodes, cplan->n_threads, (void*)cplan->threadpool);
-        test_track_fallback_execution(); // Track fallback path was taken
+    if (should_dispatch) {
+        // Only initialize coordinator if NUMA is actually enabled
+        bool coord_init = ggml_numa_openmp_coordinator_init();
+        bool not_in_fallback = !ggml_numa_is_fallback_active();
         
-        // Fix thread count for fallback execution using OpenMP coordinator config
-        ggml_numa_openmp_config_t config = ggml_numa_openmp_coordinator_get_config();
-        int fallback_threads = config.threads_per_node * config.total_numa_nodes;
-        if (cplan->n_threads > fallback_threads) {
-            GGML_LOG_INFO("🔧 NUMA Fallback: Limiting requested threads (%d) to fallback threadpool capacity (%d)\n", 
-                          cplan->n_threads, fallback_threads);
-            cplan->n_threads = fallback_threads;
+        GGML_LOG_DEBUG("NUMA Dispatch Decision: should_dispatch=%d, coord_init=%d, not_in_fallback=%d\n", 
+                       should_dispatch, coord_init, not_in_fallback);
+        
+        if (coord_init && not_in_fallback) {
+            GGML_LOG_INFO("🎯 NUMA Path: Processing computation graph with %d nodes through NUMA executor\n", cgraph->n_nodes);
+            test_track_numa_execution(0); // Track NUMA path was taken
+            return ggml_numa_executor_compute_graph(cgraph, cplan);
         }
     }
+    
+    // Standard execution path - no NUMA functions called
+    GGML_LOG_INFO("🔄 Standard Path: Processing computation graph with %d nodes, %d threads, threadpool=%p\n", 
+                  cgraph->n_nodes, cplan->n_threads, (void*)cplan->threadpool);
+    test_track_fallback_execution(); // Track standard path was taken
 #endif
 
     // Continue with non-NUMA execution
