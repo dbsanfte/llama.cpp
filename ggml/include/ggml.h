@@ -221,6 +221,10 @@
 #define GGML_MAX_N_THREADS      512
 #define GGML_MAX_OP_PARAMS      64
 
+#ifdef GGML_NUMA_MIRROR
+    #define GGML_NUMA_MAX_NODES     8
+#endif
+
 #ifndef GGML_MAX_NAME
 #   define GGML_MAX_NAME        64
 #endif
