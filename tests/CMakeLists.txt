@@ -210,6 +210,64 @@ if (NOT GGML_BACKEND_DL)
     llama_build_and_test(test-rope.cpp)
 endif()
 
+# NUMA tests - only build if NUMA support is enabled
+if (GGML_NUMA_MIRROR)
+    # NUMA mathematical correctness tests
+    
+    # Custom function for NUMA tests that adds proper include paths
+    function(llama_build_and_test_numa source)
+        include(CMakeParseArguments)
+        set(options)
+        set(oneValueArgs NAME LABEL WORKING_DIRECTORY)
+        set(multiValueArgs ARGS)
+        cmake_parse_arguments(LLAMA_TEST "${options}" "${oneValueArgs}" "${multiValueArgs}" ${ARGN})
+
+        if (NOT DEFINED LLAMA_TEST_LABEL)
+            set(LLAMA_TEST_LABEL "numa")
+        endif()
+        if (NOT DEFINED LLAMA_TEST_WORKING_DIRECTORY)
+            set(LLAMA_TEST_WORKING_DIRECTORY .)
+        endif()
+        if (DEFINED LLAMA_TEST_NAME)
+            set(TEST_TARGET ${LLAMA_TEST_NAME})
+        else()
+            get_filename_component(TEST_TARGET ${source} NAME_WE)
+        endif()
+
+        add_executable(${TEST_TARGET} ${source} get-model.cpp)
+        install(TARGETS ${TEST_TARGET} RUNTIME)
+        target_link_libraries(${TEST_TARGET} PRIVATE common)
+        
+        # Add NUMA include paths
+        target_include_directories(${TEST_TARGET} PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src ${CMAKE_SOURCE_DIR}/ggml/src/ggml-cpu)
+
+        add_test(
+            NAME ${TEST_TARGET}
+            WORKING_DIRECTORY ${LLAMA_TEST_WORKING_DIRECTORY}
+            COMMAND $<TARGET_FILE:${TEST_TARGET}>
+            ${LLAMA_TEST_ARGS})
+
+        set_property(TEST ${TEST_TARGET} PROPERTY LABELS ${LLAMA_TEST_LABEL})
+    endfunction()
+    
+    llama_build_and_test_numa(test-numa-mathematical-correctness-add.cpp)
+    llama_build_and_test_numa(test-numa-mathematical-correctness-sub.cpp)  
+    llama_build_and_test_numa(test-numa-mathematical-correctness-mul.cpp)
+    llama_build_and_test_numa(test-numa-mathematical-correctness-div.cpp)
+    llama_build_and_test_numa(test-numa-mathematical-correctness-rope.cpp)
+    llama_build_and_test_numa(test-numa-mathematical-correctness-rms_norm.cpp)
+    llama_build_and_test_numa(test-numa-mathematical-correctness-soft_max.cpp)
+    llama_build_and_test_numa(test-numa-mathematical-correctness-glu.cpp)
+    llama_build_and_test_numa(test-numa-mathematical-correctness-cpy.cpp)
+    llama_build_and_test_numa(test-numa-mathematical-correctness-get_rows.cpp)
+    llama_build_and_test_numa(test-numa-mathematical-correctness-mul_mat.cpp)
+    llama_build_and_test_numa(test-numa-mathematical-correctness-mul_mat_id.cpp)
+    
+    # NUMA performance tests
+    llama_build_and_test_numa(test-numa-performance-reshape.cpp)
+    llama_build_and_test_numa(test-numa-noop-performance.cpp)
+endif()
+
 # libmtmd
 set(LLAMA_TEST_NAME test-mtmd-c-api)
 llama_build_and_test(test-mtmd-c-api.c)

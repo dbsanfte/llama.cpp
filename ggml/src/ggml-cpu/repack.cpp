@@ -1658,7 +1658,7 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
         // If there are more than three rows in src1, use gemm; otherwise, use gemv.
         if (ne11 > 3) {
             gemm<BLOC_TYPE, INTER_SIZE, NB_COLS, PARAM_TYPE>(ne00,
-                    (float *) ((char *) tensor_data(dst)) + src0_start, ne01,
+                    (float *) ((char *) tensor_data(dst) + src0_start), ne01,
                     (const char *) tensor_data(src0) + src0_start * nb01,
                     (const char *) src1_wdata, ne11 - ne11 % 4, src0_end - src0_start);
         }

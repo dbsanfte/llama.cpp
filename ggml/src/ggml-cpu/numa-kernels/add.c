@@ -15,7 +15,7 @@
 #include <string.h>
 
 // ============================================================================
-// ADD Kernel Implementation (F32 Only for Testing Refined Macros)
+// ADD Kernel Implementation 
 // ============================================================================
 
 /**

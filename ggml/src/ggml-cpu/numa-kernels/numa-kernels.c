@@ -327,40 +327,40 @@ enum ggml_status ggml_numa_kernels_init(void) {
     // This allows kernels to define their own strategies and function pointers
     
     // Register ROPE kernel 
-    NUMA_REGISTER_KERNEL(rope);
+    //NUMA_REGISTER_KERNEL(rope);
 
     // Register MUL_MAT kernel
-    NUMA_REGISTER_KERNEL(mul_mat);
+    //NUMA_REGISTER_KERNEL(mul_mat);
     
     // Register MUL_MAT_ID kernel (Expert-based matrix multiplication)
-    NUMA_REGISTER_KERNEL(mul_mat_id);
+    //NUMA_REGISTER_KERNEL(mul_mat_id);
     
     // Register the binary op kernels:
-    NUMA_REGISTER_KERNEL(add); 
-    NUMA_REGISTER_KERNEL(mul);
-    NUMA_REGISTER_KERNEL(div);
-    NUMA_REGISTER_KERNEL(sub);
+    //NUMA_REGISTER_KERNEL(add); 
+    //NUMA_REGISTER_KERNEL(mul);
+    //NUMA_REGISTER_KERNEL(div);
+    //NUMA_REGISTER_KERNEL(sub);
     
     // Register data movement kernels:
-    NUMA_REGISTER_KERNEL(cpy);
-    NUMA_REGISTER_KERNEL(cont);  // CONT as thin wrapper around CPY
-    NUMA_REGISTER_KERNEL(get_rows);
+    //NUMA_REGISTER_KERNEL(cpy);
+    //NUMA_REGISTER_KERNEL(cont);  // CONT as thin wrapper around CPY
+    //NUMA_REGISTER_KERNEL(get_rows);
     
     // Register reduction kernels:
-    NUMA_REGISTER_KERNEL(rms_norm);
-    NUMA_REGISTER_KERNEL(soft_max);
+    //NUMA_REGISTER_KERNEL(rms_norm);
+    //NUMA_REGISTER_KERNEL(soft_max);
     
     // Register activation kernels:
-    NUMA_REGISTER_KERNEL(glu);
+    //NUMA_REGISTER_KERNEL(glu);
     
     // Register view operations (metadata-only, no-op kernels):
-    NUMA_REGISTER_KERNEL(reshape);
-    NUMA_REGISTER_KERNEL(transpose);
-    NUMA_REGISTER_KERNEL(view);
-    NUMA_REGISTER_KERNEL(permute);
+    //NUMA_REGISTER_KERNEL(reshape);
+    //NUMA_REGISTER_KERNEL(transpose);
+    //NUMA_REGISTER_KERNEL(view);
+    //NUMA_REGISTER_KERNEL(permute);
     
     // Register NOOP kernel for performance testing
-    NUMA_REGISTER_KERNEL(noop);
+    //NUMA_REGISTER_KERNEL(noop);
     
     g_numa_kernels_initialized = true;
     

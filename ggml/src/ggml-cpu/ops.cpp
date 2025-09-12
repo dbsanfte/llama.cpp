@@ -1103,6 +1103,58 @@ static void ggml_compute_forward_dup_i32(
                 }
             }
         }
+    } else if (dst->type == GGML_TYPE_I32) {
+        for (int64_t i03 = 0; i03 < ne03; i03++) {
+            for (int64_t i02 = 0; i02 < ne02; i02++) {
+                i10 += ne00 * ir0;
+                while (i10 >= ne0) {
+                    i10 -= ne0;
+                    if (++i11 == ne1) {
+                        i11 = 0;
+                        if (++i12 == ne2) {
+                            i12 = 0;
+                            if (++i13 == ne3) {
+                                i13 = 0;
+                            }
+                        }
+                    }
+                }
+                for (int64_t i01 = ir0; i01 < ir1; i01++) {
+                    for (int64_t i00 = 0; i00 < ne00; i00++) {
+                        const char * src0_ptr = ((char *) tensor_data(src0) + i00*nb00 + i01*nb01 + i02*nb02 + i03*nb03);
+                              char * dst_ptr  = ((char *)  tensor_data(dst) + i10*nb0  + i11*nb1  + i12*nb2  + i13*nb3);
+
+                        *(int32_t *) dst_ptr = *(const float *) src0_ptr;
+
+                        if (++i10 == ne0) {
+                            i10 = 0;
+                            if (++i11 == ne1) {
+                                i11 = 0;
+                                if (++i12 == ne2) {
+                                    i12 = 0;
+                                    if (++i13 == ne3) {
+                                        i13 = 0;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                i10 += ne00 * (ne01 - ir1);
+                while (i10 >= ne0) {
+                    i10 -= ne0;
+                    if (++i11 == ne1) {
+                        i11 = 0;
+                        if (++i12 == ne2) {
+                            i12 = 0;
+                            if (++i13 == ne3) {
+                                i13 = 0;
+                            }
+                        }
+                    }
+                }
+            }
+        }
     } else {
         GGML_ABORT("fatal error"); // TODO: implement
     }
@@ -3967,6 +4019,8 @@ static void ggml_compute_forward_geglu_erf_f32(
     GGML_ASSERT(ggml_nrows(dst) == nr);
 
     const int32_t swapped = ggml_get_op_params_i32(dst, 1);
+    const float alpha = ggml_get_op_params_f32(dst, 2);
+    const float limit = ggml_get_op_params_f32(dst, 3);
 
     // rows per thread
     const int dr = (nr + nth - 1)/nth;
@@ -3978,6 +4032,7 @@ static void ggml_compute_forward_geglu_erf_f32(
     for (int i1 = ir0; i1 < ir1; i1++) {
         float * src0_p = (float *) (src0_d + i1*src0_o);
         float * src1_p = (float *) (src1_d + i1*src1_o);
+        float * dst_p  = (float *) ((char *) tensor_data(dst) + i1*(dst->nb[1]));
 
         if (!src1) {
             src0_p += swapped ? nc : 0;
@@ -4321,14 +4376,79 @@ static void ggml_compute_forward_rms_norm_f32(
             for (int64_t i01 = ith; i01 < ne01; i01 += nth) {
                 const float * x = (float *) ((char *) tensor_data(src0) + i01*nb01 + i02*nb02 + i03*nb03);
 
+                // NUMA DEBUG: Check for invalid tensor data
+                if (x == nullptr) {
+                    fprintf(stderr, "NUMA DEBUG: tensor_data(src0) returned null pointer!\n");
+                    fprintf(stderr, "  src0=%p, tensor_data(src0)=%p\n", src0, tensor_data(src0));
+                    fprintf(stderr, "  i01=%ld, nb01=%zu, i02=%ld, nb02=%zu, i03=%ld, nb03=%zu\n",
+                            i01, nb01, i02, nb02, i03, nb03);
+                    abort();
+                }
+
+                // NUMA DEBUG: Check tensor NUMA data state
+                extern int ggml_current_numa_node;
+                fprintf(stderr, "NUMA DEBUG: Accessing tensor data from node %d\n", ggml_current_numa_node);
+                fprintf(stderr, "  src0=%p, ne00=%ld\n", (void*)src0, ne00);
+#ifdef GGML_NUMA_MIRROR
+                for (int node = 0; node < 2; node++) {
+                    void* node_data = src0->__data[node];
+                    fprintf(stderr, "  src0->__data[%d] = %p\n", node, node_data);
+                }
+#endif
+                fprintf(stderr, "  tensor_data(src0) = %p\n", tensor_data(src0));
+                fprintf(stderr, "  Final x = %p\n", (void*)x);
+
                 ggml_float sum = 0.0;
                 for (int64_t i00 = 0; i00 < ne00; i00++) {
-                    sum += (ggml_float)(x[i00] * x[i00]);
+                    float val = x[i00];
+                    // NUMA DEBUG: Check for NaN/inf in input data - show first 10 values for pattern analysis
+                    if (i00 < 10) {
+                        fprintf(stderr, "  x[%ld] = %f\n", i00, val);
+                    }
+                    if (!isfinite(val)) {
+                        fprintf(stderr, "NUMA DEBUG: Non-finite value detected in RMS_NORM input!\n");
+                        fprintf(stderr, "  x[%ld] = %f (at position i01=%ld, i02=%ld, i03=%ld)\n", 
+                                i00, val, i01, i02, i03);
+                        fprintf(stderr, "  src0=%p, tensor_data(src0)=%p, x=%p\n", src0, tensor_data(src0), x);
+                        
+                        // NUMA DEBUG: Show all NUMA node data pointers
+#ifdef GGML_NUMA_MIRROR
+                        for (int node = 0; node < 2; node++) {
+                            void* node_data = src0->__data[node];
+                            fprintf(stderr, "  src0->__data[%d] = %p", node, node_data);
+                            if (node_data != nullptr) {
+                                float* node_float_data = (float*)((char*)node_data + i01*nb01 + i02*nb02 + i03*nb03);
+                                fprintf(stderr, " -> x[%ld] = %f", i00, node_float_data[i00]);
+                            }
+                            fprintf(stderr, "\n");
+                        }
+#endif
+                        
+                        fprintf(stderr, "  Context: ne00=%ld, i01=%ld, nb01=%zu, current_numa_node=%d\n", 
+                                ne00, i01, nb01, ggml_current_numa_node);
+                        abort();
+                    }
+                    sum += (ggml_float)(val * val);
                 }
 
                 const float mean = sum/ne00;
 
+                // NUMA DEBUG: Check calculated mean
+                if (!isfinite(mean) || mean < 0) {
+                    fprintf(stderr, "NUMA DEBUG: Invalid mean calculated in RMS_NORM!\n");
+                    fprintf(stderr, "  mean = %f, sum = %f, ne00 = %ld\n", mean, (float)sum, ne00);
+                    fprintf(stderr, "  eps = %f, mean + eps = %f\n", eps, mean + eps);
+                    abort();
+                }
+
                 float * y = (float *) ((char *) tensor_data(dst) + i01*nb1 + i02*nb2 + i03*nb3);
+
+                // NUMA DEBUG: Check output tensor data
+                if (y == nullptr) {
+                    fprintf(stderr, "NUMA DEBUG: tensor_data(dst) returned null pointer!\n");
+                    fprintf(stderr, "  dst=%p, tensor_data(dst)=%p\n", dst, tensor_data(dst));
+                    abort();
+                }
 
                 memcpy(y, x, ne00 * sizeof(float));
                 // for (int i00 = 0; i00 < ne00; i00++) {
@@ -4337,7 +4457,16 @@ static void ggml_compute_forward_rms_norm_f32(
 
                 const float scale = 1.0f/sqrtf(mean + eps);
 
-                // if you hit this, likely you got an inf somewhere earlier
+                // NUMA DEBUG: Enhanced assertion with debugging info
+                if (!(scale > 0.0f)) {
+                    fprintf(stderr, "NUMA DEBUG: RMS_NORM scale assertion failed!\n");
+                    fprintf(stderr, "  scale = %f, mean = %f, eps = %f\n", scale, mean, eps);
+                    fprintf(stderr, "  mean + eps = %f, sqrtf(mean + eps) = %f\n", mean + eps, sqrtf(mean + eps));
+                    fprintf(stderr, "  sum = %f, ne00 = %ld\n", (float)sum, ne00);
+                    fprintf(stderr, "  src0=%p, tensor_data(src0)=%p, x=%p\n", src0, tensor_data(src0), x);
+                    fprintf(stderr, "  dst=%p, tensor_data(dst)=%p, y=%p\n", dst, tensor_data(dst), y);
+                    abort();
+                }
                 assert(scale > 0.0f);
 
                 ggml_vec_scale_f32(ne00, y, scale);

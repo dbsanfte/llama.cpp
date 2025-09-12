@@ -143,14 +143,6 @@ int get_memory_numa_node(void* ptr);
  */
 void ggml_force_link_numa_allocator_symbols(void);
 
-/**
- * @brief NUMA Strategy Functions (defined in ggml.c)
- */
-int ggml_numa_get_strategy(void);
-int ggml_numa_get_isolate_node(void);
-void ggml_numa_set_strategy(int strategy);
-void ggml_numa_set_isolate_node(int node);
-
 #ifdef __cplusplus
 }
 #endif

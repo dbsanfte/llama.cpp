@@ -14,7 +14,16 @@
 #include "vec.h"
 #include "ops.h"
 #include "ggml.h"
+
+#ifdef GGML_NUMA_MIRROR
+#include "ggml-numa-openmp-coordinator.h"
 #include "ggml-numa-executor.h"
+#ifdef __linux__
+#include <numa.h>
+#include <sched.h>
+#endif
+
+#endif
 
 #if defined(_MSC_VER) || defined(__MINGW32__)
 #include <malloc.h> // using malloc.h with MSC/MINGW
@@ -42,11 +51,6 @@
 #ifdef GGML_USE_OPENMP
 #include <omp.h>
 #endif
-
-// Forward declarations for test tracking functions
-void test_track_numa_execution(int node_id);
-void test_track_fallback_execution(void);
-void test_track_data_parallel(void);
 
 #if defined(__ARM_FEATURE_SVE) || defined(__ARM_FEATURE_MATMUL_INT8)
 #undef GGML_USE_LLAMAFILE
@@ -507,39 +511,15 @@ static inline void ggml_thread_cpu_relax(void) {;}
 #endif
 
 //
-// NUMA support
-//
-
-#define GGML_NUMA_MAX_NODES 8
-#define GGML_NUMA_MAX_CPUS 512
-
-struct ggml_numa_node {
-    uint32_t cpus[GGML_NUMA_MAX_CPUS]; // hardware threads on this node
-    uint32_t n_cpus;
-};
-
-struct ggml_numa_nodes {
-    enum ggml_numa_strategy numa_strategy;
-    struct ggml_numa_node nodes[GGML_NUMA_MAX_NODES];
-    uint32_t n_nodes;
-    uint32_t total_cpus; // hardware threads on system
-    uint32_t current_node; // node on which main process is execting
-#if defined(__gnu_linux__)
-    cpu_set_t cpuset; // cpuset from numactl
-#else
-    uint32_t cpuset; // no NUMA support outside of Linux at this time. Use a portable datatype
-#endif
-};
-
-//
 // ggml state
 //
 
 struct ggml_state {
-    struct ggml_numa_nodes numa;
+    // Placeholder for future state if needed
+    int initialized;
 };
 
-static struct ggml_state g_state = {0};
+// Note: g_state removed as it was unused
 
 void ggml_barrier(struct ggml_threadpool * tp) {
     int n_threads = atomic_load_explicit(&tp->n_threads_cur, memory_order_relaxed);
@@ -587,112 +567,10 @@ int ggml_threadpool_chunk_add(struct ggml_threadpool * tp, int value) {
     return atomic_fetch_add_explicit(&tp->current_chunk, value, memory_order_relaxed);
 }
 
-#if defined(__gnu_linux__)
-static cpu_set_t ggml_get_numa_affinity(void) {
-    cpu_set_t cpuset;
-    pthread_t thread;
-    thread = pthread_self();
-    CPU_ZERO(&cpuset);
-    pthread_getaffinity_np(thread, sizeof(cpu_set_t), &cpuset);
-    return cpuset;
-}
-#else
-static uint32_t ggml_get_numa_affinity(void) {
-    return 0; // no NUMA support
-}
-#endif
+//
+// NUMA Management Functions
+//
 
-void ggml_numa_init(enum ggml_numa_strategy numa_flag) {
-    if (g_state.numa.n_nodes > 0) {
-        fprintf(stderr, "ggml_numa_init: NUMA already initialized\n");
-
-        return;
-    }
-
-#if defined(__gnu_linux__)
-    struct stat st;
-    char path[256];
-    int rv;
-
-    // set numa scheme
-    g_state.numa.numa_strategy = numa_flag;
-
-    GGML_PRINT_DEBUG("numa strategy %u\n",g_state.numa.numa_strategy);
-
-    g_state.numa.cpuset = ggml_get_numa_affinity();
-
-    // enumerate nodes
-    while (g_state.numa.n_nodes < GGML_NUMA_MAX_NODES) {
-        rv = snprintf(path, sizeof(path), "/sys/devices/system/node/node%u", g_state.numa.n_nodes);
-        GGML_ASSERT(rv > 0 && (unsigned)rv < sizeof(path));
-        if (stat(path, &st) != 0) { break; }
-        ++g_state.numa.n_nodes;
-    }
-
-    // enumerate CPUs
-    while (g_state.numa.total_cpus < GGML_NUMA_MAX_CPUS) {
-        rv = snprintf(path, sizeof(path), "/sys/devices/system/cpu/cpu%u", g_state.numa.total_cpus);
-        GGML_ASSERT(rv > 0 && (unsigned)rv < sizeof(path));
-        if (stat(path, &st) != 0) { break; }
-        ++g_state.numa.total_cpus;
-    }
-
-    GGML_PRINT_DEBUG("found %u numa nodes, %u CPUs\n", g_state.numa.n_nodes, g_state.numa.total_cpus);
-
-    // figure out which node we're on
-    uint current_cpu;
-    int getcpu_ret = 0;
-#if __GLIBC__ > 2 || (__GLIBC__ == 2 && __GLIBC_MINOR__ > 33) || defined(__COSMOPOLITAN__)
-    getcpu_ret = getcpu(&current_cpu, &g_state.numa.current_node);
-#else
-    // old glibc doesn't have a wrapper for this call. Fall back on direct syscall
-#   if !defined(SYS_getcpu) && defined(SYS_get_cpu)
-#       define SYS_getcpu SYS_get_cpu // some older glibc versions use this name
-#   endif
-    getcpu_ret = syscall(SYS_getcpu, &current_cpu, &g_state.numa.current_node);
-#endif
-
-    if (g_state.numa.n_nodes < 1 || g_state.numa.total_cpus < 1 || getcpu_ret != 0) {
-        g_state.numa.n_nodes = 0;
-        return;
-    }
-
-    GGML_PRINT_DEBUG("found our process on numa node %u, CPU %u\n", g_state.numa.current_node, current_cpu);
-
-    for (uint32_t n = 0; n < g_state.numa.n_nodes; ++n) {
-        struct ggml_numa_node * node = &g_state.numa.nodes[n];
-        GGML_PRINT_DEBUG("CPUs on node %u:", n);
-        node->n_cpus = 0;
-        for (uint32_t c = 0; c < g_state.numa.total_cpus; ++c) {
-            rv = snprintf(path, sizeof(path), "/sys/devices/system/node/node%u/cpu%u", n, c);
-            GGML_ASSERT(rv > 0 && (unsigned)rv < sizeof(path));
-            if (stat(path, &st) == 0) {
-                node->cpus[node->n_cpus++] = c;
-                GGML_PRINT_DEBUG(" %u", c);
-            }
-        }
-        GGML_PRINT_DEBUG("\n");
-    }
-
-    if (ggml_is_numa()) {
-        FILE *fptr = fopen("/proc/sys/kernel/numa_balancing", "r");
-        if (fptr != NULL) {
-            char buf[42];
-            if (fgets(buf, sizeof(buf), fptr) && strncmp(buf, "0\n", sizeof(buf)) != 0) {
-                GGML_LOG_WARN("/proc/sys/kernel/numa_balancing is enabled, this has been observed to impair performance\n");
-            }
-            fclose(fptr);
-        }
-    }
-#else
-    UNUSED(numa_flag);
-    // TODO
-#endif
-}
-
-bool ggml_is_numa(void) {
-    return g_state.numa.n_nodes > 1;
-}
 
 #if defined(__ARM_ARCH)
 
@@ -733,7 +611,7 @@ struct ggml_tensor * ggml_set_i32 (struct ggml_tensor * tensor, int32_t value) {
     const int nc    = tensor->ne[0];
     const size_t n1 = tensor->nb[1];
 
-    char * const data = (char *)tensor_data(tensor);
+    char * const data = tensor_data(tensor);
 
     switch (tensor->type) {
         case GGML_TYPE_I8:
@@ -792,7 +670,7 @@ struct ggml_tensor * ggml_set_f32(struct ggml_tensor * tensor, float value) {
     const int nc    = tensor->ne[0];
     const size_t n1 = tensor->nb[1];
 
-    char * const data = (char *)tensor_data(tensor);
+    char * const data = tensor_data(tensor);
 
     switch (tensor->type) {
         case GGML_TYPE_I8:
@@ -1124,7 +1002,7 @@ void ggml_set_f32_nd(const struct ggml_tensor * tensor, int i0, int i1, int i2, 
 
 // ggml_compute_forward_mul_mat
 
-static void ggml_compute_forward_mul_mat_one_chunk(
+void ggml_compute_forward_mul_mat_one_chunk_legacy(
     const struct ggml_compute_params * params,
     struct ggml_tensor * dst,
     const enum ggml_type type,
@@ -1147,8 +1025,6 @@ static void ggml_compute_forward_mul_mat_one_chunk(
     // broadcast factors
     const int64_t r2 = ne12 / ne02;
     const int64_t r3 = ne13 / ne03;
-
-    //printf("ir0_start = %6lld, ir0_end = %6lld, ir1_start = %6lld, ir1_end = %6lld\n", ir0_start, ir0_end, ir1_start, ir1_end);
 
     // threads with no work simply yield (not sure if it helps)
     if (ir0_start >= ir0_end || ir1_start >= ir1_end) {
@@ -1203,11 +1079,168 @@ static void ggml_compute_forward_mul_mat_one_chunk(
                 //}
 
                 for (int64_t ir0 = iir0; ir0 < iir0 + blck_0 && ir0 < ir0_end; ir0 += num_rows_per_vec_dot) {
+                    // DEBUG: Log reference vec_dot operations for comparison with NUMA kernel
+                    if (getenv("GGML_NUMA_DEBUG")) {
+                        printf("[STANDARD] vec_dot call: ne00=%ld, ir0=%ld, ir1=%ld, src0_type=%d, src1_type=%d\n",
+                               ne00, ir0, ir1, src0->type, src1->type);
+                        
+                        // Log first few bytes of src0 and src1 data for this vec_dot call
+                        const char* src0_ptr = src0_row + ir0 * nb01;
+                        printf("[STANDARD] src0 bytes: ");
+                        for (int i = 0; i < MIN(16, ne00 * ggml_type_size(src0->type)); i++) {
+                            printf("%02x ", ((unsigned char*)src0_ptr)[i]);
+                        }
+                        printf("\n[STANDARD] src1 bytes: ");
+                        for (int i = 0; i < MIN(16, ne00 * ggml_type_size(src1->type)); i++) {
+                            printf("%02x ", ((unsigned char*)src1_col)[i]);
+                        }
+                        printf("\n");
+                    }
+                    
                     vec_dot(ne00, &tmp[ir0 - iir0], (num_rows_per_vec_dot > 1 ? 16 : 0), src0_row + ir0 * nb01, (num_rows_per_vec_dot > 1 ? nb01 : 0), src1_col, (num_rows_per_vec_dot > 1 ? src1_col_stride : 0), num_rows_per_vec_dot);
+                    
+                    // DEBUG: Log result of vec_dot call
+                    if (getenv("GGML_NUMA_DEBUG")) {
+                        printf("[STANDARD] vec_dot result: %.8f\n", tmp[ir0 - iir0]);
+                    }
                 }
 
                 for (int cn = 0; cn < num_rows_per_vec_dot; ++cn) {
                     memcpy(&dst_col[iir0 + cn * nb1 / nb0], tmp + (cn * 16), (MIN(iir0 + blck_0, ir0_end) - iir0) * sizeof(float));
+                }
+            }
+        }
+    }
+}
+
+// Clean alternative implementation for performance comparison
+void ggml_compute_forward_mul_mat_one_chunk(
+    const struct ggml_compute_params * params,
+    struct ggml_tensor * dst,
+    const enum ggml_type type,
+    const int64_t num_rows_per_vec_dot,
+    const int64_t ir0_start,
+    const int64_t ir0_end,
+    const int64_t ir1_start,
+    const int64_t ir1_end) {
+
+    const struct ggml_tensor * src0 = dst->src[0];
+    const struct ggml_tensor * src1 = dst->src[1];
+
+    GGML_TENSOR_BINARY_OP_LOCALS
+
+    const bool src1_cont = ggml_is_contiguous(src1);
+
+    ggml_vec_dot_t const vec_dot      = type_traits_cpu[type].vec_dot;
+    enum ggml_type const vec_dot_type = type_traits_cpu[type].vec_dot_type;
+
+    // broadcast factors
+    const int64_t r2 = ne12 / ne02;
+    const int64_t r3 = ne13 / ne03;
+
+    // threads with no work simply yield (not sure if it helps)
+    if (ir0_start >= ir0_end || ir1_start >= ir1_end) {
+        return;
+    }
+
+    const void * wdata = (src1->type == vec_dot_type) ? tensor_data(src1) : params->wdata;
+    const size_t row_size = ggml_row_size(vec_dot_type, ne10);
+
+    assert(ne12 % ne02 == 0);
+    assert(ne13 % ne03 == 0);
+
+    // block-tiling attempt - use same values as legacy
+    const int64_t blck_0 = 16;
+    const int64_t blck_1 = 16;
+
+    const size_t src1_col_stride = src1_cont || src1->type != vec_dot_type ? row_size : nb11;
+
+    // Mirror the exact same iteration pattern as legacy implementation
+    for (int64_t iir1 = ir1_start; iir1 < ir1_end; iir1 += blck_1) {
+        for (int64_t iir0 = ir0_start; iir0 < ir0_end; iir0 += blck_0) {
+            for (int64_t ir1 = iir1; ir1 < iir1 + blck_1 && ir1 < ir1_end; ir1 += num_rows_per_vec_dot) {
+                const int64_t i13 = (ir1 / (ne12 * ne1));
+                const int64_t i12 = (ir1 - i13 * ne12 * ne1) / ne1;
+                const int64_t i11 = (ir1 - i13 * ne12 * ne1 - i12 * ne1);
+
+                // broadcast src0 into src1
+                const int64_t i03 = i13 / r3;
+                const int64_t i02 = i12 / r2;
+
+                const int64_t i1 = i11;
+                const int64_t i2 = i12;
+                const int64_t i3 = i13;
+
+                const char * src0_row = (const char*)tensor_data(src0) + (0 + i02 * nb02 + i03 * nb03);
+
+                // desc: when src1 is not a contiguous memory block we have to calculate the offset using the strides
+                //       if it is, then we have either copied the data to params->wdata and made it contiguous or we are using
+                //       the original src1 data pointer, so we should index using the indices directly
+                // TODO: this is a bit of a hack, we should probably have a better way to handle this
+                const char * src1_col = (const char*)wdata +
+                    (src1_cont || src1->type != vec_dot_type
+                        ? (i11 + i12 * ne11 + i13 * ne12 * ne11) * row_size
+                        : (i11 * nb11 + i12 * nb12 + i13 * nb13));
+                float * dst_col = (float*)((char*)tensor_data(dst) + (i1 * nb1 + i2 * nb2 + i3 * nb3));
+
+                // Direct assignment version of the legacy logic (no tmp buffer)
+                for (int64_t ir0 = iir0; ir0 < iir0 + blck_0 && ir0 < ir0_end; ir0 += num_rows_per_vec_dot) {
+                    if (num_rows_per_vec_dot == 1) {
+                        // Log detailed vec_dot operation (REFERENCE IMPLEMENTATION)
+                        /*
+                        if (getenv("GGML_NUMA_DEBUG")) {
+                            printf("[REFERENCE] Pre-vec_dot[%ld,%ld]: vec_dot=%p, ne00=%ld, dst=%p, src0=%p, src1=%p\n",
+                                   ir0, ir1, (void*)vec_dot, ne00, (void*)&dst_col[ir0], 
+                                   (void*)(src0_row + ir0*nb01), (void*)src1_col);
+                            
+                            // Log first few elements of input data
+                            const float* src0_data = (const float*)(src0_row + ir0*nb01);
+                            const float* src1_data = (const float*)src1_col;
+                            printf("[REFERENCE] Input data - src0[0:3]: %.8f %.8f %.8f, src1[0:3]: %.8f %.8f %.8f\n",
+                                   src0_data[0], src0_data[1], src0_data[2], src1_data[0], src1_data[1], src1_data[2]);
+                        }
+                        */
+                        
+                        // Simple case: mirror the memcpy pattern &dst_col[iir0 + ...]
+                        vec_dot(ne00, &dst_col[ir0], 0, src0_row + ir0*nb01, 0, src1_col, 0, 1);
+                        
+                        // Log post-computation result
+                        /*
+                        if (getenv("GGML_NUMA_DEBUG")) {
+                            printf("[REFERENCE] Post-vec_dot[%ld,%ld]: result=%.8f\n", ir0, ir1, dst_col[ir0]);
+                        }
+                        */
+                    } else {
+                        // Multi-row case: mirror the tmp buffer logic but write directly
+                        for (int cn = 0; cn < num_rows_per_vec_dot; ++cn) {
+                            float * dst_ptr = &dst_col[ir0 + cn * nb1 / nb0];
+                            const char * src0_ptr = src0_row + (ir0 + cn) * nb01;
+                            const char * src1_ptr = src1_col + cn * src1_col_stride;
+                            
+                            // Log detailed vec_dot operation (REFERENCE IMPLEMENTATION)
+                            /*
+                            if (getenv("GGML_NUMA_DEBUG")) {
+                                printf("[REFERENCE] Pre-vec_dot[%ld,%ld,%d]: vec_dot=%p, ne00=%ld, dst=%p, src0=%p, src1=%p\n",
+                                       ir0, ir1, cn, (void*)vec_dot, ne00, (void*)dst_ptr, (void*)src0_ptr, (void*)src1_ptr);
+                                
+                                // Log first few elements of input data
+                                const float* src0_data = (const float*)src0_ptr;
+                                const float* src1_data = (const float*)src1_ptr;
+                                printf("[REFERENCE] Input data - src0[0:3]: %.8f %.8f %.8f, src1[0:3]: %.8f %.8f %.8f\n",
+                                       src0_data[0], src0_data[1], src0_data[2], src1_data[0], src1_data[1], src1_data[2]);
+                            }
+                            */
+                            
+                            vec_dot(ne00, dst_ptr, 0, src0_ptr, 0, src1_ptr, 0, 1);
+                            
+                            // Log post-computation result
+                            /*
+                            if (getenv("GGML_NUMA_DEBUG")) {
+                                printf("[REFERENCE] Post-vec_dot[%ld,%ld,%d]: result=%.8f\n", ir0, ir1, cn, *dst_ptr);
+                            }
+                            */
+                        }
+                    }
                 }
             }
         }
@@ -1220,6 +1253,18 @@ void ggml_compute_forward_mul_mat(
 
     const struct ggml_tensor * src0 = dst->src[0];
     const struct ggml_tensor * src1 = dst->src[1];
+
+    // DEBUG: Log standard MUL_MAT execution for comparison with NUMA kernel
+    /*
+    if (getenv("GGML_NUMA_DEBUG")) {
+        printf("[STANDARD] ggml_compute_forward_mul_mat: src0_type=%d, src1_type=%d, dst_type=%d\n", 
+               src0->type, src1->type, dst->type);
+        printf("[STANDARD] Dimensions: src0=[%ld,%ld,%ld,%ld], src1=[%ld,%ld,%ld,%ld], dst=[%ld,%ld,%ld,%ld]\n",
+               src0->ne[0], src0->ne[1], src0->ne[2], src0->ne[3],
+               src1->ne[0], src1->ne[1], src1->ne[2], src1->ne[3],
+               dst->ne[0], dst->ne[1], dst->ne[2], dst->ne[3]);
+    }
+    */
 
     GGML_TENSOR_BINARY_OP_LOCALS
 
@@ -1670,7 +1715,21 @@ static void ggml_compute_forward_mul_mat_id(
 
 /////////////////////////////////
 
-static void ggml_compute_forward(struct ggml_compute_params * params, struct ggml_tensor * tensor) {
+// NUMA Fallback NOOP function for performance testing
+static void ggml_compute_forward_numa_fallback_noop(
+    const struct ggml_compute_params * params,
+    struct ggml_tensor * dst) {
+    
+    GGML_UNUSED(params);
+    GGML_UNUSED(dst);
+    
+    // This is a NOOP function for performance testing
+    // It does nothing and returns immediately
+    return;
+}
+
+// Main compute function - made public for NUMA executor fallback
+void ggml_compute_forward(struct ggml_compute_params * params, struct ggml_tensor * tensor) {
     GGML_ASSERT(params);
 
     if (tensor->op == GGML_OP_NONE || ggml_is_empty(tensor)) {
@@ -1681,6 +1740,38 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
     if (ggml_cpu_extra_compute_forward(params, tensor)) {
         return;
     }
+
+#ifdef GGML_NUMA_MIRROR
+    // Direct NUMA execution via simple coordinator and executor
+    // Let the NUMA registry decide if the operation is worth coordinating
+    if (params->ith == 0 && ggml_numa_should_dispatch()) { // Only for main thread AND when dispatch enabled
+        GGML_LOG_DEBUG("💡 Direct NUMA check: op=%s, ith=%d, nelements=%zu\n", 
+                      ggml_op_name(tensor->op), params->ith, ggml_nelements(tensor));
+        
+        // Create minimal compute plan for executor
+        struct ggml_cplan cplan = {0};
+        cplan.work_size = 0;
+        cplan.work_data = NULL;
+        cplan.n_threads = params->nth;
+        cplan.threadpool = params->threadpool;
+        cplan.abort_callback = NULL;
+        cplan.abort_callback_data = NULL;
+        
+        enum ggml_status numa_result = ggml_numa_executor_execute_tensor(tensor, &cplan);
+        if (numa_result == GGML_STATUS_SUCCESS) {
+            GGML_LOG_DEBUG("Tensor operation %s successfully executed via NUMA executor\n", ggml_op_name(tensor->op));
+            return; // Successfully handled by NUMA executor
+        }
+        // CRITICAL: NUMA kernel failure is now a hard error - no fallback allowed
+        GGML_LOG_ERROR("CRITICAL: NUMA kernel for operation %s failed with status %d - this indicates an incomplete implementation\n", 
+                       ggml_op_name(tensor->op), (int)numa_result);
+        GGML_ABORT("NUMA kernel failure: %s returned %d (kernels must handle all supported type combinations)", 
+                   ggml_op_name(tensor->op), (int)numa_result);
+    } else {
+        GGML_LOG_DEBUG("Tensor operation %s skipped direct NUMA dispatch (thread %d, not main)\n", 
+                      ggml_op_name(tensor->op), params->ith);
+    }
+#endif
 
     switch (tensor->op) {
         case GGML_OP_DUP:
@@ -2054,10 +2145,15 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 // nop
             } break;
-        case GGML_OP_NUMA_NOOP:
         case GGML_OP_NUMA_FALLBACK_NOOP:
             {
-                // NUMA no-op operations - nothing to do
+                ggml_compute_forward_numa_fallback_noop(params, tensor);
+            } break;
+        case GGML_OP_NUMA_NOOP:
+            {
+                // This should be handled by NUMA executor, but add fallback
+                // In case NUMA executor is disabled or fails
+                // Just do nothing (NOOP)
             } break;
         case GGML_OP_COUNT:
             {
@@ -2066,79 +2162,25 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
     }
 }
 
-// Android's libc implementation "bionic" does not support setting affinity
-#if defined(__gnu_linux__)
-static void set_numa_thread_affinity(int thread_n) {
-    if (!ggml_is_numa()) {
-        return;
-    }
-
-    int node_num;
-    int rv;
-    size_t setsize = CPU_ALLOC_SIZE(g_state.numa.total_cpus);
-
-    switch(g_state.numa.numa_strategy) {
-        case GGML_NUMA_STRATEGY_DISTRIBUTE:
-            // run thread on node_num thread_n / (threads per node)
-            node_num = thread_n % g_state.numa.n_nodes;
-            break;
-        case GGML_NUMA_STRATEGY_ISOLATE:
-            // run thread on current_node
-            node_num = g_state.numa.current_node;
-            break;
-        case GGML_NUMA_STRATEGY_NUMACTL:
-            // use the cpuset that numactl gave us
-            rv = pthread_setaffinity_np(pthread_self(), setsize, &g_state.numa.cpuset);
-            if (rv) {
-                fprintf(stderr, "warning: pthread_setaffinity_np() failed: %s\n",strerror(rv));
-            }
-            return;
-        default:
-            return;
-    }
-
-    struct ggml_numa_node * node = &g_state.numa.nodes[node_num];
-
-    cpu_set_t * cpus = CPU_ALLOC(g_state.numa.total_cpus);
-    CPU_ZERO_S(setsize, cpus);
-    for (size_t i = 0; i < node->n_cpus; ++i) {
-        CPU_SET_S(node->cpus[i], setsize, cpus);
-    }
-
-    rv = pthread_setaffinity_np(pthread_self(), setsize, cpus);
-    if (rv) {
-            fprintf(stderr, "warning: pthread_setaffinity_np() failed: %s\n", strerror(rv));
-    }
-
-    CPU_FREE(cpus);
+// NUMA thread affinity management
+// When GGML_NUMA_MIRROR is defined, this is handled by the coordinator
+static void set_numa_thread_affinity(int thread_n) { 
+#ifdef GGML_NUMA_MIRROR
+    // NUMA coordinator handles thread affinity
+    UNUSED(thread_n);
+#else
+    // No NUMA support in default mode
+    UNUSED(thread_n);
+#endif
 }
 
 static void clear_numa_thread_affinity(void) {
-    if (!ggml_is_numa()) {
-        return;
-    }
-
-    size_t setsize = CPU_ALLOC_SIZE(g_state.numa.total_cpus);
-
-    cpu_set_t * cpus = CPU_ALLOC(g_state.numa.total_cpus);
-    CPU_ZERO_S(setsize, cpus);
-    for (unsigned i = 0; i < g_state.numa.total_cpus; ++i) {
-        CPU_SET_S(i, setsize, cpus);
-    }
-
-    int rv = pthread_setaffinity_np(pthread_self(), setsize, cpus);
-    if (rv) {
-        fprintf(stderr, "warning: pthread_setaffinity_np() failed: %s\n", strerror(rv));
-    }
-
-    CPU_FREE(cpus);
-}
+#ifdef GGML_NUMA_MIRROR
+    // NUMA coordinator handles thread affinity
 #else
-// TODO: Windows etc.
-// (the linux implementation may also work on BSD, someone should test)
-static void set_numa_thread_affinity(int thread_n) { UNUSED(thread_n);  }
-static void clear_numa_thread_affinity(void) {}
+    // No NUMA support in default mode
 #endif
+}
 
 static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
     int n_tasks = 0;
@@ -2368,6 +2410,14 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
             {
                 n_tasks = 1;
             } break;
+        case GGML_OP_NUMA_FALLBACK_NOOP:
+            {
+                n_tasks = 1;
+            } break;
+        case GGML_OP_NUMA_NOOP:
+            {
+                n_tasks = 1;
+            } break;
         case GGML_OP_COUNT:
             {
                 GGML_ABORT("fatal error");
@@ -2390,6 +2440,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
 }
 
 static thread_ret_t ggml_graph_compute_secondary_thread(void* data);
+enum ggml_status ggml_graph_compute_impl(struct ggml_cgraph * cgraph, struct ggml_cplan * cplan);
 
 #if defined(_WIN32)
 #include "windows.h"
@@ -2640,6 +2691,13 @@ void ggml_threadpool_free(struct ggml_threadpool* threadpool) {
     ggml_aligned_free(threadpool, sizeof(struct ggml_threadpool));
 }
 
+int ggml_threadpool_get_n_threads(struct ggml_threadpool * threadpool) {
+    if (!threadpool) {
+        return 1;
+    }
+    return threadpool->n_threads_max;
+}
+
 #ifndef GGML_USE_OPENMP
 // pause/resume must be called under mutex
 static void ggml_threadpool_pause_locked(struct ggml_threadpool * threadpool) {
@@ -2851,6 +2909,14 @@ struct ggml_cplan ggml_graph_plan(
                 case GGML_OP_CROSS_ENTROPY_LOSS:
                     {
                         cur = ggml_type_size(node->type)*(n_tasks + node->src[0]->ne[0]*n_tasks);
+                    } break;
+                case GGML_OP_NUMA_FALLBACK_NOOP:
+                    {
+                        cur = 0; // NOOP requires no work buffer
+                    } break;
+                case GGML_OP_NUMA_NOOP:
+                    {
+                        cur = 0; // NOOP requires no work buffer
                     } break;
                 case GGML_OP_COUNT:
                     {
@@ -3132,9 +3198,6 @@ struct ggml_threadpool * ggml_threadpool_new(struct ggml_threadpool_params * tpp
     return ggml_threadpool_new_impl(tpp, NULL, NULL);
 }
 
-// Forward declaration
-enum ggml_status ggml_graph_compute_impl(struct ggml_cgraph * cgraph, struct ggml_cplan * cplan);
-
 enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cplan * cplan) {
     ggml_cpu_init();
 
@@ -3143,13 +3206,27 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
     GGML_ASSERT(cplan->work_size == 0 || cplan->work_data != NULL);
 
 #ifdef GGML_NUMA_MIRROR
-    // Early return for NUMA coordinator path
-    // Check if NUMA executor should handle this computation graph
-    // For now, always use NUMA executor when available for comprehensive coverage
-    if (true) {  // TODO: Add smarter graph analysis
-        return ggml_numa_executor_compute_graph(cgraph, cplan);
+    // Check if we're inside a fallback operation to prevent infinite recursion
+    extern bool ggml_numa_is_fallback_active(void);
+    
+    // NUMA intercept: Check if NUMA system should handle this graph computation
+    bool should_dispatch = ggml_numa_should_dispatch();
+    
+    if (should_dispatch) {
+        // Only initialize coordinator if NUMA is actually enabled
+        bool coord_init = ggml_numa_openmp_coordinator_init();
+        bool not_in_fallback = !ggml_numa_is_fallback_active();
+        
+        GGML_LOG_DEBUG("NUMA Dispatch Decision: should_dispatch=%d, coord_init=%d, not_in_fallback=%d\n", 
+                       should_dispatch, coord_init, not_in_fallback);
+        
+        if (coord_init && not_in_fallback) {
+            GGML_LOG_INFO("🎯 NUMA Path: Processing computation graph with %d nodes through NUMA executor\n", cgraph->n_nodes);
+            test_track_numa_execution(0); // Track NUMA path was taken
+            return ggml_numa_executor_compute_graph(cgraph, cplan);
+        }
     }
-
+    
     // Standard execution path - no NUMA functions called
     GGML_LOG_INFO("🔄 Standard Path: Processing computation graph with %d nodes, %d threads, threadpool=%p\n", 
                   cgraph->n_nodes, cplan->n_threads, (void*)cplan->threadpool);
@@ -3167,7 +3244,7 @@ enum ggml_status ggml_graph_compute_impl(struct ggml_cgraph * cgraph, struct ggm
     struct ggml_threadpool * threadpool = cplan->threadpool;
 
     GGML_LOG_INFO("📊 Fallback Execution: threads=%d, threadpool=%p (disposable=%s)\n", 
-                  n_threads, (void*)threadpool, threadpool ? "false" : "true");
+                  n_threads, threadpool, threadpool ? "false" : "true");
 
     bool disposable_threadpool = false;
 
@@ -3253,7 +3330,6 @@ enum ggml_status ggml_graph_compute_with_ctx(struct ggml_context * ctx, struct g
     if (cplan.work_size > 0) {
         // Get current CPU and NUMA node for NUMA-aware allocation
         int current_cpu = sched_getcpu();
-        (void)current_cpu; // Suppress unused variable warning
         // For NUMA builds, just use the standard buffer allocation
         // The simple coordinator manages its own threadpool work buffers
         cplan.work_data = (uint8_t *)ggml_new_buffer(ctx, cplan.work_size);
