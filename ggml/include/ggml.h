@@ -221,12 +221,13 @@
 #define GGML_MAX_N_THREADS      512
 #define GGML_MAX_OP_PARAMS      64
 
-#ifdef GGML_NUMA_MIRROR
-    #define GGML_NUMA_MAX_NODES     8
-#endif
-
 #ifndef GGML_MAX_NAME
 #   define GGML_MAX_NAME        64
+#endif
+
+#ifdef GGML_NUMA_MIRROR
+    // maximum number of NUMA nodes for tensor data mirroring
+    #define GGML_NUMA_MAX_NODES     8
 #endif
 
 #define GGML_DEFAULT_N_THREADS  4
@@ -649,14 +650,110 @@ extern "C" {
         struct ggml_tensor * view_src;
         size_t               view_offs;
 
+#ifdef GGML_NUMA_MIRROR
+        union {
+        #ifdef __NVCC__
+            void * data;
+        #endif
+            void * __data[GGML_NUMA_MAX_NODES];
+        };
+#else
         void * data;
+#endif
 
         char name[GGML_MAX_NAME];
 
         void * extra; // extra things e.g. for ggml-cuda.cu
 
+#ifdef GGML_NUMA_MIRROR
+        char padding[12]; // Adjusted for expanded __data array
+#else
         char padding[8];
+#endif
     };
+
+#ifdef GGML_NUMA_MIRROR
+    extern __thread int ggml_current_numa_node;
+    // Function to check if NUMA mirroring should be active at runtime
+    extern bool ggml_numa_should_mirror(void);
+    // Function to check if NUMA dispatch/coordinator should be active at runtime
+    extern bool ggml_numa_should_dispatch(void);
+    
+    // Functions for performance testing: control NUMA dispatch behavior
+    extern void ggml_numa_set_dispatch_enabled(bool enabled);
+    extern bool ggml_numa_get_dispatch_enabled(void);
+    extern void ggml_numa_clear_dispatch_override(void);
+#endif
+
+    static inline void * tensor_data(const struct ggml_tensor * tensor) {
+#ifdef GGML_NUMA_MIRROR
+        // Check if mirroring is actually enabled at runtime
+        if (!ggml_numa_should_mirror()) {
+            // Mirroring disabled - find the first non-NULL data pointer
+            // This handles cases where tensors were allocated by backends that don't use NUMA
+            for (int i = 0; i < GGML_NUMA_MAX_NODES; i++) {
+                if (tensor->__data[i] != NULL) {
+                    return tensor->__data[i];
+                }
+            }
+            // All NUMA slots are NULL - fall back to __data[0] (main data pointer)
+            // In NUMA mirroring mode, __data[0] is equivalent to the regular data pointer
+            return tensor->__data[0];
+        }
+        
+        // Mirroring enabled - use NUMA-aware access
+        extern int ggml_numa_node_count(void);
+        int n = ggml_current_numa_node;
+        if (n == -1)
+            n = 0;
+        
+        // CRITICAL: Bounds check to prevent accessing uninitialized __data slots
+        int max_nodes = ggml_numa_node_count();
+        if (max_nodes > GGML_NUMA_MAX_NODES)
+            max_nodes = GGML_NUMA_MAX_NODES;
+        if (n >= max_nodes)
+            n = 0;
+        
+        // Additional safety: if the requested node's data is NULL, fall back to node 0
+        if (tensor->__data[n] == NULL && n > 0) {
+            n = 0;
+        }
+        
+        // Final safety: if even node 0 is NULL, try finding any non-NULL data
+        if (tensor->__data[n] == NULL) {
+            for (int i = 0; i < GGML_NUMA_MAX_NODES; i++) {
+                if (tensor->__data[i] != NULL) {
+                    return tensor->__data[i];
+                }
+            }
+            // All NUMA slots are NULL - fall back to __data[0] (main data pointer)
+            // In NUMA mirroring mode, __data[0] is equivalent to the regular data pointer
+            return tensor->__data[0];
+        }
+        
+        return tensor->__data[n];
+#else
+        return tensor->data;
+#endif
+    }
+
+    // Forward declaration for NUMA mirroring
+#ifdef GGML_NUMA_MIRROR
+    static inline void tensor_set_data_numa_mirror(struct ggml_tensor * tensor, void * data) {
+        // Minimal implementation - just set all data pointers to the same value
+        for (int i = 0; i < GGML_NUMA_MAX_NODES; i++) {
+            tensor->__data[i] = data;
+        }
+    }
+#endif
+
+    static inline void tensor_set_data(struct ggml_tensor * tensor, void * data) {
+#ifdef GGML_NUMA_MIRROR
+        tensor_set_data_numa_mirror(tensor, data);
+#else
+        tensor->data = data;
+#endif
+    }
 
     static const size_t GGML_TENSOR_SIZE = sizeof(struct ggml_tensor);
 

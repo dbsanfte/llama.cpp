@@ -10,6 +10,24 @@
 #include <cerrno>
 #include <algorithm>
 
+#ifdef GGML_NUMA_MIRROR
+#include <numa.h>
+#include <numaif.h>
+#include <atomic>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
+// NUMA debug logging macros
+#define NUMA_LOG_DEBUG(fmt, ...) \
+    do { \
+        const char* debug_env = getenv("GGML_NUMA_DEBUG"); \
+        if (debug_env && atoi(debug_env) >= 1) { \
+            LLAMA_LOG_DEBUG(fmt, ##__VA_ARGS__); \
+        } \
+    } while (0)
+#endif
+
 #ifdef __has_include
     #if __has_include(<unistd.h>)
         #include <unistd.h>
@@ -51,6 +69,94 @@ static std::string llama_format_win_err(DWORD err) {
     std::string ret(buf, size);
     LocalFree(buf);
     return ret;
+}
+#endif
+
+#ifdef GGML_NUMA_MIRROR
+// NUMA system validation with comprehensive node testing
+static bool validate_numa_system() {
+    if (!numa_available()) {
+        NUMA_LOG_DEBUG("NUMA library not available\n");
+        return false;
+    }
+    
+    int num_nodes = numa_num_configured_nodes();
+    if (num_nodes <= 0) {
+        NUMA_LOG_DEBUG("No NUMA nodes configured (got %d)\n", num_nodes);
+        return false;
+    }
+    
+    // Test if we can actually allocate memory on different nodes
+    bool numa_system_working = true;
+    for (int node = 0; node < num_nodes && numa_system_working; node++) {
+        if (numa_node_size(node, nullptr) <= 0) {
+            NUMA_LOG_DEBUG("NUMA node %d has no available memory\n", node);
+            numa_system_working = false;
+        }
+    }
+    
+    if (numa_system_working) {
+        NUMA_LOG_DEBUG("✅ NUMA system validation successful - %d nodes working\n", num_nodes);
+    } else {
+        NUMA_LOG_DEBUG("❌ NUMA system validation failed - fallback to regular allocation\n");
+    }
+    
+    return numa_system_working;
+}
+
+// NUMA allocation using posix_memalign + first-touch approach with SIMD alignment
+static void* numa_alloc_mmap_first_touch(size_t size, int node) {
+    // Define SIMD alignment (same as ggml_aligned_malloc)
+#if defined(__s390x__)
+    const size_t alignment = 256;
+#else
+    const size_t alignment = 64;  // 64-byte alignment for AVX-512
+#endif
+    
+    // Bind current thread to the target NUMA node for first-touch
+    struct bitmask* old_mask = numa_get_run_node_mask();
+    if (numa_run_on_node(node) != 0) {
+        NUMA_LOG_DEBUG("Warning: could not bind thread to NUMA node %d: %s\n", node, strerror(errno));
+        // Continue anyway - might still work
+    }
+    
+    // Use posix_memalign for SIMD alignment
+    void* ptr = nullptr;
+    int ret = posix_memalign(&ptr, alignment, size);
+    if (ret != 0) {
+        NUMA_LOG_DEBUG("posix_memalign failed for %zu bytes with alignment %zu: %s\n", 
+                       size, alignment, strerror(ret));
+        // Restore original thread binding
+        if (old_mask) {
+            numa_run_on_node_mask(old_mask);
+            numa_free_nodemask(old_mask);
+        }
+        return nullptr;
+    }
+    
+    // First-touch: touch every page to ensure physical allocation on current node
+    volatile char* mem = (volatile char*)ptr;
+    const size_t page_size = sysconf(_SC_PAGESIZE);
+    for (size_t i = 0; i < size; i += page_size) {
+        mem[i] = 0; // First touch allocates the page on current NUMA node
+    }
+    
+    // Restore original thread binding
+    if (old_mask) {
+        numa_run_on_node_mask(old_mask);
+        numa_free_nodemask(old_mask);
+    }
+    
+    NUMA_LOG_DEBUG("✅ posix_memalign + first-touch allocation: %zu bytes for node %d at %p (SIMD aligned to %zu bytes)\n", 
+                   size, node, ptr, alignment);
+    return ptr;
+}
+
+static void numa_free_mmap_first_touch(void* ptr, size_t size) {
+    if (ptr) {
+        free(ptr);  // Use free() for posix_memalign() allocated memory
+        NUMA_LOG_DEBUG("Freed aligned memory at %p, size %zu\n", ptr, size);
+    }
 }
 #endif
 
@@ -272,10 +378,137 @@ void llama_file::write_u32(uint32_t val) const { pimpl->write_u32(val); }
 struct llama_mmap::impl {
 #ifdef _POSIX_MAPPED_FILES
     std::vector<std::pair<size_t, size_t>> mapped_fragments;
+#ifdef GGML_NUMA_MIRROR
+    struct numa_mapping {
+        void* addr;
+        size_t size;
+        std::string path;
+    };
+    std::vector<numa_mapping> numa_mappings;
+    
+    // NUMA mirroring implementation - creates copies of model data on each NUMA node
+    void mmap_numa_mirror(struct llama_file * file, size_t prefetch) {
+        int fd = file->file_id();
+        int flags = MAP_SHARED;
+        if (prefetch) { flags |= MAP_POPULATE; }
+        
+#ifdef __linux__
+        if (posix_fadvise(fd, 0, 0, POSIX_FADV_SEQUENTIAL)) {
+            LLAMA_LOG_WARN("warning: posix_fadvise(.., POSIX_FADV_SEQUENTIAL) failed: %s\n",
+                    strerror(errno));
+        }
+#endif
+        
+        int oldpolicy;
+        struct bitmask* oldmask = numa_allocate_nodemask();
+        if (get_mempolicy(&oldpolicy, oldmask->maskp,
+                          oldmask->size + 1, 0, 0) < 0) {
+            LLAMA_LOG_WARN("get_mempolicy failed, errno=%d %s\n", errno, strerror(errno));
+            oldpolicy = MPOL_DEFAULT;
+        }
+
+        // Get the number of NUMA nodes
+        int num_nodes = numa_num_configured_nodes();
+        if (num_nodes <= 0) {
+            LLAMA_LOG_WARN("numa_num_configured_nodes returned %d, defaulting to 1\n", num_nodes);
+            num_nodes = 1;
+        }
+        LLAMA_LOG_INFO("Detected %d NUMA nodes for mirror mode\n", num_nodes);
+
+        // Validate NUMA mirroring request based on strategy and hardware
+        if (num_nodes <= 1) {
+            LLAMA_LOG_ERROR("NUMA mirror mode requested but only %d NUMA node(s) detected\n", num_nodes);
+            LLAMA_LOG_ERROR("NUMA mirroring requires multiple NUMA nodes to be effective\n");
+            throw std::runtime_error("NUMA mirror mode requires multiple NUMA nodes");
+        }
+
+        size_t total_size = file->size();
+        
+        LLAMA_LOG_INFO("Creating NUMA mirrors with validated allocation: %zu bytes per node\n", total_size);
+
+        // Allocate and populate memory on each NUMA node using validated allocator
+        for (int node = 0; node < num_nodes; ++node) {
+            numa_set_preferred(node);
+            LLAMA_LOG_INFO("Allocating mirror on NUMA node %d\n", node);
+                                   
+            // Use mmap + first-touch for container compatibility
+            void* node_mem = nullptr;
+            
+            // For large allocations, use mmap + first-touch allocation
+            node_mem = numa_alloc_mmap_first_touch(total_size, node);
+            if (!node_mem) {
+                // Clean up any previous allocations before throwing
+                for (const auto& mapping : numa_mappings) {
+                    numa_free_mmap_first_touch(mapping.addr, mapping.size);
+                }
+                LLAMA_LOG_ERROR("Failed to allocate %zu bytes on NUMA node %d\n", total_size, node);
+                throw std::runtime_error(format("mmap + first-touch allocation failed for node %d: %s", node, strerror(errno)));
+            }
+            
+            // Verify SIMD alignment - our posix_memalign implementation guarantees this
+#if defined(__s390x__)
+            const size_t expected_alignment = 256;
+#else
+            const size_t expected_alignment = 64;  // 64-byte alignment for AVX-512
+#endif
+            if (reinterpret_cast<uintptr_t>(node_mem) % expected_alignment != 0) {
+                LLAMA_LOG_ERROR("SIMD alignment verification failed: %p not aligned to %zu bytes\n", 
+                               node_mem, expected_alignment);
+                numa_free_mmap_first_touch(node_mem, total_size);
+                throw std::runtime_error(format("SIMD alignment verification failed for node %d", node));
+            }
+            NUMA_LOG_DEBUG("✅ SIMD alignment verified: %p aligned to %zu bytes\n", node_mem, expected_alignment);
+            
+            NUMA_LOG_DEBUG("NUMA node %d: allocated %zu bytes at %p\n", node, total_size, node_mem);
+            
+            // Read model data from file directly into NUMA-local memory
+            // Use the llama_file API instead of direct pread to ensure proper file handling
+            try {
+                file->seek(0, SEEK_SET);
+                file->read_raw(node_mem, total_size);
+            } catch (const std::exception& e) {
+                LLAMA_LOG_ERROR("Failed to read model data for NUMA node %d: %s\n", node, e.what());
+                numa_free_mmap_first_touch(node_mem, total_size);
+                // Clean up any previous allocations
+                for (const auto& mapping : numa_mappings) {
+                    numa_free_mmap_first_touch(mapping.addr, mapping.size);
+                }
+                throw std::runtime_error(format("Failed to read model data for NUMA node %d: %s", node, e.what()));
+            }
+            
+            NUMA_LOG_DEBUG("NUMA node %d: loaded %zu bytes from file at %p\n", node, total_size, node_mem);
+            
+            // Store the NUMA allocation directly
+            numa_mappings.push_back({node_mem, total_size, ""});
+        }
+
+        // Set addr to the first allocation for compatibility
+        addr = numa_mappings.empty() ? nullptr : numa_mappings[0].addr;
+        
+        LLAMA_LOG_INFO("NUMA mirror mode: successfully created %d copies of %zu bytes\n", 
+                      num_nodes, total_size);
+    }
+#endif
 
     impl(struct llama_file * file, size_t prefetch, bool numa) {
         size = file->size();
         int fd = file->file_id();
+        
+#ifdef GGML_NUMA_MIRROR
+        // If NUMA mirroring is requested, use NUMA mirror mode
+        if (numa && validate_numa_system()) {
+            LLAMA_LOG_INFO("NUMA mirror mode - replicating model data on each NUMA node\n");
+            mmap_numa_mirror(file, prefetch);
+            return;
+        }
+        
+        // Fall back to regular mmap if NUMA not requested or not available
+        if (numa) {
+            LLAMA_LOG_WARN("NUMA mirroring requested but not available, falling back to regular mmap\n");
+        }
+#endif
+
+        // Regular mmap implementation
         int flags = MAP_SHARED;
         if (numa) { prefetch = 0; }
 #ifdef __linux__
@@ -355,6 +588,19 @@ struct llama_mmap::impl {
     }
 
     ~impl() {
+#ifdef GGML_NUMA_MIRROR
+        // Clean up NUMA mappings first
+        for (const auto& mapping : numa_mappings) {
+            numa_free_mmap_first_touch(mapping.addr, mapping.size);
+        }
+        
+        // If we have NUMA mappings, we don't have regular mapped_fragments
+        if (!numa_mappings.empty()) {
+            return;
+        }
+#endif
+        
+        // Clean up regular mmap fragments
         for (const auto & frag : mapped_fragments) {
             if (munmap((char *) addr + frag.first, frag.second - frag.first)) {
                 LLAMA_LOG_WARN("warning: munmap failed: %s\n", strerror(errno));

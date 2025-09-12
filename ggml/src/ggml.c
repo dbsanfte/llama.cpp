@@ -7,6 +7,10 @@
 #include "ggml-cpu.h"
 #include "ggml.h"
 
+#ifdef GGML_NUMA_MIRROR
+#include "ggml-numa-allocator.h"  // NUMA-aware memory allocation
+#endif
+
 // FIXME: required here for quantization functions
 #include "ggml-quants.h"
 
@@ -472,6 +476,62 @@ void ggml_fp32_to_bf16_row(const float * x, ggml_bf16_t * y, int64_t n) {
 bool ggml_guid_matches(ggml_guid_t guid_a, ggml_guid_t guid_b) {
     return memcmp(guid_a, guid_b, sizeof(ggml_guid)) == 0;
 }
+
+#ifdef GGML_NUMA_MIRROR
+// Minimal NUMA support stubs
+__thread int ggml_current_numa_node = -1;
+
+bool ggml_numa_should_mirror(void) {
+    // For now, return false to disable mirroring
+    return false;
+}
+
+bool ggml_numa_should_dispatch(void) {
+    // For now, return false to disable NUMA dispatch
+    return false;
+}
+
+void ggml_numa_set_dispatch_enabled(bool enabled) {
+    // Stub implementation
+    (void)enabled;
+}
+
+bool ggml_numa_get_dispatch_enabled(void) {
+    // Stub implementation
+    return false;
+}
+
+void ggml_numa_clear_dispatch_override(void) {
+    // Stub implementation
+}
+
+int ggml_numa_node_count(void) {
+    // Stub implementation - return 1 node
+    return 1;
+}
+#endif
+
+// NUMA state management (moved from ggml-cpu.c to resolve linking dependencies)
+struct ggml_numa_state {
+    enum ggml_numa_strategy strategy;
+    bool numa_enabled;
+    int numa_nodes;
+    int isolate_node;
+    int cache_strategy;
+    bool initialized;
+    struct ggml_threadpool_params threadpool_params;
+    bool threadpool_params_valid;
+};
+
+static struct ggml_numa_state g_numa_state = {
+    .strategy = GGML_NUMA_STRATEGY_DISABLED,
+    .numa_enabled = false,
+    .numa_nodes = 1,
+    .isolate_node = -1,
+    .cache_strategy = 0,
+    .initialized = false,
+    .threadpool_params_valid = false,
+};
 
 const char * ggml_version(void) {
     return GGML_VERSION;
@@ -1503,9 +1563,48 @@ struct ggml_context * ggml_init(struct ggml_init_params params) {
 
     const size_t mem_size = params.mem_buffer ? params.mem_size : GGML_PAD(params.mem_size, GGML_MEM_ALIGN);
 
+    void * context_memory = NULL;
+    if (!params.mem_buffer) {
+#ifdef GGML_NUMA_MIRROR
+        // Check if NUMA allocator should be bypassed
+        const char* bypass_numa = getenv("GGML_BYPASS_NUMA_ALLOCATOR");
+        bool use_numa = (bypass_numa == NULL || strcmp(bypass_numa, "1") != 0);
+
+        // Only use NUMA allocation for contexts >= 16MB that benefit from distribution
+        // Small contexts should always use regular allocation to avoid complexity
+        const size_t numa_threshold = 16 * 1024 * 1024; // 16MB threshold for NUMA allocation
+        bool should_use_numa = use_numa && (mem_size >= numa_threshold);
+
+        if (should_use_numa) {
+            printf("🗂️ NUMA: Allocating NUMA-distributed context memory pool: %zu MB\n", mem_size / (1024 * 1024));
+            GGML_PRINT_DEBUG("🗂️ Allocating NUMA-distributed context memory pool: %zu MB\n", mem_size / (1024 * 1024));
+            context_memory = ggml_numa_alloc_context_memory(mem_size, NULL);
+        } 
+
+        // Fallback to regular allocation (for small contexts or if NUMA failed)
+        if (!context_memory) {
+            if (should_use_numa) {
+                printf("⚠️ NUMA: NUMA allocation failed, falling back to regular allocation\n");
+                GGML_PRINT_DEBUG("⚠️ NUMA allocation failed, falling back to regular allocation\n");
+            } else if (!use_numa) {
+                printf("⚠️ NUMA: NUMA allocator bypassed via GGML_BYPASS_NUMA_ALLOCATOR=1\n");
+                GGML_PRINT_DEBUG("⚠️ NUMA allocator bypassed via GGML_BYPASS_NUMA_ALLOCATOR=1\n");
+            }
+            // For small contexts, this is the expected path
+            printf("📦 NUMA: Using regular allocation for context: %zu bytes (%.2f MB, threshold: 16 MB)\n", 
+                   mem_size, mem_size / (1024.0 * 1024.0));
+            context_memory = ggml_aligned_malloc(mem_size);
+        }
+#else
+        context_memory = ggml_aligned_malloc(mem_size);
+#endif
+    } else {
+        context_memory = params.mem_buffer;
+    }
+
     *ctx = (struct ggml_context) {
         /*.mem_size           =*/ mem_size,
-        /*.mem_buffer         =*/ params.mem_buffer ? params.mem_buffer : ggml_aligned_malloc(mem_size),
+        /*.mem_buffer         =*/ context_memory,
         /*.mem_buffer_owned   =*/ params.mem_buffer ? false : true,
         /*.no_alloc           =*/ params.no_alloc,
         /*.n_objects          =*/ 0,
@@ -1538,7 +1637,16 @@ void ggml_free(struct ggml_context * ctx) {
     }
 
     if (ctx->mem_buffer_owned) {
+#ifdef GGML_NUMA_MIRROR
+        // Check if this was allocated by NUMA allocator
+        if (ggml_numa_is_numa_allocated(ctx->mem_buffer)) {
+            ggml_numa_free(ctx->mem_buffer);
+        } else {
+            ggml_aligned_free(ctx->mem_buffer, ctx->mem_size);
+        }
+#else
         ggml_aligned_free(ctx->mem_buffer, ctx->mem_size);
+#endif
     }
 
     GGML_FREE(ctx);
@@ -1647,7 +1755,7 @@ static struct ggml_tensor * ggml_new_tensor_impl(
 
     GGML_ASSERT(view_src == NULL || data_size == 0 || data_size + view_offs <= ggml_nbytes(view_src));
 
-    void * data = view_src != NULL ? view_src->data : NULL;
+    void * data = view_src != NULL ? tensor_data(view_src) : NULL;
     if (data != NULL) {
         data = (char *) data + view_offs;
     }
@@ -1675,11 +1783,21 @@ static struct ggml_tensor * ggml_new_tensor_impl(
         /*.src          =*/ { NULL },
         /*.view_src     =*/ view_src,
         /*.view_offs    =*/ view_offs,
+#ifdef GGML_NUMA_MIRROR
+        /*.__data       =*/ { 0 },  // Initialize all NUMA data pointers to NULL
+#else
         /*.data         =*/ obj_alloc_size > 0 ? (void *)(result + 1) : data,
+#endif
         /*.name         =*/ { 0 },
         /*.extra        =*/ NULL,
         /*.padding      =*/ { 0 },
     };
+
+#ifdef GGML_NUMA_MIRROR
+    // Set the data using the NUMA-aware setter
+    void * tensor_data_to_set = obj_alloc_size > 0 ? (void *)(result + 1) : data;
+    tensor_set_data(result, tensor_data_to_set);
+#endif
 
     // TODO: this should not be needed as long as we don't rely on aligned SIMD loads
     //GGML_ASSERT_ALIGNED(result->data);
@@ -1779,12 +1897,12 @@ void ggml_unravel_index(const struct ggml_tensor * tensor, int64_t i, int64_t * 
 }
 
 void * ggml_get_data(const struct ggml_tensor * tensor) {
-    return tensor->data;
+    return tensor_data(tensor);
 }
 
 float * ggml_get_data_f32(const struct ggml_tensor * tensor) {
     assert(tensor->type == GGML_TYPE_F32);
-    return (float *)(tensor->data);
+    return (float *)(tensor_data(tensor));
 }
 
 enum ggml_unary_op ggml_get_unary_op(const struct ggml_tensor * tensor) {
@@ -6741,8 +6859,8 @@ struct ggml_tensor * ggml_set_zero(struct ggml_tensor * tensor) {
     if (tensor->buffer) {
         ggml_backend_tensor_memset(tensor, 0, 0, ggml_nbytes(tensor));
     } else {
-        GGML_ASSERT(tensor->data);
-        memset(tensor->data, 0, ggml_nbytes(tensor));
+        GGML_ASSERT(tensor_data(tensor));
+        memset(tensor_data(tensor), 0, ggml_nbytes(tensor));
     }
     return tensor;
 }
@@ -6773,8 +6891,8 @@ void ggml_graph_reset(struct ggml_cgraph * cgraph) {
                 if (grad_acc->buffer) {
                     ggml_backend_tensor_set(grad_acc, &onef, 0, sizeof(float));
                 } else {
-                    GGML_ASSERT(grad_acc->data);
-                    *((float *) grad_acc->data) = onef;
+                    GGML_ASSERT(tensor_data(grad_acc));
+                    *((float *) tensor_data(grad_acc)) = onef;
                 }
             } else {
                 ggml_set_zero(grad_acc);
@@ -6992,7 +7110,7 @@ void ggml_graph_dump_dot(const struct ggml_cgraph * gb, const struct ggml_cgraph
         }
 
         fprintf(fp, "CONST %d [%" PRId64 ", %" PRId64 "]", i, node->ne[0], node->ne[1]);
-        if (ggml_nelements(node) < 5 && node->data != NULL) {
+        if (ggml_nelements(node) < 5 && tensor_data(node) != NULL) {
             fprintf(fp, " | (");
             for (int j = 0; j < ggml_nelements(node); j++) {
                 // FIXME: use ggml-backend to obtain the tensor data
@@ -7180,6 +7298,25 @@ size_t ggml_quantize_chunk(
     GGML_ASSERT(result == nrows * row_size);
 
     return result;
+}
+
+// NUMA state management (moved from ggml-cpu.c)
+//
+
+int ggml_numa_get_strategy(void) {
+    return (int)g_numa_state.strategy;
+}
+
+int ggml_numa_get_isolate_node(void) {
+    return g_numa_state.isolate_node;
+}
+
+void ggml_numa_set_strategy(int strategy) {
+    g_numa_state.strategy = (enum ggml_numa_strategy)strategy;
+}
+
+void ggml_numa_set_isolate_node(int node) {
+    g_numa_state.isolate_node = node;
 }
 
 ////////////////////////////////////////////////////////////////////////////////

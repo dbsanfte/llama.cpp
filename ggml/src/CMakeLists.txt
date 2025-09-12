@@ -205,6 +205,13 @@ add_library(ggml-base
             ggml-quants.h
             gguf.cpp)
 
+# Add NUMA allocator files when NUMA mirroring is enabled
+if (GGML_NUMA_MIRROR)
+    target_sources(ggml-base PRIVATE
+        ggml-numa-allocator.c
+        ggml-numa-allocator.h)
+endif()
+
 target_include_directories(ggml-base PRIVATE .)
 if (GGML_BACKEND_DL)
     target_compile_definitions(ggml-base PUBLIC GGML_BACKEND_DL)
