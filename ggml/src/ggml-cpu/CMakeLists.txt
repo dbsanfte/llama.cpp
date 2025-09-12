@@ -24,6 +24,60 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
     list (APPEND GGML_CPU_SOURCES
         ggml-cpu/ggml-cpu.c
         ggml-cpu/ggml-cpu.cpp
+        # New NUMA Architecture
+        ggml-cpu/ggml-numa-shared.h
+        ggml-cpu/ggml-numa-shared.c
+        ggml-cpu/ggml-numa-openmp-coordinator.c
+        ggml-cpu/ggml-numa-openmp-coordinator.h
+        ggml-cpu/ggml-numa-cpu-backend.c
+        ggml-cpu/ggml-numa-cpu-backend.h
+        ggml-cpu/ggml-numa-executor.c
+        ggml-cpu/ggml-numa-executor.h
+        ggml-cpu/ggml-numa-perf.c
+        ggml-cpu/ggml-numa-perf.h
+        # NUMA Vector Operations - SIMD-optimized transcendental functions
+        ggml-cpu/ggml-vec-numa.c
+        ggml-cpu/ggml-vec-numa.h
+        # NUMA Kernels - Implementations for data-parallel execution
+        ggml-cpu/numa-kernels/numa-kernels.c
+        ggml-cpu/numa-kernels/numa-kernels.h
+        ggml-cpu/numa-kernels/add.c
+        ggml-cpu/numa-kernels/add.h
+        ggml-cpu/numa-kernels/cont.c
+        ggml-cpu/numa-kernels/cont.h
+        ggml-cpu/numa-kernels/cpy.c
+        ggml-cpu/numa-kernels/cpy.h
+        ggml-cpu/numa-kernels/get_rows.c
+        ggml-cpu/numa-kernels/get_rows.h
+        ggml-cpu/numa-kernels/mul.c
+        ggml-cpu/numa-kernels/mul.h
+        ggml-cpu/numa-kernels/div.c
+        ggml-cpu/numa-kernels/div.h
+        ggml-cpu/numa-kernels/sub.c
+        ggml-cpu/numa-kernels/sub.h
+        ggml-cpu/numa-kernels/mul_mat.c
+        ggml-cpu/numa-kernels/mul_mat.h
+        ggml-cpu/numa-kernels/mul_mat_id.c
+        ggml-cpu/numa-kernels/mul_mat_id.h
+        ggml-cpu/numa-kernels/rope.c
+        ggml-cpu/numa-kernels/rope.h
+        ggml-cpu/numa-kernels/noop.c
+        ggml-cpu/numa-kernels/noop.h
+        ggml-cpu/numa-kernels/reshape.c
+        ggml-cpu/numa-kernels/reshape.h
+        ggml-cpu/numa-kernels/transpose.c
+        ggml-cpu/numa-kernels/transpose.h
+        ggml-cpu/numa-kernels/view.c
+        ggml-cpu/numa-kernels/view.h
+        ggml-cpu/numa-kernels/permute.c
+        ggml-cpu/numa-kernels/permute.h
+        ggml-cpu/numa-kernels/rms_norm.c
+        ggml-cpu/numa-kernels/rms_norm.h
+        ggml-cpu/numa-kernels/soft_max.c
+        ggml-cpu/numa-kernels/soft_max.h
+        ggml-cpu/numa-kernels/glu.c
+        ggml-cpu/numa-kernels/glu.h
+        ggml-work-item.c
         ggml-cpu/repack.cpp
         ggml-cpu/repack.h
         ggml-cpu/hbm.cpp
@@ -68,12 +122,26 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
     endif()
 
     if (GGML_OPENMP)
-        find_package(OpenMP)
+        # Request OpenMP 5.0 for advanced affinity APIs, fallback to any version
+        find_package(OpenMP 5.0)
+        if (NOT OpenMP_FOUND)
+            # Fallback to any OpenMP version if 5.0 not available
+            find_package(OpenMP REQUIRED)
+        endif()
+        
         if (OpenMP_FOUND)
             set(GGML_OPENMP_ENABLED "ON" CACHE INTERNAL "")
             target_compile_definitions(${GGML_CPU_NAME} PRIVATE GGML_USE_OPENMP)
+            
+            # Enable OpenMP 5.0 features if available (even with older _OPENMP macro)
+            if (OpenMP_C_VERSION VERSION_GREATER_EQUAL "5.0" OR OpenMP_CXX_VERSION VERSION_GREATER_EQUAL "5.0")
+                target_compile_definitions(${GGML_CPU_NAME} PRIVATE GGML_USE_OPENMP_5_0)
+                message(STATUS "OpenMP 5.0+ features available")
+            else()
+                message(STATUS "Using OpenMP ${OpenMP_C_VERSION}, some advanced features may not be available")
+            endif()
 
-            target_link_libraries(${GGML_CPU_NAME} PRIVATE OpenMP::OpenMP_C OpenMP::OpenMP_CXX)
+            target_link_libraries(${GGML_CPU_NAME} PUBLIC OpenMP::OpenMP_C OpenMP::OpenMP_CXX)
         else()
             set(GGML_OPENMP_ENABLED "OFF" CACHE INTERNAL "")
             message(WARNING "OpenMP not found")
@@ -605,5 +673,40 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
     if (CMAKE_CXX_COMPILER_ID STREQUAL "IntelLLVM")
         # The compiler automatically enables "-ffast-math" which can cause NaNs in tests due to "-fassociative-math"
         target_compile_options(${GGML_CPU_NAME} PRIVATE "-fno-associative-math")
+    endif()
+
+    # NUMA support for ggml-cpu backend
+    if (GGML_NUMA_MIRROR)
+        find_library(NUMA_LIBRARY NAMES numa)
+        if (NUMA_LIBRARY)
+            message(STATUS "Adding NUMA support to ${GGML_CPU_NAME}")
+            target_compile_definitions(${GGML_CPU_NAME} PRIVATE GGML_NUMA_MIRROR)
+            target_compile_definitions(${GGML_CPU_NAME} PRIVATE GGML_NUMA)
+            target_link_libraries(${GGML_CPU_NAME} PRIVATE ${NUMA_LIBRARY})
+        else()
+            message(WARNING "NUMA library not found for ${GGML_CPU_NAME}")
+        endif()
+    endif()
+
+    # GNU libmvec support for vectorized transcendental functions
+    if (CMAKE_C_COMPILER_ID STREQUAL "GNU" AND UNIX AND NOT APPLE)
+        find_library(MVEC_LIBRARY NAMES mvec)
+        if (MVEC_LIBRARY)
+            message(STATUS "Adding GNU libmvec vectorized math support to ${GGML_CPU_NAME}")
+            # Use selective fast-math flags that don't conflict with GGML
+            # Avoid -ffast-math as it enables -ffinite-math-only which conflicts with GGML
+            target_compile_options(${GGML_CPU_NAME} PRIVATE 
+                -fno-math-errno 
+                -fno-trapping-math 
+                -ftree-vectorize 
+                -funsafe-math-optimizations)
+            target_link_libraries(${GGML_CPU_NAME} PRIVATE ${MVEC_LIBRARY})
+            # Enable auto-vectorization of math functions
+            target_compile_definitions(${GGML_CPU_NAME} PRIVATE GGML_NUMA_LIBMVEC_ENABLED)
+        else()
+            message(STATUS "GNU libmvec not found for ${GGML_CPU_NAME} - using scalar transcendental fallbacks")
+        endif()
+    else()
+        message(STATUS "GNU libmvec not available (requires GCC on Linux) for ${GGML_CPU_NAME}")
     endif()
 endfunction()

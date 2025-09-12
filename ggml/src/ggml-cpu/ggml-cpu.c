@@ -14,6 +14,7 @@
 #include "vec.h"
 #include "ops.h"
 #include "ggml.h"
+#include "ggml-numa-executor.h"
 
 #if defined(_MSC_VER) || defined(__MINGW32__)
 #include <malloc.h> // using malloc.h with MSC/MINGW
@@ -41,6 +42,11 @@
 #ifdef GGML_USE_OPENMP
 #include <omp.h>
 #endif
+
+// Forward declarations for test tracking functions
+void test_track_numa_execution(int node_id);
+void test_track_fallback_execution(void);
+void test_track_data_parallel(void);
 
 #if defined(__ARM_FEATURE_SVE) || defined(__ARM_FEATURE_MATMUL_INT8)
 #undef GGML_USE_LLAMAFILE
@@ -74,6 +80,12 @@
 
 // precomputed f32 table for f16 (256 KB) (simd-mappings.h)
 float ggml_table_f32_f16[1 << 16];
+
+// Test tracking functions - provide default no-op implementations
+// Tests can override these with their own implementations
+__attribute__((weak)) void test_track_numa_execution(int node_id) { (void)node_id; }
+__attribute__((weak)) void test_track_fallback_execution(void) { }
+__attribute__((weak)) void test_track_data_parallel(void) { }
 
 #if defined(__ARM_ARCH)
 struct ggml_arm_arch_features_type {
@@ -2042,6 +2054,11 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 // nop
             } break;
+        case GGML_OP_NUMA_NOOP:
+        case GGML_OP_NUMA_FALLBACK_NOOP:
+            {
+                // NUMA no-op operations - nothing to do
+            } break;
         case GGML_OP_COUNT:
             {
                 GGML_ABORT("fatal error");
@@ -3115,6 +3132,9 @@ struct ggml_threadpool * ggml_threadpool_new(struct ggml_threadpool_params * tpp
     return ggml_threadpool_new_impl(tpp, NULL, NULL);
 }
 
+// Forward declaration
+enum ggml_status ggml_graph_compute_impl(struct ggml_cgraph * cgraph, struct ggml_cplan * cplan);
+
 enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cplan * cplan) {
     ggml_cpu_init();
 
@@ -3122,17 +3142,48 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
     GGML_ASSERT(cplan->n_threads > 0);
     GGML_ASSERT(cplan->work_size == 0 || cplan->work_data != NULL);
 
+#ifdef GGML_NUMA_MIRROR
+    // Early return for NUMA coordinator path
+    // Check if NUMA executor should handle this computation graph
+    // For now, always use NUMA executor when available for comprehensive coverage
+    if (true) {  // TODO: Add smarter graph analysis
+        return ggml_numa_executor_compute_graph(cgraph, cplan);
+    }
+
+    // Standard execution path - no NUMA functions called
+    GGML_LOG_INFO("🔄 Standard Path: Processing computation graph with %d nodes, %d threads, threadpool=%p\n", 
+                  cgraph->n_nodes, cplan->n_threads, (void*)cplan->threadpool);
+    test_track_fallback_execution(); // Track standard path was taken
+#endif
+
+    // Continue with non-NUMA execution
+    return ggml_graph_compute_impl(cgraph, cplan);
+}
+
+// Internal implementation without NUMA interception
+enum ggml_status ggml_graph_compute_impl(struct ggml_cgraph * cgraph, struct ggml_cplan * cplan) {
+
     int n_threads                               = cplan->n_threads;
     struct ggml_threadpool * threadpool = cplan->threadpool;
+
+    GGML_LOG_INFO("📊 Fallback Execution: threads=%d, threadpool=%p (disposable=%s)\n", 
+                  n_threads, (void*)threadpool, threadpool ? "false" : "true");
 
     bool disposable_threadpool = false;
 
     if (threadpool == NULL) {
-        //GGML_PRINT_DEBUG("Threadpool is not specified. Will create a disposable threadpool : n_threads %d\n", n_threads);
-        disposable_threadpool = true;
-
+#ifdef GGML_NUMA_MIRROR
+        // For OpenMP coordinator, create standard threadpool for fallback operations
+        GGML_LOG_INFO("🔧 Creating fallback threadpool for %d threads\n", n_threads);
+        disposable_threadpool = true; // Will be freed after use
         struct ggml_threadpool_params ttp = ggml_threadpool_params_default(n_threads);
         threadpool = ggml_threadpool_new_impl(&ttp, cgraph, cplan);
+#else
+        // Non-NUMA build: create disposable threadpool as before
+        disposable_threadpool = true;
+        struct ggml_threadpool_params ttp = ggml_threadpool_params_default(n_threads);
+        threadpool = ggml_threadpool_new_impl(&ttp, cgraph, cplan);
+#endif
     } else {
         // Reset some of the parameters that need resetting
         // No worker threads should be accessing the parameters below at this stage
@@ -3166,6 +3217,12 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
         n_threads = threadpool->n_threads_max;
     }
 
+    // For dedicated fallback threadpool, ensure we don't exceed the available thread count
+    if (n_threads > threadpool->n_threads_max) {
+        GGML_LOG_WARN("🔧 Limiting requested threads (%d) to threadpool maximum (%d)\n", n_threads, threadpool->n_threads_max);
+        n_threads = threadpool->n_threads_max;
+    }
+
     // Kick all threads to start the new graph
     ggml_graph_compute_kickoff(threadpool, n_threads);
 
@@ -3188,7 +3245,23 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
 enum ggml_status ggml_graph_compute_with_ctx(struct ggml_context * ctx, struct ggml_cgraph * cgraph, int n_threads) {
     struct ggml_cplan cplan = ggml_graph_plan(cgraph, n_threads, NULL);
 
+#ifdef GGML_NUMA_MIRROR
+    // NUMA-AWARE WORK BUFFER ALLOCATION
+    // Instead of using ggml_new_buffer() which allocates from context memory (not NUMA-aware),
+    // we'll use our persistent dispatcher work buffer system for optimal NUMA performance
+    
+    if (cplan.work_size > 0) {
+        // Get current CPU and NUMA node for NUMA-aware allocation
+        int current_cpu = sched_getcpu();
+        (void)current_cpu; // Suppress unused variable warning
+        // For NUMA builds, just use the standard buffer allocation
+        // The simple coordinator manages its own threadpool work buffers
+        cplan.work_data = (uint8_t *)ggml_new_buffer(ctx, cplan.work_size);
+    }
+#else
+    // Non-NUMA build: use original context allocation
     cplan.work_data = (uint8_t *)ggml_new_buffer(ctx, cplan.work_size);
+#endif
 
     return ggml_graph_compute(cgraph, &cplan);
 }
