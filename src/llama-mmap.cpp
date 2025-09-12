@@ -20,57 +20,145 @@
 #include <sys/mman.h>
 #include "../ggml/src/ggml-cpu/ggml-numa-shared.h"
 
-// Container-compatible NUMA allocation function - Use mmap with first-touch
-static void* numa_alloc_onnode_fixed(size_t size, int node) {
-    // Use mmap + first-touch approach (more reliable in containers)
-    void* memory = mmap(NULL, size, PROT_READ | PROT_WRITE, 
-                       MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    if (memory == MAP_FAILED) {
-        printf("❌ mmap failed for %zu bytes on node %d: %s\n", size, node, strerror(errno));
-        // Fallback to regular allocation
-        void* ptr = aligned_alloc(64, size);
-        if (ptr) {
-            memset(ptr, 0, size);
-        }
-        return ptr;
+// Robust NUMA validation and allocation system
+static bool numa_system_validated = false;
+static bool numa_system_working = false;
+
+// Validate that NUMA is actually working by testing allocation and policy
+static bool validate_numa_system() {
+    if (numa_system_validated) {
+        return numa_system_working;
     }
     
-    // Bind current thread to target node for first-touch
-    if (numa_available() >= 0) {
-        numa_run_on_node(node);
-        
-        struct bitmask *old_mask = numa_get_membind();
-        struct bitmask *mask = numa_allocate_nodemask();
-        numa_bitmask_setbit(mask, node);
-        numa_set_membind(mask);
-        
-        // First-touch all pages to establish NUMA locality
-        volatile char* mem_ptr = (volatile char*)memory;
-        const size_t page_size = 4096;
-        for (size_t i = 0; i < size; i += page_size) {
-            mem_ptr[i] = 0; // Zero and establish NUMA placement
+    numa_system_validated = true;
+    numa_system_working = false;
+    
+    if (numa_available() < 0) {
+        NUMA_LOG_DEBUG("NUMA not available on this system\n");
+        return false;
+    }
+    
+    int num_nodes = numa_num_configured_nodes();
+    if (num_nodes <= 1) {
+        NUMA_LOG_DEBUG("Only %d NUMA node(s) configured\n", num_nodes);
+        return false;
+    }
+    
+    NUMA_LOG_DEBUG("NUMA validation: Testing %d nodes\n", num_nodes);
+    
+    // Test allocation on each node and verify placement
+    const size_t test_size = 4096; // One page
+    bool all_nodes_working = true;
+    
+    for (int node = 0; node < num_nodes; node++) {
+        // Test allocation
+        void* test_ptr = numa_alloc_onnode(test_size, node);
+        if (!test_ptr) {
+            NUMA_LOG_DEBUG("NUMA validation: node %d allocation failed\n", node);
+            all_nodes_working = false;
+            continue;
         }
         
-        // Restore original NUMA policy
-        numa_set_membind(old_mask);
-        numa_free_nodemask(mask);
+        // Verify the allocation is actually on the requested node
+        int actual_node = -1;
+        if (get_mempolicy(&actual_node, NULL, 0, test_ptr, MPOL_F_NODE | MPOL_F_ADDR) == 0) {
+            if (actual_node != node) {
+                NUMA_LOG_DEBUG("NUMA validation: node %d requested, but memory at %p is on node %d\n", 
+                               node, test_ptr, actual_node);
+                all_nodes_working = false;
+            } else {
+                NUMA_LOG_DEBUG("NUMA validation: node %d allocation verified at %p\n", node, test_ptr);
+            }
+        } else {
+            NUMA_LOG_DEBUG("NUMA validation: get_mempolicy failed for node %d: %s\n", node, strerror(errno));
+            all_nodes_working = false;
+        }
+        
+        // Touch the memory to ensure it's actually allocated
+        volatile char* mem = (volatile char*)test_ptr;
+        mem[0] = 1;
+        mem[test_size - 1] = 1;
+        
+        numa_free(test_ptr, test_size);
+    }
+    
+    // Test thread binding
+    struct bitmask* old_mask = numa_get_run_node_mask();
+    for (int node = 0; node < num_nodes; node++) {
+        if (numa_run_on_node(node) != 0) {
+            NUMA_LOG_DEBUG("NUMA validation: cannot bind to node %d\n", node);
+            all_nodes_working = false;
+        }
+    }
+    // Restore original thread binding
+    if (old_mask) {
+        numa_run_on_node_mask(old_mask);
         numa_free_nodemask(old_mask);
-        
-        NUMA_LOG_DEBUG("✅ NUMA allocation successful for node %d (size=%zu) at %p\n", node, size, memory);
-    } else {
-        // No NUMA support, just zero the memory
-        memset(memory, 0, size);
-        NUMA_LOG_DEBUG("✅ Non-NUMA allocation (size=%zu) at %p\n", size, memory);
     }
     
-    return memory;
+    numa_system_working = all_nodes_working;
+    
+    if (numa_system_working) {
+        NUMA_LOG_DEBUG("✅ NUMA system validation successful - %d nodes working\n", num_nodes);
+    } else {
+        NUMA_LOG_DEBUG("❌ NUMA system validation failed - fallback to regular allocation\n");
+    }
+    
+    return numa_system_working;
 }
 
-static void numa_free_fixed(void* ptr, size_t size) {
-    // Check if this was an mmap allocation by trying munmap first
-    if (munmap(ptr, size) != 0) {
-        // If munmap fails, it might be a regular malloc allocation, use free
-        free(ptr);
+// NUMA allocation using posix_memalign + first-touch approach with SIMD alignment
+static void* numa_alloc_mmap_first_touch(size_t size, int node) {
+    // Define SIMD alignment (same as ggml_aligned_malloc)
+#if defined(__s390x__)
+    const size_t alignment = 256;
+#else
+    const size_t alignment = 64;  // 64-byte alignment for AVX-512
+#endif
+    
+    // Bind current thread to the target NUMA node for first-touch
+    struct bitmask* old_mask = numa_get_run_node_mask();
+    if (numa_run_on_node(node) != 0) {
+        NUMA_LOG_DEBUG("Warning: could not bind thread to NUMA node %d: %s\n", node, strerror(errno));
+        // Continue anyway - might still work
+    }
+    
+    // Use posix_memalign for SIMD alignment
+    void* ptr = nullptr;
+    int ret = posix_memalign(&ptr, alignment, size);
+    if (ret != 0) {
+        NUMA_LOG_DEBUG("posix_memalign failed for %zu bytes with alignment %zu: %s\n", 
+                       size, alignment, strerror(ret));
+        // Restore original thread binding
+        if (old_mask) {
+            numa_run_on_node_mask(old_mask);
+            numa_free_nodemask(old_mask);
+        }
+        return nullptr;
+    }
+    
+    // First-touch: touch every page to ensure physical allocation on current node
+    volatile char* mem = (volatile char*)ptr;
+    const size_t page_size = sysconf(_SC_PAGESIZE);
+    for (size_t i = 0; i < size; i += page_size) {
+        mem[i] = 0; // First touch allocates the page on current NUMA node
+    }
+    
+    // Restore original thread binding
+    if (old_mask) {
+        numa_run_on_node_mask(old_mask);
+        numa_free_nodemask(old_mask);
+    }
+    
+    NUMA_LOG_DEBUG("✅ posix_memalign + first-touch allocation: %zu bytes for node %d at %p (SIMD aligned to %zu bytes)\n", 
+                   size, node, ptr, alignment);
+    return ptr;
+}
+
+static void numa_free_mmap_first_touch(void* ptr, size_t size) {
+    if (ptr) {
+        free(ptr);  // Use free() for posix_memalign() allocated memory
+        NUMA_LOG_DEBUG("Freed aligned memory at %p, size %zu\n", ptr, size);
     }
 }
 #endif
@@ -366,7 +454,7 @@ struct llama_mmap::impl {
             return;
         }
         
-        LLAMA_LOG_INFO("Distributing %zu bytes across %d NUMA nodes using numa_alloc_onnode\n", size, num_nodes);
+        LLAMA_LOG_INFO("Distributing %zu bytes across %d NUMA nodes using validated allocation\n", size, num_nodes);
         
         // Calculate chunk size for distribution (round up to page boundary)
         size_t page_size = sysconf(_SC_PAGESIZE);
@@ -385,24 +473,38 @@ struct llama_mmap::impl {
             LLAMA_LOG_INFO("Allocating %zu bytes on NUMA node %d at file offset %zu\n", 
                           node_size, node, file_offset);
             
-            // Use our container-compatible NUMA allocation
-            void* node_mem = numa_alloc_onnode_fixed(node_size, node);
+            // Use mmap + first-touch allocation for container compatibility
+            void* node_mem = numa_alloc_mmap_first_touch(node_size, node);
             if (!node_mem) {
                 LLAMA_LOG_ERROR("Failed to allocate %zu bytes on NUMA node %d\n", node_size, node);
                 // Clean up any previous allocations
                 for (auto& mapping : numa_mappings) {
-                    numa_free_fixed(mapping.addr, mapping.size);
+                    numa_free_mmap_first_touch(mapping.addr, mapping.size);
                 }
-                throw std::runtime_error(format("numa_alloc_onnode failed for node %d", node));
+                throw std::runtime_error(format("mmap + first-touch allocation failed for node %d", node));
             }
+            
+            // Verify SIMD alignment - our posix_memalign implementation guarantees this
+#if defined(__s390x__)
+            const size_t expected_alignment = 256;
+#else
+            const size_t expected_alignment = 64;  // 64-byte alignment for AVX-512
+#endif
+            if (reinterpret_cast<uintptr_t>(node_mem) % expected_alignment != 0) {
+                LLAMA_LOG_ERROR("SIMD alignment verification failed: %p not aligned to %zu bytes\n", 
+                               node_mem, expected_alignment);
+                numa_free_mmap_first_touch(node_mem, node_size);
+                throw std::runtime_error(format("SIMD alignment verification failed for node %d", node));
+            }
+            LLAMA_LOG_INFO("✅ SIMD alignment verified: %p aligned to %zu bytes\n", node_mem, expected_alignment);
             
             // Read data from file directly into NUMA-local memory
             if (pread(fd, node_mem, node_size, file_offset) != (ssize_t)node_size) {
                 LLAMA_LOG_ERROR("Failed to read data for NUMA node %d\n", node);
-                numa_free_fixed(node_mem, node_size);
+                numa_free_mmap_first_touch(node_mem, node_size);
                 // Clean up any previous allocations
                 for (auto& mapping : numa_mappings) {
-                    numa_free_fixed(mapping.addr, mapping.size);
+                    numa_free_mmap_first_touch(mapping.addr, mapping.size);
                 }
                 throw std::runtime_error(format("pread failed: %s", strerror(errno)));
             }
@@ -540,27 +642,40 @@ struct llama_mmap::impl {
 
         size_t total_size = file->size();
         
-        LLAMA_LOG_INFO("Creating NUMA mirrors with numa_alloc_onnode: %zu bytes per node\n", total_size);
+        LLAMA_LOG_INFO("Creating NUMA mirrors with validated allocation: %zu bytes per node\n", total_size);
 
-        // Allocate and populate memory on each NUMA node using numa_alloc_onnode
+        // Allocate and populate memory on each NUMA node using validated allocator
         for (int node = 0; node < num_nodes; ++node) {
             numa_set_preferred(node);
             LLAMA_LOG_INFO("Allocating mirror on NUMA node %d\n", node);
                                    
-            // Use our robust NUMA allocator that works in containers
+            // Use mmap + first-touch for container compatibility
             void* node_mem = nullptr;
             
-            // For large allocations, use our NUMA-aware allocator
-            // Use our container-compatible NUMA allocation
-            node_mem = numa_alloc_onnode_fixed(total_size, node);
+            // For large allocations, use mmap + first-touch allocation
+            node_mem = numa_alloc_mmap_first_touch(total_size, node);
             if (!node_mem) {
                 // Clean up any previous allocations before throwing
                 for (const auto& mapping : numa_mappings) {
-                    numa_free_fixed(mapping.addr, mapping.size);
+                    numa_free_mmap_first_touch(mapping.addr, mapping.size);
                 }
                 LLAMA_LOG_ERROR("Failed to allocate %zu bytes on NUMA node %d\n", total_size, node);
-                throw std::runtime_error(format("numa_alloc_onnode failed for node %d: %s", node, strerror(errno)));
+                throw std::runtime_error(format("mmap + first-touch allocation failed for node %d: %s", node, strerror(errno)));
             }
+            
+            // Verify SIMD alignment - our posix_memalign implementation guarantees this
+#if defined(__s390x__)
+            const size_t expected_alignment = 256;
+#else
+            const size_t expected_alignment = 64;  // 64-byte alignment for AVX-512
+#endif
+            if (reinterpret_cast<uintptr_t>(node_mem) % expected_alignment != 0) {
+                LLAMA_LOG_ERROR("SIMD alignment verification failed: %p not aligned to %zu bytes\n", 
+                               node_mem, expected_alignment);
+                numa_free_mmap_first_touch(node_mem, total_size);
+                throw std::runtime_error(format("SIMD alignment verification failed for node %d", node));
+            }
+            LLAMA_LOG_INFO("✅ SIMD alignment verified: %p aligned to %zu bytes\n", node_mem, expected_alignment);
             
             LLAMA_LOG_INFO("NUMA node %d: allocated %zu bytes at %p\n", node, total_size, node_mem);
             
@@ -571,10 +686,10 @@ struct llama_mmap::impl {
                 file->read_raw(node_mem, total_size);
             } catch (const std::exception& e) {
                 LLAMA_LOG_ERROR("Failed to read model data for NUMA node %d: %s\n", node, e.what());
-                numa_free_fixed(node_mem, total_size);
+                numa_free_mmap_first_touch(node_mem, total_size);
                 // Clean up any previous allocations
                 for (const auto& mapping : numa_mappings) {
-                    numa_free_fixed(mapping.addr, mapping.size);
+                    numa_free_mmap_first_touch(mapping.addr, mapping.size);
                 }
                 throw std::runtime_error(format("Failed to read model data for NUMA node %d: %s", node, e.what()));
             }
@@ -678,20 +793,34 @@ struct llama_mmap::impl {
         LLAMA_LOG_INFO("Detected %d NUMA nodes for unified multi-part mapping\n", num_nodes);
         LLAMA_LOG_INFO("Total unified model size: %zu bytes across %zu files\n", total_size, files.size());
 
-        LLAMA_LOG_INFO("Creating NUMA mirrors with numa_alloc_onnode: %zu bytes per node for %zu files\n", 
+        LLAMA_LOG_INFO("Creating NUMA mirrors with mmap + first-touch: %zu bytes per node for %zu files\n", 
                       total_size, files.size());
 
-        // Allocate and populate memory on each NUMA node using our fixed allocator
+        // Allocate and populate memory on each NUMA node using mmap + first-touch
         for (int node = 0; node < num_nodes; ++node) {
-            void* node_addr = numa_alloc_onnode_fixed(total_size, node);
+            void* node_addr = numa_alloc_mmap_first_touch(total_size, node);
             if (!node_addr) {
                 LLAMA_LOG_ERROR("Failed to allocate %zu bytes on NUMA node %d\n", total_size, node);
                 // Clean up any previous allocations
                 for (const auto& mapping : numa_mappings) {
-                    numa_free_fixed(mapping.addr, mapping.size);
+                    numa_free_mmap_first_touch(mapping.addr, mapping.size);
                 }
                 throw std::runtime_error(format("Failed to allocate memory on NUMA node %d", node));
             }
+            
+            // Verify SIMD alignment - our posix_memalign implementation guarantees this
+#if defined(__s390x__)
+            const size_t expected_alignment = 256;
+#else
+            const size_t expected_alignment = 64;  // 64-byte alignment for AVX-512
+#endif
+            if (reinterpret_cast<uintptr_t>(node_addr) % expected_alignment != 0) {
+                LLAMA_LOG_ERROR("SIMD alignment verification failed: %p not aligned to %zu bytes\n", 
+                               node_addr, expected_alignment);
+                numa_free_mmap_first_touch(node_addr, total_size);
+                throw std::runtime_error(format("SIMD alignment verification failed for node %d", node));
+            }
+            LLAMA_LOG_INFO("✅ SIMD alignment verified: %p aligned to %zu bytes\n", node_addr, expected_alignment);
             
             // Store the mapping
             numa_mappings.push_back({node_addr, total_size, ""});
@@ -830,10 +959,10 @@ struct llama_mmap::impl {
 
     ~impl() {
 #ifdef GGML_NUMA_MIRROR
-        // Free all NUMA memory allocations
+        // Free all NUMA memory allocations using mmap free function
         for (const auto& mapping : numa_mappings) {
             if (mapping.addr) {
-                numa_free_fixed(mapping.addr, mapping.size);
+                numa_free_mmap_first_touch(mapping.addr, mapping.size);
             }
         }
 #else

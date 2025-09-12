@@ -93,7 +93,7 @@ static enum ggml_status ggml_numa_kernel_cpy_quantized_execute(
         NUMA_4D_QUANTIZED_ROWWISE_LOOP(ctx, dst, src0, qk, {
             NUMA_LOG_TRACE("CPY Quantized BLOCK: Thread %d block(i03=%ld,i02=%ld,i01=%ld,blk=%ld) src_offset=%zu dst_offset=%zu src_ptr=%p dst_ptr=%p",
                            ctx.thread_id, i03, i02, i01, block_idx, src_block_offset, dst_block_offset,
-                           (void*)(src_data + src_block_offset), (void*)(dst_data + dst_block_offset));
+                           (const void*)(src_data + src_block_offset), (void*)(dst_data + dst_block_offset));
             
             // Read a few bytes from source to debug
             const char *src_ptr = src_data + src_block_offset;
@@ -113,27 +113,30 @@ static enum ggml_status ggml_numa_kernel_cpy_quantized_execute(
             // Log first few F32 values written to destination
             float *dst_ptr = dst_data + dst_block_offset;
             NUMA_LOG_TRACE("CPY Quantized DST_DATA: Thread %d first 4 floats: %.6f %.6f %.6f %.6f",
-                           ctx.thread_id, dst_ptr[0], dst_ptr[1], dst_ptr[2], dst_ptr[3]);
+                           ctx.thread_id, (double)dst_ptr[0], (double)dst_ptr[1], (double)dst_ptr[2], (double)dst_ptr[3]);
         });
     } else {
         // Reshape operations: use element-wise processing with quantized blocks
         // Process elements assigned to this thread using linear indexing
         const int64_t total_elements = ggml_nelements(dst);
+        GGML_UNUSED(total_elements);
         
         // Source tensor dimensions for linear-to-4D conversion
         const int64_t src_ne0 = src0->ne[0];
         const int64_t src_ne1 = src0->ne[1]; 
         const int64_t src_ne2 = src0->ne[2];
         const int64_t src_ne3 = src0->ne[3];
+        GGML_UNUSED(src_ne3);
         
         // Destination tensor dimensions for linear-to-4D conversion
         const int64_t dst_ne0 = dst->ne[0];
         const int64_t dst_ne1 = dst->ne[1]; 
         const int64_t dst_ne2 = dst->ne[2];
         const int64_t dst_ne3 = dst->ne[3];
+        GGML_UNUSED(dst_ne3);
         
         // Process all quantized blocks that contain elements in our thread's range
-        for (int64_t idx = ctx.thread_start; idx < ctx.thread_end; idx++) {
+        for (size_t idx = ctx.thread_start; idx < ctx.thread_end; idx++) {
             // Calculate source coordinates from linear index using shared macro
             int64_t i03_src, i02_src, i01_src, i00_src;
             NUMA_LINEAR_TO_4D_COORDS(idx, src_ne0, src_ne1, src_ne2, src_ne3, i00_src, i01_src, i02_src, i03_src);
@@ -163,7 +166,7 @@ static enum ggml_status ggml_numa_kernel_cpy_quantized_execute(
             if (idx < ctx.thread_start + 4) {
                 NUMA_LOG_TRACE("CPY Quantized ELEM: Thread %d idx=%ld src_coords=(%ld,%ld,%ld,%ld) dst_coords=(%ld,%ld,%ld,%ld) block_idx=%ld elem_in_block=%ld value=%f",
                                ctx.thread_id, idx, i00_src, i01_src, i02_src, i03_src, i00_dst, i01_dst, i02_dst, i03_dst, 
-                               block_idx, element_in_block, temp_block[element_in_block]);
+                               block_idx, element_in_block, (double)temp_block[element_in_block]);
             }
         }
     }
@@ -240,10 +243,10 @@ static enum ggml_status ggml_numa_kernel_cpy_standard_execute(
         
         // Check if we can use simple contiguous copy
         bool is_contiguous = (ggml_is_contiguous(src0) && ggml_is_contiguous(dst));
-        bool same_shape = ggml_are_same_shape(src0, dst);
+        bool is_same_shape = ggml_are_same_shape(src0, dst);
         
         NUMA_LOG_TRACE("CPY Standard: is_contiguous=%d, same_shape=%d, single_thread=%d", 
-                       is_contiguous, same_shape, (params->ith == 0 && params->nth == 1));
+                       is_contiguous, is_same_shape, (params->ith == 0 && params->nth == 1));
         
         if (is_contiguous && ggml_nelements(src0) > 1024 && params->ith == 0 && params->nth == 1) {
             // Use bulk memcpy for large contiguous tensors - ONLY in single-thread mode

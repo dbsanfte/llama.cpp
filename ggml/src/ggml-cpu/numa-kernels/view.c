@@ -68,6 +68,8 @@
  */
 enum ggml_status ggml_numa_kernel_view_execute(void * work_context, 
                                                struct ggml_compute_params * params) {
+    GGML_UNUSED(work_context);
+    GGML_UNUSED(params);
     // VIEW is a metadata-only operation - no computation required
     // This function should never be called.
     NUMA_ASSERT(false, "VIEW kernel execute function should not be called - metadata-only operation");

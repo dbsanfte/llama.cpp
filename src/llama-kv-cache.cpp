@@ -107,10 +107,7 @@ llama_kv_cache::llama_kv_cache(
 
         const char * dev_name = "CPU";
 
-        ggml_backend_buffer_type_t buft;
-        // Use standard CPU buffer type - the backend will automatically select
-        // the best available buffer (enhanced CPU_REPACK with NUMA awareness if available)
-        buft = ggml_backend_cpu_buffer_type();
+        ggml_backend_buffer_type_t buft = ggml_backend_cpu_buffer_type();
 
         if (offload) {
             auto * dev = model.dev_layer(il);

@@ -351,7 +351,7 @@ test_single_model() {
     
     # Start llama-server in background with optional NUMA mode
     # Note: All environment variables are automatically inherited by the child process
-    "$BIN_DIR/llama-server" -m "$model_path" --host 0.0.0.0 $NUMA_OPTION --port $server_port > "$debug_log" 2>&1 &
+    "$BIN_DIR/llama-server" -m "$model_path" -fa on --host 0.0.0.0 $NUMA_OPTION --port $server_port > "$debug_log" 2>&1 &
     server_pid=$!
     
     # Function to cleanup server
@@ -538,18 +538,18 @@ run_integration_test() {
     echo "========================================"
     
     # Test 1: Small model (Qwen 0.5B)
-    #echo -e "${YELLOW}🔬 Test 1: Small Model Validation${NC}"
-    #local small_model_name="Qwen 2.5 0.5B (Q8_0)"
-    #local small_model_path="./.devcontainer/qwen2.5-0.5b-instruct-q8_0.gguf"
-    #local small_model_url="https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF/resolve/main/qwen2.5-0.5b-instruct-q8_0.gguf"
-    #local small_model_id="qwen2.5-0.5b-instruct"
-    #local small_test_prompt="Hello!"
-    #local small_expected_pattern="Hello! How can I assist you today?"
-    # 
-    #if ! test_single_model "$small_model_name" "$small_model_path" "$small_model_url" "$small_model_id" "$small_expected_pattern" "$small_test_prompt"; then
-    #    echo -e "${RED}❌ Small model test failed - stopping integration test${NC}"
-    #    return 1
-    #fi
+    echo -e "${YELLOW}🔬 Test 1: Small Model Validation${NC}"
+    local small_model_name="Qwen 2.5 0.5B (Q8_0)"
+    local small_model_path="./.devcontainer/qwen2.5-0.5b-instruct-q8_0.gguf"
+    local small_model_url="https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF/resolve/main/qwen2.5-0.5b-instruct-q8_0.gguf"
+    local small_model_id="qwen2.5-0.5b-instruct"
+    local small_test_prompt="Hello!"
+    local small_expected_pattern="Hello! How can I assist you today?"
+    
+    if ! test_single_model "$small_model_name" "$small_model_path" "$small_model_url" "$small_model_id" "$small_expected_pattern" "$small_test_prompt"; then
+        echo -e "${RED}❌ Small model test failed - stopping integration test${NC}"
+        return 1
+    fi
     
     # Test 2: MoE model (GPT-OSS 20B - Unsloth Dynamic Quant)
     echo -e "${YELLOW}🔬 Test 2: MoE Model Validation${NC}"

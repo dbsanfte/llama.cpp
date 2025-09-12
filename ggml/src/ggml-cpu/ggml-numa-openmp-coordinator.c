@@ -186,7 +186,7 @@ typedef struct {
 
 // Per-NUMA shared work buffers - indexed by NUMA node ID
 static ggml_numa_shared_work_buffer_t g_numa_shared_work_buffers[GGML_NUMA_MAX_NODES] = {0};
-static bool g_numa_shared_buffers_initialized = false;
+// TODO: Consider using g_numa_shared_buffers_initialized for buffer lifecycle management
 
 /**
  * @brief Get or allocate per-NUMA shared work buffer
@@ -547,6 +547,7 @@ static bool ggml_numa_openmp_init_per_numa_threadpools(void) {
  * @return True if thread teams initialized successfully, false otherwise
  */
 static bool ggml_numa_openmp_init_per_numa_threadpools_with_mask(const ggml_numa_cpu_mask_t * cpu_mask) {
+    GGML_UNUSED(cpu_mask);
     if (!g_openmp_config.numa_available) {
         NUMA_LOG_DEBUG("NUMA not available, skipping per-NUMA thread team creation\n");
         return true; // Not an error for non-NUMA systems
@@ -657,6 +658,7 @@ typedef struct {
  * @brief Calculate execution configuration for single-thread strategy
  */
 static ggml_numa_execution_config_t ggml_numa_calc_single_thread_config(int target_numa_node) {
+    GGML_UNUSED(target_numa_node);
     return (ggml_numa_execution_config_t) {
         .strategy_name = "single-thread",
         .total_threads = 1,
@@ -672,6 +674,7 @@ static ggml_numa_execution_config_t ggml_numa_calc_single_thread_config(int targ
  * @brief Calculate execution configuration for single-node strategy
  */
 static ggml_numa_execution_config_t ggml_numa_calc_single_node_config(int target_numa_node) {
+    GGML_UNUSED(target_numa_node);
     int threads_per_node = g_openmp_config.threads_per_node;
     return (ggml_numa_execution_config_t) {
         .strategy_name = "single-node",
@@ -1272,6 +1275,8 @@ struct ggml_threadpool * ggml_numa_openmp_get_fallback_threadpool(void) {
             max_threads = (int)nprocs;
         }
         #endif
+        
+        GGML_UNUSED(max_threads); // Computed but using 1 for fallback simplicity
         
         // Create threadpool parameters with single thread for fallback simplicity
         struct ggml_threadpool_params tpp = ggml_threadpool_params_default(1);

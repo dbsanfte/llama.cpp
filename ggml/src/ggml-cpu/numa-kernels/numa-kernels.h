@@ -568,16 +568,16 @@ ggml_numa_kernel_registration_info_t ggml_numa_kernel_##op_name##_register(void)
     info.work_funcs.valid = true; \
     \
     /* Query function pointer - enables direct dispatch without switch statements */ \
-    info.query_fn = (void*)ggml_numa_kernel_##op_name##_query; \
+    info.query_fn = ggml_numa_kernel_##op_name##_query; \
     \
     /* Work buffer calculation function pointer */ \
-    info.work_buffer_calc_fn = (void*)ggml_numa_kernel_##op_name##_work_buffer_calc; \
+    info.work_buffer_calc_fn = ggml_numa_kernel_##op_name##_work_buffer_calc; \
     \
     /* Aggregation functions - most operations don't need them */ \
     if (needs_aggregation) { \
-        info.agg_funcs.single_single_fn = (void*)ggml_numa_kernel_##op_name##_aggregate; \
-        info.agg_funcs.single_multi_fn = (void*)ggml_numa_kernel_##op_name##_aggregate; \
-        info.agg_funcs.data_parallel_fn = (void*)ggml_numa_kernel_##op_name##_aggregate; \
+        info.agg_funcs.single_single_fn = ggml_numa_kernel_##op_name##_aggregate; \
+        info.agg_funcs.single_multi_fn = ggml_numa_kernel_##op_name##_aggregate; \
+        info.agg_funcs.data_parallel_fn = ggml_numa_kernel_##op_name##_aggregate; \
         info.agg_funcs.valid = true; \
     } else { \
         info.agg_funcs.single_single_fn = NULL; \
@@ -622,10 +622,10 @@ ggml_numa_kernel_registration_info_t ggml_numa_kernel_##op_name##_register(void)
     info.work_funcs.valid = true; \
     \
     /* Query function pointer - enables direct dispatch without switch statements */ \
-    info.query_fn = (void*)ggml_numa_kernel_##op_name##_query; \
+    info.query_fn = ggml_numa_kernel_##op_name##_query; \
     \
     /* Work buffer calculation function pointer */ \
-    info.work_buffer_calc_fn = (void*)ggml_numa_kernel_##op_name##_work_buffer_calc; \
+    info.work_buffer_calc_fn = ggml_numa_kernel_##op_name##_work_buffer_calc; \
     \
     /* No aggregation functions needed */ \
     info.agg_funcs.single_single_fn = NULL; \
@@ -667,7 +667,7 @@ ggml_numa_kernel_registration_info_t ggml_numa_kernel_##op_name##_register(void)
     info.work_funcs.valid = false; \
     \
     /* Query function pointer - still needed for registration */ \
-    info.query_fn = (void*)ggml_numa_kernel_##op_name##_query; \
+    info.query_fn = ggml_numa_kernel_##op_name##_query; \
     \
     /* No work buffer needed for no-op kernels */ \
     info.work_buffer_calc_fn = NULL; \
@@ -714,15 +714,15 @@ ggml_numa_kernel_registration_info_t ggml_numa_kernel_##op_name##_register(void)
     info.work_funcs.valid = true; \
     \
     /* Query function pointer - enables direct dispatch without switch statements */ \
-    info.query_fn = (void*)ggml_numa_kernel_##op_name##_query; \
+    info.query_fn = ggml_numa_kernel_##op_name##_query; \
     \
     /* Work buffer calculation function pointer */ \
-    info.work_buffer_calc_fn = (void*)ggml_numa_kernel_##op_name##_work_buffer_calc; \
+    info.work_buffer_calc_fn = ggml_numa_kernel_##op_name##_work_buffer_calc; \
     \
     /* Aggregation functions for reduction operations */ \
-    info.agg_funcs.single_single_fn = (void*)ggml_numa_kernel_##op_name##_aggregate; \
-    info.agg_funcs.single_multi_fn = (void*)ggml_numa_kernel_##op_name##_aggregate; \
-    info.agg_funcs.data_parallel_fn = (void*)ggml_numa_kernel_##op_name##_aggregate; \
+    info.agg_funcs.single_single_fn = ggml_numa_kernel_##op_name##_aggregate; \
+    info.agg_funcs.single_multi_fn = ggml_numa_kernel_##op_name##_aggregate; \
+    info.agg_funcs.data_parallel_fn = ggml_numa_kernel_##op_name##_aggregate; \
     info.agg_funcs.valid = true; \
     \
     return info; \
@@ -1875,7 +1875,7 @@ typedef struct {
  *   NUMA_4D_COORDS_TO_PTR(tensor_data(src0), src0, i00_src, i01_src, i02_src, i03_src, float, src_ptr);
  */
 #define NUMA_4D_COORDS_TO_PTR(base_data, tensor, i0, i1, i2, i3, element_type, result_ptr) do { \
-    result_ptr = (const element_type *)((const char *)(base_data) + \
+    result_ptr = (element_type *)((char *)(base_data) + \
         (i0) * (tensor)->nb[0] + (i1) * (tensor)->nb[1] + \
         (i2) * (tensor)->nb[2] + (i3) * (tensor)->nb[3]); \
 } while(0)
@@ -1982,6 +1982,9 @@ typedef struct {
     const size_t _nb00 = (src0)->nb[0], _nb01 = (src0)->nb[1], _nb02 = (src0)->nb[2], _nb03 = (src0)->nb[3]; \
     const size_t _nb0 = (dst)->nb[0], _nb1 = (dst)->nb[1], _nb2 = (dst)->nb[2], _nb3 = (dst)->nb[3]; \
     const int64_t _ne0_dst = (dst)->ne[0], _ne1_dst = (dst)->ne[1], _ne2_dst = (dst)->ne[2]; \
+    /* Suppress unused variable warnings - not all strides are used in every case */ \
+    GGML_UNUSED(_nb00); GGML_UNUSED(_nb01); GGML_UNUSED(_nb02); GGML_UNUSED(_nb03); \
+    GGML_UNUSED(_nb0); GGML_UNUSED(_nb1); GGML_UNUSED(_nb2); GGML_UNUSED(_nb3); \
     \
     for (int64_t idx = (start_idx); idx < (end_idx); idx++) { \
         /* Convert linear index to 4D coordinates for both tensors */ \
@@ -2640,6 +2643,7 @@ typedef struct {
         extern __thread int ggml_current_numa_node; \
         extern __thread bool ggml_numa_is_data_parallel_execution; \
         extern __thread int ggml_numa_total_nodes_for_data_parallel; \
+        GGML_UNUSED(ggml_numa_total_nodes_for_data_parallel); \
         \
         (ctx).numa_node = ggml_current_numa_node; \
         (ctx).is_data_parallel = ggml_numa_is_data_parallel_execution; \

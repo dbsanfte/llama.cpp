@@ -58,9 +58,11 @@ enum ggml_status ggml_numa_kernel_rms_norm_execute(void * work_context, struct g
     
     // === COMPOSABLE KERNEL SETUP USING NEW BUILDING BLOCKS ===
     NUMA_ROWWISE_KERNEL_SETUP(ctx, dst, params, dst_data, float);
+    GGML_UNUSED(dst_data);
     
     // Get source data using building block
     NUMA_GET_SOURCE_POINTER(src_data, dst, 0, float);
+    GGML_UNUSED(src_data);
     
     // Extract tensor dimensions
     const int64_t ne00 = dst->ne[0];  // Elements per row

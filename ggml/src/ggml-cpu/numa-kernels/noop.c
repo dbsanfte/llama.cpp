@@ -55,6 +55,7 @@ enum ggml_status ggml_numa_kernel_noop_unified_execute(void * work_context, stru
     extern __thread int ggml_current_numa_node;
     extern __thread bool ggml_numa_is_data_parallel_execution;
     extern __thread int ggml_numa_total_nodes_for_data_parallel;
+    GGML_UNUSED(ggml_numa_total_nodes_for_data_parallel);
     
     // Log minimal execution details for debugging
     NUMA_LOG_TRACE("NOOP kernel executing on NUMA node %d, thread %d/%d, data_parallel=%s", 

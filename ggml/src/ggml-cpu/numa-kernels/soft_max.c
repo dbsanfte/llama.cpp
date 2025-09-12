@@ -70,7 +70,7 @@ enum ggml_status ggml_numa_kernel_soft_max_f32_execute(void * work_context, stru
     
     // DEBUG: Print scale and max_bias values (only from thread 0 to avoid spam)
     if (params->ith == 0) {
-        NUMA_LOG_DEBUG("NUMA SOFT_MAX: scale=%.8f, max_bias=%.8f", scale, max_bias);
+        NUMA_LOG_DEBUG("NUMA SOFT_MAX: scale=%.8f, max_bias=%.8f", (double)scale, (double)max_bias);
         NUMA_LOG_DEBUG("NUMA SOFT_MAX: params->ith=%d, params->nth=%d", params->ith, params->nth);
         NUMA_LOG_DEBUG("NUMA SOFT_MAX: ctx.thread_id=%d, ctx.total_threads=%d", ctx.thread_id, ctx.total_threads);
     }

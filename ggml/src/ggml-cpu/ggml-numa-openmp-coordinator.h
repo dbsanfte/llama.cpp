@@ -30,9 +30,6 @@ struct ggml_tensor;
 struct ggml_compute_params;
 struct ggml_cplan;
 
-// Include for status types - use forward declaration
-enum ggml_status;
-
 // Thread-local variables for NUMA kernel coordination
 // These are defined in ggml-numa-openmp-coordinator.c and accessed by kernels
 extern __thread int ggml_current_numa_node;

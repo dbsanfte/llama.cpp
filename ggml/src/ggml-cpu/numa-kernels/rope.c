@@ -760,6 +760,7 @@ NUMA_KERNEL_QUERY_FUNCTION(rope, 128, 1024)
 
 // Custom work buffer calculation (too complex for simple expression macro)
 size_t ggml_numa_kernel_rope_work_buffer_calc(const struct ggml_tensor * tensor, int total_numa_nodes, int total_threads) {
+    GGML_UNUSED(total_numa_nodes);
     if (!tensor) {
         return 0;
     }

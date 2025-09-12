@@ -48,7 +48,7 @@ enum ggml_status ggml_numa_kernel_get_rows_execute(void * work_context, struct g
     
     // Process rows in this thread's range using composable macro system
     // The NUMA_ROWWISE_KERNEL_SETUP already calculates thread_start and thread_end correctly
-    for (int64_t i = ctx.thread_start; i < ctx.thread_end; i++) {
+    for (size_t i = ctx.thread_start; i < ctx.thread_end; i++) {
         const int64_t src_row_idx = indices[i];
         
         // Bounds check on source row index - FAIL on invalid indices

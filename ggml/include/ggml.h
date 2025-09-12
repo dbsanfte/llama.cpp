@@ -711,8 +711,16 @@ extern "C" {
 #ifdef GGML_NUMA_MIRROR
         // Check if mirroring is actually enabled at runtime
         if (!ggml_numa_should_mirror()) {
-            // Mirroring disabled - just return the first data pointer
-            return tensor->__data[0];
+            // Mirroring disabled - find the first non-NULL data pointer
+            // This handles cases where tensors were allocated by backends that don't use NUMA
+            for (int i = 0; i < GGML_NUMA_MAX_NODES; i++) {
+                if (tensor->__data[i] != NULL) {
+                    return tensor->__data[i];
+                }
+            }
+            // All NUMA slots are NULL - this suggests a backend allocation issue
+            // Return NULL and let the caller handle it
+            return NULL;
         }
         
         // Mirroring enabled - use NUMA-aware access
@@ -720,12 +728,29 @@ extern "C" {
         int n = ggml_current_numa_node;
         if (n == -1)
             n = 0;
-        // Bounds check to prevent accessing beyond available nodes
+        
+        // CRITICAL: Bounds check to prevent accessing uninitialized __data slots
         int max_nodes = ggml_numa_node_count();
         if (max_nodes > GGML_NUMA_MAX_NODES)
             max_nodes = GGML_NUMA_MAX_NODES;
         if (n >= max_nodes)
             n = 0;
+        
+        // Additional safety: if the requested node's data is NULL, fall back to node 0
+        if (tensor->__data[n] == NULL && n > 0) {
+            n = 0;
+        }
+        
+        // Final safety: if even node 0 is NULL, try finding any non-NULL data
+        if (tensor->__data[n] == NULL) {
+            for (int i = 0; i < GGML_NUMA_MAX_NODES; i++) {
+                if (tensor->__data[i] != NULL) {
+                    return tensor->__data[i];
+                }
+            }
+            // All NUMA slots are NULL - return NULL
+            return NULL;
+        }
         
         return tensor->__data[n];
 #else

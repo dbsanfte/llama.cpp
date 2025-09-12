@@ -127,7 +127,7 @@ static void ggml_numa_kernel_mul_mat_id_one_chunk(
                     
                     vec_dot(ne00, &tmp[ir0 - iir0], 0, src0_cur + ir0*nb01, 0, src1_col, 0, 1);
                     
-                    NUMA_LOG_TRACE("vec_dot result: tmp[%ld] = %f\n", ir0 - iir0, tmp[ir0 - iir0]);
+                    NUMA_LOG_TRACE("vec_dot result: tmp[%ld] = %f\n", ir0 - iir0, (double)tmp[ir0 - iir0]);
                 }
 
                 memcpy(&dst_col[iir0], tmp, (MIN(iir0 + blck_0, ir0_end) - iir0)*sizeof(float));
@@ -175,6 +175,7 @@ enum ggml_status ggml_numa_kernel_mul_mat_id_execute(void * work_context, struct
     enum ggml_type    const vec_dot_type    = type_traits->vec_dot_type;
     ggml_from_float_t const from_float      = type_traits->from_float;
     ggml_vec_dot_t    const vec_dot         = type_traits->vec_dot;
+    GGML_UNUSED(from_float);
 
     // Critical assertions from reference implementation
     NUMA_ASSERT(nb00 == ggml_type_size(type), "src0 must not be permuted");
@@ -189,6 +190,7 @@ enum ggml_status ggml_numa_kernel_mul_mat_id_execute(void * work_context, struct
     // Get shared result tensor data for direct writes
     float * dst_data;
     NUMA_GET_SHARED_DATA(tensor, dst_data, float);
+    GGML_UNUSED(dst_data);
 
     // PHASE 1: MULTITHREADED TYPE CONVERSION (PER NUMA NODE)
     // Each NUMA node converts full src1 tensor using multiple threads for speed
@@ -197,8 +199,8 @@ enum ggml_status ggml_numa_kernel_mul_mat_id_execute(void * work_context, struct
         wdata = (char *)params->wdata;
         NUMA_ASSERT(wdata != NULL, "Work buffer required for type conversion");
         
-        ggml_from_float_t const from_float = ggml_get_type_traits_cpu(vec_dot_type)->from_float;
-        NUMA_ASSERT(from_float != NULL, "from_float function not available");
+        ggml_from_float_t const from_float_converter = ggml_get_type_traits_cpu(vec_dot_type)->from_float;
+        NUMA_ASSERT(from_float_converter != NULL, "from_float function not available");
         
         // Block-based conversion matching reference implementation exactly
         const size_t nbw0 = ggml_type_size(vec_dot_type);
@@ -219,7 +221,7 @@ enum ggml_status ggml_numa_kernel_mul_mat_id_execute(void * work_context, struct
                     size_t bs = ggml_blck_size(vec_dot_type);
                     int64_t ne10_block_start = (ith * ne10/bs) / nth;
                     int64_t ne10_block_end   = ((ith + 1) * ne10/bs) / nth;
-                    from_float((float *)((char *) tensor_data(src1) + i13*nb13 + i12*nb12 + i11*nb11 + ne10_block_start*bs*nb10),
+                    from_float_converter((float *)((char *) tensor_data(src1) + i13*nb13 + i12*nb12 + i11*nb11 + ne10_block_start*bs*nb10),
                                (void *)               (wdata + i13*nbw3 + i12*nbw2 + i11*nbw1 + ne10_block_start*nbw0),
                                (ne10_block_end - ne10_block_start) * bs);
                 }

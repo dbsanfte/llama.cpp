@@ -2065,7 +2065,7 @@ static struct ggml_tensor * ggml_new_tensor_impl(
         /*.view_src     =*/ view_src,
         /*.view_offs    =*/ view_offs,
     #ifdef GGML_NUMA_MIRROR
-        /*.data         =*/ { .__data = { NULL, NULL } },
+        /*.data         =*/ { .__data = { NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL } },
 #else
         /*.data         =*/ NULL,
 #endif
@@ -2074,8 +2074,7 @@ static struct ggml_tensor * ggml_new_tensor_impl(
         /*.padding      =*/ { 0 },
     };
 
-    // TODO: this should not be needed as long as we don't rely on aligned SIMD loads
-    //GGML_ASSERT_ALIGNED(tensor_data(result));
+    GGML_ASSERT_ALIGNED(tensor_data(result));
 
     for (int i = 0; i < n_dims; i++) {
         result->ne[i] = ne[i];
@@ -2104,8 +2103,12 @@ static struct ggml_tensor * ggml_new_tensor_impl(
     } else if (view_src != NULL) {
         // For view tensors, copy data pointers from source
 #ifdef GGML_NUMA_MIRROR
-        result->__data[0] = data;
-        result->__data[1] = data; // Same data for views
+        // CRITICAL: Initialize ALL NUMA data pointers to the same data for view tensors
+        // View tensors don't go through tensor_set_data_numa_mirror(), so we must
+        // initialize all slots to prevent accessing uninitialized pointers
+        for (int i = 0; i < GGML_NUMA_MAX_NODES; i++) {
+            result->__data[i] = data;
+        }
 #else
         result->data = data;
 #endif

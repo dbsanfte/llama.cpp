@@ -895,6 +895,22 @@ static size_t ggml_numa_calculate_work_size(struct ggml_tensor * tensor, int n_t
                 work_size = (tensor->ne[0] + cache_line_size_f32) * n_threads * sizeof(float);
                 NUMA_LOG_DEBUG("NUMA Work Buffer: SOFT_MAX calculated size: %zu bytes for %d threads", work_size, n_threads);
             } break;
+        case GGML_OP_FLASH_ATTN_EXT:
+            {
+                // FLASH_ATTN_EXT needs work buffer for temporary VKQ accumulator per thread
+                // Based on ggml_compute_forward_flash_attn_ext_f16: VKQ32 = (float *) params->wdata + ith*(1*DK + 2*DV + CACHE_LINE_SIZE_F32)
+                if (tensor->src[0] && tensor->src[1]) {
+                    const size_t cache_line_size_f32 = 16;  // CACHE_LINE_SIZE_F32 approximation
+                    const int64_t DK = tensor->src[0]->ne[0];  // key dimensions from q tensor
+                    const int64_t DV = tensor->src[2] ? tensor->src[2]->ne[0] : DK;  // value dimensions from v tensor
+                    work_size = (1*DK + 2*DV + cache_line_size_f32) * n_threads * sizeof(float);
+                    NUMA_LOG_DEBUG("NUMA Work Buffer: FLASH_ATTN_EXT calculated size: %zu bytes for %d threads (DK=%lld, DV=%lld)", 
+                                   work_size, n_threads, (long long)DK, (long long)DV);
+                } else {
+                    NUMA_LOG_WARN("NUMA Work Buffer: FLASH_ATTN_EXT missing source tensors");
+                    work_size = 0;
+                }
+            } break;
         default:
             // For unknown operations, use zero work size
             work_size = 0;
