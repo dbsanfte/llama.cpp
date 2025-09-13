@@ -504,8 +504,12 @@ test_single_model() {
     
     echo "💬 Generated content: \"$content\""
     
-    # Check if response contains expected pattern (case-insensitive)
-    if echo "$content" | grep -i "$expected_pattern" >/dev/null; then
+    # Check if response contains expected pattern (exact match, case-sensitive for precision)
+    # Convert both content and pattern to single-line format for reliable comparison
+    local content_normalized=$(echo "$content" | tr '\n' ' ' | tr -s ' ')
+    local pattern_normalized=$(echo "$expected_pattern" | tr '\n' ' ' | tr -s ' ')
+    
+    if echo "$content_normalized" | grep -F "$pattern_normalized" >/dev/null; then
         echo -e "${GREEN}✅ Integration test PASSED: Response contains expected pattern${NC}"
         if [ -n "$NUMA_OPTION" ]; then
             echo "🎯 NUMA-enabled llama-server is working correctly with $model_name!"

@@ -95,10 +95,10 @@ static void * ggml_get_or_grow_thread_work_buffer(size_t required_size, int targ
     if (g_thread_work_buffer.current_size > 0) {
         // Grow by 50% to reduce future reallocations
         new_size = required_size + (required_size / 2);
-        NUMA_LOG_DEBUG("GROWING_WORK_BUFFER: thread=%d old_size=%zu new_size=%zu node=%d", 
+        NUMA_LOG_TRACE("GROWING_WORK_BUFFER: thread=%d old_size=%zu new_size=%zu node=%d", 
                        omp_get_thread_num(), g_thread_work_buffer.current_size, new_size, target_numa_node);
     } else {
-        NUMA_LOG_DEBUG("ALLOCATING_WORK_BUFFER: thread=%d size=%zu node=%d", 
+        NUMA_LOG_TRACE("ALLOCATING_WORK_BUFFER: thread=%d size=%zu node=%d", 
                        omp_get_thread_num(), new_size, target_numa_node);
     }
     
@@ -121,7 +121,7 @@ static void * ggml_get_or_grow_thread_work_buffer(size_t required_size, int targ
         new_buffer = numa_alloc_onnode(new_size, target_numa_node);
         if (new_buffer) {
             is_numa_allocated = true;
-            NUMA_LOG_DEBUG("NUMA_WORK_BUFFER_ALLOCATED: thread=%d size=%zu node=%d ptr=%p", 
+            NUMA_LOG_TRACE("NUMA_WORK_BUFFER_ALLOCATED: thread=%d size=%zu node=%d ptr=%p", 
                            omp_get_thread_num(), new_size, target_numa_node, new_buffer);
         } else {
             NUMA_LOG_DEBUG("NUMA allocation failed for work buffer, falling back to malloc");
@@ -215,7 +215,7 @@ static void * ggml_get_or_allocate_numa_shared_work_buffer(size_t required_size,
         #pragma omp atomic
         shared_buffer->ref_count++;
         
-        NUMA_LOG_DEBUG("NUMA_SHARED_BUFFER_REUSE: node=%d size=%zu ptr=%p refs=%d", 
+        NUMA_LOG_TRACE("NUMA_SHARED_BUFFER_REUSE: node=%d size=%zu ptr=%p refs=%d", 
                        numa_node, shared_buffer->current_size, shared_buffer->buffer, shared_buffer->ref_count);
         return shared_buffer->buffer;
     }
@@ -228,7 +228,7 @@ static void * ggml_get_or_allocate_numa_shared_work_buffer(size_t required_size,
         if (!shared_buffer->buffer || shared_buffer->current_size < required_size) {
             // Free old buffer if it exists
             if (shared_buffer->buffer) {
-                NUMA_LOG_DEBUG("NUMA_SHARED_BUFFER_GROWING: node=%d old_size=%zu new_size=%zu", 
+                NUMA_LOG_TRACE("NUMA_SHARED_BUFFER_GROWING: node=%d old_size=%zu new_size=%zu", 
                                numa_node, shared_buffer->current_size, required_size);
                 if (shared_buffer->numa_node >= 0) {
                     numa_free(shared_buffer->buffer, shared_buffer->current_size);
@@ -251,7 +251,7 @@ static void * ggml_get_or_allocate_numa_shared_work_buffer(size_t required_size,
                 shared_buffer->is_allocated = true;
                 shared_buffer->ref_count = 0;  // Will be incremented below
                 
-                NUMA_LOG_DEBUG("NUMA_SHARED_BUFFER_ALLOCATED: node=%d size=%zu ptr=%p", 
+                NUMA_LOG_TRACE("NUMA_SHARED_BUFFER_ALLOCATED: node=%d size=%zu ptr=%p", 
                                numa_node, required_size, new_buffer);
                 result_buffer = new_buffer;
             } else {
@@ -772,7 +772,7 @@ static enum ggml_status ggml_numa_openmp_execute_unified(
         };
         
         enum ggml_status result = work_fn(tensor, &params);
-        NUMA_LOG_VERBOSE("single-thread fast-path execution completed with status %d\n", result);
+        NUMA_LOG_TRACE("single-thread fast-path execution completed with status %d\n", result);
         return result;
     }
 
@@ -799,7 +799,7 @@ static enum ggml_status ggml_numa_openmp_execute_unified(
             // CRITICAL BOUNDS CHECK for data-parallel execution
             if (numa_node >= config.total_numa_nodes) {
                 // Thread excluded from data-parallel work
-                NUMA_LOG_VERBOSE("THREAD_EXCLUDED: omp_thread=%d numa_node=%d >= total_nodes=%d (excluded from work)",
+                NUMA_LOG_TRACE("THREAD_EXCLUDED: omp_thread=%d numa_node=%d >= total_nodes=%d (excluded from work)",
                                omp_thread_id, numa_node, config.total_numa_nodes);
                 should_work = false;  // Thread participates in barrier but does no work
             }
@@ -810,7 +810,7 @@ static enum ggml_status ggml_numa_openmp_execute_unified(
         }
 
         if (should_work) {
-            NUMA_LOG_DEBUG("%s_TASK: OpenMP thread %d mapped to NUMA %d, local task %d/%d\n",
+            NUMA_LOG_TRACE("%s_TASK: OpenMP thread %d mapped to NUMA %d, local task %d/%d\n",
                            config.strategy_name, omp_thread_id, numa_node, local_task_id, config.threads_per_node);
 
             // OPTIMIZATION: Batch thread-local variable setup to reduce assignments
@@ -838,10 +838,10 @@ static enum ggml_status ggml_numa_openmp_execute_unified(
                     if (shared_work_buffer != NULL) {
                         thread_work_buffer = (char*)shared_work_buffer;
                         thread_work_size = work_buffer_size;
-                        NUMA_LOG_DEBUG("%s_SHARED_BUFFER: Using shared work buffer for thread %d on NUMA %d", 
+                        NUMA_LOG_TRACE("%s_SHARED_BUFFER: Using shared work buffer for thread %d on NUMA %d", 
                                        config.strategy_name, local_task_id, numa_node);
                     } else {
-                        NUMA_LOG_DEBUG("%s_SHARED_BUFFER: Failed to allocate shared buffer, falling back to per-thread", config.strategy_name);
+                        NUMA_LOG_WARN("%s_SHARED_BUFFER: Failed to allocate shared buffer, falling back to per-thread", config.strategy_name);
                         thread_work_buffer = (char*)ggml_get_or_grow_thread_work_buffer(work_buffer_size, numa_node);
                     }
                 } else {

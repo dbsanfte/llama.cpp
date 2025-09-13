@@ -73,8 +73,8 @@ NUMA_KERNEL_REGISTER_METADATA(
     div,                                    // kernel name
     GGML_OP_DIV,                           // operation type
     "NUMA DIV Kernel",                     // kernel description
-    1024,                                  // single_single threshold
-    262144,                                // single_multi threshold
+    128,                                  // single_single threshold
+    256,                                // single_multi threshold
     ggml_numa_kernel_div_execute           // execution function
 )
 
