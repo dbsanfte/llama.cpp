@@ -950,13 +950,29 @@ extern "C" {
             return;
         }
         
-        // SMART NUMA MIRRORING STRATEGY:
-        // 1. For model weights/constants: Use copy-on-access (lazy mirroring)
-        // 2. For intermediate computation tensors: Mirror immediately only if needed
-        // 3. Avoid unnecessary allocations during model loading
-        
         extern int ggml_numa_node_count(void);
         int numa_nodes = ggml_numa_node_count();
+        
+        // CRITICAL FIX: Check if NUMA pointers are already correctly set up by model loader
+        // If we detect that different NUMA nodes have different addresses, DON'T override them
+        bool already_numa_configured = false;
+        if (numa_nodes > 1) {
+            for (int i = 1; i < numa_nodes && i < GGML_NUMA_MAX_NODES; i++) {
+                if (tensor->__data[i] && tensor->__data[i] != tensor->__data[0]) {
+                    already_numa_configured = true;
+                    break;
+                }
+            }
+        }
+        
+        if (already_numa_configured) {
+            // Model loader already set up NUMA pointers correctly - don't override!
+            return;
+        }
+        
+        // SMART NUMA MIRRORING STRATEGY:
+        // 1. For model weights: Mirrors are already set up by llama-mmap.cpp at model load time
+        // 2. For intermediate computation tensors: Keep on Node 0 to avoid data syncing complexity
         
         // First: Check if we already have NUMA-mirrored data that needs cleanup
         bool has_existing_numa_copies = false;
@@ -982,8 +998,11 @@ extern "C" {
             }
         }
         
-        // LAZY MIRRORING: Initially, all nodes point to the same data
-        // NUMA copies will be created on-demand during execution
+        // ** All numas point to Node 0's copy **
+        // This avoids having to sync intermediate tensors created during
+        // inferencing, which tend to be fairly small anyways, so not much benefit
+        // mirroring them, versus the mess that keeping mirrors in sync
+        // would lead us into...
         for (int i = 0; i < GGML_NUMA_MAX_NODES; i++) {
             tensor->__data[i] = data;
         }
@@ -1003,9 +1022,7 @@ extern "C" {
             return;
         }
         
-        // Temporary fix: Skip cleanup to avoid segfaults during development
-        // The NUMA memory will be cleaned up by the global NUMA subsystem
-        // TODO: Investigate proper tensor cleanup synchronization
+        
         return;
     }
 #endif

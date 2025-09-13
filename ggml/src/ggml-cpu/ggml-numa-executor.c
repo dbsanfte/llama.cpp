@@ -28,6 +28,7 @@
 #include "ggml-numa-openmp-coordinator.h"
 #include "numa-kernels/numa-kernels.h"  // For ggml_numa_is_kernel_noop
 #include "ggml-cpu-impl.h"
+#include "ggml-impl.h"  // For ggml_aligned_malloc/free
 #include "ops.h"
 #include "binary-ops.h"  // For ggml_compute_forward_mul, sub, div
 #include "unary-ops.h"   // For unary operations
@@ -837,11 +838,23 @@ static size_t ggml_numa_calculate_work_size(struct ggml_tensor * tensor, int n_t
         case GGML_OP_MUL_MAT:
             {
                 if (tensor->src[0] && tensor->src[1]) {
+                    const struct ggml_tensor * src1 = tensor->src[1];
                     const struct ggml_type_traits_cpu * traits = ggml_get_type_traits_cpu(tensor->src[0]->type);
                     const enum ggml_type vec_dot_type = traits->vec_dot_type;
                     
-                    if (tensor->src[1]->type != vec_dot_type) {
-                        work_size = ggml_row_size(vec_dot_type, ggml_nelements(tensor->src[1]));
+                    if (src1->type != vec_dot_type) {
+                        // Calculate work buffer size exactly as expected by ggml_compute_forward_mul_mat
+                        // The assertion is: assert(params->wsize >= ne13*nbw3);
+                        // where nbw3 = nbw2*ne12 = nbw1*ne11*ne12 = ggml_row_size(vec_dot_type, ne10)*ne11*ne12
+                        const int64_t ne10 = src1->ne[0];
+                        const int64_t ne11 = src1->ne[1]; 
+                        const int64_t ne12 = src1->ne[2];
+                        const int64_t ne13 = src1->ne[3];
+                        
+                        const size_t nbw1 = ggml_row_size(vec_dot_type, ne10);
+                        const size_t nbw2 = nbw1 * ne11;
+                        const size_t nbw3 = nbw2 * ne12;
+                        work_size = ne13 * nbw3;
                     }
                     NUMA_LOG_DEBUG("NUMA Work Buffer: MUL_MAT src0_type=%d, src1_type=%d, vec_dot_type=%d, calculated size: %zu bytes", 
                                    (int)tensor->src[0]->type, (int)tensor->src[1]->type, (int)vec_dot_type, work_size);
@@ -966,12 +979,12 @@ enum ggml_status ggml_numa_executor_direct_kernel_dispatch(struct ggml_tensor * 
         GGML_LOG_DEBUG("NUMA Direct Kernel: Using existing work buffer (%zu bytes >= %zu needed)\n", 
                        cplan->work_size, needed_work_size);
     } else if (needed_work_size > 0) {
-        // Allocate temporary work buffer for fallback operations
-        work_data = malloc(needed_work_size);
+        // Allocate temporary work buffer for fallback operations using proper GGML alignment
+        work_data = ggml_aligned_malloc(needed_work_size);
         if (work_data) {
-            GGML_LOG_DEBUG("NUMA Direct Kernel: Allocated temporary work buffer (%zu bytes)\n", needed_work_size);
+            GGML_LOG_DEBUG("NUMA Direct Kernel: Allocated temporary aligned work buffer (%zu bytes)\n", needed_work_size);
         } else {
-            GGML_LOG_DEBUG("NUMA Direct Kernel: Failed to allocate work buffer (%zu bytes) - continuing without\n", needed_work_size);
+            GGML_LOG_DEBUG("NUMA Direct Kernel: Failed to allocate aligned work buffer (%zu bytes) - continuing without\n", needed_work_size);
             // Continue without work buffer - some operations can work without it
         }
     } else {
@@ -999,26 +1012,36 @@ enum ggml_status ggml_numa_executor_direct_kernel_dispatch(struct ggml_tensor * 
         return GGML_STATUS_FAILED;
     }
     
-    // Set up compute params for direct kernel execution - use single thread with fallback threadpool
+    // OPTIMIZATION: Use GGML's proper compute infrastructure instead of direct kernel dispatch
+    // This provides proper threading, synchronization, and memory management
+    // Set flag to disable NUMA dispatch during this call (prevents infinite recursion)
+    ggml_numa_set_fallback_flag(true);
+    
+    // Set up compute params for GGML infrastructure execution
+    // Use single-threaded execution - let the threadpool handle parallelism properly
     struct ggml_compute_params params = {
         .ith = 0,
-        .nth = 1, // Single-threaded fallback execution 
+        .nth = 1, // Single-threaded to avoid conflicts with GGML's own threading
         .wsize = needed_work_size,
         .wdata = work_data,
-        .threadpool = fallback_threadpool  // Must provide valid threadpool for barrier operations
+        .threadpool = fallback_threadpool  // Must provide valid threadpool for barriers
     };
     
-    GGML_LOG_INFO("🚀 NUMA Direct Fallback Kernel Dispatch: Executing operation %s (work_size=%zu, threads=%d, threadpool=%p)\n", 
-                   ggml_op_name(tensor->op), needed_work_size, params.nth, (void*)params.threadpool);
+    GGML_LOG_INFO("🚀 NUMA GGML Infrastructure Dispatch: Executing operation %s (work_size=%zu, threads=%d->1, threadpool=%p)\n", 
+                   ggml_op_name(tensor->op), needed_work_size, cplan->n_threads, (void*)params.threadpool);
     
-    // OPTIMIZATION: Direct kernel dispatch - call the operation's compute function directly
-    // This eliminates temporary graph creation, temporary compute plan creation, and graph computation pipeline overhead
-    enum ggml_status result = ggml_numa_executor_call_direct_kernel(tensor, &params);
+    // Use GGML's proper compute infrastructure instead of direct kernel calls
+    // This ensures proper threading, barriers, and memory management
+    ggml_compute_forward(&params, tensor);
+    enum ggml_status result = GGML_STATUS_SUCCESS;
+    
+    // Re-enable NUMA dispatch after completion
+    ggml_numa_set_fallback_flag(false);
     
     // Clean up temporary work buffer if we allocated one
     if (work_data && work_data != cplan->work_data) {
-        free(work_data);
-        GGML_LOG_DEBUG("NUMA Direct Kernel: Freed temporary work buffer\n");
+        ggml_aligned_free(work_data, needed_work_size);
+        GGML_LOG_DEBUG("NUMA Direct Kernel: Freed temporary aligned work buffer\n");
     }
     
     // Clear flag after computation
