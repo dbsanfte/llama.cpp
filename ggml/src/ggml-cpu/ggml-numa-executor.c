@@ -39,295 +39,81 @@
 #include <sched.h>
 #endif
 
-// Forward declarations
-static size_t ggml_numa_calculate_work_size(struct ggml_tensor * tensor, int n_threads);
+// ============================================================================
+// NUMA Topology Cache 
+// ============================================================================
 
 /**
- * @brief Direct kernel dispatch implementation
- * 
- * High-performance execution path that calls compute functions directly
- * without the overhead of temporary graph creation. This function provides
- * zero-copy direct kernel invocation with minimal function call overhead.
- * 
- * @param tensor The operation tensor to execute
- * @param params The compute parameters with threading and buffer information
- * @return GGML_STATUS_SUCCESS on success, GGML_STATUS_FAILED on error
+ * @brief Cached NUMA topology information to avoid syscalls in hot path
  */
-enum ggml_status ggml_numa_executor_call_direct_kernel(struct ggml_tensor * tensor, struct ggml_compute_params * params) {
-    if (!tensor || !params) {
-        return GGML_STATUS_FAILED;
+typedef struct {
+    bool initialized;           // Whether cache has been populated
+    int current_cpu;           // Cached result of sched_getcpu()
+    int current_node;          // Cached result of numa_node_of_cpu(current_cpu)
+    int numa_nodes;            // Cached result of numa_max_node() + 1
+    bool numa_available;       // Whether NUMA is available on this system
+} ggml_numa_topology_cache_t;
+
+// Global cache instance
+static ggml_numa_topology_cache_t g_numa_topology_cache = {0};
+
+/**
+ * @brief Initialize NUMA topology cache (called once at startup)
+ */
+static void ggml_numa_topology_cache_init(void) {
+    if (g_numa_topology_cache.initialized) {
+        return;  // Already initialized
     }
     
-    NUMA_LOG_DEBUG("Direct Kernel: Dispatching operation %s directly\n", ggml_op_name(tensor->op));
-    
-    // Direct kernel dispatch based on operation type - no temporary graph overhead
-    switch (tensor->op) {
-        case GGML_OP_DUP:
-            ggml_compute_forward_dup(params, tensor);
-            break;
-        case GGML_OP_ADD:
-            ggml_compute_forward_add(params, tensor);
-            break;
-        case GGML_OP_ADD1:
-            ggml_compute_forward_add1(params, tensor);
-            break;
-        case GGML_OP_ACC:
-            ggml_compute_forward_acc(params, tensor);
-            break;
-        case GGML_OP_SUB:
-            ggml_compute_forward_sub(params, tensor);
-            break;
-        case GGML_OP_MUL:
-            ggml_compute_forward_mul(params, tensor);
-            break;
-        case GGML_OP_DIV:
-            ggml_compute_forward_div(params, tensor);
-            break;
-        case GGML_OP_SQR:
-            ggml_compute_forward_sqr(params, tensor);
-            break;
-        case GGML_OP_SQRT:
-            ggml_compute_forward_sqrt(params, tensor);
-            break;
-        case GGML_OP_LOG:
-            ggml_compute_forward_log(params, tensor);
-            break;
-        case GGML_OP_SIN:
-            ggml_compute_forward_sin(params, tensor);
-            break;
-        case GGML_OP_COS:
-            ggml_compute_forward_cos(params, tensor);
-            break;
-        case GGML_OP_SUM:
-            ggml_compute_forward_sum(params, tensor);
-            break;
-        case GGML_OP_SUM_ROWS:
-            ggml_compute_forward_sum_rows(params, tensor);
-            break;
-        case GGML_OP_MEAN:
-            ggml_compute_forward_mean(params, tensor);
-            break;
-        case GGML_OP_ARGMAX:
-            ggml_compute_forward_argmax(params, tensor);
-            break;
-        case GGML_OP_COUNT_EQUAL:
-            ggml_compute_forward_count_equal(params, tensor);
-            break;
-        case GGML_OP_REPEAT:
-            ggml_compute_forward_repeat(params, tensor);
-            break;
-        case GGML_OP_REPEAT_BACK:
-            ggml_compute_forward_repeat_back(params, tensor);
-            break;
-        case GGML_OP_CONCAT:
-            ggml_compute_forward_concat(params, tensor);
-            break;
-        case GGML_OP_SILU_BACK:
-            ggml_compute_forward_silu_back(params, tensor);
-            break;
-        case GGML_OP_NORM:
-            ggml_compute_forward_norm(params, tensor);
-            break;
-        case GGML_OP_RMS_NORM:
-            ggml_compute_forward_rms_norm(params, tensor);
-            break;
-        case GGML_OP_RMS_NORM_BACK:
-            ggml_compute_forward_rms_norm_back(params, tensor);
-            break;
-        case GGML_OP_GROUP_NORM:
-            ggml_compute_forward_group_norm(params, tensor);
-            break;
-        case GGML_OP_L2_NORM:
-            ggml_compute_forward_l2_norm(params, tensor);
-            break;
-        case GGML_OP_OUT_PROD:
-            ggml_compute_forward_out_prod(params, tensor);
-            break;
-        case GGML_OP_SCALE:
-            ggml_compute_forward_scale(params, tensor);
-            break;
-        case GGML_OP_SET:
-            ggml_compute_forward_set(params, tensor);
-            break;
-        case GGML_OP_CPY:
-            ggml_compute_forward_cpy(params, tensor);
-            break;
-        case GGML_OP_CONT:
-            ggml_compute_forward_cont(params, tensor);
-            break;
-        case GGML_OP_RESHAPE:
-            ggml_compute_forward_reshape(params, tensor);
-            break;
-        case GGML_OP_VIEW:
-            ggml_compute_forward_view(params, tensor);
-            break;
-        case GGML_OP_PERMUTE:
-            ggml_compute_forward_permute(params, tensor);
-            break;
-        case GGML_OP_TRANSPOSE:
-            ggml_compute_forward_transpose(params, tensor);
-            break;
-        case GGML_OP_GET_ROWS:
-            ggml_compute_forward_get_rows(params, tensor);
-            break;
-        case GGML_OP_GET_ROWS_BACK:
-            ggml_compute_forward_get_rows_back(params, tensor);
-            break;
-        case GGML_OP_SET_ROWS:
-            ggml_compute_forward_set_rows(params, tensor);
-            break;
-        case GGML_OP_DIAG:
-            ggml_compute_forward_diag(params, tensor);
-            break;
-        case GGML_OP_DIAG_MASK_INF:
-            ggml_compute_forward_diag_mask_inf(params, tensor);
-            break;
-        case GGML_OP_DIAG_MASK_ZERO:
-            ggml_compute_forward_diag_mask_zero(params, tensor);
-            break;
-        case GGML_OP_SOFT_MAX:
-            ggml_compute_forward_soft_max(params, tensor);
-            break;
-        case GGML_OP_SOFT_MAX_BACK:
-            ggml_compute_forward_soft_max_ext_back(params, tensor);
-            break;
-        case GGML_OP_ROPE:
-            ggml_compute_forward_rope(params, tensor);
-            break;
-        case GGML_OP_ROPE_BACK:
-            ggml_compute_forward_rope_back(params, tensor);
-            break;
-        case GGML_OP_CLAMP:
-            ggml_compute_forward_clamp(params, tensor);
-            break;
-        case GGML_OP_CONV_TRANSPOSE_1D:
-            ggml_compute_forward_conv_transpose_1d(params, tensor);
-            break;
-        case GGML_OP_IM2COL:
-            ggml_compute_forward_im2col(params, tensor);
-            break;
-        case GGML_OP_IM2COL_BACK:
-            ggml_compute_forward_im2col_back_f32(params, tensor);
-            break;
-        case GGML_OP_CONV_2D:
-            ggml_compute_forward_conv_2d(params, tensor);
-            break;
-        case GGML_OP_CONV_2D_DW:
-            ggml_compute_forward_conv_2d_dw(params, tensor);
-            break;
-        case GGML_OP_CONV_TRANSPOSE_2D:
-            ggml_compute_forward_conv_transpose_2d(params, tensor);
-            break;
-        case GGML_OP_POOL_1D:
-            ggml_compute_forward_pool_1d(params, tensor);
-            break;
-        case GGML_OP_POOL_2D:
-            ggml_compute_forward_pool_2d(params, tensor);
-            break;
-        case GGML_OP_POOL_2D_BACK:
-            ggml_compute_forward_pool_2d_back(params, tensor);
-            break;
-        case GGML_OP_UPSCALE:
-            ggml_compute_forward_upscale(params, tensor);
-            break;
-        case GGML_OP_PAD:
-            ggml_compute_forward_pad(params, tensor);
-            break;
-        case GGML_OP_PAD_REFLECT_1D:
-            ggml_compute_forward_pad_reflect_1d(params, tensor);
-            break;
-        case GGML_OP_ROLL:
-            ggml_compute_forward_roll(params, tensor);
-            break;
-        case GGML_OP_ARANGE:
-            ggml_compute_forward_arange(params, tensor);
-            break;
-        case GGML_OP_TIMESTEP_EMBEDDING:
-            ggml_compute_forward_timestep_embedding(params, tensor);
-            break;
-        case GGML_OP_ARGSORT:
-            ggml_compute_forward_argsort(params, tensor);
-            break;
-        case GGML_OP_LEAKY_RELU:
-            ggml_compute_forward_leaky_relu(params, tensor);
-            break;
-        case GGML_OP_FLASH_ATTN_EXT:
-            ggml_compute_forward_flash_attn_ext(params, tensor);
-            break;
-        case GGML_OP_FLASH_ATTN_BACK:
-            ggml_compute_forward_flash_attn_back(params, false, tensor);
-            break;
-        case GGML_OP_SSM_CONV:
-            ggml_compute_forward_ssm_conv(params, tensor);
-            break;
-        case GGML_OP_SSM_SCAN:
-            ggml_compute_forward_ssm_scan(params, tensor);
-            break;
-        case GGML_OP_WIN_PART:
-            ggml_compute_forward_win_part(params, tensor);
-            break;
-        case GGML_OP_WIN_UNPART:
-            ggml_compute_forward_win_unpart(params, tensor);
-            break;
-        case GGML_OP_UNARY:
-            ggml_compute_forward_unary(params, tensor);
-            break;
-        case GGML_OP_GLU:
-            ggml_compute_forward_glu(params, tensor);
-            break;
-        case GGML_OP_GET_REL_POS:
-            ggml_compute_forward_get_rel_pos(params, tensor);
-            break;
-        case GGML_OP_ADD_REL_POS:
-            ggml_compute_forward_add_rel_pos(params, tensor);
-            break;
-        case GGML_OP_RWKV_WKV6:
-            ggml_compute_forward_rwkv_wkv6(params, tensor);
-            break;
-        case GGML_OP_RWKV_WKV7:
-            ggml_compute_forward_rwkv_wkv7(params, tensor);
-            break;
-        case GGML_OP_MAP_CUSTOM1:
-            ggml_compute_forward_map_custom1(params, tensor);
-            break;
-        case GGML_OP_MAP_CUSTOM2:
-            ggml_compute_forward_map_custom2(params, tensor);
-            break;
-        case GGML_OP_MAP_CUSTOM3:
-            ggml_compute_forward_map_custom3(params, tensor);
-            break;
-        case GGML_OP_CROSS_ENTROPY_LOSS:
-            ggml_compute_forward_cross_entropy_loss(params, tensor);
-            break;
-        case GGML_OP_CROSS_ENTROPY_LOSS_BACK:
-            ggml_compute_forward_cross_entropy_loss_back(params, tensor);
-            break;
-        case GGML_OP_OPT_STEP_ADAMW:
-            ggml_compute_forward_opt_step_adamw(params, tensor);
-            break;
-        case GGML_OP_MUL_MAT:
-            ggml_compute_forward_mul_mat(params, tensor);
-            break;
-        case GGML_OP_MUL_MAT_ID:
-            // For MUL_MAT_ID, fall back to legacy approach since it's complex
-            GGML_LOG_DEBUG("Direct Kernel: MUL_MAT_ID not supported in direct dispatch, falling back to legacy");
-            return GGML_STATUS_FAILED;
-            break;
-        case GGML_OP_NONE:
-            // No operation
-            break;
-        default:
-            GGML_LOG_ERROR("Direct Kernel: Unsupported operation %s (%d), falling back to legacy approach", 
-                          ggml_op_name(tensor->op), tensor->op);
-            return GGML_STATUS_FAILED;
+    #ifdef __linux__
+    g_numa_topology_cache.current_cpu = sched_getcpu();
+    if (g_numa_topology_cache.current_cpu >= 0) {
+        g_numa_topology_cache.current_node = numa_node_of_cpu(g_numa_topology_cache.current_cpu);
+        g_numa_topology_cache.numa_nodes = numa_max_node() + 1;
+        g_numa_topology_cache.numa_available = true;
+        
+        NUMA_LOG_DEBUG("NUMA Topology Cache: Initialized - CPU %d, Node %d, %d nodes available",
+                       g_numa_topology_cache.current_cpu,
+                       g_numa_topology_cache.current_node,
+                       g_numa_topology_cache.numa_nodes);
+    } else {
+        // sched_getcpu() failed - NUMA not available or system issue
+        g_numa_topology_cache.current_cpu = -1;
+        g_numa_topology_cache.current_node = -1;
+        g_numa_topology_cache.numa_nodes = 1;
+        g_numa_topology_cache.numa_available = false;
+        
+        NUMA_LOG_DEBUG("NUMA Topology Cache: Failed to get CPU info - NUMA not available");
     }
+    #else
+    // Non-Linux platforms
+    g_numa_topology_cache.current_cpu = -1;
+    g_numa_topology_cache.current_node = -1;
+    g_numa_topology_cache.numa_nodes = 1;
+    g_numa_topology_cache.numa_available = false;
     
-    GGML_LOG_DEBUG("Direct Kernel: Operation %s completed successfully", ggml_op_name(tensor->op));
-    return GGML_STATUS_SUCCESS;
+    NUMA_LOG_DEBUG("NUMA Topology Cache: Non-Linux platform - NUMA info not available");
+    #endif
+    
+    g_numa_topology_cache.initialized = true;
 }
 
-// Kernel headers - using the new query interface
-#include "numa-kernels/numa-kernels.h"  // New centralized query interface
+/**
+ * @brief Get cached NUMA topology information (hot path friendly)
+ */
+static inline void ggml_numa_topology_cache_get(int* current_cpu, int* current_node, int* numa_nodes, bool* numa_available) {
+    if (!g_numa_topology_cache.initialized) {
+        ggml_numa_topology_cache_init();
+    }
+    
+    if (current_cpu) *current_cpu = g_numa_topology_cache.current_cpu;
+    if (current_node) *current_node = g_numa_topology_cache.current_node;
+    if (numa_nodes) *numa_nodes = g_numa_topology_cache.numa_nodes;
+    if (numa_available) *numa_available = g_numa_topology_cache.numa_available;
+}
+
+// Forward declarations
+static size_t ggml_numa_calculate_work_size(struct ggml_tensor * tensor, int n_threads);
 
 // External test tracking function (has weak default implementation in ggml-cpu.c)
 extern void test_track_data_parallel(void);
@@ -451,16 +237,17 @@ enum ggml_status ggml_numa_executor_execute_tensor(struct ggml_tensor * tensor, 
                        ggml_nelements(tensor->src[1]));
     }
     
-    // Check NUMA environment
-    #ifdef __linux__
-    int current_cpu = sched_getcpu();
-    int current_node = numa_node_of_cpu(current_cpu);
-    int numa_nodes = numa_max_node() + 1;
-    NUMA_LOG_DEBUG("DEBUG: NUMA Executor: Running on CPU %d (NUMA node %d), %d nodes available\n", 
-           current_cpu, current_node, numa_nodes);
-    #else
-    NUMA_LOG_DEBUG("DEBUG: NUMA Executor: NUMA info not available (not Linux)\n");
-    #endif
+    // Check NUMA environment using cached topology (avoids syscalls in hot path)
+    int current_cpu, current_node, numa_nodes;
+    bool numa_available;
+    ggml_numa_topology_cache_get(&current_cpu, &current_node, &numa_nodes, &numa_available);
+    
+    if (numa_available) {
+        NUMA_LOG_DEBUG("DEBUG: NUMA Executor: Running on CPU %d (NUMA node %d), %d nodes available\n", 
+               current_cpu, current_node, numa_nodes);
+    } else {
+        NUMA_LOG_DEBUG("DEBUG: NUMA Executor: NUMA info not available\n");
+    }
     
     // Initialize kernel registry if not already done (critical for first operation)
     if (ggml_numa_kernels_init() != GGML_STATUS_SUCCESS) {

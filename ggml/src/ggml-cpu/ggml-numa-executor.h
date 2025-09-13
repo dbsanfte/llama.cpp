@@ -142,19 +142,6 @@ enum ggml_status ggml_numa_executor_execute_tensor_forced_strategy(
  */
 enum ggml_status ggml_numa_executor_direct_kernel_dispatch(struct ggml_tensor * tensor, struct ggml_cplan * cplan);
 
-/**
- * @brief Call the direct kernel compute function for a given tensor operation
- * 
- * Internal helper function for direct kernel dispatch that handles the
- * low-level invocation of compute kernels with proper parameter setup
- * and error handling.
- * 
- * @param tensor The operation tensor
- * @param params The compute parameters
- * @return GGML_STATUS_SUCCESS on success, error code on failure
- */
-enum ggml_status ggml_numa_executor_call_direct_kernel(struct ggml_tensor * tensor, struct ggml_compute_params * params);
-
 #ifdef __cplusplus
 }
 #endif

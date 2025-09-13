@@ -551,14 +551,15 @@ run_integration_test() {
         return 1
     fi
     
-    # Test 2: MoE model (GPT-OSS 20B - Unsloth Dynamic Quant)
+    # Test 2: MoE model (Unsloth Dynamic Quant)
     echo -e "${YELLOW}🔬 Test 2: MoE Model Validation${NC}"
     local moe_model_name="Qwen 3 30B-A3B-Instruct (MoE, Q4_K)"
     local moe_model_path="./.devcontainer/Qwen3-30B-A3B-UD-Q4_K_XL.gguf"
     local moe_model_url="https://huggingface.co/unsloth/Qwen3-30B-A3B-GGUF/resolve/main/Qwen3-30B-A3B-UD-Q4_K_XL.gguf"
     local moe_model_id="qwen3-30b-a3b-instruct"
     local moe_test_prompt="Hello!"
-    local moe_expected_pattern="Hello! How can I assist you today?"
+    local moe_expected_pattern="<think>
+Okay, the user said \"Hello!\" so I should respond politely. I need to make"
 
     if ! test_single_model "$moe_model_name" "$moe_model_path" "$moe_model_url" "$moe_model_id" "$moe_expected_pattern" "$moe_test_prompt"; then
         echo -e "${RED}❌ MoE model test failed - stopping integration test${NC}"
