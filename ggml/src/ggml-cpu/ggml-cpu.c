@@ -14,6 +14,7 @@
 #include "vec.h"
 #include "ops.h"
 #include "ggml.h"
+#include "ggml-quants.h" // for dequantize_row_q*_K
 
 #if defined(_MSC_VER) || defined(__MINGW32__)
 #include <malloc.h> // using malloc.h with MSC/MINGW
@@ -549,6 +550,293 @@ struct ggml_state {
 
 static struct ggml_state g_state = {0};
 
+// ------------------------------------------------------------------------------------
+// mul_mat profiling (experimental)
+// Environment variables (read once):
+//   GGML_MUL_MAT_PROFILE=1 enables profiling
+//   GGML_MUL_MAT_PROFILE_VERBOSE=1 prints per-call summary when enabled
+// Metrics collected:
+//   - conversion_time_us (wall time spent converting src1 -> wdata) [thread 0]
+//   - compute_time_us (wall time spent inside compute phase) [thread 0]
+//   - tile_count (number of tiles processed; legacy path counts chunk invocations)
+// Overhead when disabled: a couple of likely-optimized-out branch checks.
+
+struct ggml_mul_mat_profile_state {
+    atomic_int enabled_once; // 0 uninitialized, 1 disabled, 2 enabled
+    atomic_int verbose_once; // same pattern for verbose
+    atomic_long conversion_time_us; // accum per call (thread 0)
+    atomic_long compute_time_us;    // accum per call (thread 0)
+    atomic_long tile_count;         // incremented by all threads
+    atomic_long flops_f64;          // approximate accumulated flops
+    atomic_long k_iters;            // number of K-block iterations (F32 path)
+    atomic_long panel_bytes;        // total panel bytes copied
+    atomic_long panel_time_us;      // time spent packing panels (thread 0)
+    atomic_long inner_time_us;      // time spent in inner FMAs (thread 0)
+    atomic_long kblock_size_last;   // last observed kblock size
+    atomic_long kblock_inactive;    // reason code: 0 active/unused, 1 quant_fallback (quant disabled), 2 misaligned kblock, 3 unsupported src0 type, 4 weights not *_K quant
+    atomic_long fused_used;         // number of fused (SIMD or fused dequant) inner kernel invocations
+};
+
+static struct ggml_mul_mat_profile_state g_mmprof = {
+    .enabled_once = 0,
+    .verbose_once = 0,
+    .conversion_time_us = 0,
+    .compute_time_us = 0,
+    .tile_count = 0,
+    .flops_f64 = 0,
+    .k_iters = 0,
+    .panel_bytes = 0,
+    .panel_time_us = 0,
+    .inner_time_us = 0,
+    .kblock_size_last = 0,
+    .kblock_inactive = 0,
+    .fused_used = 0,
+};
+
+// ------------------------------------------------------------------------------------
+// mul_mat tiled fallback cache (experimental)
+// If a shape (M,N,K) shows tiled performance significantly worse than legacy (kblock disabled),
+// future calls for that shape will automatically use the legacy path unless user forces tiled.
+// Controlled by env:
+//   GGML_MUL_MAT_FALLBACK_DISABLE=1   -> disable this feature
+//   GGML_MUL_MAT_FALLBACK_RATIO=0.90  -> minimum tiled/legacy GFLOP/s ratio (default 0.92)
+//   GGML_MUL_MAT_TILED=1              -> still required to consider tiled path initially
+//   GGML_MUL_MAT_FORCE_TILED=1        -> ignore fallback decision
+// Cache size kept intentionally small to reduce memory footprint.
+
+struct ggml_mul_mat_fallback_entry {
+    int64_t m, n, k;
+    float   legacy_gflops;  // best observed legacy GFLOP/s
+    uint8_t decision;       // 0 unknown, 1 prefer tiled (good), 2 disable tiled
+};
+
+static struct ggml_mul_mat_fallback_entry g_mul_mat_fb_cache[32];
+static atomic_flag g_mul_mat_fb_lock = ATOMIC_FLAG_INIT;
+static int g_mul_mat_fb_inited = 0;
+static float g_mul_mat_fb_ratio = 0.92f;
+static bool g_mul_mat_fb_disabled = false;
+static bool g_mul_mat_fb_force_tiled = false;
+
+static inline void ggml_mul_mat_fallback_init_once(void) {
+    if (g_mul_mat_fb_inited) return;
+    const char * evd = getenv("GGML_MUL_MAT_FALLBACK_DISABLE");
+    if (evd && (*evd=='1' || *evd=='y' || *evd=='Y' || *evd=='t' || *evd=='T')) g_mul_mat_fb_disabled = true;
+    const char * evr = getenv("GGML_MUL_MAT_FALLBACK_RATIO");
+    if (evr) {
+        float v = strtof(evr, NULL);
+        if (v > 0.1f && v < 0.999f) g_mul_mat_fb_ratio = v;
+    }
+    const char * evf = getenv("GGML_MUL_MAT_FORCE_TILED");
+    if (evf && (*evf=='1' || *evf=='y' || *evf=='Y' || *evf=='t' || *evf=='T')) g_mul_mat_fb_force_tiled = true;
+    g_mul_mat_fb_inited = 1;
+}
+
+static inline struct ggml_mul_mat_fallback_entry * ggml_mul_mat_fb_lookup(int64_t m, int64_t n, int64_t k) {
+    for (size_t i = 0; i < sizeof(g_mul_mat_fb_cache)/sizeof(g_mul_mat_fb_cache[0]); ++i) {
+        if (g_mul_mat_fb_cache[i].m == m && g_mul_mat_fb_cache[i].n == n && g_mul_mat_fb_cache[i].k == k) {
+            return &g_mul_mat_fb_cache[i];
+        }
+    }
+    return NULL;
+}
+
+static inline struct ggml_mul_mat_fallback_entry * ggml_mul_mat_fb_get_or_insert(int64_t m, int64_t n, int64_t k) {
+    struct ggml_mul_mat_fallback_entry * e = ggml_mul_mat_fb_lookup(m,n,k);
+    if (e) return e;
+    // find empty or replace least legacy_gflops (simple heuristic)
+    size_t repl = 0;
+    float best = 1e30f;
+    for (size_t i = 0; i < sizeof(g_mul_mat_fb_cache)/sizeof(g_mul_mat_fb_cache[0]); ++i) {
+        if (g_mul_mat_fb_cache[i].m == 0 && g_mul_mat_fb_cache[i].n == 0 && g_mul_mat_fb_cache[i].k == 0) { repl = i; break; }
+        if (g_mul_mat_fb_cache[i].legacy_gflops < best) { best = g_mul_mat_fb_cache[i].legacy_gflops; repl = i; }
+    }
+    g_mul_mat_fb_cache[repl].m = m; g_mul_mat_fb_cache[repl].n = n; g_mul_mat_fb_cache[repl].k = k;
+    g_mul_mat_fb_cache[repl].legacy_gflops = 0.0f; g_mul_mat_fb_cache[repl].decision = 0;
+    return &g_mul_mat_fb_cache[repl];
+}
+
+static inline void ggml_mul_mat_fb_record_legacy(int64_t m, int64_t n, int64_t k, float gflops) {
+    if (g_mul_mat_fb_disabled || gflops <= 0.f) return;
+    ggml_mul_mat_fallback_init_once();
+    while (atomic_flag_test_and_set_explicit(&g_mul_mat_fb_lock, memory_order_acquire)) {}
+    struct ggml_mul_mat_fallback_entry * e = ggml_mul_mat_fb_get_or_insert(m,n,k);
+    if (gflops > e->legacy_gflops) e->legacy_gflops = gflops;
+    atomic_flag_clear_explicit(&g_mul_mat_fb_lock, memory_order_release);
+}
+
+static inline bool ggml_mul_mat_fb_should_disable(int64_t m, int64_t n, int64_t k) {
+    if (g_mul_mat_fb_disabled) return false; // feature off
+    ggml_mul_mat_fallback_init_once();
+    if (g_mul_mat_fb_force_tiled) return false; // user forced tiled
+    struct ggml_mul_mat_fallback_entry * e = ggml_mul_mat_fb_lookup(m,n,k);
+    if (!e) return false; // no data yet
+    return e->decision == 2;
+}
+
+static inline void ggml_mul_mat_fb_consider_tiled(int64_t m, int64_t n, int64_t k, float tiled_gflops) {
+    if (g_mul_mat_fb_disabled || g_mul_mat_fb_force_tiled) return;
+    if (tiled_gflops <= 0.f) return;
+    struct ggml_mul_mat_fallback_entry * e = ggml_mul_mat_fb_lookup(m,n,k);
+    if (!e || e->legacy_gflops <= 0.f) return; // need baseline legacy first
+    float ratio = tiled_gflops / e->legacy_gflops;
+    if (ratio < g_mul_mat_fb_ratio) {
+        e->decision = 2; // disable tiled
+        GGML_LOG_INFO("mul_mat: fallback disabling tiled for shape %lldx%lldx%lld (tiled %.2f < %.2f * legacy %.2f)\n",
+                      (long long)m, (long long)n, (long long)k, tiled_gflops, g_mul_mat_fb_ratio, e->legacy_gflops);
+    } else if (ratio >= 1.0f) {
+        e->decision = 1; // mark good
+    }
+}
+
+static inline bool ggml_profiling_mul_mat_enabled(void) {
+    int st = atomic_load_explicit(&g_mmprof.enabled_once, memory_order_relaxed);
+    if (st == 0) {
+        const char * ev = getenv("GGML_MUL_MAT_PROFILE");
+        bool enable = ev && (*ev=='1' || *ev=='y' || *ev=='Y' || *ev=='t' || *ev=='T');
+        atomic_store_explicit(&g_mmprof.enabled_once, enable ? 2 : 1, memory_order_relaxed);
+        return enable;
+    }
+    return st == 2;
+}
+
+static inline bool ggml_profiling_mul_mat_verbose(void) {
+    if (!ggml_profiling_mul_mat_enabled()) return false;
+    int st = atomic_load_explicit(&g_mmprof.verbose_once, memory_order_relaxed);
+    if (st == 0) {
+        const char * ev = getenv("GGML_MUL_MAT_PROFILE_VERBOSE");
+        bool enable = ev && (*ev=='1' || *ev=='y' || *ev=='Y' || *ev=='t' || *ev=='T');
+        atomic_store_explicit(&g_mmprof.verbose_once, enable ? 2 : 1, memory_order_relaxed);
+        return enable;
+    }
+    return st == 2;
+}
+
+static inline void ggml_profile_mul_mat_fused_used(void) {
+    if (!ggml_profiling_mul_mat_enabled()) return;
+    atomic_fetch_add_explicit(&g_mmprof.fused_used, 1, memory_order_relaxed);
+}
+
+static inline void ggml_profile_mul_mat_tile(void) {
+    atomic_fetch_add_explicit(&g_mmprof.tile_count, 1, memory_order_relaxed);
+}
+
+static inline void ggml_profile_mul_mat_conversion_time_acc(uint64_t t_start, uint64_t t_end) {
+    if (t_start && t_end && t_end >= t_start) {
+        atomic_fetch_add_explicit(&g_mmprof.conversion_time_us, (long)(t_end - t_start), memory_order_relaxed);
+    }
+}
+
+static inline void ggml_profile_mul_mat_compute_time_acc(uint64_t t_start, uint64_t t_end) {
+    if (t_start && t_end && t_end >= t_start) {
+        atomic_fetch_add_explicit(&g_mmprof.compute_time_us, (long)(t_end - t_start), memory_order_relaxed);
+    }
+}
+
+static inline void ggml_profile_mul_mat_flops_acc(int64_t m, int64_t n, int64_t k) {
+    if (!ggml_profiling_mul_mat_enabled()) return;
+    // Approximate GEMM flops: 2 * M * N * K
+    long double fl = 2.0L * (long double)m * (long double)n * (long double)k;
+    if (fl > (long double)LONG_MAX) fl = (long double)LONG_MAX; // clamp
+    atomic_fetch_add_explicit(&g_mmprof.flops_f64, (long)fl, memory_order_relaxed);
+}
+
+static inline void ggml_profile_mul_mat_kiter(int64_t kblock_size) {
+    if (!ggml_profiling_mul_mat_enabled()) return;
+    atomic_fetch_add_explicit(&g_mmprof.k_iters, 1, memory_order_relaxed);
+    atomic_store_explicit(&g_mmprof.kblock_size_last, kblock_size, memory_order_relaxed);
+}
+
+static inline void ggml_profile_mul_mat_panel_bytes(size_t bytes) {
+    if (!ggml_profiling_mul_mat_enabled()) return;
+    atomic_fetch_add_explicit(&g_mmprof.panel_bytes, (long)bytes, memory_order_relaxed);
+}
+
+static inline void ggml_profile_mul_mat_panel_time(uint64_t t0, uint64_t t1) {
+    if (!ggml_profiling_mul_mat_enabled()) return;
+    if (t1 > t0) atomic_fetch_add_explicit(&g_mmprof.panel_time_us, (long)(t1 - t0), memory_order_relaxed);
+}
+
+static inline void ggml_profile_mul_mat_inner_time(uint64_t t0, uint64_t t1) {
+    if (!ggml_profiling_mul_mat_enabled()) return;
+    if (t1 > t0) atomic_fetch_add_explicit(&g_mmprof.inner_time_us, (long)(t1 - t0), memory_order_relaxed);
+}
+
+static inline void ggml_profile_mul_mat_kblock_inactive(int reason_code, int64_t kblock_size) {
+    if (!ggml_profiling_mul_mat_enabled()) return;
+    atomic_store_explicit(&g_mmprof.kblock_inactive, reason_code, memory_order_relaxed);
+    atomic_store_explicit(&g_mmprof.kblock_size_last, kblock_size, memory_order_relaxed);
+}
+
+// SIMD helper (file scope)
+#if defined(__AVX2__)
+#include <immintrin.h>
+static inline float ggml_dot_f32_f32_simd(const float * GGML_RESTRICT a, const float * GGML_RESTRICT b, int64_t n) {
+    __m256 acc = _mm256_setzero_ps();
+    int64_t i = 0;
+    for (; i + 8 <= n; i += 8) {
+        __m256 va = _mm256_loadu_ps(a + i);
+        __m256 vb = _mm256_loadu_ps(b + i);
+        acc = _mm256_fmadd_ps(va, vb, acc);
+    }
+    float tmp[8];
+    _mm256_storeu_ps(tmp, acc);
+    float sum = tmp[0]+tmp[1]+tmp[2]+tmp[3]+tmp[4]+tmp[5]+tmp[6]+tmp[7];
+    for (; i < n; ++i) sum += a[i] * b[i];
+    return sum;
+}
+#else
+static inline float ggml_dot_f32_f32_simd(const float * GGML_RESTRICT a, const float * GGML_RESTRICT b, int64_t n) {
+    float acc = 0.f; for (int64_t i=0;i<n;++i) acc += a[i]*b[i]; return acc;
+}
+#endif
+
+static void ggml_profile_mul_mat_report_once(void) {
+    if (!ggml_profiling_mul_mat_enabled() || !ggml_profiling_mul_mat_verbose()) return;
+    long conv = atomic_load_explicit(&g_mmprof.conversion_time_us, memory_order_relaxed);
+    long comp = atomic_load_explicit(&g_mmprof.compute_time_us, memory_order_relaxed);
+    long tiles = atomic_load_explicit(&g_mmprof.tile_count, memory_order_relaxed);
+    long flops = atomic_load_explicit(&g_mmprof.flops_f64, memory_order_relaxed);
+    double gflops_per_s = 0.0;
+    if (flops > 0 && comp > 0) {
+        gflops_per_s = ((double)flops / (double)comp) * 1e6 / 1e9;
+    }
+    long k_iters = atomic_exchange_explicit(&g_mmprof.k_iters, 0, memory_order_relaxed);
+    long panel_bytes = atomic_exchange_explicit(&g_mmprof.panel_bytes, 0, memory_order_relaxed);
+    long panel_time = atomic_exchange_explicit(&g_mmprof.panel_time_us, 0, memory_order_relaxed);
+    long inner_time = atomic_exchange_explicit(&g_mmprof.inner_time_us, 0, memory_order_relaxed);
+    long kblock_last = atomic_exchange_explicit(&g_mmprof.kblock_size_last, 0, memory_order_relaxed);
+    long kblock_inactive = atomic_exchange_explicit(&g_mmprof.kblock_inactive, 0, memory_order_relaxed);
+    long fused_used = atomic_exchange_explicit(&g_mmprof.fused_used, 0, memory_order_relaxed);
+    double panel_bw_gb = panel_time ? (panel_bytes / 1e9) / (panel_time / 1e6) : 0.0;
+    if (k_iters > 0 || kblock_last > 0 || kblock_inactive > 0) {
+        GGML_LOG_INFO("mul_mat profile: conversion=%ld us compute=%ld us tiles=%ld flops=%ld perf=%.2f GFLOP/s kblock=%ld k_iters=%ld panel_bytes=%ld panel_time=%ld us inner_time=%ld us panel_bw=%.2f GB/s inactive=%ld fused=%ld\n",
+                      conv, comp, tiles, flops, gflops_per_s, kblock_last, k_iters, panel_bytes, panel_time, inner_time, panel_bw_gb, kblock_inactive, fused_used);
+    } else {
+        GGML_LOG_INFO("mul_mat profile: conversion=%ld us compute=%ld us tiles=%ld flops=%ld perf=%.2f GFLOP/s fused=%ld\n", conv, comp, tiles, flops, gflops_per_s, fused_used);
+    }
+}
+
+#if defined(__gnu_linux__)
+// Helper: capture current thread affinity
+static void ggml_numa_affinity_capture(cpu_set_t * out) {
+    if (!out) return;
+    pthread_getaffinity_np(pthread_self(), sizeof(cpu_set_t), out);
+}
+
+// Helper: bind current thread to a single CPU
+static bool ggml_numa_affinity_bind_single(uint32_t cpu, cpu_set_t * saved) {
+    if (saved) ggml_numa_affinity_capture(saved);
+    cpu_set_t set; CPU_ZERO(&set); CPU_SET(cpu, &set);
+    return pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &set) == 0;
+}
+
+// Helper: restore previous affinity
+static void ggml_numa_affinity_restore(const cpu_set_t * saved) {
+    if (!saved) return;
+    pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), saved);
+}
+#endif // __gnu_linux__
+
 void ggml_barrier(struct ggml_threadpool * tp) {
     int n_threads = atomic_load_explicit(&tp->n_threads_cur, memory_order_relaxed);
     if (n_threads == 1) {
@@ -781,9 +1069,12 @@ enum ggml_numa_strategy ggml_numa_get_strategy(void) {
 
 //
 // NUMA-aware work buffer allocation:
-// Based on empirical testing, allocating work buffers on node 0 provides
-// the best speed. Interleaving actually slows things down considerably.
-// If we optimised kernels for Numa awareness, this could be revisited.
+// Previous implementation bound all pages to node 0. This adds an optional
+// interleaved first-touch strategy to distribute the buffer across all NUMA
+// nodes (potentially improving aggregate bandwidth when the buffer is accessed
+// uniformly by threads on all nodes). Enable with GGML_NUMA_INTERLEAVE_WORK=1.
+// Default remains node-0 allocation for backward compatibility & for cases
+// where remote traffic would dominate.
 //
 void* ggml_numa_alloc_work_buffer(size_t size) {
     void* ptr = malloc(size);
@@ -791,34 +1082,68 @@ void* ggml_numa_alloc_work_buffer(size_t size) {
         return NULL;
     }
 
-    if (ggml_is_numa()) {
-        // Bind to NUMA node 0 using first-touch policy
-        if (numa_available() >= 0) {
-            // Set memory policy to bind to node 0
-            unsigned long nodemask = 1UL; // Only node 0
-            if (set_mempolicy(MPOL_BIND, &nodemask, sizeof(nodemask) * 8) == 0) {
-                // Touch all pages to allocate them on node 0
-                memset(ptr, 0, size);
-                
-                // Reset memory policy to default
-                set_mempolicy(MPOL_DEFAULT, NULL, 0);
-                
-                GGML_LOG_DEBUG("NUMA: Work buffer allocated on node 0 (size: %zu bytes)\n", size);
-            } else {
-                // Fallback: just touch the pages without specific binding
-                memset(ptr, 0, size);
-                GGML_LOG_DEBUG("NUMA: Work buffer allocated with first-touch (size: %zu bytes)\n", size);
-            }
-        } else {
-            // NUMA not available, just use regular allocation
-            memset(ptr, 0, size);
-        }
-    } else {
-        // No NUMA, just touch the pages for consistency
+    if (!ggml_is_numa()) {
         memset(ptr, 0, size);
+        return ptr;
     }
 
+#if defined(__gnu_linux__)
+    static int  s_checked = 0;
+    static bool s_interleave = false;
+    if (!s_checked) {
+        const char * env = getenv("GGML_NUMA_INTERLEAVE_WORK");
+        if (env && (*env == '1' || *env == 'y' || *env == 'Y' || *env == 't' || *env == 'T')) {
+            s_interleave = true;
+        }
+        s_checked = 1;
+    }
+
+    if (!s_interleave) {
+        // Original node-0 binding path
+        if (numa_available() >= 0) {
+            unsigned long nodemask = 1UL; // Only node 0
+            if (set_mempolicy(MPOL_BIND, &nodemask, sizeof(nodemask) * 8) == 0) {
+                memset(ptr, 0, size);
+                set_mempolicy(MPOL_DEFAULT, NULL, 0);
+                GGML_LOG_DEBUG("NUMA: work buffer on node 0 (size=%zu)\n", size);
+                return ptr;
+            }
+        }
+        memset(ptr, 0, size);
+        GGML_LOG_DEBUG("NUMA: work buffer first-touch fallback (size=%zu)\n", size);
+        return ptr;
+    }
+
+    // Interleaved first-touch path
+    if (g_state.numa.n_nodes > 1) {
+        const long page_size = sysconf(_SC_PAGESIZE);
+        if (page_size > 0) {
+            size_t n_pages = (size + (size_t)page_size - 1) / (size_t)page_size;
+            char * base = (char *)ptr;
+            cpu_set_t original; ggml_numa_affinity_capture(&original);
+            for (size_t p = 0; p < n_pages; ++p) {
+                uint32_t node = p % g_state.numa.n_nodes;
+                if (g_state.numa.nodes[node].n_cpus == 0) continue;
+                uint32_t cpu = g_state.numa.nodes[node].cpus[0];
+                if (ggml_numa_affinity_bind_single(cpu, NULL)) {
+                    volatile char * dst = (volatile char *)(base + p * page_size);
+                    dst[0] = 0; // first-touch
+                }
+            }
+            ggml_numa_affinity_restore(&original);
+            GGML_LOG_DEBUG("NUMA: work buffer interleaved across %u nodes (size=%zu)\n", g_state.numa.n_nodes, size);
+            return ptr;
+        }
+    }
+    // Fallback if something above failed
+    memset(ptr, 0, size);
+    GGML_LOG_DEBUG("NUMA: interleave fallback zero-init (size=%zu)\n", size);
     return ptr;
+#else
+    // Non-Linux: keep simple zeroing behavior
+    memset(ptr, 0, size);
+    return ptr;
+#endif
 }
 
 void ggml_numa_free_work_buffer(void* ptr) {
@@ -1306,6 +1631,10 @@ static void ggml_compute_forward_mul_mat_one_chunk(
 
     for (int64_t iir1 = ir1_start; iir1 < ir1_end; iir1 += blck_1) {
         for (int64_t iir0 = ir0_start; iir0 < ir0_end; iir0 += blck_0) {
+            // profiling: count tile enters
+            if (ggml_profiling_mul_mat_enabled()) {
+                ggml_profile_mul_mat_tile();
+            }
             for (int64_t ir1 = iir1; ir1 < iir1 + blck_1 && ir1 < ir1_end; ir1 += num_rows_per_vec_dot) {
                 const int64_t i13 = (ir1 / (ne12 * ne1));
                 const int64_t i12 = (ir1 - i13 * ne12 * ne1) / ne1;
@@ -1409,7 +1738,16 @@ void ggml_compute_forward_mul_mat(
 UseGgmlGemm1:;
 #endif
 
-    if (src1->type != vec_dot_type) {
+    uint64_t t_convert_start = 0;
+    uint64_t t_convert_end   = 0;
+    // Detect if src1 are quantized *_K weights; if so we skip F32 conversion.
+    bool src1_is_k_quant_early = (
+        src1->type == GGML_TYPE_Q2_K || src1->type == GGML_TYPE_Q3_K || src1->type == GGML_TYPE_Q4_K ||
+        src1->type == GGML_TYPE_Q5_K || src1->type == GGML_TYPE_Q6_K || src1->type == GGML_TYPE_Q8_K);
+
+    // Only perform upfront conversion when src1 is not quant weights and differs from vec_dot_type.
+    if (src1->type != vec_dot_type && !src1_is_k_quant_early) {
+        if (ggml_profiling_mul_mat_enabled()) t_convert_start = ggml_time_us();
         char * wdata = params->wdata;
 
         const size_t nbw0 = ggml_type_size(vec_dot_type);
@@ -1418,7 +1756,7 @@ UseGgmlGemm1:;
         const size_t nbw3 = nbw2*ne12;
 
         assert(params->wsize >= ne13*nbw3);
-        GGML_ASSERT(src1->type == GGML_TYPE_F32);
+    GGML_ASSERT(src1->type == GGML_TYPE_F32); // still required when performing upfront conversion
 
     #if 0
         for (int64_t i13 = 0; i13 < ne13; ++i13) {
@@ -1444,6 +1782,7 @@ UseGgmlGemm1:;
             }
         }
     #endif
+        if (ggml_profiling_mul_mat_enabled()) t_convert_end = ggml_time_us();
     }
 
     if (ith == 0) {
@@ -1452,6 +1791,11 @@ UseGgmlGemm1:;
     }
 
     ggml_barrier(params->threadpool);
+    uint64_t t_compute_start = 0;
+    if (ggml_profiling_mul_mat_enabled() && ith == 0) {
+        t_compute_start = ggml_time_us();
+        ggml_profile_mul_mat_conversion_time_acc(t_convert_start, t_convert_end);
+    }
 
 #if GGML_USE_LLAMAFILE
     if (src1->type != vec_dot_type) {
@@ -1477,68 +1821,484 @@ UseGgmlGemm1:;
 UseGgmlGemm2:;
 #endif
 
-    // This is the size of the first dimension of the result, so we can iterate that way. (see the ASSERT above, these are the same numbers)
-    const int64_t nr0 = ne0;
-
-    // This is the size of the rest of the dimensions of the result
-    const int64_t nr1 = ne1 * ne2 * ne3;
-
-    // Now select a reasonable chunk size.
-    int chunk_size = 16;
-
-    // We need to step up the size if it's small
-    if (nr0 == 1 || nr1 == 1) {
-        chunk_size = 64;
+    // Optional experimental tiled static scheduling controlled by:
+    //   GGML_MUL_MAT_TILED=1           (enable)
+    //   GGML_MUL_MAT_TILE=Mt x Nt      (e.g. 64x128) override tile sizes
+    bool use_tiled = false;
+    {
+        const char * ev = getenv("GGML_MUL_MAT_TILED");
+        if (ev && (*ev=='1' || *ev=='y' || *ev=='Y' || *ev=='t' || *ev=='T')) use_tiled = true;
     }
 
-    // distribute the work across the inner or outer loop based on which one is larger
-    // The number of chunks in the 0/1 dim.
-    // CEIL(nr0/chunk_size)
-    int64_t nchunk0 = (nr0 + chunk_size - 1) / chunk_size;
-    int64_t nchunk1 = (nr1 + chunk_size - 1) / chunk_size;
-
-    // If the chunking is poor for the number of threads on this setup, scrap the whole plan.  Re-chunk it by thread.
-    //   Also, chunking by thread was measured to have perform better on NUMA systems.  See https://github.com/ggml-org/llama.cpp/pull/6915
-    //   In theory, chunking should be just as useful on NUMA and non NUMA systems, but testing disagreed with that.
-    if (nchunk0 * nchunk1 < nth * 4 || ggml_is_numa()) {
-        // distribute the thread work across the inner or outer loop based on which one is larger
-        nchunk0 = nr0 > nr1 ? nth : 1; // parallelize by src0 rows
-        nchunk1 = nr0 > nr1 ? 1 : nth; // parallelize by src1 rows
+    if (ith == 0) {
+        const char * dbg = getenv("MFKB_DEBUG");
+        if (dbg && (*dbg=='1' || *dbg=='y' || *dbg=='Y' || *dbg=='t' || *dbg=='T')) {
+            long long dbgM = (long long)ne0;
+            long long dbgN = (long long)(ne1 * ne2 * ne3);
+            GGML_LOG_INFO("mul_mat debug-entry: M=%lld N=%lld K=%lld use_tiled=%d env_tiled=%s\n",
+                          dbgM, dbgN, (long long)ne00, use_tiled, getenv("GGML_MUL_MAT_TILED"));
+        }
     }
 
-    // The number of elements in each chunk
-    const int64_t dr0 = (nr0 + nchunk0 - 1) / nchunk0;
-    const int64_t dr1 = (nr1 + nchunk1 - 1) / nchunk1;
+    const int64_t nr0 = ne0;                // M dimension
+    const int64_t nr1 = ne1 * ne2 * ne3;     // Combined N dimension (flattened)
 
-    // The first chunk comes from our thread_id, the rest will get auto-assigned.
-    int current_chunk = ith;
+    // Temporary debug marker: verify this function is executed for micro-fused-kblock
+    // Will emit once per call when env MFKB_MARK_ONCE is set. Remove after diagnosis.
+    if (getenv("MFKB_MARK_ONCE")) {
+        GGML_LOG_INFO("mul_mat debug-marker: entered ggml_compute_forward_mul_mat() M=%lld N=%lld K=%lld\n", (long long)nr0, (long long)nr1, (long long)ne00);
+    }
 
-    while (current_chunk < nchunk0 * nchunk1) {
-        const int64_t ith0 = current_chunk % nchunk0;
-        const int64_t ith1 = current_chunk / nchunk0;
+    // Phase1: K-block scaffolding (env-controlled, no behavioral change yet except profiling awareness)
+    static int s_kblock_checked = 0;
+    static int64_t s_kblock_size = 0; // 0 means disabled
+    static bool s_kblock_quant_enabled = false;
+    static bool s_kblock_quant_fused = false; // experimental fused dequant+dot (currently SIMD inner kernel marker)
+    if (!s_kblock_checked) {
+        const char * ev = getenv("GGML_GEMM_KBLOCK");
+        if (ev) {
+            long val = strtol(ev, NULL, 10);
+            if (val > 0) s_kblock_size = val;
+        }
+        const char * evq = getenv("GGML_GEMM_KBLOCK_QUANT");
+        if (evq && (*evq=='1' || *evq=='y' || *evq=='Y' || *evq=='t' || *evq=='T')) {
+            s_kblock_quant_enabled = true;
+        }
+        const char * evqf = getenv("GGML_GEMM_KBLOCK_QUANT_FUSED");
+        if (evqf && (*evqf=='1' || *evqf=='y' || *evqf=='Y' || *evqf=='t' || *evqf=='T')) {
+            s_kblock_quant_fused = true;
+        }
+        s_kblock_checked = 1;
+        if (getenv("MFKB_DEBUG")) {
+            GGML_LOG_INFO("mul_mat debug-init: kblock=%lld quant_enabled=%d fused_flag=%d (first init)\n", (long long)s_kblock_size, (int)s_kblock_quant_enabled, (int)s_kblock_quant_fused);
+        }
+    }
 
-        const int64_t ir0_start = dr0 * ith0;
-        const int64_t ir0_end = MIN(ir0_start + dr0, nr0);
+    // Development: allow late enabling of fused flag if env set after first initialization (hot reload scenario)
+    if (!s_kblock_quant_fused) {
+        const char * evqf_rt = getenv("GGML_GEMM_KBLOCK_QUANT_FUSED");
+        if (evqf_rt && (*evqf_rt=='1' || *evqf_rt=='y' || *evqf_rt=='Y' || *evqf_rt=='t' || *evqf_rt=='T')) {
+            s_kblock_quant_fused = true;
+            if (getenv("MFKB_DEBUG")) GGML_LOG_INFO("mul_mat debug-runtime: fused flag enabled late\n");
+        }
+    }
 
-        const int64_t ir1_start = dr1 * ith1;
-        const int64_t ir1_end = MIN(ir1_start + dr1, nr1);
+    if (!use_tiled) {
+        // legacy chunk-based path
+        int chunk_size = 16;
+        if (nr0 == 1 || nr1 == 1) { chunk_size = 64; }
+        int64_t nchunk0 = (nr0 + chunk_size - 1) / chunk_size;
+        int64_t nchunk1 = (nr1 + chunk_size - 1) / chunk_size;
+        if (nchunk0 * nchunk1 < nth * 4 || ggml_is_numa()) {
+            nchunk0 = nr0 > nr1 ? nth : 1;
+            nchunk1 = nr0 > nr1 ? 1 : nth;
+        }
+        const int64_t dr0 = (nr0 + nchunk0 - 1) / nchunk0;
+        const int64_t dr1 = (nr1 + nchunk1 - 1) / nchunk1;
+        int current_chunk = ith;
+        while (current_chunk < nchunk0 * nchunk1) {
+            const int64_t ith0 = current_chunk % nchunk0;
+            const int64_t ith1 = current_chunk / nchunk0;
+            const int64_t ir0_start = dr0 * ith0;
+            const int64_t ir0_end   = MIN(ir0_start + dr0, nr0);
+            const int64_t ir1_start = dr1 * ith1;
+            const int64_t ir1_end   = MIN(ir1_start + dr1, nr1);
+            int64_t num_rows_per_vec_dot = vec_dot_num_rows;
+            if ((nr0 % 2 != 0) || (ne11 % 2 != 0) || ((ir0_end - ir0_start) % 2 != 0) || ((ir1_end - ir1_start) % 2 != 0)) {
+                num_rows_per_vec_dot = 1;
+            }
+            ggml_compute_forward_mul_mat_one_chunk(params, dst, src0->type, num_rows_per_vec_dot,
+                                                   ir0_start, ir0_end, ir1_start, ir1_end);
+            if (ith == 0 && ggml_profiling_mul_mat_enabled()) {
+                // Approximate flops for this sub-rectangle: (ir0_end-ir0_start)*(ir1_end-ir1_start)*K
+                ggml_profile_mul_mat_flops_acc(ir0_end - ir0_start, ir1_end - ir1_start, ne00);
+            }
+            if (nth >= nchunk0 * nchunk1) break;
+            current_chunk = atomic_fetch_add_explicit(&params->threadpool->current_chunk, 1, memory_order_relaxed);
+        }
+        if (ggml_profiling_mul_mat_enabled() && ith == 0) {
+            uint64_t t_end = ggml_time_us();
+            ggml_profile_mul_mat_compute_time_acc(t_compute_start, t_end);
+            // Derive GFLOP/s snapshot before report (compute_time_us just added)
+            long comp = atomic_load_explicit(&g_mmprof.compute_time_us, memory_order_relaxed);
+            long flops = atomic_load_explicit(&g_mmprof.flops_f64, memory_order_relaxed);
+            if (comp > 0 && flops > 0) {
+                double gflops = ((double)flops / (double)comp) * 1e6 / 1e9;
+                // Only record for kblock disabled shapes (pure legacy baseline)
+                ggml_mul_mat_fb_record_legacy(nr0, nr1, ne00, (float)gflops);
+            }
+            ggml_profile_mul_mat_report_once();
+        }
+        return;
+    }
 
-        // dot kernels can handle 1 row and col at a time, but mmla kernels can process 2 rows and cols
+    // Tiled static path
+    if (use_tiled && ggml_mul_mat_fb_should_disable(nr0, nr1, ne00)) {
+        use_tiled = false; // revert to legacy for this call
+        if (ith == 0 && ggml_profiling_mul_mat_enabled()) {
+            GGML_LOG_INFO("mul_mat: fallback reverting to legacy for shape %lldx%lldx%lld\n", (long long)nr0, (long long)nr1, (long long)ne00);
+        }
+    }
+    // Heuristic base tile sizes; may tune later or make arch dependent.
+    int64_t tile_m = 64; // rows of A (M)
+    int64_t tile_n = 64; // flattened columns (N)
+    bool tile_overridden = false;
+    {
+        const char * ev = getenv("GGML_MUL_MAT_TILE");
+        if (ev) {
+            // Parse simple "MxN" pattern
+            long tm = 0, tn = 0;
+            if (sscanf(ev, "%ldx%ld", &tm, &tn) == 2 && tm > 0 && tn > 0) {
+                tile_m = tm; tile_n = tn; tile_overridden = true;
+            }
+        }
+    }
+
+    // Adjust for very small dimensions
+    if (nr0 < tile_m) tile_m = nr0;
+    if (nr1 < tile_n) tile_n = nr1;
+
+    // Light heuristic: if N is huge relative to M (common in inference with small batch), shrink M tile
+    if (nr0 <= 32 && nr1 >= 1024) tile_m = (nr0 + nth - 1) / nth; // distribute M minimally
+    if (tile_m < 1) tile_m = 1;
+    if (tile_n < 1) tile_n = 1;
+
+    // Defer tile count computation until after kblock heuristic may adjust tile_n
+
+    // If K-block enabled but absurdly large, clamp to full K (effectively disable)
+    int64_t kblock = (s_kblock_size > 0 ? s_kblock_size : 0);
+    if (kblock > ne00) kblock = 0;
+    // Experimental upper cap (per request) - do not allow kblock > 768 for now to limit panel size & memory traffic
+    if (kblock > 768) kblock = 768;
+    // Apply tile_n expansion heuristic now that kblock is known
+    if (kblock > 0 && !tile_overridden) {
+        long factor = 0;
+        const char * evf = getenv("GGML_MUL_MAT_TILE_N_FACTOR");
+        if (evf) {
+            long f = strtol(evf, NULL, 10);
+            if (f > 0 && f <= 8) factor = f; // safety clamp
+        }
+        if (factor == 0) factor = 2; // default heuristic multiplier
+        size_t panel_cap = 1024 * 1024; // 1MB default
+        const char * evc = getenv("GGML_MUL_MAT_PANEL_CAP");
+        if (evc) {
+            long pc = strtol(evc, NULL, 10);
+            if (pc > 16*1024 && pc < 16*1024*1024) panel_cap = (size_t)pc; // 16KB..16MB range
+        }
+        int64_t proposed = tile_n * factor;
+        if (proposed > nr1) proposed = nr1;
+        long double panel_bytes_ld = (long double)kblock * (long double)proposed * sizeof(float);
+        if (panel_bytes_ld <= (long double)panel_cap) {
+            tile_n = proposed;
+        } else {
+            while (factor > 1) {
+                factor /= 2;
+                proposed = tile_n * factor;
+                if (proposed < tile_n) break;
+                panel_bytes_ld = (long double)kblock * (long double)proposed * sizeof(float);
+                if (panel_bytes_ld <= (long double)panel_cap) { tile_n = proposed; break; }
+            }
+        }
+    }
+    // Simple heuristic default if user only set GGML_GEMM_KBLOCK=auto in future (not yet): none.
+
+    // Now compute tile counts (after any adjustment)
+    const int64_t ntiles_m = (nr0 + tile_m - 1) / tile_m;
+    const int64_t ntiles_n = (nr1 + tile_n - 1) / tile_n;
+    const int64_t total_tiles = ntiles_m * ntiles_n;
+
+    // If user requested kblock but data types not F32xF32 and quant kblock disabled -> record inactive
+    if (kblock > 0) {
+        bool is_f32_pair = (src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32);
+        bool is_quant_pair = !is_f32_pair;
+        if (is_quant_pair && !s_kblock_quant_enabled) {
+            if (ith == 0) ggml_profile_mul_mat_kblock_inactive(1, kblock); // quant fallback
+        }
+    }
+
+    // Static assignment: spread tiles roughly evenly across threads
+    for (int64_t tile_idx = ith; tile_idx < total_tiles; tile_idx += nth) {
+        const int64_t tm = tile_idx % ntiles_m;
+        const int64_t tn = tile_idx / ntiles_m;
+        const int64_t ir0_start = tm * tile_m;
+        const int64_t ir0_end   = MIN(ir0_start + tile_m, nr0);
+        const int64_t ir1_start = tn * tile_n;
+        const int64_t ir1_end   = MIN(ir1_start + tile_n, nr1);
         int64_t num_rows_per_vec_dot = vec_dot_num_rows;
-
-        // these checks are needed to avoid crossing dim1 boundaries
-        // can be optimized, but the logic would become more complicated, so keeping it like this for simplicity
         if ((nr0 % 2 != 0) || (ne11 % 2 != 0) || ((ir0_end - ir0_start) % 2 != 0) || ((ir1_end - ir1_start) % 2 != 0)) {
             num_rows_per_vec_dot = 1;
         }
-        ggml_compute_forward_mul_mat_one_chunk(params, dst, src0->type, num_rows_per_vec_dot, ir0_start, ir0_end, ir1_start, ir1_end);
 
-        if (nth >= nchunk0 * nchunk1) {
-            break;
+        if (kblock == 0) {
+            // Original full-K behavior
+            ggml_compute_forward_mul_mat_one_chunk(params, dst, src0->type, num_rows_per_vec_dot,
+                                                   ir0_start, ir0_end, ir1_start, ir1_end);
+            if (ith == 0 && ggml_profiling_mul_mat_enabled()) {
+                ggml_profile_mul_mat_flops_acc(ir0_end - ir0_start, ir1_end - ir1_start, ne00);
+            }
+        // Extended inactive reasons (codes):
+        // 1 = quant path disabled (existing)
+        // 2 = misaligned kblock (quant *_K types require kblock % QK_K == 0)
+        // 3 = activation (src0) type unsupported for quant partial-K (needs F32 currently)
+        // 4 = weight (src1) not a *_K quant type while quant kblock requested
+        // We record these once per call (thread 0) so user sees why extended metrics are absent.
+        if (kblock > 0 && s_kblock_quant_enabled && ith == 0) {
+            bool weights_k_quant = (
+                src1->type == GGML_TYPE_Q2_K || src1->type == GGML_TYPE_Q3_K || src1->type == GGML_TYPE_Q4_K ||
+                src1->type == GGML_TYPE_Q5_K || src1->type == GGML_TYPE_Q6_K || src1->type == GGML_TYPE_Q8_K);
+            if (!weights_k_quant && !(src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32)) {
+                // Requested quant kblock but weights not *_K (and not pure F32 pair)
+                ggml_profile_mul_mat_kblock_inactive(4, kblock);
+            } else if (weights_k_quant) {
+    #ifdef QK_K
+                const int QK_REQUIRED_CHECK = QK_K;
+    #else
+                const int QK_REQUIRED_CHECK = 256; // fallback assumption
+    #endif
+                if (src0->type != GGML_TYPE_F32) {
+                    ggml_profile_mul_mat_kblock_inactive(3, kblock);
+                } else if ((kblock % QK_REQUIRED_CHECK) != 0) {
+                    ggml_profile_mul_mat_kblock_inactive(2, kblock);
+                }
+            }
         }
+        } else {
+            // Potential partial-K paths: F32xF32 (implemented earlier) and new quant dequant path for *_K types when enabled.
+            bool is_f32_pair = (src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32);
+            bool quant_enabled = s_kblock_quant_enabled;
+            bool src1_is_k_quant = (
+                src1->type == GGML_TYPE_Q2_K || src1->type == GGML_TYPE_Q3_K || src1->type == GGML_TYPE_Q4_K ||
+                src1->type == GGML_TYPE_Q5_K || src1->type == GGML_TYPE_Q6_K || src1->type == GGML_TYPE_Q8_K);
+            bool can_quant_partial = (quant_enabled && src0->type == GGML_TYPE_F32 && src1_is_k_quant);
 
-        current_chunk = atomic_fetch_add_explicit(&params->threadpool->current_chunk, 1, memory_order_relaxed);
+            if (ith == 0) {
+                const char * dbg = getenv("MFKB_DEBUG");
+                if (dbg && (*dbg=='1' || *dbg=='y' || *dbg=='Y' || *dbg=='t' || *dbg=='T')) {
+                    GGML_LOG_INFO("mul_mat debug: shape M=%lld N=%lld K=%lld quant_enabled=%d src1_is_k_quant=%d can_quant_partial=%d kblock=%lld fused_flag=%d use_tiled=%d\n",
+                                  (long long)nr0, (long long)nr1, (long long)ne00,
+                                  quant_enabled, src1_is_k_quant, can_quant_partial, (long long)kblock, s_kblock_quant_fused, use_tiled);
+                }
+            }
+
+            if (!is_f32_pair && !can_quant_partial) {
+                // fallback
+                ggml_compute_forward_mul_mat_one_chunk(params, dst, src0->type, num_rows_per_vec_dot,
+                                                       ir0_start, ir0_end, ir1_start, ir1_end);
+                if (ith == 0 && ggml_profiling_mul_mat_enabled()) {
+                    ggml_profile_mul_mat_flops_acc(ir0_end - ir0_start, ir1_end - ir1_start, ne00);
+                }
+                continue;
+            }
+
+            // Common setup for partial accumulation writes (zero destination tile region first)
+            const int64_t tile_rows = ir0_end - ir0_start;
+            const int64_t tile_cols = ir1_end - ir1_start;
+            // Prepare destination column base pointers
+            const int64_t stack_cap = 256;
+            float * dst_col_ptrs_stack[stack_cap];
+            float ** dst_col_ptrs = dst_col_ptrs_stack;
+            if (tile_cols > stack_cap) {
+                dst_col_ptrs = (float**)malloc(sizeof(float*) * tile_cols);
+            }
+            for (int64_t off = 0, ir1 = ir1_start; ir1 < ir1_end; ++ir1, ++off) {
+                const int64_t i13 = (ir1 / (ne12 * ne1));
+                const int64_t i12 = (ir1 - i13 * ne12 * ne1) / ne1;
+                const int64_t i11 = (ir1 - i13 * ne12 * ne1 - i12 * ne1);
+                dst_col_ptrs[off] = (float*)((char*)tensor_data(dst) + (i11 * nb1 + i12 * nb2 + i13 * nb3));
+            }
+            for (int64_t off = 0; off < tile_cols; ++off) {
+                memset(dst_col_ptrs[off] + ir0_start, 0, tile_rows * sizeof(float));
+            }
+
+            // Thread-local panel buffers (separate for F32 packed / quant dequant output reuse same structure)
+            struct kblock_panel_tls { float * buf; size_t cap; };
+            static _Thread_local struct kblock_panel_tls kbpanel = { NULL, 0 };
+
+            // For quant path we dequantize per-column K-slice; require kblock multiple of QK_K for all *_K quant formats.
+            // Retrieve QK_K from quant header via macro (declared in ggml-quants.h indirectly); guard at compile time.
+#ifdef QK_K
+            const int QK_REQUIRED = QK_K;
+#else
+            const int QK_REQUIRED = 256; // fallback assumption
+#endif
+            if (can_quant_partial && (kblock % QK_REQUIRED) != 0) {
+                // Requirement not met -> fallback once and profile inactive-other reason.
+                if (ith == 0) ggml_profile_mul_mat_kblock_inactive(2 /* other */, kblock);
+                ggml_compute_forward_mul_mat_one_chunk(params, dst, src0->type, num_rows_per_vec_dot,
+                                                       ir0_start, ir0_end, ir1_start, ir1_end);
+                if (ith == 0 && ggml_profiling_mul_mat_enabled()) {
+                    ggml_profile_mul_mat_flops_acc(ir0_end - ir0_start, ir1_end - ir1_start, ne00);
+                }
+                if (tile_cols > stack_cap) free(dst_col_ptrs);
+                continue;
+            }
+
+            const int64_t K = ne00;
+            for (int64_t k0 = 0; k0 < K; k0 += kblock) {
+                const int64_t k_step = MIN(kblock, K - k0);
+                size_t need = (size_t)k_step * (size_t)tile_cols;
+                bool fused_quant = can_quant_partial && s_kblock_quant_fused;
+                if (ith == 0) {
+                    const char * dbg = getenv("MFKB_DEBUG");
+                    if (dbg && (*dbg=='1' || *dbg=='y' || *dbg=='Y' || *dbg=='t' || *dbg=='T')) {
+                        GGML_LOG_INFO("mul_mat debug: entering k-loop k0=%lld k_step=%lld fused_quant=%d (kblock=%lld)\n", (long long)k0, (long long)k_step, fused_quant, (long long)kblock);
+                    }
+                }
+                if (!fused_quant) {
+                    if (kbpanel.cap < need) {
+                        free(kbpanel.buf);
+                        kbpanel.buf = (float*)malloc(need * sizeof(float));
+                        kbpanel.cap = need;
+                    }
+                }
+                float * panel = kbpanel.buf; // may be NULL if fused_quant
+                uint64_t t_panel_start = (ggml_profiling_mul_mat_enabled() && !fused_quant) ? ggml_time_us() : 0;
+
+                if (is_f32_pair) {
+                    // Pack plain F32 weights slice
+                    for (int64_t off = 0, ir1 = ir1_start; ir1 < ir1_end; ++ir1, ++off) {
+                        const int64_t i13 = (ir1 / (ne12 * ne1));
+                        const int64_t i12 = (ir1 - i13 * ne12 * ne1) / ne1;
+                        const int64_t i11 = (ir1 - i13 * ne12 * ne1 - i12 * ne1);
+                        const char * src1_col_full = (const char*)(tensor_data(src1)) + (i11 * nb11 + i12 * nb12 + i13 * nb13);
+                        const float * src1_slice = (const float*)(src1_col_full + k0 * nb01); // nb01 stride per K element
+                        memcpy(panel + off * k_step, src1_slice, k_step * sizeof(float));
+                    }
+                } else if (can_quant_partial) {
+                    if (!fused_quant) {
+                        // Panel dequant from src1 (quant weights) into 'panel'
+                        for (int64_t off = 0, ir1 = ir1_start; ir1 < ir1_end; ++ir1, ++off) {
+                            const int64_t i13 = (ir1 / (ne12 * ne1));
+                            const int64_t i12 = (ir1 - i13 * ne12 * ne1) / ne1;
+                            const int64_t i11 = (ir1 - i13 * ne12 * ne1 - i12 * ne1);
+                            const char * wcol_base = (const char*)tensor_data(src1) + (i11 * nb11 + i12 * nb12 + i13 * nb13);
+                            char * w_slice_ptr = (char*)wcol_base + k0 * nb01;
+                            float * out_col = panel + off * k_step;
+                            int64_t remaining = k_step;
+                            int64_t processed = 0;
+                            while (remaining > 0) {
+                                int64_t chunk = remaining;
+                                if (chunk % QK_REQUIRED != 0) chunk -= (chunk % QK_REQUIRED);
+                                if (chunk == 0) break;
+                                switch (src1->type) {
+                                    case GGML_TYPE_Q2_K: dequantize_row_q2_K((const block_q2_K*)w_slice_ptr, out_col + processed, chunk); break;
+                                    case GGML_TYPE_Q3_K: dequantize_row_q3_K((const block_q3_K*)w_slice_ptr, out_col + processed, chunk); break;
+                                    case GGML_TYPE_Q4_K: dequantize_row_q4_K((const block_q4_K*)w_slice_ptr, out_col + processed, chunk); break;
+                                    case GGML_TYPE_Q5_K: dequantize_row_q5_K((const block_q5_K*)w_slice_ptr, out_col + processed, chunk); break;
+                                    case GGML_TYPE_Q6_K: dequantize_row_q6_K((const block_q6_K*)w_slice_ptr, out_col + processed, chunk); break;
+                                    case GGML_TYPE_Q8_K: dequantize_row_q8_K((const block_q8_K*)w_slice_ptr, out_col + processed, chunk); break;
+                                    default: GGML_UNREACHABLE();
+                                }
+                                processed += chunk;
+                                remaining -= chunk;
+                                w_slice_ptr += (chunk / QK_REQUIRED) * ggml_type_size(src1->type) * (QK_REQUIRED / ggml_blck_size(src1->type));
+                            }
+                            if (processed != k_step) {
+                                for (int64_t fill = processed; fill < k_step; ++fill) out_col[fill] = 0.0f;
+                            }
+                        }
+                    } else {
+                        // fused_quant path (on-the-fly dequant handled in inner loop elsewhere); mark once per k-block
+                        if (ith == 0) ggml_profile_mul_mat_fused_used();
+                        if (ith == 0 && ggml_profiling_mul_mat_enabled() && ggml_profiling_mul_mat_verbose()) {
+                            GGML_LOG_INFO("mul_mat debug: fused k-block processed k0=%lld k_step=%lld\n", (long long)k0, (long long)k_step);
+                        }
+                    }
+                }
+
+                if (ggml_profiling_mul_mat_enabled() && !fused_quant) {
+                    uint64_t t_panel_end = ggml_time_us();
+                    ggml_profile_mul_mat_panel_time(t_panel_start, t_panel_end);
+                    ggml_profile_mul_mat_panel_bytes((size_t)k_step * (size_t)tile_cols * sizeof(float));
+                }
+                uint64_t t_inner_start = ggml_profiling_mul_mat_enabled() ? ggml_time_us() : 0;
+
+                // Compute indices mapping once for A broadcasting
+                const int64_t i13_first = (ir1_start / (ne12 * ne1));
+                const int64_t i12_first = (ir1_start - i13_first * ne12 * ne1) / ne1;
+                const int64_t i02 = i12_first / (ne12 / ne02);
+                const int64_t i03 = i13_first / (ne13 / ne03);
+                const char * src0_base = (const char*)tensor_data(src0) + (i02 * nb02 + i03 * nb03);
+
+                if (!fused_quant) {
+                    for (int64_t ir0 = ir0_start; ir0 < ir0_end; ++ir0) {
+                        const float * a_slice = (const float*)(src0_base + ir0 * nb01) + k0;
+                        for (int64_t off = 0; off < tile_cols; ++off) {
+                            const float * bcol = panel + off * k_step;
+                            float acc = ggml_dot_f32_f32_simd(a_slice, bcol, k_step);
+                            dst_col_ptrs[off][ir0] += acc;
+                        }
+                    }
+                } else {
+                    // On-the-fly fused dequant: dequant one column slice then dot
+                    for (int64_t off = 0; off < tile_cols; ++off) {
+                        const int64_t ir1 = ir1_start + off;
+                        const int64_t i13 = (ir1 / (ne12 * ne1));
+                        const int64_t i12 = (ir1 - i13 * ne12 * ne1) / ne1;
+                        const int64_t i11 = (ir1 - i13 * ne12 * ne1 - i12 * ne1);
+                        const char * wcol_base = (const char*)tensor_data(src1) + (i11 * nb11 + i12 * nb12 + i13 * nb13);
+                        const char * w_slice_ptr0 = wcol_base + k0 * nb01;
+                        float * tmp = (float*)alloca(k_step * sizeof(float));
+                        int64_t remaining = k_step;
+                        int64_t processed = 0;
+                        const char * w_ptr = w_slice_ptr0;
+                        while (remaining > 0) {
+                            int64_t chunk = remaining;
+                            if (chunk % QK_REQUIRED != 0) chunk -= (chunk % QK_REQUIRED);
+                            if (chunk == 0) break;
+                            switch (src1->type) {
+                                case GGML_TYPE_Q2_K: dequantize_row_q2_K((const block_q2_K*)w_ptr, tmp + processed, chunk); break;
+                                case GGML_TYPE_Q3_K: dequantize_row_q3_K((const block_q3_K*)w_ptr, tmp + processed, chunk); break;
+                                case GGML_TYPE_Q4_K: dequantize_row_q4_K((const block_q4_K*)w_ptr, tmp + processed, chunk); break;
+                                case GGML_TYPE_Q5_K: dequantize_row_q5_K((const block_q5_K*)w_ptr, tmp + processed, chunk); break;
+                                case GGML_TYPE_Q6_K: dequantize_row_q6_K((const block_q6_K*)w_ptr, tmp + processed, chunk); break;
+                                case GGML_TYPE_Q8_K: dequantize_row_q8_K((const block_q8_K*)w_ptr, tmp + processed, chunk); break;
+                                default: GGML_UNREACHABLE();
+                            }
+                            processed += chunk;
+                            remaining -= chunk;
+                            w_ptr += (chunk / QK_REQUIRED) * ggml_type_size(src1->type) * (QK_REQUIRED / ggml_blck_size(src1->type));
+                        }
+                        if (processed != k_step) {
+                            for (int64_t fill = processed; fill < k_step; ++fill) tmp[fill] = 0.0f;
+                        }
+                        for (int64_t ir0 = ir0_start; ir0 < ir0_end; ++ir0) {
+                            const float * a_slice = (const float*)(src0_base + ir0 * nb01) + k0;
+                            float acc = ggml_dot_f32_f32_simd(a_slice, tmp, k_step);
+                            dst_col_ptrs[off][ir0] += acc;
+                        }
+                    }
+                }
+                if (ggml_profiling_mul_mat_enabled()) {
+                    uint64_t t_inner_end = ggml_time_us();
+                    ggml_profile_mul_mat_inner_time(t_inner_start, t_inner_end);
+                    // Count k_iters and flops regardless of which thread processed the partial-K slice
+                    ggml_profile_mul_mat_kiter(k_step);
+                    ggml_profile_mul_mat_flops_acc(ir0_end - ir0_start, ir1_end - ir1_start, k_step);
+                }
+            }
+
+            if (tile_cols > stack_cap) free(dst_col_ptrs);
+        }
     }
+    if (ggml_profiling_mul_mat_enabled() && ith == 0) {
+        uint64_t t_end = ggml_time_us();
+        // Compute incremental compute time and derive this-call GFLOP/s (avoid cumulative distortion)
+        uint64_t call_compute_us = t_end - t_compute_start;
+        ggml_profile_mul_mat_compute_time_acc(t_compute_start, t_end);
+        // Acquire recent flops added during this call: since flops are cumulative, we cannot easily isolate without a reset.
+        // Approximate by recomputing GFLOP/s from total; still valid for relative comparison when legacy recorded early.
+        long comp = atomic_load_explicit(&g_mmprof.compute_time_us, memory_order_relaxed);
+        long flops = atomic_load_explicit(&g_mmprof.flops_f64, memory_order_relaxed);
+        if (comp > 0 && flops > 0) {
+            double gflops = ((double)flops / (double)comp) * 1e6 / 1e9;
+            // Consider disabling only when kblock disabled (we want fallback decisions only for plain tiled vs legacy)
+            if (kblock == 0) ggml_mul_mat_fb_consider_tiled(nr0, nr1, ne00, (float)gflops);
+        }
+        ggml_profile_mul_mat_report_once();
+        (void)call_compute_us; // placeholder if we later want per-call metric
+    }
+    return;
 }
 
 // ggml_compute_forward_mul_mat_id
@@ -2637,19 +3397,112 @@ static bool ggml_thread_apply_priority(int32_t prio) {
     return true;
 }
 
-#elif defined(__gnu_linux__)
-// TODO: this may not work on BSD, to be verified
+            // Real partial-K accumulation path (Phase1 minimal): only enabled for pure F32 operands.
+            // Fallback to original behavior if types are not F32 (quantized kernels need full-K vec_dot).
+            if (src0->type != GGML_TYPE_F32 || src1->type != GGML_TYPE_F32) {
+                ggml_compute_forward_mul_mat_one_chunk(params, dst, src0->type, num_rows_per_vec_dot,
+                                                       ir0_start, ir0_end, ir1_start, ir1_end);
+                if (ith == 0 && ggml_profiling_mul_mat_enabled()) {
+                    ggml_profile_mul_mat_flops_acc(ir0_end - ir0_start, ir1_end - ir1_start, ne00);
+                }
+            } else {
+                // Thread-local panel buffer for B slice (KB x tile_n_cols)
+                struct kblock_panel_tls { float * buf; size_t cap; };
+                static _Thread_local struct kblock_panel_tls kbpanel = { NULL, 0 };
+                const int64_t tile_rows = ir0_end - ir0_start;
+                const int64_t tile_cols = ir1_end - ir1_start;
+                // Precompute destination column base pointers & index triplets for flattened columns
+                // Store up to tile_n entries on stack (tile_n is modest, typically <= 256). If larger, allocate.
+                const int64_t stack_cap = 256;
+                float * dst_col_ptrs_stack[stack_cap];
+                float ** dst_col_ptrs = dst_col_ptrs_stack;
+                int64_t * col_i13_stack[stack_cap]; // not needed after pointer computed; skip.
+                if (tile_cols > stack_cap) {
+                    dst_col_ptrs = (float**)malloc(sizeof(float*) * tile_cols);
+                }
+                // Prepare mapping for each flattened column index
+                for (int64_t off = 0, ir1 = ir1_start; ir1 < ir1_end; ++ir1, ++off) {
+                    const int64_t i13 = (ir1 / (ne12 * ne1));
+                    const int64_t i12 = (ir1 - i13 * ne12 * ne1) / ne1;
+                    const int64_t i11 = (ir1 - i13 * ne12 * ne1 - i12 * ne1);
+                    const int64_t i1 = i11; const int64_t i2 = i12; const int64_t i3 = i13;
+                    dst_col_ptrs[off] = (float*)((char*)tensor_data(dst) + (i1 * nb1 + i2 * nb2 + i3 * nb3));
+                }
 
-static bool ggml_thread_apply_affinity(const bool * mask) {
-    cpu_set_t cpuset;
-    int err;
+                // Zero output tile region once before accumulation if first kblock processed by this thread.
+                // We only zero the portion this tile covers: rows [ir0_start, ir0_end), columns in tile_cols.
+                // For simplicity, always zero then accumulate partial blocks.
+                for (int64_t off = 0; off < tile_cols; ++off) {
+                    memset(dst_col_ptrs[off] + ir0_start, 0, tile_rows * sizeof(float));
+                }
 
-    CPU_ZERO(&cpuset);
-
-    for (uint32_t i = 0; i < GGML_MAX_N_THREADS; i++) {
-        if (mask[i]) {
-            GGML_PRINT_DEBUG("Thread %lx: adding %d to cpuset\n", pthread_self(), i);
-            CPU_SET(i, &cpuset);
+                const int64_t K = ne00; // shared K dimension length
+                for (int64_t k0 = 0; k0 < K; k0 += kblock) {
+                    const int64_t k_step = MIN(kblock, K - k0);
+                    // Ensure panel capacity
+                    size_t need = (size_t)k_step * (size_t)tile_cols;
+                    if (kbpanel.cap < need) {
+                        free(kbpanel.buf);
+                        size_t new_cap = need;
+                        kbpanel.buf = (float*)malloc(new_cap * sizeof(float));
+                        kbpanel.cap = new_cap;
+                    }
+                    float * panel = kbpanel.buf; // layout: column-major blocks of length k_step
+                    uint64_t t_panel_start = ggml_profiling_mul_mat_enabled() ? ggml_time_us() : 0;
+                    // Pack B slice for each column
+                    for (int64_t off = 0, ir1 = ir1_start; ir1 < ir1_end; ++ir1, ++off) {
+                        const int64_t i13 = (ir1 / (ne12 * ne1));
+                        const int64_t i12 = (ir1 - i13 * ne12 * ne1) / ne1;
+                        const int64_t i11 = (ir1 - i13 * ne12 * ne1 - i12 * ne1);
+                        const char * src1_col_full = (const char*) (src1->type == vec_dot_type ? tensor_data(src1) : params->wdata) +
+                            ( (ggml_is_contiguous(src1) || src1->type != vec_dot_type)
+                                ? (i11 + i12 * ne11 + i13 * ne12 * ne11) * ggml_row_size(vec_dot_type, ne10)
+                                : (i11 * nb11 + i12 * nb12 + i13 * nb13));
+                        // src1_col_full is start of full-K column; advance by k0 * sizeof(float)
+                        const float * src1_slice = (const float*)(src1_col_full) + k0;
+                        memcpy(panel + off * k_step, src1_slice, k_step * sizeof(float));
+                    }
+                    if (ggml_profiling_mul_mat_enabled()) {
+                        uint64_t t_panel_end = ggml_time_us();
+                        ggml_profile_mul_mat_panel_time(t_panel_start, t_panel_end);
+                        ggml_profile_mul_mat_panel_bytes((size_t)k_step * (size_t)tile_cols * sizeof(float));
+                    }
+                    uint64_t t_inner_start = ggml_profiling_mul_mat_enabled() ? ggml_time_us() : 0;
+                    // Multiply A rows slice with packed panel, accumulate
+                    for (int64_t ir0 = ir0_start; ir0 < ir0_end; ++ir0) {
+                        // Determine broadcast indices (reuse pattern from original microkernel)
+                        // For each column output pointer already points to row 0, so offset by ir0 later.
+                        // Row pointer for A:
+                        // broadcast factors: r2 = ne12 / ne02, r3 = ne13 / ne03 already computed earlier above.
+                        // Compute i02/i03 from first column's indices (ir1_start) for row broadcasting.
+                        const int64_t i13_first = (ir1_start / (ne12 * ne1));
+                        const int64_t i12_first = (ir1_start - i13_first * ne12 * ne1) / ne1;
+                        const int64_t i02 = i12_first / (ne12 / ne02);
+                        const int64_t i03 = i13_first / (ne13 / ne03);
+                        const char * src0_row_base = (const char*)tensor_data(src0) + (0 + i02 * nb02 + i03 * nb03);
+                        const float * a_slice = (const float*)(src0_row_base + ir0 * nb01) + k0; // advance k0
+                        for (int64_t off = 0; off < tile_cols; ++off) {
+                            float acc = 0.f;
+                            const float * bcol = panel + off * k_step;
+                            for (int64_t kk = 0; kk < k_step; ++kk) {
+                                acc += a_slice[kk] * bcol[kk];
+                            }
+                            dst_col_ptrs[off][ir0] += acc;
+                        }
+                    }
+                    if (ggml_profiling_mul_mat_enabled()) {
+                        uint64_t t_inner_end = ggml_time_us();
+                        ggml_profile_mul_mat_inner_time(t_inner_start, t_inner_end);
+                        ggml_profile_mul_mat_kiter(k_step);
+                    }
+                }
+                if (ith == 0 && ggml_profiling_mul_mat_enabled()) {
+                    ggml_profile_mul_mat_flops_acc(ir0_end - ir0_start, ir1_end - ir1_start, ne00);
+                }
+                if (tile_cols > stack_cap) {
+                    free(dst_col_ptrs);
+                }
+            }
         }
     }
 
