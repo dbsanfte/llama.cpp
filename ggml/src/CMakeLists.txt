@@ -203,11 +203,16 @@ add_library(ggml-base
             ggml-threading.h
             ggml-quants.c
             ggml-quants.h
+            ggml-experimental.cpp
             gguf.cpp)
 
-target_include_directories(ggml-base PRIVATE .)
+target_include_directories(ggml-base PUBLIC ../include PRIVATE .)
 if (GGML_BACKEND_DL)
     target_compile_definitions(ggml-base PUBLIC GGML_BACKEND_DL)
+endif()
+
+if (GGML_EXPERIMENT_PREFETCH_K)
+    target_compile_definitions(ggml-base PUBLIC GGML_EXPERIMENT_PREFETCH_K)
 endif()
 
 add_library(ggml

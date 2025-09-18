@@ -429,8 +429,21 @@ void ggml_vec_dot_q2_K_q8_K_generic(int n, float * GGML_RESTRICT s, size_t bs, c
     const int nb = n / QK_K;
 
     float sumf = 0;
-
+    int prefetch_enabled = 0;
+#if defined(GGML_EXPERIMENT_PREFETCH_K)
+    extern int ggml_experimental_get_prefetch_k(void);
+    prefetch_enabled = ggml_experimental_get_prefetch_k();
+#endif
     for (int i = 0; i < nb; ++i) {
+#if defined(GGML_EXPERIMENT_PREFETCH_K)
+        if (prefetch_enabled && i + 1 < nb) {
+            const uint8_t * next_qs = x[i+1].qs;
+            const int8_t  * next_q8 = y[i+1].qs;
+            __builtin_prefetch(next_qs, 0, 1);
+            __builtin_prefetch(next_qs + 64, 0, 1);
+            __builtin_prefetch(next_q8, 0, 1);
+        }
+#endif
 
         const uint8_t * q2 = x[i].qs;
         const  int8_t * q8 = y[i].qs;
@@ -502,7 +515,23 @@ void ggml_vec_dot_q3_K_q8_K_generic(int n, float * GGML_RESTRICT s, size_t bs, c
     const int8_t * scales = (const int8_t*)auxs;
 
     float sumf = 0;
+    int prefetch_enabled = 0;
+#if defined(GGML_EXPERIMENT_PREFETCH_K)
+    extern int ggml_experimental_get_prefetch_k(void);
+    prefetch_enabled = ggml_experimental_get_prefetch_k();
+#endif
     for (int i = 0; i < nb; ++i) {
+#if defined(GGML_EXPERIMENT_PREFETCH_K)
+        if (prefetch_enabled && i + 1 < nb) {
+            const uint8_t * next_qs = x[i+1].qs;
+            const uint8_t * next_hm = x[i+1].hmask;
+            const int8_t  * next_q8 = y[i+1].qs;
+            __builtin_prefetch(next_qs, 0, 1);
+            __builtin_prefetch(next_qs + 64, 0, 1);
+            __builtin_prefetch(next_hm, 0, 1);
+            __builtin_prefetch(next_q8, 0, 1);
+        }
+#endif
         const uint8_t * GGML_RESTRICT q3 = x[i].qs;
         const uint8_t * GGML_RESTRICT hm = x[i].hmask;
         const  int8_t * GGML_RESTRICT q8 = y[i].qs;
@@ -576,7 +605,21 @@ void ggml_vec_dot_q4_K_q8_K_generic(int n, float * GGML_RESTRICT s, size_t bs, c
     memset(sums, 0, 8*sizeof(float));
 
     float sumf = 0;
+    int prefetch_enabled = 0;
+#if defined(GGML_EXPERIMENT_PREFETCH_K)
+    extern int ggml_experimental_get_prefetch_k(void);
+    prefetch_enabled = ggml_experimental_get_prefetch_k();
+#endif
     for (int i = 0; i < nb; ++i) {
+#if defined(GGML_EXPERIMENT_PREFETCH_K)
+        if (prefetch_enabled && i + 1 < nb) {
+            const uint8_t * next_qs = x[i+1].qs;
+            const int8_t  * next_q8 = y[i+1].qs;
+            __builtin_prefetch(next_qs, 0, 1);
+            __builtin_prefetch(next_qs + 64, 0, 1);
+            __builtin_prefetch(next_q8, 0, 1);
+        }
+#endif
         const uint8_t * GGML_RESTRICT q4 = x[i].qs;
         const  int8_t * GGML_RESTRICT q8 = y[i].qs;
         memset(aux32, 0, 8*sizeof(int32_t));
@@ -651,7 +694,23 @@ void ggml_vec_dot_q5_K_q8_K_generic(int n, float * GGML_RESTRICT s, size_t bs, c
     memset(sums, 0, 8*sizeof(float));
 
     float sumf = 0;
+    int prefetch_enabled = 0;
+#if defined(GGML_EXPERIMENT_PREFETCH_K)
+    extern int ggml_experimental_get_prefetch_k(void);
+    prefetch_enabled = ggml_experimental_get_prefetch_k();
+#endif
     for (int i = 0; i < nb; ++i) {
+#if defined(GGML_EXPERIMENT_PREFETCH_K)
+        if (prefetch_enabled && i + 1 < nb) {
+            const uint8_t * next_qs = x[i+1].qs;
+            const uint8_t * next_qh = x[i+1].qh;
+            const int8_t  * next_q8 = y[i+1].qs;
+            __builtin_prefetch(next_qs, 0, 1);
+            __builtin_prefetch(next_qs + 64, 0, 1);
+            __builtin_prefetch(next_qh, 0, 1);
+            __builtin_prefetch(next_q8, 0, 1);
+        }
+#endif
         const uint8_t * GGML_RESTRICT q4 = x[i].qs;
         const uint8_t * GGML_RESTRICT hm = x[i].qh;
         const  int8_t * GGML_RESTRICT q8 = y[i].qs;
@@ -722,7 +781,23 @@ void ggml_vec_dot_q6_K_q8_K_generic(int n, float * GGML_RESTRICT s, size_t bs, c
     memset(sums, 0, 8*sizeof(float));
 
     float sumf = 0;
+    int prefetch_enabled = 0;
+#if defined(GGML_EXPERIMENT_PREFETCH_K)
+    extern int ggml_experimental_get_prefetch_k(void);
+    prefetch_enabled = ggml_experimental_get_prefetch_k();
+#endif
     for (int i = 0; i < nb; ++i) {
+#if defined(GGML_EXPERIMENT_PREFETCH_K)
+        if (prefetch_enabled && i + 1 < nb) {
+            const uint8_t * next_q4 = x[i+1].ql;
+            const uint8_t * next_qh = x[i+1].qh;
+            const int8_t  * next_q8 = y[i+1].qs;
+            __builtin_prefetch(next_q4, 0, 1);
+            __builtin_prefetch(next_q4 + 64, 0, 1);
+            __builtin_prefetch(next_qh, 0, 1);
+            __builtin_prefetch(next_q8, 0, 1);
+        }
+#endif
         const uint8_t * GGML_RESTRICT q4 = x[i].ql;
         const uint8_t * GGML_RESTRICT qh = x[i].qh;
         const  int8_t * GGML_RESTRICT q8 = y[i].qs;

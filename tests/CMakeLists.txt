@@ -199,6 +199,9 @@ endif()
 llama_build_and_test(test-gguf.cpp)
 llama_build_and_test(test-backend-ops.cpp)
 
+# Performance micro-benchmark (prefetch K-series). Label 'perf'; requires build with GGML_EXPERIMENT_PREFETCH_K=ON
+llama_build_and_test(test-prefetch-k.cpp LABEL perf)
+
 llama_build_and_test(test-model-load-cancel.cpp  LABEL "model")
 llama_build_and_test(test-autorelease.cpp        LABEL "model")
 

@@ -135,6 +135,9 @@ option(GGML_RV_ZICBOP        "ggml: enable riscv zicbop"     ON)
 option(GGML_XTHEADVECTOR     "ggml: enable xtheadvector"     OFF)
 option(GGML_VXE              "ggml: enable vxe"              ON)
 
+# experimental knobs
+option(GGML_EXPERIMENT_PREFETCH_K "ggml: enable experimental software prefetch in K-series vec_dot" OFF)
+
 option(GGML_CPU_ALL_VARIANTS "ggml: build all variants of the CPU backend (requires GGML_BACKEND_DL)" OFF)
 set(GGML_CPU_ARM_ARCH        "" CACHE STRING "ggml: CPU architecture for ARM")
 set(GGML_CPU_POWERPC_CPUTYPE "" CACHE STRING "ggml: CPU type for PowerPC")
@@ -269,16 +272,17 @@ set(GGML_PUBLIC_HEADERS
     include/ggml-cpu.h
     include/ggml-alloc.h
     include/ggml-backend.h
-    include/ggml-blas.h
-    include/ggml-cann.h
-    include/ggml-cpp.h
     include/ggml-cuda.h
-    include/ggml-opt.h
+    include/ggml-cann.h
     include/ggml-metal.h
-    include/ggml-rpc.h
     include/ggml-sycl.h
     include/ggml-vulkan.h
-    include/ggml-webgpu.h
+    include/ggml-musa.h
+    include/ggml-blas.h
+    include/ggml-rpc.h
+    include/gguf.h
+    include/ggml-experimental.h
+    include/ggml-experimental.h
     include/gguf.h)
 
 set_target_properties(ggml PROPERTIES PUBLIC_HEADER "${GGML_PUBLIC_HEADERS}")
