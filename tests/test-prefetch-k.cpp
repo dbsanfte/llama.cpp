@@ -36,7 +36,7 @@ static void fill(std::vector<float> & v) { for (auto & x : v) x = (float)((rand(
 static void run_case(const bench_case & bc) {
     printf("\n[case %s] M=%d K=%d N=%d iters=%d type=%d\n", bc.label, bc.M, bc.K, bc.N, bc.iters, (int)bc.wtype);
     struct ggml_init_params ip = { 0 };
-    size_t mem_sz = 64ull*1024ull*1024ull; // 64 MB scratch
+    size_t mem_sz = 128ull*1024ull*1024ull; // enlarged to 128 MB scratch for larger test tensors
     static std::vector<uint8_t> arena; arena.resize(mem_sz);
     ip.mem_size = mem_sz; ip.mem_buffer = arena.data();
     ggml_context * ctx = ggml_init(ip);
@@ -105,10 +105,18 @@ static void run_case(const bench_case & bc) {
 int main(){
     srand(42);
     std::vector<bench_case> cases = {
-        {512, 4096, 16, 10, GGML_TYPE_Q4_K, "q4k_small"},
-        {1024, 4096, 16, 10, GGML_TYPE_Q4_K, "q4k_med"},
-        {512, 8192, 16, 6, GGML_TYPE_Q6_K, "q6k_largeK_smallM"},
-        {1024, 8192, 8, 6, GGML_TYPE_Q6_K, "q6k_large"}
+        // Smaller working sets - more iterations to reduce noise
+        {512,   4096, 16, 40, GGML_TYPE_Q4_K, "q4k_small"},
+        {1024,  4096, 16, 30, GGML_TYPE_Q4_K, "q4k_med"},
+        // Existing larger K (8K) with increased iterations
+        {512,   8192, 16, 20, GGML_TYPE_Q6_K, "q6k_largeK_smallM"},
+        {1024,  8192,  8, 16, GGML_TYPE_Q6_K, "q6k_large"},
+        // New big-K (16K) scenarios for Q4_K
+        {1024, 16384, 16, 12, GGML_TYPE_Q4_K, "q4k_bigK"},
+        {2048, 16384, 16, 8,  GGML_TYPE_Q4_K, "q4k_huge"},
+        // New big-K (16K) scenarios for Q6_K (N kept small to manage runtime)
+        {1024, 16384,  8, 12, GGML_TYPE_Q6_K, "q6k_bigK"},
+        {2048, 16384,  8, 8,  GGML_TYPE_Q6_K, "q6k_huge"}
     };
     for (auto & bc : cases) run_case(bc);
     return 0;

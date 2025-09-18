@@ -436,9 +436,9 @@ void ggml_vec_dot_q2_K_q8_K_generic(int n, float * GGML_RESTRICT s, size_t bs, c
 #endif
     for (int i = 0; i < nb; ++i) {
 #if defined(GGML_EXPERIMENT_PREFETCH_K)
-        if (prefetch_enabled && i + 1 < nb) {
-            const uint8_t * next_qs = x[i+1].qs;
-            const int8_t  * next_q8 = y[i+1].qs;
+        if (prefetch_enabled && i + 2 < nb) {
+            const uint8_t * next_qs = x[i+2].qs;
+            const int8_t  * next_q8 = y[i+2].qs;
             __builtin_prefetch(next_qs, 0, 1);
             __builtin_prefetch(next_qs + 64, 0, 1);
             __builtin_prefetch(next_q8, 0, 1);
@@ -522,10 +522,10 @@ void ggml_vec_dot_q3_K_q8_K_generic(int n, float * GGML_RESTRICT s, size_t bs, c
 #endif
     for (int i = 0; i < nb; ++i) {
 #if defined(GGML_EXPERIMENT_PREFETCH_K)
-        if (prefetch_enabled && i + 1 < nb) {
-            const uint8_t * next_qs = x[i+1].qs;
-            const uint8_t * next_hm = x[i+1].hmask;
-            const int8_t  * next_q8 = y[i+1].qs;
+        if (prefetch_enabled && i + 2 < nb) {
+            const uint8_t * next_qs = x[i+2].qs;
+            const uint8_t * next_hm = x[i+2].hmask;
+            const int8_t  * next_q8 = y[i+2].qs;
             __builtin_prefetch(next_qs, 0, 1);
             __builtin_prefetch(next_qs + 64, 0, 1);
             __builtin_prefetch(next_hm, 0, 1);
@@ -612,9 +612,9 @@ void ggml_vec_dot_q4_K_q8_K_generic(int n, float * GGML_RESTRICT s, size_t bs, c
 #endif
     for (int i = 0; i < nb; ++i) {
 #if defined(GGML_EXPERIMENT_PREFETCH_K)
-        if (prefetch_enabled && i + 1 < nb) {
-            const uint8_t * next_qs = x[i+1].qs;
-            const int8_t  * next_q8 = y[i+1].qs;
+        if (prefetch_enabled && i + 2 < nb) {
+            const uint8_t * next_qs = x[i+2].qs;
+            const int8_t  * next_q8 = y[i+2].qs;
             __builtin_prefetch(next_qs, 0, 1);
             __builtin_prefetch(next_qs + 64, 0, 1);
             __builtin_prefetch(next_q8, 0, 1);
@@ -701,10 +701,10 @@ void ggml_vec_dot_q5_K_q8_K_generic(int n, float * GGML_RESTRICT s, size_t bs, c
 #endif
     for (int i = 0; i < nb; ++i) {
 #if defined(GGML_EXPERIMENT_PREFETCH_K)
-        if (prefetch_enabled && i + 1 < nb) {
-            const uint8_t * next_qs = x[i+1].qs;
-            const uint8_t * next_qh = x[i+1].qh;
-            const int8_t  * next_q8 = y[i+1].qs;
+        if (prefetch_enabled && i + 2 < nb) {
+            const uint8_t * next_qs = x[i+2].qs;
+            const uint8_t * next_qh = x[i+2].qh;
+            const int8_t  * next_q8 = y[i+2].qs;
             __builtin_prefetch(next_qs, 0, 1);
             __builtin_prefetch(next_qs + 64, 0, 1);
             __builtin_prefetch(next_qh, 0, 1);
@@ -788,10 +788,10 @@ void ggml_vec_dot_q6_K_q8_K_generic(int n, float * GGML_RESTRICT s, size_t bs, c
 #endif
     for (int i = 0; i < nb; ++i) {
 #if defined(GGML_EXPERIMENT_PREFETCH_K)
-        if (prefetch_enabled && i + 1 < nb) {
-            const uint8_t * next_q4 = x[i+1].ql;
-            const uint8_t * next_qh = x[i+1].qh;
-            const int8_t  * next_q8 = y[i+1].qs;
+        if (prefetch_enabled && i + 2 < nb) {
+            const uint8_t * next_q4 = x[i+2].ql;
+            const uint8_t * next_qh = x[i+2].qh;
+            const int8_t  * next_q8 = y[i+2].qs;
             __builtin_prefetch(next_q4, 0, 1);
             __builtin_prefetch(next_q4 + 64, 0, 1);
             __builtin_prefetch(next_qh, 0, 1);
